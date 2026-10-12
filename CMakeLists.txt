@@ -11,5 +11,10 @@ endif()
 
 add_compile_options(-Wall -Wextra)
 
+enable_testing()
+
 add_subdirectory(src/ps4elf)
+add_subdirectory(src/formats)
 add_subdirectory(tools/inspect)
+add_subdirectory(tools/par)
+add_subdirectory(tests)

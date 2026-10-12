@@ -16,8 +16,11 @@ written in C++.
 
 ## Status
 
-Step 1. `lpn-inspect` parses the decrypted eboot, resolves imports and recovers ~60k
-function boundaries from `.eh_frame` for Ghidra.
+Step 1.
+- `lpn-inspect` parses the decrypted eboot, resolves imports and recovers ~60k function
+  boundaries from `.eh_frame` for Ghidra.
+- `lpn-par` lists and extracts `.par` archives, including SLLZ decompression and nested
+  archives. See [docs/formats.md](docs/formats.md).
 
 ## Build
 
@@ -31,6 +34,14 @@ ninja -C build
 ```sh
 scripts/fetch-nids.sh aerolib.csv
 build/tools/inspect/lpn-inspect /path/to/CUSA12776/eboot.bin --nids aerolib.csv --out analysis/
+```
+
+Unpack an archive (add `--recursive` to unpack archives nested inside it):
+
+```sh
+build/tools/par/lpn-par list    /path/to/CUSA12776/data/hact/c10_0102.par --recursive
+build/tools/par/lpn-par extract /path/to/CUSA12776/data/hact/c10_0102.par out/c10_0102 --recursive
+ctest --test-dir build
 ```
 
 Then in Ghidra, load `eboot.bin` (the [GhidraOrbis](https://github.com/astrelsky/GhidraOrbis)
@@ -49,6 +60,9 @@ run `ghidra/MapLpnSegments.py` on `analysis/` before analysis to map the segment
 ## Layout
 
 - `src/ps4elf/`: PS4 ELF, dynamic linking and `.eh_frame` parsing
+- `src/formats/`: game file formats (PARC, SLLZ)
 - `tools/inspect/`: `lpn-inspect`
+- `tools/par/`: `lpn-par`
+- `tests/`: unit tests on synthetic data
 - `ghidra/`: Ghidra scripts
 - `docs/`: findings about the game
