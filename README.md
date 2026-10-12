@@ -21,6 +21,7 @@ Step 1.
   boundaries from `.eh_frame` for Ghidra.
 - `lpn-par` lists and extracts `.par` archives, including SLLZ decompression and nested
   archives. See [docs/formats.md](docs/formats.md).
+- `lpn-gmd` reads GMD models (meshes, skeleton, material bindings) and exports OBJ for viewing.
 
 ## Build
 
@@ -41,6 +42,9 @@ Unpack an archive (add `--recursive` to unpack archives nested inside it):
 ```sh
 build/tools/par/lpn-par list    /path/to/CUSA12776/data/hact/c10_0102.par --recursive
 build/tools/par/lpn-par extract /path/to/CUSA12776/data/hact/c10_0102.par out/c10_0102 --recursive
+build/tools/par/lpn-par extract /path/to/CUSA12776/data/chara/ps4/adv/c_ca_ken/mesh.par out/mesh
+build/tools/gmd/lpn-gmd info out/mesh/c_ca_ken.gmd
+build/tools/gmd/lpn-gmd obj  out/mesh/c_ca_ken.gmd out/mesh/ken.obj   # textures resolve from the same folder
 ctest --test-dir build
 ```
 
@@ -63,6 +67,7 @@ run `ghidra/MapLpnSegments.py` on `analysis/` before analysis to map the segment
 - `src/formats/`: game file formats (PARC, SLLZ)
 - `tools/inspect/`: `lpn-inspect`
 - `tools/par/`: `lpn-par`
+- `tools/gmd/`: `lpn-gmd`
 - `tests/`: unit tests on synthetic data
 - `ghidra/`: Ghidra scripts
 - `docs/`: findings about the game

@@ -1,5 +1,6 @@
 // Tests for the .par and SLLZ readers, using synthetic data (no game files needed).
 
+#include "formats/gmd.h"
 #include "formats/par.h"
 #include "formats/sllz.h"
 
@@ -127,12 +128,27 @@ void testPar() {
     CHECK(!formats::ParArchive::parse(truncated, &err));
 }
 
+void testGmdVertexLayout() {
+    // The three layouts seen in Kenshiro's model, with their declared strides.
+    auto a = formats::gmdVertexLayout(0x41fe0ffc3ull, nullptr);
+    CHECK(a && a->stride == 40 && a->normal == 20 && a->tangent == 24 && a->uv == 36);
+    auto b = formats::gmdVertexLayout(0x41800ffc3ull, nullptr);
+    CHECK(b && b->stride == 32 && b->uv == 28);
+    auto c = formats::gmdVertexLayout(0x418001fc3ull, nullptr);
+    CHECK(c && c->stride == 28 && c->tangent == -1 && c->uv == 24);
+
+    std::string err;
+    CHECK(!formats::gmdVertexLayout(0x3 | 0x100000, &err)); // unknown bit
+    CHECK(!formats::gmdVertexLayout(0x2, &err));            // not float3 positions
+}
+
 } // namespace
 
 int main() {
     testSllzRoundTrip();
     testSllzKnownStream();
     testPar();
+    testGmdVertexLayout();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

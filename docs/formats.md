@@ -47,12 +47,72 @@ flag's last bit, before that token's payload.
 
 Only version 1 appears in the samples so far.
 
+## Textures (.dds)
+
+Standard DDS with a DX10 header, BC1 (DXT1) or BC3 (DXT5), full mip chains, linear (not
+PS4-tiled). They load directly in normal tools and can go straight to Vulkan as BC textures.
+Suffixes: `_di` diffuse, `_tn` normal, `_mt` material/specular, `_am` multi/ambient mask.
+
+## GMD models (GSGM)
+
+Little-endian. Verified on `chara/ps4/adv/c_ca_ken/mesh.par` → `c_ca_ken.gmd` (Kenshiro).
+
+Header: `GSGM` at 0, the model name at 0x10 (u16 checksum + 30 chars), then (offset, count)
+pairs from 0x30:
+
+| # | Table | Entry |
+|---|---|---|
+| 0 | nodes | 0x80 |
+| 1 | objects | 0x40 |
+| 2 | meshes | 0x40 |
+| 3 | attributes (material bindings) | 0x80 |
+| 4 | materials | 0x10 |
+| 5 | matrices | |
+| 6 | vertex buffer layouts | 0x20 |
+| 7 | vertex data | bytes |
+| 8 | texture names | 0x20 |
+| 9 | shader names | 0x20 |
+| 10 | node names | 0x20 |
+| 11 | index data | u16 count |
+| 12 | object draw lists | bytes |
+| 13 | mesh matrix lists | bytes |
+
+After these come 8 floats of model bounds.
+
+**Node:** index, first child, next sibling, object, matrix, stack op, name index, type; then
+vec4 position, quaternion rotation, vec4 scale, vec4 world position, vec4 anim axis, 4 flags.
+Parents are implied by the child/sibling links. Mesh objects are root nodes named `[lN]name`,
+N being the level of detail (`[l0]` full detail, `[l3]` lowest).
+
+**Vertex buffer:** index, vertex count, u64 packing flags, data offset, data size, stride, pad.
+Layout from the flags (inferred; the three samples' strides all check out):
+
+| Bits | Field | Bytes |
+|---|---|---|
+| 0-2 = 3 | position, float32 xyz | 12 |
+| 6-7 | bone weights u8×4, then bone indices u8×4 | 8 |
+| 8-12 | normal, u8×4 mapped to [-1, 1] | 4 |
+| 13-15 | tangent, u8×4 | 4 |
+| 21-23 | unknown u8×4 | 4 |
+| 24-26 | unknown u8×4 | 4 |
+| 27-28 | uv0, float16×2 | 4 |
+
+**Mesh:** index, attribute, vertex buffer, vertex count, triangle list (count, start), two
+triangle-strip variants of the same geometry (count, start each), matrix list (count, byte
+offset), node, object, unknown, first vertex. Indices are u16 and absolute within the vertex
+buffer, so subtract the first vertex. A matrix list is a u8 count followed by that many u8
+matrix indices; vertex bone indices refer to it.
+
+**Attribute:** index, material, shader, 2 unknown, flags, 2 unknown, then 8 texture indices
+(0xFFFF = unused). Slot 0 is diffuse, 1 multi (`_am`), 2 material (`_mt`), 5 normal (`_tn`).
+
 ## Inner formats seen
 
 | Magic | Extension | What |
 |---|---|---|
 | `DDS ` | .dds | Textures (standard DirectDraw Surface) |
 | `PIBX` | .pib | Particle effects |
+| `GSGM` | .gmd | Models |
 | `GSGT` | .gmt | Animation |
 | `CMTP` | .cmt | Camera motion |
 | `MEP_` | .mep | Effect placement |
