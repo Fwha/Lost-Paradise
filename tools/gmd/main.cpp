@@ -1,13 +1,16 @@
 // lpn-gmd: inspect GMD models and export them for viewing.
 //
 //   lpn-gmd info model.gmd
-//   lpn-gmd obj  model.gmd out.obj
+//   lpn-gmd obj  model.gmd out.obj [--anim anim.gmt --frame N]
 //
 // The OBJ export writes one group per mesh and an .mtl next to it whose map_Kd points at
 // the diffuse texture's .dds name, so extracting the model's .par into the same folder
 // lets Blender pick the textures up. Only full-detail ([l0]) meshes are exported.
+// With --anim, the model is posed by the animation's first clip at frame N (default 0).
 
 #include "formats/gmd.h"
+#include "formats/gmt.h"
+#include "formats/skeleton.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -31,7 +34,8 @@ bool isLod0(const formats::GmdModel& m, const formats::GmdMesh& mesh) {
 }
 
 int usage() {
-    std::fprintf(stderr, "usage: lpn-gmd info model.gmd\n       lpn-gmd obj model.gmd out.obj\n");
+    std::fprintf(stderr, "usage: lpn-gmd info model.gmd\n"
+                         "       lpn-gmd obj model.gmd out.obj [--anim anim.gmt --frame N]\n");
     return 2;
 }
 
@@ -65,7 +69,16 @@ void info(const formats::GmdModel& m) {
     std::printf("\n");
 }
 
-bool writeObj(const formats::GmdModel& m, const fs::path& out) {
+bool readFile(const char* path, std::vector<uint8_t>& out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    out.assign(std::istreambuf_iterator<char>(in), {});
+    return true;
+}
+
+bool writeObj(const formats::GmdModel& m, const fs::path& out, const formats::GmtAnimation* anim,
+              float frame) {
+    const auto world = formats::poseNodes(m, anim, frame);
     fs::path mtlPath = out;
     mtlPath.replace_extension(".mtl");
     std::ofstream obj(out), mtl(mtlPath);
@@ -84,8 +97,11 @@ bool writeObj(const formats::GmdModel& m, const fs::path& out) {
         const auto& mesh = m.meshes()[i];
         if (!isLod0(m, mesh)) continue; // lower-detail copies would overlap the model
         obj << "g mesh" << i << "\nusemtl attr" << mesh.attributeIndex << '\n';
-        for (const auto& v : mesh.vertices) {
-            obj << "v " << v.position[0] << ' ' << v.position[1] << ' ' << v.position[2] << '\n';
+        const auto positions = anim ? formats::skinMesh(m, mesh, world) : std::vector<formats::Vec3>{};
+        for (size_t vi = 0; vi < mesh.vertices.size(); ++vi) {
+            const auto& v = mesh.vertices[vi];
+            const auto& p = anim ? positions[vi] : v.position;
+            obj << "v " << p[0] << ' ' << p[1] << ' ' << p[2] << '\n';
             // DDS rows run top-down; OBJ texture space runs bottom-up.
             obj << "vt " << v.uv[0] << ' ' << 1.0f - v.uv[1] << '\n';
             obj << "vn " << v.normal[0] << ' ' << v.normal[1] << ' ' << v.normal[2] << '\n';
@@ -108,12 +124,11 @@ bool writeObj(const formats::GmdModel& m, const fs::path& out) {
 int main(int argc, char** argv) {
     if (argc < 3) return usage();
     const std::string cmd = argv[1];
-    std::ifstream in(argv[2], std::ios::binary);
-    if (!in) {
+    std::vector<uint8_t> data;
+    if (!readFile(argv[2], data)) {
         std::fprintf(stderr, "cannot read %s\n", argv[2]);
         return 1;
     }
-    std::vector<uint8_t> data(std::istreambuf_iterator<char>(in), {});
 
     std::string err;
     auto model = formats::GmdModel::parse(data, &err);
@@ -125,8 +140,29 @@ int main(int argc, char** argv) {
         info(*model);
         return 0;
     }
-    if (cmd == "obj" && argc == 4) {
-        if (!writeObj(*model, argv[3])) {
+    if (cmd == "obj" && argc >= 4) {
+        const char* animPath = nullptr;
+        float frame = 0;
+        for (int i = 4; i < argc; ++i) {
+            const std::string a = argv[i];
+            if (a == "--anim" && i + 1 < argc) animPath = argv[++i];
+            else if (a == "--frame" && i + 1 < argc) frame = std::stof(argv[++i]);
+            else return usage();
+        }
+        std::optional<formats::GmtFile> gmt;
+        if (animPath) {
+            std::vector<uint8_t> animData;
+            if (!readFile(animPath, animData)) {
+                std::fprintf(stderr, "cannot read %s\n", animPath);
+                return 1;
+            }
+            gmt = formats::GmtFile::parse(animData, &err);
+            if (!gmt || gmt->animations().empty()) {
+                std::fprintf(stderr, "%s: %s\n", animPath, gmt ? "no animations" : err.c_str());
+                return 1;
+            }
+        }
+        if (!writeObj(*model, argv[3], gmt ? &gmt->animations()[0] : nullptr, frame)) {
             std::fprintf(stderr, "cannot write %s\n", argv[3]);
             return 1;
         }

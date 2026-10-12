@@ -21,7 +21,9 @@ Step 1.
   boundaries from `.eh_frame` for Ghidra.
 - `lpn-par` lists and extracts `.par` archives, including SLLZ decompression and nested
   archives. See [docs/formats.md](docs/formats.md).
-- `lpn-gmd` reads GMD models (meshes, skeleton, material bindings) and exports OBJ for viewing.
+- `lpn-gmd` reads GMD models (meshes, skeleton, material bindings) and exports OBJ for viewing,
+  optionally posed by an animation.
+- `lpn-gmt` reads GMT skeletal animations.
 
 ## Build
 
@@ -45,6 +47,9 @@ build/tools/par/lpn-par extract /path/to/CUSA12776/data/hact/c10_0102.par out/c1
 build/tools/par/lpn-par extract /path/to/CUSA12776/data/chara/ps4/adv/c_ca_ken/mesh.par out/mesh
 build/tools/gmd/lpn-gmd info out/mesh/c_ca_ken.gmd
 build/tools/gmd/lpn-gmd obj  out/mesh/c_ca_ken.gmd out/mesh/ken.obj   # textures resolve from the same folder
+build/tools/gmt/lpn-gmt info out/c10_0102/000.par/c10_000_11.gmt
+build/tools/gmd/lpn-gmd obj  out/mesh/c_ca_ken.gmd out/mesh/posed.obj \
+    --anim out/c10_0102/000.par/c10_000_11.gmt --frame 80
 ctest --test-dir build
 ```
 
@@ -64,10 +69,11 @@ run `ghidra/MapLpnSegments.py` on `analysis/` before analysis to map the segment
 ## Layout
 
 - `src/ps4elf/`: PS4 ELF, dynamic linking and `.eh_frame` parsing
-- `src/formats/`: game file formats (PARC, SLLZ)
+- `src/formats/`: game file formats (PARC, SLLZ, GMD, GMT) and skinning
 - `tools/inspect/`: `lpn-inspect`
 - `tools/par/`: `lpn-par`
 - `tools/gmd/`: `lpn-gmd`
+- `tools/gmt/`: `lpn-gmt`
 - `tests/`: unit tests on synthetic data
 - `ghidra/`: Ghidra scripts
 - `docs/`: findings about the game

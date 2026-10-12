@@ -103,8 +103,50 @@ offset), node, object, unknown, first vertex. Indices are u16 and absolute withi
 buffer, so subtract the first vertex. A matrix list is a u8 count followed by that many u8
 matrix indices; vertex bone indices refer to it.
 
+**Matrices:** one 4x4 float inverse bind matrix per skinning bone, stored transposed (for row
+vectors). A node's matrix index selects its matrix; object nodes have indices past the end of
+the table. Skinning matrix = node world × inverse bind.
+
 **Attribute:** index, material, shader, 2 unknown, flags, 2 unknown, then 8 texture indices
 (0xFFFF = unused). Slot 0 is diffuse, 1 multi (`_am`), 2 material (`_mt`), 5 normal (`_tn`).
+
+## GMT animations (GSGT)
+
+Big-endian. Verified on the `hact/c10_0102.par` clips, which animate a standard character
+skeleton and pose Kenshiro's model correctly.
+
+Header: `GSGT`, `02 01` (big-endian), version `0x00020002`, data size, the name at 0x10 (u16
+checksum + 30 chars), then (count, offset) pairs from 0x30:
+
+| # | Table | Entry |
+|---|---|---|
+| 0 | animations | 0x40 |
+| 1 | graphs (keyframe lists) | u32 offset |
+| 2 | graph data | bytes |
+| 3 | strings (animation and bone names) | 0x20 |
+| 4 | bone groups | u16 first string, u16 bone count |
+| 5 | curve groups (one per bone) | u16 first curve, u16 curve count |
+| 6 | curves | 0x10 |
+| 7 | key data | bytes |
+
+**Animation:** start frame, end frame, index, f32 frame rate, name string, bone group, first
+curve group, curve group count, curve count, then graph and data ranges.
+
+**Graph:** u16 key count, then that many u16 frame numbers (a single key at frame 0 means a
+constant).
+
+**Curve:** graph index, key data offset, format, channel. Key data is 32-byte aligned.
+
+| Format | Channel | Keys |
+|---|---|---|
+| 2 | 0 | rotation quaternion, int16 ×4 (xyzw) / 16384 |
+| 4 | axis mask << 16 \| 1 | location on one axis (1 = X, 2 = Y, 4 = Z), float |
+| 6 | 1 | location, float ×3 |
+| 19, 20, 21 | 1-3 << 16 | rotation about X, Y, Z only: int16 ×2 (axis, w) / 16384 |
+| 28 | `pattern_c_n`, ... | hand pattern indices (not decoded) |
+| 29 | `face_c_n`, ... | face pattern values (not decoded) |
+
+Bones are matched to model nodes by name. Unanimated bones keep the model's rest pose.
 
 ## Inner formats seen
 
