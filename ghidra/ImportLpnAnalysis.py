@@ -2,7 +2,8 @@
 #
 # Load eboot.bin with the GhidraOrbis loader (or as raw x86-64 at image base 0 with the
 # segments from segments.csv), run auto-analysis, then run this script and pick the
-# directory lpn-inspect wrote with --out.
+# directory lpn-inspect wrote with --out. In headless mode, pass that directory as the
+# script argument: -postScript ImportLpnAnalysis.py /path/to/analysis
 #
 # @category LostParadise
 # @runtime Jython
@@ -23,7 +24,11 @@ def read_csv(path):
         return list(csv.DictReader(f))
 
 
-out_dir = askDirectory("lpn-inspect output directory", "Use").getAbsolutePath()
+args = getScriptArgs()
+if args:
+    out_dir = os.path.abspath(args[0])
+else:
+    out_dir = askDirectory("lpn-inspect output directory", "Use").getAbsolutePath()
 listing = currentProgram.getListing()
 symbols = currentProgram.getSymbolTable()
 

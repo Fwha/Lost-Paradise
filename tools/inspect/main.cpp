@@ -84,11 +84,11 @@ int main(int argc, char** argv) {
     fs::create_directories(outDir);
 
     std::ofstream seg(fs::path(outDir) / "segments.csv");
-    seg << "type,vaddr,filesz,memsz,flags\n";
+    seg << "type,offset,vaddr,filesz,memsz,flags\n";
     for (const auto& s : elf->segments()) {
         char line[128];
-        std::snprintf(line, sizeof line, "0x%x,0x%" PRIx64 ",0x%" PRIx64 ",0x%" PRIx64 ",%u\n",
-                      s.type, s.vaddr, s.filesz, s.memsz, s.flags);
+        std::snprintf(line, sizeof line, "0x%x,0x%" PRIx64 ",0x%" PRIx64 ",0x%" PRIx64 ",0x%" PRIx64 ",%u\n",
+                      s.type, s.offset, s.vaddr, s.filesz, s.memsz, s.flags);
         seg << line;
     }
 

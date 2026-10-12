@@ -34,7 +34,17 @@ build/tools/inspect/lpn-inspect /path/to/CUSA12776/eboot.bin --nids aerolib.csv 
 ```
 
 Then in Ghidra, load `eboot.bin` (the [GhidraOrbis](https://github.com/astrelsky/GhidraOrbis)
-loader is recommended), run auto-analysis, and run `ghidra/ImportLpnAnalysis.py` on `analysis/`.
+loader is recommended; Ghidra's built-in ELF loader also maps the segments correctly), run
+auto-analysis, and run `ghidra/ImportLpnAnalysis.py` on `analysis/`. Headless (Ghidra 12 needs
+the bundled Jython extension installed and JDK 21+):
+
+```sh
+analyzeHeadless ghidra-project LostParadise -import /path/to/eboot.bin \
+    -scriptPath ghidra -postScript ImportLpnAnalysis.py "$PWD/analysis"
+```
+
+If no loader accepts the file, import it as Raw Binary (`x86:LE:64:default`, `gcc`, base 0) and
+run `ghidra/MapLpnSegments.py` on `analysis/` before analysis to map the segments.
 
 ## Layout
 
