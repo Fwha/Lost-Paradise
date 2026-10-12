@@ -1,6 +1,10 @@
 // Tests for the .par and SLLZ readers, using synthetic data (no game files needed).
 
 #include "formats/gmd.h"
+#include "formats/gmt.h"
+#include "formats/skeleton.h"
+
+#include <cmath>
 #include "formats/par.h"
 #include "formats/sllz.h"
 
@@ -142,6 +146,35 @@ void testGmdVertexLayout() {
     CHECK(!formats::gmdVertexLayout(0x2, &err));            // not float3 positions
 }
 
+bool near(float a, float b) { return std::fabs(a - b) < 1e-4f; }
+
+void testGmtSampling() {
+    formats::GmtTrack<formats::Vec3> loc;
+    loc.frames = {0, 10};
+    loc.values = {{0, 0, 0}, {10, 20, 30}};
+    const auto mid = formats::sampleTrack(loc, 5);
+    CHECK(near(mid[0], 5) && near(mid[1], 10) && near(mid[2], 15));
+    CHECK(near(formats::sampleTrack(loc, -3)[0], 0));  // clamps before the first key
+    CHECK(near(formats::sampleTrack(loc, 99)[2], 30)); // and after the last
+
+    // Opposite-sign quaternions are the same rotation; interpolation must take the short way.
+    formats::GmtTrack<formats::Quat> rot;
+    rot.frames = {0, 2};
+    rot.values = {{0, 0, 0, 1}, {0, 0, 0, -1}};
+    const auto q = formats::sampleTrack(rot, 1);
+    CHECK(near(std::fabs(q[3]), 1));
+}
+
+void testSkeletonMath() {
+    // 90 degrees about Y maps +X to -Z, then translate.
+    const float s = std::sqrt(0.5f);
+    const auto m = formats::matFromTrs({1, 2, 3}, {0, s, 0, s}, {1, 1, 1});
+    const auto p = formats::matTransformPoint(m, {1, 0, 0});
+    CHECK(near(p[0], 1) && near(p[1], 2) && near(p[2], 2));
+    const auto id = formats::matMultiply(m, formats::matIdentity());
+    CHECK(id == m);
+}
+
 } // namespace
 
 int main() {
@@ -149,6 +182,8 @@ int main() {
     testSllzKnownStream();
     testPar();
     testGmdVertexLayout();
+    testGmtSampling();
+    testSkeletonMath();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

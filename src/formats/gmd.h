@@ -14,13 +14,16 @@
 
 namespace formats {
 
+// Row-major 4x4 matrix for column vectors: p' = M * p, translation in m[3], m[7], m[11].
+using GmdMatrix = std::array<float, 16>;
+
 struct GmdNode {
     std::string name;
     int32_t parent = -1;
     int32_t firstChild = -1;
     int32_t nextSibling = -1;
     int32_t objectIndex = -1;
-    int32_t matrixIndex = -1;
+    int32_t matrixIndex = -1; // into GmdModel::inverseBindMatrices when a skinning bone
     uint32_t nodeType = 0;
     std::array<float, 3> position{};
     std::array<float, 4> rotation{0, 0, 0, 1}; // quaternion xyzw
@@ -60,7 +63,7 @@ struct GmdMesh {
     uint32_t nodeIndex = 0;
     std::vector<GmdVertex> vertices;
     std::vector<uint32_t> indices;   // triangle list, relative to `vertices`
-    std::vector<uint32_t> boneNodes; // matrix list: vertex bone slot -> matrix index
+    std::vector<uint32_t> boneMatrices; // vertex bone slot -> inverse bind matrix index
 };
 
 class GmdModel {
@@ -74,6 +77,7 @@ public:
     const std::vector<GmdAttribute>& attributes() const { return attributes_; }
     const std::vector<std::string>& textures() const { return textures_; }
     const std::vector<std::string>& shaders() const { return shaders_; }
+    const std::vector<GmdMatrix>& inverseBindMatrices() const { return inverseBind_; }
 
 private:
     std::string name_;
@@ -82,6 +86,7 @@ private:
     std::vector<GmdAttribute> attributes_;
     std::vector<std::string> textures_;
     std::vector<std::string> shaders_;
+    std::vector<GmdMatrix> inverseBind_;
 };
 
 // Byte layout of one vertex, derived from a vertex buffer's packing flags.

@@ -21,6 +21,7 @@ constexpr size_t kMeshSize = 0x40;
 constexpr size_t kAttributeSize = 0x80;
 constexpr size_t kVertexBufferSize = 0x20;
 constexpr size_t kNameSize = 0x20; // u16 checksum + 30 chars
+constexpr size_t kMatrixSize = 0x40;
 
 struct Table_ {
     uint32_t offset = 0;
@@ -125,7 +126,7 @@ std::optional<GmdModel> GmdModel::parse(std::span<const uint8_t> data, std::stri
         !tableFits(kAttributes, kAttributeSize) || !tableFits(kVertexBuffers, kVertexBufferSize) ||
         !tableFits(kTextures, kNameSize) || !tableFits(kShaders, kNameSize) ||
         !tableFits(kNodeNames, kNameSize) || !tableFits(kVertexData, 1) ||
-        !tableFits(kIndexData, 2) || !tableFits(kMatrixLists, 1))
+        !tableFits(kIndexData, 2) || !tableFits(kMatrixLists, 1) || !tableFits(kMatrices, kMatrixSize))
         return fail("GSGM tables run past the end of the file");
 
     GmdModel m;
@@ -134,6 +135,15 @@ std::optional<GmdModel> GmdModel::parse(std::span<const uint8_t> data, std::stri
         m.textures_.push_back(r.name(t[kTextures].offset + i * kNameSize));
     for (uint32_t i = 0; i < t[kShaders].count; ++i)
         m.shaders_.push_back(r.name(t[kShaders].offset + i * kNameSize));
+
+    // Inverse bind matrices, stored transposed (row vectors).
+    for (uint32_t i = 0; i < t[kMatrices].count; ++i) {
+        GmdMatrix mtx;
+        for (int row = 0; row < 4; ++row)
+            for (int col = 0; col < 4; ++col)
+                mtx[row * 4 + col] = r.f32(t[kMatrices].offset + i * kMatrixSize + (col * 4 + row) * 4);
+        m.inverseBind_.push_back(mtx);
+    }
 
     // Nodes: index, first child, next sibling, object, matrix, stack op, name index, type,
     // then position, rotation, scale, world position (vec4 each).
@@ -259,8 +269,11 @@ std::optional<GmdModel> GmdModel::parse(std::span<const uint8_t> data, std::stri
             if (uint64_t(matrixOffset) + 1 + matrixCount > t[kMatrixLists].count ||
                 r.u8(t[kMatrixLists].offset + matrixOffset) != matrixCount)
                 return fail(where + ": bad matrix list");
-            for (uint32_t k = 0; k < matrixCount; ++k)
-                mesh.boneNodes.push_back(r.u8(t[kMatrixLists].offset + matrixOffset + 1 + k));
+            for (uint32_t k = 0; k < matrixCount; ++k) {
+                const uint8_t idx = r.u8(t[kMatrixLists].offset + matrixOffset + 1 + k);
+                if (idx >= t[kMatrices].count) return fail(where + ": bad bone matrix");
+                mesh.boneMatrices.push_back(idx);
+            }
         }
         m.meshes_.push_back(std::move(mesh));
     }
