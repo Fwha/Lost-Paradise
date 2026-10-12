@@ -1,0 +1,9 @@
+build/
+out/
+# Never commit game data or firmware
+*.bin
+*.self
+*.sprx
+*.prx
+*.par
+aerolib.csv
