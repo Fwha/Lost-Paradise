@@ -160,6 +160,11 @@ void setScreenshot(uint64_t flip, const char* path) {
 
 void setScreenshotEvery(uint64_t flips) { gScreenshotEvery = flips; }
 
+uint64_t flipCount() {
+    std::lock_guard lock(gDisplay.m);
+    return gDisplay.status.count;
+}
+
 namespace {
 
 int32_t sceVideoOutOpen(int32_t, int32_t busType, int32_t, const void*) {

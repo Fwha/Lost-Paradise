@@ -1,12 +1,15 @@
 #include "host/window.h"
 
 #include "host/hle.h"
+#include "host/videoout.h"
 
+#include <algorithm>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -27,6 +30,13 @@ bool gNewFrame = false;
 
 std::mutex gPadMutex;
 PadState gPad;
+
+struct ScriptedPress {
+    uint32_t button;
+    uint64_t frame;
+};
+std::vector<ScriptedPress> gScript;
+constexpr uint64_t kPressFrames = 10;
 
 enum : uint32_t {
     kL3 = 0x2, kR3 = 0x4, kOptions = 0x8, kUp = 0x10, kRight = 0x20, kDown = 0x40, kLeft = 0x80, kL2 = 0x100,
@@ -167,7 +177,38 @@ void startPresenter(bool headless) {
 
 PadState padState() {
     std::lock_guard lock(gPadMutex);
-    return gPad;
+    PadState s = gPad;
+    if (!gScript.empty()) {
+        const uint64_t now = flipCount();
+        for (const auto& p : gScript)
+            if (now >= p.frame && now < p.frame + kPressFrames) s.buttons |= p.button;
+    }
+    return s;
+}
+
+bool addScriptedPresses(const char* spec) {
+    static const struct {
+        const char* name;
+        uint32_t bit;
+    } names[] = {{"cross", kCross},   {"circle", kCircle}, {"square", kSquare}, {"triangle", kTriangle},
+                 {"options", kOptions}, {"up", kUp},       {"down", kDown},     {"left", kLeft},
+                 {"right", kRight},   {"l1", kL1},         {"r1", kR1},         {"touchpad", kTouchPad}};
+    std::string all(spec);
+    size_t pos = 0;
+    while (pos <= all.size()) {
+        const size_t end = std::min(all.find(',', pos), all.size());
+        const std::string item = all.substr(pos, end - pos);
+        const size_t at = item.find('@');
+        if (at == std::string::npos) return false;
+        uint32_t bit = 0;
+        for (const auto& n : names)
+            if (item.compare(0, at, n.name) == 0 && std::strlen(n.name) == at) bit = n.bit;
+        if (!bit) return false;
+        std::lock_guard lock(gPadMutex);
+        gScript.push_back({bit, std::strtoull(item.c_str() + at + 1, nullptr, 10)});
+        pos = end + 1;
+    }
+    return true;
 }
 
 void presentFrame(const Frame& f) {

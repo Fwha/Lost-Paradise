@@ -15,6 +15,8 @@ void setVblankRate(double hz);
 void setScreenshot(uint64_t flip, const char* path);
 // Saves every Nth displayed frame as screenshot-<N>.ppm.
 void setScreenshotEvery(uint64_t flips);
+// Frames displayed so far.
+uint64_t flipCount();
 
 void registerVideoOutHle();
 

@@ -35,6 +35,7 @@ int usage() {
                  "  --dump-frame N write frame N's draws and shaders to ./gpu-dump\n"
                  "  --screenshot N save the Nth displayed frame as screenshot.ppm\n"
                  "  --screenshot-every N  save every Nth displayed frame as screenshot-<frame>.ppm\n"
+                 "  --press LIST   scripted button presses, e.g. cross@1800,options@2400 (frame numbers)\n"
                  "  --no-gpu       do not render (no Vulkan)\n"
                  "  --vblank HZ    display refresh rate (default 59.94)\n"
                  "  --data DIR     host folder for saves and downloads (default ./lpn-data)\n"
@@ -64,7 +65,12 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--headless")) headless = true;
         else if (!std::strcmp(argv[i], "--dump-frame") && i + 1 < argc)
             host::enableFrameDump(unsigned(std::strtoul(argv[++i], nullptr, 0)), "gpu-dump");
-        else if (!std::strcmp(argv[i], "--screenshot-every") && i + 1 < argc)
+        else if (!std::strcmp(argv[i], "--press") && i + 1 < argc) {
+            if (!host::addScriptedPresses(argv[++i])) {
+                std::fprintf(stderr, "bad --press list: %s\n", argv[i]);
+                return 1;
+            }
+        } else if (!std::strcmp(argv[i], "--screenshot-every") && i + 1 < argc)
             host::setScreenshotEvery(std::strtoull(argv[++i], nullptr, 0));
         else if (!std::strcmp(argv[i], "--screenshot") && i + 1 < argc)
             host::setScreenshot(std::strtoull(argv[++i], nullptr, 0), "screenshot.ppm");
