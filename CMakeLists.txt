@@ -21,3 +21,8 @@ add_subdirectory(tools/gmd)
 add_subdirectory(tools/gmt)
 add_subdirectory(src/host)
 add_subdirectory(tests)
+
+add_library(gcn STATIC src/gcn/decoder.cpp)
+target_include_directories(gcn PUBLIC src)
+add_executable(lpn-gcn tools/gcn/main.cpp)
+target_link_libraries(lpn-gcn PRIVATE gcn)

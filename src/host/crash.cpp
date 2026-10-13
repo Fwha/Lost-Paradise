@@ -1,5 +1,6 @@
 #include "host/crash.h"
 
+#include "host/hle.h"
 #include "host/linker.h"
 #include "host/module.h"
 
@@ -45,6 +46,11 @@ void onFatal(int sig, siginfo_t* info, void* ctx) {
     _exit(128 + sig);
 }
 
+void onInterrupt(int) {
+    printUnimplementedSummary();
+    _exit(130);
+}
+
 } // namespace
 
 void installCrashHandler() {
@@ -58,6 +64,7 @@ void installCrashHandler() {
     sa.sa_sigaction = onFatal;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP}) sigaction(sig, &sa, nullptr);
+    signal(SIGINT, onInterrupt); // Ctrl+C: show which stubs were hit before leaving
 }
 
 } // namespace host

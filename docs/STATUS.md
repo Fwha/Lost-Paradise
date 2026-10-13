@@ -34,6 +34,9 @@ Last updated 2026-10-13.
 - The game now runs its frame loop steadily (~50 fps, ~8,300 GPU packets per frame) in
   English (USER_DEFINED_PARAM_4 from param.sfo), loading shaders, fonts, UI, sound banks and
   scenario data. Nothing is visible yet: frames are GPU-rendered and the GPU isn't emulated.
+- GPU groundwork: GNM draw/shader helpers emit real PM4, the command processor tracks
+  registers and reports each draw/dispatch, `--dump-frame N` writes a frame report and its
+  shaders, and `lpn-gcn` disassembles GCN (tested against a real shader).
 - Earlier first run: libc starts, the game prints "test2", starts its file threads, sets up memory
   pools, opens video out, builds GNM command buffers and submits them, then spins waiting for
   the first flip (no VideoOut/GPU yet).
@@ -49,8 +52,8 @@ Last updated 2026-10-13.
 
 1. Keep booting with the full data folder (the container only has the files staged so far;
    the next one the game asks for is `data/reactorpar/reactor_ps4.par`).
-2. GNM rendering: real PM4 from the sceGnmSet*/Draw* helpers (they write NOPs today),
-   register state tracking, GCN shaders → SPIR-V → Vulkan, detiling the display buffers.
+2. GNM rendering: GCN → SPIR-V for the 63 instructions the boot frame uses, a Vulkan
+   backend, texture detiling. See `docs/gpu.md` for what a frame contains.
 3. Audio through SDL, C++ exceptions (`sceKernelGetModuleInfoForUnwind`) if the game uses them.
 
 ## Working setup
@@ -60,7 +63,9 @@ Last updated 2026-10-13.
 - Build: `cmake -S . -B build -G Ninja && ninja -C build && ctest --test-dir build`.
 - Run: `build/src/host/lpn-host <path>/CUSA12776 --nids aerolib.csv` (`--strict` stops at the
   first unimplemented call, `--list-unimplemented` lists what is still stubbed,
-  `--trace-files` logs every file opened, `--headless` skips the window).
+  `--trace-files` logs every file opened, `--headless` skips the window,
+  `--dump-frame N` writes ./gpu-dump; Ctrl+C prints the stub summary).
+- `lpn-gcn shader.bin` disassembles; `lpn-gcn --stats gpu-dump/shaders/*` counts instructions.
 - Controls: arrows = d-pad, WASD/IJKL = sticks, Enter = Cross, Backspace = Circle,
   Z = Square, X = Triangle, Q/E = L1/R1, 1/3 = L2/R2, Esc = Options, Tab = touchpad;
   any SDL game controller works too.

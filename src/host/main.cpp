@@ -4,6 +4,7 @@
 // linked against each other; everything they import from the PS4 system libraries is
 // bound to our C++ implementations, or to a logging stub until one exists.
 #include "host/crash.h"
+#include "host/gpu/frame_dump.h"
 #include "host/hle.h"
 #include "host/kernel.h"
 #include "host/linker.h"
@@ -30,6 +31,7 @@ int usage() {
                  "usage: lpn-host <CUSA12776 dir> --nids <aerolib.csv> [options]\n"
                  "  --headless     no window\n"
                  "  --trace-files  log every file the game opens\n"
+                 "  --dump-frame N write frame N's draws and shaders to ./gpu-dump\n"
                  "  --vblank HZ    display refresh rate (default 59.94)\n"
                  "  --data DIR     host folder for saves and downloads (default ./lpn-data)\n"
                  "  --strict       stop at the first call to an unimplemented import\n"
@@ -56,6 +58,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--data") && i + 1 < argc) dataDir = argv[++i];
         else if (!std::strcmp(argv[i], "--strict")) host::hleOptions().abortOnUnimplemented = true;
         else if (!std::strcmp(argv[i], "--headless")) headless = true;
+        else if (!std::strcmp(argv[i], "--dump-frame") && i + 1 < argc)
+            host::enableFrameDump(unsigned(std::strtoul(argv[++i], nullptr, 0)), "gpu-dump");
         else if (!std::strcmp(argv[i], "--trace-files")) host::process().traceFiles = true;
         else if (!std::strcmp(argv[i], "--vblank") && i + 1 < argc) host::setVblankRate(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--list-unimplemented")) listUnimplemented = true;
