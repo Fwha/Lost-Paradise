@@ -7,3 +7,4 @@ out/
 *.prx
 *.par
 aerolib.csv
+lpn-data/

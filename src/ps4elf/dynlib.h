@@ -44,6 +44,13 @@ struct Symbol {
     uint8_t type() const { return info & 0xF; }
 };
 
+// A symbol this module defines for others, e.g. a libc function in libc.prx.
+struct Export {
+    std::string nid;
+    std::string library;
+    uint64_t value = 0; // vaddr within the module
+};
+
 struct Relocation {
     uint64_t offset = 0;   // vaddr patched
     uint32_t type = 0;
@@ -67,14 +74,20 @@ public:
     const std::vector<std::string>& needed() const { return needed_; }
     const std::map<uint16_t, std::string>& modules() const { return modules_; }
     const std::map<uint16_t, std::string>& libraries() const { return libraries_; }
+    const std::map<uint16_t, std::string>& exportLibraries() const { return exportLibraries_; }
+    std::optional<uint64_t> init() const { return init_; } // DT_INIT vaddr
     const std::vector<Symbol>& symbols() const { return symbols_; }
     const std::vector<Relocation>& relocations() const { return relocs_; }   // RELA + JMPREL
     std::vector<Import> imports() const;
+    Import importOf(const Symbol& s) const; // nid/library/module of an import symbol
+    std::vector<Export> exports() const;
 
 private:
     std::vector<std::string> needed_;
     std::map<uint16_t, std::string> modules_;
     std::map<uint16_t, std::string> libraries_;
+    std::map<uint16_t, std::string> exportLibraries_;
+    std::optional<uint64_t> init_;
     std::vector<Symbol> symbols_;
     std::vector<Relocation> relocs_;
 };
