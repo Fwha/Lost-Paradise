@@ -133,6 +133,6 @@ private:
 
 } // namespace
 
-void enableFrameDump(unsigned frame, const std::string& dir) { setDrawListener(new FrameDump(frame, dir)); }
+void enableFrameDump(unsigned frame, const std::string& dir) { addDrawListener(new FrameDump(frame, dir)); }
 
 } // namespace host

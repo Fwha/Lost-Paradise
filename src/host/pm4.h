@@ -44,10 +44,12 @@ class DrawListener {
 public:
     virtual ~DrawListener() = default;
     virtual void onDraw(const DrawCall& draw, const GpuRegs& regs) = 0;
+    virtual void onSubmitEnd() {} // a submission's command buffers have all been processed
     virtual void onFrameEnd() {}
 };
-void setDrawListener(DrawListener* l);
-DrawListener* drawListener();
+void addDrawListener(DrawListener* l);
+void notifySubmitEnd();
+void notifyFrameEnd();
 
 void executePm4(const uint32_t* cmds, uint32_t numDwords, Pm4Stats* stats);
 

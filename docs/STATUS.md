@@ -37,6 +37,9 @@ Last updated 2026-10-13.
 - GPU groundwork: GNM draw/shader helpers emit real PM4, the command processor tracks
   registers and reports each draw/dispatch, `--dump-frame N` writes a frame report and its
   shaders, and `lpn-gcn` disassembles GCN (tested against a real shader).
+- GPU rendering (Vulkan): GCN shaders are recompiled to GLSL/SPIR-V at draw time and every
+  draw and dispatch of the frame is replayed. The boot now shows the game's own loading
+  screen (black, with the Lost Paradise logo). See `docs/gpu.md` for how it works.
 - Earlier first run: libc starts, the game prints "test2", starts its file threads, sets up memory
   pools, opens video out, builds GNM command buffers and submits them, then spins waiting for
   the first flip (no VideoOut/GPU yet).
@@ -52,8 +55,9 @@ Last updated 2026-10-13.
 
 1. Keep booting with the full data folder (the container only has the files staged so far;
    the next one the game asks for is `data/reactorpar/reactor_ps4.par`).
-2. GNM rendering: GCN → SPIR-V for the 63 instructions the boot frame uses, a Vulkan
-   backend, texture detiling. See `docs/gpu.md` for what a frame contains.
+2. Rendering: 2D-tiled texture detiling (tile mode 14), HTILE/CMASK fast clears, indirect
+   draws, a real swapchain instead of reading frames back, then performance (batching).
+   `docs/gpu.md` lists what is known to be missing.
 3. Audio through SDL, C++ exceptions (`sceKernelGetModuleInfoForUnwind`) if the game uses them.
 
 ## Working setup
@@ -65,7 +69,13 @@ Last updated 2026-10-13.
   first unimplemented call, `--list-unimplemented` lists what is still stubbed,
   `--trace-files` logs every file opened, `--headless` skips the window,
   `--dump-frame N` writes ./gpu-dump; Ctrl+C prints the stub summary).
-- `lpn-gcn shader.bin` disassembles; `lpn-gcn --stats gpu-dump/shaders/*` counts instructions.
+- `lpn-gcn shader.bin` disassembles; `lpn-gcn --stats gpu-dump/shaders/*` counts instructions;
+  `lpn-gcn --glsl shader.bin` shows the translated GLSL.
+- Rendering needs Vulkan 1.3 with VK_EXT_external_memory_host (any current Linux driver;
+  lavapipe works for testing) and glslang to build (`libvulkan-dev glslang-dev`).
+  `--no-gpu` skips it, `--screenshot N` saves the Nth frame as screenshot.ppm,
+  `LPN_GPU_TRACE=<frame>` logs every draw of that frame and dumps its render targets,
+  adding `LPN_GPU_SNAP=1` saves the target after each draw.
 - Controls: arrows = d-pad, WASD/IJKL = sticks, Enter = Cross, Backspace = Circle,
   Z = Square, X = Triangle, Q/E = L1/R1, 1/3 = L2/R2, Esc = Options, Tab = touchpad;
   any SDL game controller works too.

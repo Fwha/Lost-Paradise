@@ -3,6 +3,7 @@
 #include "host/videoout.h"
 
 #include "host/equeue.h"
+#include "host/gpu/renderer.h"
 #include "host/hle.h"
 #include "host/kernel.h"
 #include "host/window.h"
@@ -12,7 +13,9 @@
 #include <cstdio>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <vector>
 
 namespace host {
 
@@ -69,6 +72,28 @@ struct Display {
 } gDisplay;
 
 double gVblankHz = 59.94;
+uint64_t gScreenshotFlip = 0;
+std::string gScreenshotPath;
+
+// Pixels in memory order are B, G, R, A for the formats the game uses.
+void writeScreenshot(const Frame& f) {
+    FILE* out = std::fopen(gScreenshotPath.c_str(), "wb");
+    if (!out) return;
+    std::fprintf(out, "P6\n%u %u\n255\n", f.width, f.height);
+    const auto* px = static_cast<const uint8_t*>(f.pixels);
+    std::vector<uint8_t> row(size_t(f.width) * 3);
+    for (uint32_t y = 0; y < f.height; ++y) {
+        for (uint32_t x = 0; x < f.width; ++x) {
+            const uint8_t* p = px + (size_t(y) * f.pitchPixels + x) * 4;
+            row[x * 3] = p[2];
+            row[x * 3 + 1] = p[1];
+            row[x * 3 + 2] = p[0];
+        }
+        std::fwrite(row.data(), 1, row.size(), out);
+    }
+    std::fclose(out);
+    std::fprintf(stderr, "[videoout] wrote %s\n", gScreenshotPath.c_str());
+}
 using Clock = std::chrono::steady_clock;
 const Clock::time_point gStart = Clock::now();
 uint64_t nowUs() { return std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - gStart).count(); }
@@ -107,11 +132,29 @@ void vblankThread() {
         gDisplay.vblank.notify_all();
         triggerEvent(kEventVblank, kFilterVideoOut, int64_t(gDisplay.vblankCount));
         if (flipped) {
+            // Show what the GPU rendered into the buffer, when the renderer has it.
+            std::vector<uint32_t> rendered;
+            if (frame.pixels && render::readDisplayBuffer(reinterpret_cast<uint64_t>(frame.pixels), frame.width,
+                                                       frame.height, rendered)) {
+                frame.pixels = rendered.data();
+                frame.pitchPixels = frame.width;
+                frame.tilingMode = 1;
+            }
+            if (gScreenshotFlip && gDisplay.status.count == gScreenshotFlip && frame.pixels) writeScreenshot(frame);
             presentFrame(frame);
             triggerEvent(kEventFlip, kFilterVideoOut, flipArg);
         }
     }
 }
+
+} // namespace
+
+void setScreenshot(uint64_t flip, const char* path) {
+    gScreenshotFlip = flip;
+    gScreenshotPath = path;
+}
+
+namespace {
 
 int32_t sceVideoOutOpen(int32_t, int32_t busType, int32_t, const void*) {
     if (busType != 0) return kErrInvalidHandle;

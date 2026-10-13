@@ -2,6 +2,9 @@
 // UVs, sample, pack to f16, export).
 
 #include "gcn/decoder.h"
+#include "gcn/shader.h"
+
+#include <cstring>
 
 #include <cstdio>
 #include <string>
@@ -53,6 +56,38 @@ int main() {
         std::fprintf(stderr, "decoded %zu instructions over %zu dwords\n", n, i);
         ++failures;
     }
+
+    // Translate the same shader to GLSL and compile it to SPIR-V. The T# and S# come from
+    // user SGPRs s[0:11]; the analysis should find one sampled image.
+    gcn::LaunchState l;
+    l.stage = gcn::Stage::Pixel;
+    l.entry = 0x1000;
+    l.rsrc2 = 13 << 1;
+    l.psInputEna = 0x2;  // perspective center i/j in v0, v1
+    l.colorFormat = 0x4; // MRT0 exported as FP16
+    l.colorComps[0] = 4;
+    auto read = [&](uint64_t addr, void* dst, size_t size) {
+        if (addr < l.entry || addr + size > l.entry + code.size() * 4) return false;
+        std::memcpy(dst, reinterpret_cast<const char*>(code.data()) + (addr - l.entry), size);
+        return true;
+    };
+    const gcn::Program p = gcn::analyze(l, read);
+    if (p.code.size() != std::size(want) || p.images.size() != 1 || p.controlFlow) {
+        std::fprintf(stderr, "analysis: %zu instructions, %zu images\n", p.code.size(), p.images.size());
+        ++failures;
+    }
+    const gcn::Translation t = gcn::translate(p, 0);
+    std::string error;
+    if (gcn::compileGlsl(t.glsl, gcn::GlslStage::Fragment, &error).empty()) {
+        std::fprintf(stderr, "GLSL did not compile:\n%s\n%s\n", error.c_str(), t.glsl.c_str());
+        ++failures;
+    }
+    if (t.colorOutputs != 1 || t.inputs != 1 || !t.warnings.empty()) {
+        std::fprintf(stderr, "translation: outputs 0x%x inputs 0x%x, %zu warnings\n", t.colorOutputs, t.inputs,
+                     t.warnings.size());
+        ++failures;
+    }
+
     if (failures) std::fprintf(stderr, "%d failure(s)\n", failures);
     return failures ? 1 : 0;
 }
