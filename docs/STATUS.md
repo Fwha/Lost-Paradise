@@ -40,6 +40,11 @@ Last updated 2026-10-13.
 - GPU rendering (Vulkan): GCN shaders are recompiled to GLSL/SPIR-V at draw time and every
   draw and dispatch of the frame is replayed. The boot now shows the game's own loading
   screen (black, with the Lost Paradise logo). See `docs/gpu.md` for how it works.
+- Boot reaches the title, main menu and difficulty select, and starts a new game (the
+  opening cutscene `auth/a00_0100_before.par` loads in Southern Town). Scripted presses
+  (`--press`) drive menus in headless runs.
+- `--no-gpu` runs ignore the title press: the game reads back compute results. Use
+  `--compute-only` (runs dispatches, skips draws, ~20 fps on lavapipe) for progress runs.
 - Earlier first run: libc starts, the game prints "test2", starts its file threads, sets up memory
   pools, opens video out, builds GNM command buffers and submits them, then spins waiting for
   the first flip (no VideoOut/GPU yet).
@@ -54,7 +59,7 @@ Last updated 2026-10-13.
 ## Next steps
 
 1. Keep booting with the full data folder (the container only has the files staged so far;
-   the next one the game asks for is `data/reactorpar/reactor_ps4.par`).
+   the next one the game asks for is `data/chara/ps4/face/c_cm_f_zco_a/tex00.par`).
 2. Rendering: 2D-tiled texture detiling (tile mode 14), HTILE/CMASK fast clears, indirect
    draws, a real swapchain instead of reading frames back, then performance (batching).
    `docs/gpu.md` lists what is known to be missing.
@@ -69,6 +74,9 @@ Last updated 2026-10-13.
   first unimplemented call, `--list-unimplemented` lists what is still stubbed,
   `--trace-files` logs every file opened, `--headless` skips the window,
   `--dump-frame N` writes ./gpu-dump; Ctrl+C prints the stub summary).
+- Progress runs: `--compute-only --trace-files --press cross@1500,...` (frame numbers);
+  `--trace-hle N` logs each system call's first use, and first use after frame N;
+  `--screenshot-every N` saves every Nth frame (needs full rendering, ~1 fps on lavapipe).
 - `lpn-gcn shader.bin` disassembles; `lpn-gcn --stats gpu-dump/shaders/*` counts instructions;
   `lpn-gcn --glsl shader.bin` shows the translated GLSL.
 - Rendering needs Vulkan 1.3 with VK_EXT_external_memory_host (any current Linux driver;
