@@ -173,6 +173,7 @@ public:
                          d.kind == DrawCall::kDispatch ? "dispatch" : "draw", shaderAddress(r, reg::kPgmLoVs),
                          shaderAddress(r, reg::kPgmLoPs), shaderAddress(r, reg::kPgmLoCs));
         if (d.kind == DrawCall::kDispatch) dispatch(d, r);
+        else if (computeOnly_) return;
         else if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r);
         else warnOnce("indirect draws and dispatches are not rendered yet");
     }
@@ -1479,6 +1480,11 @@ private:
     std::set<std::string> warned_;
     uint64_t frame_ = 0, drawIndex_ = 0, traceFrame_ = ~0ull;
     bool trace_ = false, snap_ = false;
+
+public:
+    bool computeOnly_ = false;
+
+private:
     struct {
         uint64_t draws = 0, dispatches = 0;
     } stats_;
@@ -1488,8 +1494,9 @@ Renderer* gRenderer = nullptr;
 
 } // namespace
 
-bool startRenderer() {
+bool startRenderer(bool computeOnly) {
     auto* r = new Renderer;
+    r->computeOnly_ = computeOnly;
     if (!r->init()) {
         delete r;
         return false;

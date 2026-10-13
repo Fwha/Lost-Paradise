@@ -37,6 +37,7 @@ int usage() {
                  "  --screenshot-every N  save every Nth displayed frame as screenshot-<frame>.ppm\n"
                  "  --press LIST   scripted button presses, e.g. cross@1800,options@2400 (frame numbers)\n"
                  "  --no-gpu       do not render (no Vulkan)\n"
+                 "  --compute-only run GPU compute work but skip draws (fast; the game still progresses)\n"
                  "  --vblank HZ    display refresh rate (default 59.94)\n"
                  "  --data DIR     host folder for saves and downloads (default ./lpn-data)\n"
                  "  --trace-hle N  log each system call's first use, and its first use after frame N\n"
@@ -58,7 +59,7 @@ void onGuestExit() { std::fprintf(stderr, "[host] guest exit handler called\n");
 
 int main(int argc, char** argv) {
     std::string gameDir, nidPath, dataDir = "lpn-data";
-    bool listUnimplemented = false, headless = false, gpu = true;
+    bool listUnimplemented = false, headless = false, gpu = true, computeOnly = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--nids") && i + 1 < argc) nidPath = argv[++i];
         else if (!std::strcmp(argv[i], "--data") && i + 1 < argc) dataDir = argv[++i];
@@ -80,6 +81,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--screenshot") && i + 1 < argc)
             host::setScreenshot(std::strtoull(argv[++i], nullptr, 0), "screenshot.ppm");
         else if (!std::strcmp(argv[i], "--no-gpu")) gpu = false;
+        else if (!std::strcmp(argv[i], "--compute-only")) computeOnly = true;
         else if (!std::strcmp(argv[i], "--trace-files")) host::process().traceFiles = true;
         else if (!std::strcmp(argv[i], "--vblank") && i + 1 < argc) host::setVblankRate(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--list-unimplemented")) listUnimplemented = true;
@@ -152,7 +154,7 @@ int main(int argc, char** argv) {
         }
     host::createGuestTls();
     host::startPresenter(headless);
-    if (gpu) host::render::startRenderer();
+    if (gpu) host::render::startRenderer(computeOnly);
     std::atexit(host::printUnimplementedSummary);
 
     // Start the bundled libraries the way the PS4 loader does: module_start(0, nullptr).
