@@ -3,10 +3,12 @@
 // clocks, audio pacing and zlib. Each answers the way an offline console would.
 #include "host/hle.h"
 #include "host/kernel.h"
+#include "host/videoout.h"
 #include "host/window.h"
 
 #include <zlib.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -41,12 +43,20 @@ int32_t sceUserServiceGetUserName(int32_t, char* name, uint64_t size) {
     return 0;
 }
 int32_t sceUserServiceGetUserColor(int32_t, int32_t* color) { return *color = 0, 0; }
-int32_t sceUserServiceGetEvent(void*) { return int32_t(0x80960007); } // NO_EVENT
+// The initial user logs in once at startup, as on a console; games may wait for it before
+// assigning a controller to the player.
+int32_t sceUserServiceGetEvent(int32_t* event) {
+    static std::atomic<bool> loggedIn{false};
+    if (loggedIn.exchange(true)) return int32_t(0x80960007); // NO_EVENT
+    event[0] = 0;                                            // SCE_USER_SERVICE_EVENT_TYPE_LOGIN
+    event[1] = kUserId;
+    return 0;
+}
 
 // --- SystemService --------------------------------------------------------------------
 
 int32_t sceSystemServiceGetStatus(uint8_t* status) {
-    std::memset(status, 0, 16); // eventNum 0, not overlaid, not in background
+    std::memset(status, 0, 132); // eventNum 0, not overlaid, not in background
     return 0;
 }
 int32_t sceSystemServiceReceiveEvent(void*) { return int32_t(0x80A10003); } // NO_EVENT
@@ -120,6 +130,14 @@ int32_t scePadOpen(int32_t, int32_t, int32_t, const void*) { return 1; }
 int32_t scePadReadState(int32_t, PadData* d) {
     std::memset(d, 0, sizeof(*d));
     const PadState s = padState();
+    static uint32_t lastButtons = ~0u;
+    static uint64_t reads = 0;
+    ++reads;
+    if (s.buttons != lastButtons) {
+        std::fprintf(stderr, "[pad] buttons 0x%x at flip %llu (read %llu)\n", s.buttons,
+                     (unsigned long long)flipCount(), (unsigned long long)reads);
+        lastButtons = s.buttons;
+    }
     d->buttons = s.buttons;
     d->lx = s.lx, d->ly = s.ly, d->rx = s.rx, d->ry = s.ry, d->l2 = s.l2, d->r2 = s.r2;
     d->orientation[3] = 1.0f;

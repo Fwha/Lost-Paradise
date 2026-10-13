@@ -1,5 +1,6 @@
 // libkernel files: PS4 paths (/app0, /savedata0, ...) mapped onto host folders.
 #include "host/hle.h"
+#include "host/videoout.h"
 #include "host/kernel.h"
 
 #include <dirent.h>
@@ -88,7 +89,7 @@ int32_t sceKernelOpen(const char* path, int32_t flags, uint16_t mode) {
     const std::string h = hostPath(path);
     const int fd = ::open(h.c_str(), hostOpenFlags(flags), mode ? mode : 0644);
     if (fd < 0) std::fprintf(stderr, "[file] open %s failed: %s\n", path, std::strerror(errno));
-    else if (process().traceFiles) std::fprintf(stderr, "[file] open %s\n", path);
+    else if (process().traceFiles) std::fprintf(stderr, "[file] open %s (flip %llu)\n", path, (unsigned long long)flipCount());
     return check(fd);
 }
 int32_t sceKernelClose(int32_t fd) { return check(::close(fd)); }

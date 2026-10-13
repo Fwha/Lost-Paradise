@@ -39,6 +39,7 @@ int usage() {
                  "  --no-gpu       do not render (no Vulkan)\n"
                  "  --vblank HZ    display refresh rate (default 59.94)\n"
                  "  --data DIR     host folder for saves and downloads (default ./lpn-data)\n"
+                 "  --trace-hle N  log each system call's first use, and its first use after frame N\n"
                  "  --strict       stop at the first call to an unimplemented import\n"
                  "  --log-limit N  log the first N calls to each unimplemented import (default 3)\n"
                  "  --list-unimplemented  print every import still bound to a logging stub\n");
@@ -62,6 +63,10 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--nids") && i + 1 < argc) nidPath = argv[++i];
         else if (!std::strcmp(argv[i], "--data") && i + 1 < argc) dataDir = argv[++i];
         else if (!std::strcmp(argv[i], "--strict")) host::hleOptions().abortOnUnimplemented = true;
+        else if (!std::strcmp(argv[i], "--trace-hle") && i + 1 < argc) {
+            host::hleOptions().traceHle = true;
+            host::hleOptions().traceFrom = std::strtoull(argv[++i], nullptr, 0);
+        }
         else if (!std::strcmp(argv[i], "--headless")) headless = true;
         else if (!std::strcmp(argv[i], "--dump-frame") && i + 1 < argc)
             host::enableFrameDump(unsigned(std::strtoul(argv[++i], nullptr, 0)), "gpu-dump");

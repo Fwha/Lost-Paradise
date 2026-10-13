@@ -15,6 +15,8 @@ struct ImportInfo {
     std::string nid;
     std::string name; // empty when the NID isn't in the database
     uint64_t calls = 0;
+    void* target = nullptr;      // traced imports: the implementation to run
+    uint64_t lastTracedFlip = 0; // traced imports: flip of the last logged call
 };
 
 // Register an implementation by library and symbol name. Call before linking.
@@ -30,6 +32,8 @@ void registerBuiltinHle();
 struct HleOptions {
     bool abortOnUnimplemented = false;
     uint64_t logLimitPerImport = 3; // further calls to the same import are counted, not logged
+    bool traceHle = false;          // route implemented imports through a logging trampoline
+    uint64_t traceFrom = 0;         // with traceHle: also log each import's first call after this flip
 };
 HleOptions& hleOptions();
 
