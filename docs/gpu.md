@@ -25,7 +25,34 @@ screen loop). Addresses are guest addresses and change between runs.
   and a few compares/branches. One compute shader uses `image_store` and
   `buffer_store_format_xyzw`.
 
+## Renderer
+
+`src/gcn` (translator) and `src/host/gpu/renderer.cpp` (Vulkan).
+
+- **Shaders.** At each draw the scalar half of the program is evaluated on the CPU with the
+  draw's user SGPRs (`gcn::analyze`): that finds the reachable code (including the fetch
+  shader a VS calls), the value of every scalar memory load, and every T#/S#/V#. The vector
+  half becomes GLSL (`gcn::translate`), one invocation per lane, with exec/vcc kept as the
+  lane's own bit and branches as a loop over a switch on the PC. Scalar load results and
+  buffer offsets reach the shader in a per-draw storage buffer; translations are cached by
+  code and resource shape.
+- **Memory.** Guest memory is imported into Vulkan (VK_EXT_external_memory_host), so shader
+  buffer reads and writes hit the game's memory directly.
+- **Surfaces.** Render targets and depth buffers are Vulkan images keyed by guest address; a
+  texture at the same address samples that image (scaled when the T# is smaller than the
+  padded target, e.g. 1600x896 inside 1664x896). Other textures are uploaded from guest
+  memory, detiled if needed, and re-uploaded when their bytes change.
+- **Draws.** RECTLIST and QUADLIST go through a generated geometry shader; GNM's
+  decompress/eliminate passes are skipped; screen-space draws (viewport transform off) are
+  mapped by the vertex shader. Each draw is its own render pass with a full barrier, and the
+  queue is drained at the end of each submission (correct first, fast later).
+- **Display.** At flip the display buffer's image is read back and shown by the existing SDL
+  window.
+
+Known gaps: tile mode 14 (2D thin) textures are read as linear; HTILE/CMASK fast clears are
+ignored (cleared surfaces keep old contents); indirect draws are skipped; cube maps, MSAA and
+some formats are not handled. The boot frame is unaffected by these.
+
 ## Next
 
-GCN → SPIR-V for these 63 instructions, a Vulkan backend for RECTLIST/full-screen draws,
-texture detiling (tile modes 10 and 14), then the composite into the display buffer.
+2D-tiled detiling, fast clears, a swapchain, and batching draws per render pass.

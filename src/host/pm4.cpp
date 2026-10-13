@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace host {
 
@@ -13,11 +14,11 @@ namespace {
 using namespace gpu;
 
 GpuRegs gRegs; // the graphics ring's state; submissions are serialised by the caller
-DrawListener* gListener = nullptr;
+std::vector<DrawListener*> gListeners;
 
 void draw(const DrawCall& d, Pm4Stats* st) {
     (d.kind >= DrawCall::kDispatch ? st->dispatches : st->draws)++;
-    if (gListener) gListener->onDraw(d, gRegs);
+    for (DrawListener* l : gListeners) l->onDraw(d, gRegs);
 }
 
 // CP DMA: copies or fills memory on the GPU timeline, which is now.
@@ -176,8 +177,13 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
 
 } // namespace
 
-void setDrawListener(DrawListener* l) { gListener = l; }
-DrawListener* drawListener() { return gListener; }
+void addDrawListener(DrawListener* l) { gListeners.push_back(l); }
+void notifySubmitEnd() {
+    for (DrawListener* l : gListeners) l->onSubmitEnd();
+}
+void notifyFrameEnd() {
+    for (DrawListener* l : gListeners) l->onFrameEnd();
+}
 
 void executePm4(const uint32_t* cmds, uint32_t numDwords, Pm4Stats* stats) {
     Pm4Stats local;

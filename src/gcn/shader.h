@@ -1,0 +1,126 @@
+// GCN shader programs: what a draw or dispatch runs, analysed against the state it was
+// launched with, and translated to GLSL for Vulkan.
+//
+// The scalar half of a GCN program is uniform across the wave, so it is evaluated on the CPU
+// at draw time: that resolves every resource descriptor (T#, S#, V#) and every scalar memory
+// load to concrete values. The vector half becomes GLSL, one invocation per lane; per-lane
+// masks (exec, vcc) are kept as that lane's own bit.
+#pragma once
+
+#include "gcn/decoder.h"
+
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace gcn {
+
+enum class Stage : uint8_t { Vertex, Pixel, Compute };
+
+// Reads guest memory; returns false when the range is not readable.
+using ReadMemory = std::function<bool(uint64_t addr, void* dst, size_t size)>;
+
+// Hardware state a shader starts from (the SPI/COMPUTE registers of the draw).
+struct LaunchState {
+    Stage stage = Stage::Vertex;
+    uint64_t entry = 0;
+    uint32_t userData[16] = {};
+    uint32_t rsrc1 = 0, rsrc2 = 0;
+    // Vertex
+    bool glClipZ = false; // clip space z in [-w, w] rather than [0, w]
+    // Pixel
+    uint32_t psInputEna = 0;
+    uint32_t psInputCntl[32] = {};
+    uint32_t numInterp = 0;
+    uint32_t colorFormat = 0; // SPI_SHADER_COL_FORMAT, 4 bits per MRT
+    uint32_t colorUint = 0;   // bit n: MRT n is an unsigned integer target
+    uint32_t colorSint = 0;   // bit n: MRT n is a signed integer target
+    uint8_t colorSwap[8] = {}; // CB_COLOR_INFO.COMP_SWAP per MRT
+    uint8_t colorComps[8] = {}; // components of each MRT's format
+    bool depthExport = false;
+    // Compute
+    uint32_t localSize[3] = {1, 1, 1};
+
+    uint32_t userSgprs() const { return (rsrc2 >> 1) & 0x1F; }
+};
+
+// Layout of the per-draw data buffer every translated shader reads (binding 0 of its range).
+namespace data {
+constexpr uint32_t kUserData = 0;     // 16 dwords of user SGPRs
+constexpr uint32_t kPosTransform = 16; // VS: position xy scale, then offset (times w); floats
+constexpr uint32_t kSmrd = 20;        // scalar load results follow
+} // namespace data
+
+struct BufferResource {
+    uint64_t pc = 0;
+    uint32_t sharp[4] = {};
+    uint32_t dfmt = 0, nfmt = 0; // element format (from the instruction for tbuffer, else the V#)
+    bool store = false;
+    uint32_t data = 0; // dword offset in draw data: byte offset in binding, stride, num_records, size
+    uint64_t base() const { return sharp[0] | (uint64_t(sharp[1] & 0xFFF) << 32); }
+    uint32_t stride() const { return (sharp[1] >> 16) & 0x3FFF; }
+    uint32_t numRecords() const { return sharp[2]; }
+};
+
+struct ImageResource {
+    uint64_t pc = 0;
+    uint32_t t[8] = {};
+    uint32_t s[4] = {};
+    bool storage = false; // image_store
+    bool compare = false; // depth compare sampling
+    uint32_t data = 0;    // dword offset in draw data: uv scale x, y (float)
+    uint64_t base() const { return (t[0] | (uint64_t(t[1] & 0x3F) << 32)) << 8; }
+    uint32_t dataFormat() const { return (t[1] >> 20) & 0x3F; }
+    uint32_t numFormat() const { return (t[1] >> 26) & 0xF; }
+    uint32_t width() const { return (t[2] & 0x3FFF) + 1; }
+    uint32_t height() const { return ((t[2] >> 14) & 0x3FFF) + 1; }
+    uint32_t dstSel() const { return t[3] & 0xFFF; }
+    uint32_t type() const { return t[3] >> 28; }
+    uint32_t tileMode() const { return (t[3] >> 20) & 0x1F; }
+    uint32_t baseLevel() const { return (t[3] >> 12) & 0xF; }
+    uint32_t lastLevel() const { return (t[3] >> 16) & 0xF; }
+    uint32_t depth() const { return (t[4] & 0x1FFF) + 1; }
+    uint32_t pitch() const { return ((t[4] >> 13) & 0x3FFF) + 1; }
+    uint32_t baseArray() const { return t[5] & 0x1FFF; }
+    uint32_t lastArray() const { return (t[5] >> 13) & 0x1FFF; }
+};
+
+// A shader as launched by one draw: its reachable code, resolved resources and scalar loads.
+struct Program {
+    LaunchState launch;
+    std::map<uint64_t, Instruction> code;
+    std::set<uint64_t> labels; // addresses control can reach other than by falling through
+    std::map<uint64_t, uint64_t> calls; // s_swappc_b64 site -> resolved callee
+    bool controlFlow = false;
+    bool writesExec = false;
+    std::map<uint64_t, uint32_t> smrd; // pc -> dword offset of its result in `data`
+    std::vector<uint32_t> data;        // per-draw data; resource fields are filled by the renderer
+    std::vector<BufferResource> buffers;
+    std::vector<ImageResource> images;
+    std::vector<std::string> warnings;
+
+    // Identifies the translation: equal keys translate to the same GLSL.
+    std::string key() const;
+};
+
+Program analyze(const LaunchState& launch, const ReadMemory& read);
+
+struct Translation {
+    std::string glsl;
+    uint32_t outputs = 0; // VS: param exports written (bit = location)
+    uint32_t inputs = 0;  // PS: input locations read
+    uint32_t colorOutputs = 0; // PS: MRTs written
+    std::vector<std::string> warnings;
+};
+
+// Bindings: draw data at `bindingBase`, then one per buffer, then one per image.
+Translation translate(const Program& program, uint32_t bindingBase);
+
+// GLSL to SPIR-V (glslang). Returns an empty vector and fills `error` on failure.
+enum class GlslStage { Vertex, Geometry, Fragment, Compute };
+std::vector<uint32_t> compileGlsl(const std::string& source, GlslStage stage, std::string* error);
+
+} // namespace gcn

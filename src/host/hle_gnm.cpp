@@ -34,6 +34,7 @@ void submit(uint32_t count, void* const* dcb, const uint32_t* dcbBytes, void* co
         if (ccb && ccb[i] && ccbBytes[i]) executePm4(static_cast<const uint32_t*>(ccb[i]), ccbBytes[i] / 4, &gStats);
         if (dcb && dcb[i] && dcbBytes[i]) executePm4(static_cast<const uint32_t*>(dcb[i]), dcbBytes[i] / 4, &gStats);
     }
+    notifySubmitEnd();
     if (++gSubmits == 300 && getenv("LPN_GPU_STATS")) {
         std::fprintf(stderr, "[gnm] PM4 opcodes over 300 frames:\n");
         for (int op = 0; op < 256; ++op)
@@ -54,7 +55,7 @@ int32_t sceGnmSubmitAndFlipCommandBuffers(uint32_t count, void* const* dcb, cons
                                           void* const* ccb, const uint32_t* ccbBytes, int32_t videoOut,
                                           int32_t bufferIndex, int32_t flipMode, int64_t flipArg) {
     submit(count, dcb, dcbBytes, ccb, ccbBytes);
-    if (DrawListener* l = drawListener()) l->onFrameEnd();
+    notifyFrameEnd();
     return videoOutSubmitFlip(videoOut, bufferIndex, flipMode, flipArg);
 }
 
@@ -116,6 +117,7 @@ void sceGnmDingDong(uint32_t vqid, uint32_t nextDw) {
         tmp.insert(tmp.end(), q.ring, q.ring + nextDw);
         executePm4(tmp.data(), uint32_t(tmp.size()), &gStats);
     }
+    notifySubmitEnd();
     q.readDw = nextDw % q.sizeDw;
 }
 void sceGnmDingDongForWorkload(uint32_t vqid, uint32_t nextDw, uint64_t) { sceGnmDingDong(vqid, nextDw); }
