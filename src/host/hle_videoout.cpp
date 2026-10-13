@@ -73,11 +73,12 @@ struct Display {
 
 double gVblankHz = 59.94;
 uint64_t gScreenshotFlip = 0;
+uint64_t gScreenshotEvery = 0;
 std::string gScreenshotPath;
 
 // Pixels in memory order are B, G, R, A for the formats the game uses.
-void writeScreenshot(const Frame& f) {
-    FILE* out = std::fopen(gScreenshotPath.c_str(), "wb");
+void writeScreenshot(const Frame& f, const std::string& path) {
+    FILE* out = std::fopen(path.c_str(), "wb");
     if (!out) return;
     std::fprintf(out, "P6\n%u %u\n255\n", f.width, f.height);
     const auto* px = static_cast<const uint8_t*>(f.pixels);
@@ -92,7 +93,7 @@ void writeScreenshot(const Frame& f) {
         std::fwrite(row.data(), 1, row.size(), out);
     }
     std::fclose(out);
-    std::fprintf(stderr, "[videoout] wrote %s\n", gScreenshotPath.c_str());
+    std::fprintf(stderr, "[videoout] wrote %s\n", path.c_str());
 }
 using Clock = std::chrono::steady_clock;
 const Clock::time_point gStart = Clock::now();
@@ -140,7 +141,10 @@ void vblankThread() {
                 frame.pitchPixels = frame.width;
                 frame.tilingMode = 1;
             }
-            if (gScreenshotFlip && gDisplay.status.count == gScreenshotFlip && frame.pixels) writeScreenshot(frame);
+            const uint64_t n = gDisplay.status.count;
+            if (frame.pixels && gScreenshotFlip && n == gScreenshotFlip) writeScreenshot(frame, gScreenshotPath);
+            if (frame.pixels && gScreenshotEvery && n % gScreenshotEvery == 0)
+                writeScreenshot(frame, "screenshot-" + std::to_string(n) + ".ppm");
             presentFrame(frame);
             triggerEvent(kEventFlip, kFilterVideoOut, flipArg);
         }
@@ -153,6 +157,8 @@ void setScreenshot(uint64_t flip, const char* path) {
     gScreenshotFlip = flip;
     gScreenshotPath = path;
 }
+
+void setScreenshotEvery(uint64_t flips) { gScreenshotEvery = flips; }
 
 namespace {
 

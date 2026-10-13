@@ -1090,11 +1090,12 @@ private:
                 p.data[b.data] = r.byteOffset;
                 p.data[b.data + 1] = b.stride();
                 p.data[b.data + 2] = b.numRecords();
+                p.data[b.data + 3] = uint32_t(r.range);
             } else {
                 r.buffer = dummyBuffer_;
                 r.offset = 0;
                 r.range = 4096;
-                p.data[b.data] = p.data[b.data + 1] = p.data[b.data + 2] = 0;
+                p.data[b.data] = p.data[b.data + 1] = p.data[b.data + 2] = p.data[b.data + 3] = 0;
             }
             bufInfos.push_back({r.buffer, r.offset, r.range});
             VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};

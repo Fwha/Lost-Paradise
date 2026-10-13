@@ -806,12 +806,12 @@ bool cmpClass(float x, uint mask) {
         const uint32_t o = r.data;
 
         out("{\n");
-        out(fmt("uint base_ = D[%u], stride_ = D[%u], nrec_ = D[%u];\n", o, o + 1, o + 2));
+        out(fmt("uint base_ = D[%u], stride_ = D[%u], nrec_ = D[%u], size_ = D[%u];\n", o, o + 1, o + 2, o + 3));
         out("uint idx_ = " + (idxen ? vreg(vaddr) : std::string("0u")) + ";\n");
         out("uint off_ = " + (offen ? vreg(vaddr + (idxen ? 1 : 0)) : std::string("0u")) + " + " + src(soff) +
             fmt(" + %uu;\n", instOffset));
         out("uint a_ = base_ + idx_ * stride_ + off_;\n");
-        out("bool in_ = stride_ != 0u ? idx_ < nrec_ : off_ < nrec_;\n");
+        out("bool in_ = (stride_ != 0u ? idx_ < nrec_ : off_ < nrec_) && a_ < size_;\n");
 
         enum Kind { kFormat, kDwords, kU8, kS8, kU16, kS16 } kind = kFormat;
         unsigned count = 0;
