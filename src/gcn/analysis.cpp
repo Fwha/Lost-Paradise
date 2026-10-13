@@ -409,7 +409,7 @@ private:
             if (b.pc == pc) return;
         BufferResource r;
         r.pc = pc;
-        sharp(st, ((w1 >> 16) & 0x1F) * 4, 4, r.sharp, pc, "buffer");
+        r.known = sharp(st, ((w1 >> 16) & 0x1F) * 4, 4, r.sharp, pc, "buffer");
         if (in.format == Format::MTBUF) {
             r.dfmt = (w >> 19) & 0xF;
             r.nfmt = (w >> 23) & 7;

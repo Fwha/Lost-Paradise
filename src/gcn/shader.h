@@ -59,6 +59,7 @@ struct BufferResource {
     uint32_t sharp[4] = {};
     uint32_t dfmt = 0, nfmt = 0; // element format (from the instruction for tbuffer, else the V#)
     bool store = false;
+    bool known = true; // false when the V# could not be evaluated at draw time
     uint32_t data = 0; // dword offset in draw data: byte offset in binding, stride, num_records, size
     uint64_t base() const { return sharp[0] | (uint64_t(sharp[1] & 0xFFF) << 32); }
     uint32_t stride() const { return (sharp[1] >> 16) & 0x3FFF; }

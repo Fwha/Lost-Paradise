@@ -15,6 +15,7 @@
 #include "host/gpu/vk.h"
 #include "host/pm4.h"
 
+#include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -337,6 +338,9 @@ private:
     }
 
     bool importRange(uint64_t start, uint64_t end, Import& out) {
+        // Some drivers (lavapipe) accept any pointer, so make sure every page is mapped.
+        std::vector<unsigned char> residency((end - start + 4095) / 4096);
+        if (mincore(reinterpret_cast<void*>(start), end - start, residency.data()) != 0) return false;
         VkMemoryHostPointerPropertiesEXT hp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
         void* ptr = reinterpret_cast<void*>(start);
         if (vk_.getMemoryHostPointerProperties(vk_.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, ptr,
@@ -1083,7 +1087,7 @@ private:
             size = std::min<uint64_t>(size ? size : 16, std::min<uint64_t>(vk_.props.limits.maxStorageBufferRange, 64ull << 20));
             BufferRange r;
             VkDeviceSize off = 0;
-            if (guestBuffer(b.base(), size, r.buffer, off)) {
+            if (b.known && guestBuffer(b.base(), size, r.buffer, off)) {
                 r.offset = off & ~(storageAlign_ - 1);
                 r.byteOffset = uint32_t(off - r.offset);
                 r.range = std::min<VkDeviceSize>(size + r.byteOffset, vk_.props.limits.maxStorageBufferRange);
