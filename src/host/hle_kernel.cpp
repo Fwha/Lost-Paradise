@@ -1,5 +1,7 @@
 // libkernel: process info, errno, time, sleeping, console output and other small calls.
+#include "host/equeue.h"
 #include "host/hle.h"
+#include "host/videoout.h"
 #include "host/kernel.h"
 #include "host/module.h"
 #include "host/tls.h"
@@ -233,6 +235,10 @@ void registerBuiltinHle() {
     registerMemoryHle();
     registerPthreadHle();
     registerFileHle();
+    registerEqueueHle();
+    registerVideoOutHle();
+    registerGnmHle();
+    registerServicesHle();
 }
 
 } // namespace host

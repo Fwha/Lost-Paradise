@@ -4,6 +4,7 @@
 // physical range twice aliases it exactly like on the console.
 #include "host/hle.h"
 #include "host/kernel.h"
+#include "host/memory.h"
 
 #include <fcntl.h>
 #include <linux/falloc.h>
@@ -52,17 +53,8 @@ int directFd() {
     return gDirectFd;
 }
 
-// mmap at an alignment above the host page size by over-reserving and trimming.
 void* mapAligned(void* hint, uint64_t len, uint64_t align, int prot, int flags, int fd, uint64_t off) {
-    if (flags & MAP_FIXED) return mmap(hint, len, prot, flags, fd, off);
-    if (align < kPage) align = kPage;
-    void* r = mmap(hint, len + align, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (r == MAP_FAILED) return r;
-    const uint64_t start = alignUp(uint64_t(r), align);
-    if (start > uint64_t(r)) munmap(r, start - uint64_t(r));
-    const uint64_t end = uint64_t(r) + len + align;
-    if (end > start + len) munmap(reinterpret_cast<void*>(start + len), end - start - len);
-    return mmap(reinterpret_cast<void*>(start), len, prot, flags | MAP_FIXED, fd, off);
+    return guestMap(hint, len, align, prot, flags, fd, off);
 }
 
 uint64_t sceKernelGetDirectMemorySize() { return kDirectMemorySize; }
@@ -138,7 +130,7 @@ void* mmap_(void* addr, uint64_t len, int32_t prot, int32_t flags, int32_t fd, i
         hflags |= MAP_ANONYMOUS;
         fd = -1;
     }
-    void* r = mmap(addr, len, prot & 7, hflags, fd, off);
+    void* r = guestMap(addr, len, kPage, prot & 7, hflags, fd, off);
     if (r == MAP_FAILED) *guestErrno() = toPs4Errno(errno);
     return r;
 }
@@ -149,9 +141,66 @@ int32_t munmap_(void* addr, uint64_t len) {
 }
 int32_t msync_(void* addr, uint64_t len, int32_t flags) { return msync(addr, len, flags ? MS_SYNC : MS_ASYNC); }
 
+// Memory pools: a reserved virtual range whose pages are committed and decommitted at will.
+// Pool physical memory is only bookkeeping on the PS4 side, so commits are plain mprotect.
+int32_t sceKernelMemoryPoolExpand(int64_t searchStart, int64_t searchEnd, uint64_t len, uint64_t align,
+                                  int64_t* physOut) {
+    return sceKernelAllocateDirectMemory(searchStart, searchEnd, len, align, 0, physOut);
+}
+
+int32_t sceKernelMemoryPoolReserve(void* addrIn, uint64_t len, uint64_t align, int32_t flags, void** addrOut) {
+    if (!addrOut || len == 0) return sceError(ps4errno::kEINVAL);
+    int hflags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+    if (flags & kMapFixed) hflags |= MAP_FIXED;
+    void* r = mapAligned(addrIn, len, align ? align : 0x200000, PROT_NONE, hflags, -1, 0);
+    if (r == MAP_FAILED) return sceErrorFromHost(errno);
+    *addrOut = r;
+    return 0;
+}
+
+int32_t sceKernelMemoryPoolCommit(void* addr, uint64_t len, int32_t /*type*/, int32_t prot, int32_t) {
+    return mprotect(addr, len, hostProt(prot)) == 0 ? 0 : sceErrorFromHost(errno);
+}
+
+int32_t sceKernelMemoryPoolDecommit(void* addr, uint64_t len, int32_t) {
+    madvise(addr, len, MADV_DONTNEED);
+    return mprotect(addr, len, PROT_NONE) == 0 ? 0 : sceErrorFromHost(errno);
+}
+
+struct PoolBatchEntry {
+    uint32_t op; // 1 commit, 2 decommit, 3 protect, 4 type+protect, 5 move
+    uint32_t flags;
+    uint64_t a, b, c; // op-specific: {addr, len, type|prot<<32}, {addr, len, prot}, {dst, src, len}
+};
+static_assert(sizeof(PoolBatchEntry) == 32);
+
+int32_t sceKernelMemoryPoolBatch(const PoolBatchEntry* entries, int32_t n, int32_t* processed, int32_t) {
+    int32_t done = 0, r = 0;
+    for (; done < n && r == 0; ++done) {
+        const auto& e = entries[done];
+        void* addr = reinterpret_cast<void*>(e.a);
+        switch (e.op) {
+        case 1: r = sceKernelMemoryPoolCommit(addr, e.b, int32_t(e.c), int32_t(e.c >> 32), 0); break;
+        case 2: r = sceKernelMemoryPoolDecommit(addr, e.b, 0); break;
+        case 3: r = sceKernelMprotect(addr, e.b, int32_t(e.c)); break;
+        case 4: r = sceKernelMprotect(addr, e.b, int32_t(e.c >> 32)); break;
+        default:
+            std::fprintf(stderr, "[memory] unsupported pool batch op %u\n", e.op);
+            r = sceError(ps4errno::kEINVAL);
+        }
+    }
+    if (processed) *processed = r ? done - 1 : done;
+    return r;
+}
+
 } // namespace
 
 void registerMemoryHle() {
+    HLE("libkernel", sceKernelMemoryPoolExpand);
+    HLE("libkernel", sceKernelMemoryPoolReserve);
+    HLE("libkernel", sceKernelMemoryPoolCommit);
+    HLE("libkernel", sceKernelMemoryPoolDecommit);
+    HLE("libkernel", sceKernelMemoryPoolBatch);
     const char* k = "libkernel";
     HLE(k, sceKernelGetDirectMemorySize);
     HLE(k, sceKernelAllocateDirectMemory);

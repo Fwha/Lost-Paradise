@@ -1,5 +1,7 @@
 #include "host/module.h"
 
+#include "host/memory.h"
+
 #include <sys/mman.h>
 
 #include <algorithm>
@@ -28,7 +30,7 @@ std::unique_ptr<Module> Module::load(const std::string& path, std::string* error
     std::unique_ptr<Module> m(new Module);
     m->name_ = std::filesystem::path(path).filename().string();
     m->size_ = alignUp(elf->imageSize(), kPageSize);
-    void* p = mmap(nullptr, m->size_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void* p = guestMap(nullptr, m->size_, kPageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) {
         if (error) *error = "cannot reserve " + std::to_string(m->size_) + " bytes for " + m->name_;
         return nullptr;

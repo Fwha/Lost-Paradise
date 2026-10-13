@@ -12,6 +12,8 @@ struct Process {
     Module* eboot = nullptr;
     std::string gameDir; // /app0
     std::string dataDir; // host folder for /download0, /savedata0, /temp0
+    std::string saveDir; // folder /savedata0 points at while save data is mounted
+    bool traceFiles = false;
 };
 Process& process();
 
@@ -37,6 +39,8 @@ void registerKernelHle();
 void registerMemoryHle();
 void registerPthreadHle();
 void registerFileHle();
+void registerGnmHle();
+void registerServicesHle();
 
 } // namespace host
 

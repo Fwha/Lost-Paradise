@@ -27,7 +27,14 @@ Last updated 2026-10-13.
   reads to a per-thread guest TCB. libkernel basics are implemented in C++ (memory, threads,
   mutexes, condvars, semaphores, files, time). Every other import goes to a stub that logs the
   call and returns 0; a fault prints registers as `module+offset` for Ghidra.
-- First run: libc starts, the game prints "test2", starts its file threads, sets up memory
+- VideoOut, event queues, memory pools, a PM4 walker that runs the game's GPU fences and
+  end-of-pipe interrupts, and offline answers for every other system service (user, pad,
+  save data, dialogs, trophies, PlayGo, network, Rtc, zlib; audio is paced but silent).
+  Guest memory sits below 1 TiB because PM4 packets hold 40-bit addresses.
+- The game now runs its frame loop steadily (~50 fps, ~8,300 GPU packets per frame) in
+  English (USER_DEFINED_PARAM_4 from param.sfo), loading shaders, fonts, UI, sound banks and
+  scenario data. Nothing is visible yet: frames are GPU-rendered and the GPU isn't emulated.
+- Earlier first run: libc starts, the game prints "test2", starts its file threads, sets up memory
   pools, opens video out, builds GNM command buffers and submits them, then spins waiting for
   the first flip (no VideoOut/GPU yet).
 
@@ -40,10 +47,11 @@ Last updated 2026-10-13.
 
 ## Next steps
 
-1. Event queues + VideoOut: a window (SDL) and real flip events so the main loop advances.
-2. Memory pools (`sceKernelMemoryPool*`), UserService, Pad, SaveData, AudioOut stubs with
-   sensible results instead of 0.
-3. GNM: parse the submitted PM4 command buffers, then GCN shaders → SPIR-V → Vulkan.
+1. Keep booting with the full data folder (the container only has the files staged so far;
+   the next one the game asks for is `data/reactorpar/reactor_ps4.par`).
+2. GNM rendering: real PM4 from the sceGnmSet*/Draw* helpers (they write NOPs today),
+   register state tracking, GCN shaders → SPIR-V → Vulkan, detiling the display buffers.
+3. Audio through SDL, C++ exceptions (`sceKernelGetModuleInfoForUnwind`) if the game uses them.
 
 ## Working setup
 
@@ -51,4 +59,9 @@ Last updated 2026-10-13.
   Never commit game files; `.gitignore` excludes them.
 - Build: `cmake -S . -B build -G Ninja && ninja -C build && ctest --test-dir build`.
 - Run: `build/src/host/lpn-host <path>/CUSA12776 --nids aerolib.csv` (`--strict` stops at the
-  first unimplemented call, `--list-unimplemented` lists what is still stubbed).
+  first unimplemented call, `--list-unimplemented` lists what is still stubbed,
+  `--trace-files` logs every file opened, `--headless` skips the window).
+- Controls: arrows = d-pad, WASD/IJKL = sticks, Enter = Cross, Backspace = Circle,
+  Z = Square, X = Triangle, Q/E = L1/R1, 1/3 = L2/R2, Esc = Options, Tab = touchpad;
+  any SDL game controller works too.
+- Building the window needs SDL2 (`pacman -S sdl2`); without it the host runs headless.
