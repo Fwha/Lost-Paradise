@@ -1,11 +1,11 @@
 # Status and handoff notes
 
-Last updated 2026-10-12.
+Last updated 2026-10-13.
 
 ## Plan
 
 1. **Map the game** (mostly done): code, imports and asset formats.
-2. **C++ host** (next): load the original x86-64 eboot natively on Linux and route its 372
+2. **C++ host** (in progress): load the original x86-64 eboot natively on Linux and route its 372
    PS4 system calls to our own code (files, threads, SDL input/audio, Vulkan renderer).
 3. **Replace piece by piece**: rewrite subsystems in C++ until no original code remains.
 4. **Extras**: uncapped framerate, resolution, widescreen, mods.
@@ -22,6 +22,14 @@ Last updated 2026-10-12.
 - GMD models (PR #2), verified on Kenshiro (`chara/ps4/adv/c_ca_ken/mesh.par`).
 - GMT animations and skinning (PR #3), verified with `hact/c10_0102.par` clips.
 - Format write-ups: `docs/formats.md`.
+- `lpn-host` (src/host): loads the eboot plus the game's own `libc.prx` and `libSceFios2.prx`
+  natively, applies all 126,563 relocations, and redirects the eboot's 5,037 `mov reg, fs:[0]`
+  reads to a per-thread guest TCB. libkernel basics are implemented in C++ (memory, threads,
+  mutexes, condvars, semaphores, files, time). Every other import goes to a stub that logs the
+  call and returns 0; a fault prints registers as `module+offset` for Ghidra.
+- First run: libc starts, the game prints "test2", starts its file threads, sets up memory
+  pools, opens video out, builds GNM command buffers and submits them, then spins waiting for
+  the first flip (no VideoOut/GPU yet).
 
 ## Open questions / unverified
 
@@ -32,14 +40,15 @@ Last updated 2026-10-12.
 
 ## Next steps
 
-1. Step 2 groundwork: an ELF loader in the host that maps the eboot segments at their
-   addresses, applies relocations, and binds each import slot to a C++ stub that logs its
-   name. Then run the entry point until the first unimplemented call.
-2. Implement libkernel/libc basics first (memory, threads, mutexes, files mapped to the dump).
-3. Graphics last within step 2: GNM command buffers (PM4) and GCN shaders → Vulkan.
+1. Event queues + VideoOut: a window (SDL) and real flip events so the main loop advances.
+2. Memory pools (`sceKernelMemoryPool*`), UserService, Pad, SaveData, AudioOut stubs with
+   sensible results instead of 0.
+3. GNM: parse the submitted PM4 command buffers, then GCN shaders → SPIR-V → Vulkan.
 
 ## Working setup
 
 - Dump on the owner's PC: `~/Documents/Fist of the North Star/` (`CUSA12776/`, `sys_modules/`).
   Never commit game files; `.gitignore` excludes them.
 - Build: `cmake -S . -B build -G Ninja && ninja -C build && ctest --test-dir build`.
+- Run: `build/src/host/lpn-host <path>/CUSA12776 --nids aerolib.csv` (`--strict` stops at the
+  first unimplemented call, `--list-unimplemented` lists what is still stubbed).

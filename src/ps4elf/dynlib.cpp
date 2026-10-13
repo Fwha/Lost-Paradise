@@ -78,6 +78,10 @@ std::optional<Dynlib> Dynlib::parse(const Elf& elf, std::string* error) {
     auto [lb, le] = tags.equal_range(DT_SCE_IMPORT_LIB);
     for (auto it = lb; it != le; ++it)
         out.libraries_[uint16_t(it->second >> 48)] = str(it->second & 0xFFFFFFFF);
+    auto [xb, xe] = tags.equal_range(DT_SCE_EXPORT_LIB);
+    for (auto it = xb; it != xe; ++it)
+        out.exportLibraries_[uint16_t(it->second >> 48)] = str(it->second & 0xFFFFFFFF);
+    out.init_ = one(12); // DT_INIT
 
     for (uint64_t off = 0; off + 24 <= *symsz; off += 24) {
         const uint8_t* p = base + *symtab + off;
@@ -104,21 +108,22 @@ std::optional<Dynlib> Dynlib::parse(const Elf& elf, std::string* error) {
     return out;
 }
 
-std::vector<Import> Dynlib::imports() const {
-    auto resolve = [&](const Symbol& s) {
-        Import imp;
-        const auto a = s.name.find('#');
-        const auto b = s.name.find('#', a + 1);
-        imp.nid = s.name.substr(0, a);
-        if (a != std::string::npos && b != std::string::npos) {
-            const auto lib = libraries_.find(uint16_t(decodeId(s.name.substr(a + 1, b - a - 1))));
-            const auto mod = modules_.find(uint16_t(decodeId(s.name.substr(b + 1))));
-            imp.library = lib != libraries_.end() ? lib->second : s.name.substr(a + 1, b - a - 1);
-            imp.module = mod != modules_.end() ? mod->second : s.name.substr(b + 1);
-        }
-        return imp;
-    };
+Import Dynlib::importOf(const Symbol& s) const {
+    Import imp;
+    const auto a = s.name.find('#');
+    const auto b = s.name.find('#', a + 1);
+    imp.nid = s.name.substr(0, a);
+    if (a != std::string::npos && b != std::string::npos) {
+        const auto lib = libraries_.find(uint16_t(decodeId(s.name.substr(a + 1, b - a - 1))));
+        const auto mod = modules_.find(uint16_t(decodeId(s.name.substr(b + 1))));
+        imp.library = lib != libraries_.end() ? lib->second : s.name.substr(a + 1, b - a - 1);
+        imp.module = mod != modules_.end() ? mod->second : s.name.substr(b + 1);
+    }
+    return imp;
+}
 
+std::vector<Import> Dynlib::imports() const {
+    auto resolve = [&](const Symbol& s) { return importOf(s); };
     std::vector<Import> out;
     std::set<uint32_t> seen;
     for (const auto& r : relocs_) {
@@ -134,6 +139,20 @@ std::vector<Import> Dynlib::imports() const {
     // Imports with no relocation (unusual) are still worth listing.
     for (uint32_t i = 1; i < symbols_.size(); ++i)
         if (symbols_[i].isImport() && !seen.count(i)) out.push_back(resolve(symbols_[i]));
+    return out;
+}
+
+std::vector<Export> Dynlib::exports() const {
+    std::vector<Export> out;
+    for (const auto& s : symbols_) {
+        if (s.shndx == 0 || s.bind() == 0) continue; // undefined or local
+        const auto a = s.name.find('#');
+        const auto b = s.name.find('#', a + 1);
+        if (a == std::string::npos || b == std::string::npos) continue;
+        const auto lib = exportLibraries_.find(uint16_t(decodeId(s.name.substr(a + 1, b - a - 1))));
+        if (lib == exportLibraries_.end()) continue;
+        out.push_back({s.name.substr(0, a), lib->second, s.value});
+    }
     return out;
 }
 
