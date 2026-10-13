@@ -8,3 +8,4 @@ out/
 *.par
 aerolib.csv
 lpn-data/
+gpu-dump/

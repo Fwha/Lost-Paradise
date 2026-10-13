@@ -20,6 +20,8 @@
 
 namespace host {
 
+void registerGnmPacketHle();
+
 namespace {
 
 std::mutex gSubmitMutex;
@@ -32,7 +34,12 @@ void submit(uint32_t count, void* const* dcb, const uint32_t* dcbBytes, void* co
         if (ccb && ccb[i] && ccbBytes[i]) executePm4(static_cast<const uint32_t*>(ccb[i]), ccbBytes[i] / 4, &gStats);
         if (dcb && dcb[i] && dcbBytes[i]) executePm4(static_cast<const uint32_t*>(dcb[i]), dcbBytes[i] / 4, &gStats);
     }
-    if (++gSubmits == 1 || gSubmits % 600 == 0)
+    if (++gSubmits == 300 && getenv("LPN_GPU_STATS")) {
+        std::fprintf(stderr, "[gnm] PM4 opcodes over 300 frames:\n");
+        for (int op = 0; op < 256; ++op)
+            if (gStats.opcodes[op]) std::fprintf(stderr, "  0x%02x %10lu\n", op, gStats.opcodes[op]);
+    }
+    if (gSubmits == 1 || gSubmits % 600 == 0)
         std::fprintf(stderr, "[gnm] %lu submits: %lu packets, %lu fences, %lu interrupts\n", gSubmits, gStats.packets,
                      gStats.fences, gStats.interrupts);
 }
@@ -47,6 +54,7 @@ int32_t sceGnmSubmitAndFlipCommandBuffers(uint32_t count, void* const* dcb, cons
                                           void* const* ccb, const uint32_t* ccbBytes, int32_t videoOut,
                                           int32_t bufferIndex, int32_t flipMode, int64_t flipArg) {
     submit(count, dcb, dcbBytes, ccb, ccbBytes);
+    if (DrawListener* l = drawListener()) l->onFrameEnd();
     return videoOutSubmitFlip(videoOut, bufferIndex, flipMode, flipArg);
 }
 
@@ -143,6 +151,7 @@ int32_t writesNop(uint32_t* cmd, uint32_t numDwords) {
 
 void registerGnmHle() {
     const char* g = "libSceGnmDriver";
+    registerGnmPacketHle();
     HLE(g, sceGnmSubmitCommandBuffers);
     HLE(g, sceGnmSubmitAndFlipCommandBuffers);
     HLE(g, sceGnmSubmitCommandBuffersForWorkload);
@@ -165,19 +174,8 @@ void registerGnmHle() {
     HLE(g, sceGnmGetTheTessellationFactorRingBufferBaseAddress);
     HLE(g, sceGnmGetOffChipTessellationBufferSize);
 
-    // Packet writers: (cmd, numDwords, ...).
-    for (const char* name :
-         {"sceGnmDrawIndex", "sceGnmDrawIndexAuto", "sceGnmDrawIndexIndirect", "sceGnmDrawIndexIndirectCountMulti",
-          "sceGnmDrawIndexMultiInstanced", "sceGnmDrawIndexOffset", "sceGnmDrawIndirect",
-          "sceGnmDrawIndirectCountMulti", "sceGnmDrawOpaqueAuto", "sceGnmDispatchDirect", "sceGnmDispatchIndirect",
-          "sceGnmDispatchIndirectOnMec", "sceGnmSetCsShaderWithModifier", "sceGnmSetEmbeddedPsShader",
-          "sceGnmSetEmbeddedVsShader", "sceGnmSetEsShader", "sceGnmSetGsShader", "sceGnmSetHsShader",
-          "sceGnmSetLsShader", "sceGnmSetPsShader350", "sceGnmSetVsShader", "sceGnmSetVgtControl",
-          "sceGnmResetVgtControl", "sceGnmUpdateGsShader", "sceGnmUpdateHsShader", "sceGnmUpdatePsShader350",
-          "sceGnmUpdateVsShader", "sceGnmInsertPushMarker", "sceGnmInsertPopMarker", "sceGnmInsertSetMarker",
-          "sceGnmInsertPushColorMarker", "sceGnmInsertSetColorMarker", "sceGnmInsertThreadTraceMarker",
-          "sceGnmInsertDingDongMarker", "sceGnmInsertWaitFlipDone", "sceGnmComputeWaitOnAddress",
-          "sceGnmComputeWaitSemaphore"})
+    // Packet writers not translated yet (other shader stages, markers, waits): NOP-filled.
+    for (const char* name : {"sceGnmDrawIndexIndirectCountMulti", "sceGnmDrawIndexMultiInstanced", "sceGnmDrawIndirectCountMulti", "sceGnmDispatchIndirectOnMec", "sceGnmSetEmbeddedPsShader", "sceGnmSetEmbeddedVsShader", "sceGnmSetEsShader", "sceGnmSetGsShader", "sceGnmSetHsShader", "sceGnmSetLsShader", "sceGnmUpdateGsShader", "sceGnmUpdateHsShader", "sceGnmInsertPushMarker", "sceGnmInsertPopMarker", "sceGnmInsertSetMarker", "sceGnmInsertPushColorMarker", "sceGnmInsertSetColorMarker", "sceGnmInsertThreadTraceMarker", "sceGnmInsertDingDongMarker", "sceGnmInsertWaitFlipDone", "sceGnmComputeWaitOnAddress", "sceGnmComputeWaitSemaphore"})
         registerHle(g, name, reinterpret_cast<void*>(&writesNop));
     // Default-state writers return how many dwords they wrote; writing none is valid.
     for (const char* name : {"sceGnmDrawInitDefaultHardwareState350", "sceGnmDrawInitToDefaultContextState400",

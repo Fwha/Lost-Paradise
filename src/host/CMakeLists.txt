@@ -12,9 +12,11 @@ add_executable(lpn-host
     hle_file.cpp
     hle_videoout.cpp
     hle_gnm.cpp
+    hle_gnm_packets.cpp
     hle_services.cpp
     equeue.cpp
     pm4.cpp
+    gpu/frame_dump.cpp
     window.cpp
     tls.cpp
     crash.cpp
