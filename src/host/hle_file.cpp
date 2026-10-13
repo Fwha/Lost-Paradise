@@ -31,6 +31,8 @@ std::string hostPath(const char* guest) {
     };
     const Process& pr = process();
     if (auto h = mount("/app0", pr.gameDir); !h.empty()) return h;
+    if (!pr.saveDir.empty())
+        if (auto h = mount("/savedata0", pr.saveDir); !h.empty()) return h;
     for (const char* m : {"/download0", "/savedata0", "/temp0", "/data"})
         if (auto h = mount(m, pr.dataDir + m); !h.empty()) {
             fs::create_directories(fs::path(pr.dataDir + m));
@@ -86,6 +88,7 @@ int32_t sceKernelOpen(const char* path, int32_t flags, uint16_t mode) {
     const std::string h = hostPath(path);
     const int fd = ::open(h.c_str(), hostOpenFlags(flags), mode ? mode : 0644);
     if (fd < 0) std::fprintf(stderr, "[file] open %s failed: %s\n", path, std::strerror(errno));
+    else if (process().traceFiles) std::fprintf(stderr, "[file] open %s\n", path);
     return check(fd);
 }
 int32_t sceKernelClose(int32_t fd) { return check(::close(fd)); }

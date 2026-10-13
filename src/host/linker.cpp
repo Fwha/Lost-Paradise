@@ -102,11 +102,11 @@ bool linkModules(const std::vector<Module*>& modules, const ps4elf::NidDb& nids,
                 return resolved[index] = it->second;
             }
             const std::string& name = nids.lookup(imp.nid);
-            if (!name.empty())
-                if (void* fn = findHle(imp.library, name)) {
-                    ++st.toHle;
-                    return resolved[index] = {uint64_t(fn), nullptr};
-                }
+            // Imports missing from the NID database are registered under their NID.
+            if (void* fn = findHle(imp.library, name.empty() ? imp.nid : name)) {
+                ++st.toHle;
+                return resolved[index] = {uint64_t(fn), nullptr};
+            }
             ++st.unimplemented;
             void*& target = unimplementedTargets[k];
             if (!target) {

@@ -9,6 +9,8 @@
 #include "host/linker.h"
 #include "host/module.h"
 #include "host/tls.h"
+#include "host/videoout.h"
+#include "host/window.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -26,6 +28,9 @@ namespace {
 int usage() {
     std::fprintf(stderr,
                  "usage: lpn-host <CUSA12776 dir> --nids <aerolib.csv> [options]\n"
+                 "  --headless     no window\n"
+                 "  --trace-files  log every file the game opens\n"
+                 "  --vblank HZ    display refresh rate (default 59.94)\n"
                  "  --data DIR     host folder for saves and downloads (default ./lpn-data)\n"
                  "  --strict       stop at the first call to an unimplemented import\n"
                  "  --log-limit N  log the first N calls to each unimplemented import (default 3)\n"
@@ -45,11 +50,14 @@ void onGuestExit() { std::fprintf(stderr, "[host] guest exit handler called\n");
 
 int main(int argc, char** argv) {
     std::string gameDir, nidPath, dataDir = "lpn-data";
-    bool listUnimplemented = false;
+    bool listUnimplemented = false, headless = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--nids") && i + 1 < argc) nidPath = argv[++i];
         else if (!std::strcmp(argv[i], "--data") && i + 1 < argc) dataDir = argv[++i];
         else if (!std::strcmp(argv[i], "--strict")) host::hleOptions().abortOnUnimplemented = true;
+        else if (!std::strcmp(argv[i], "--headless")) headless = true;
+        else if (!std::strcmp(argv[i], "--trace-files")) host::process().traceFiles = true;
+        else if (!std::strcmp(argv[i], "--vblank") && i + 1 < argc) host::setVblankRate(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--list-unimplemented")) listUnimplemented = true;
         else if (!std::strcmp(argv[i], "--log-limit") && i + 1 < argc)
             host::hleOptions().logLimitPerImport = std::strtoull(argv[++i], nullptr, 0);
@@ -119,6 +127,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     host::createGuestTls();
+    host::startPresenter(headless);
     std::atexit(host::printUnimplementedSummary);
 
     // Start the bundled libraries the way the PS4 loader does: module_start(0, nullptr).

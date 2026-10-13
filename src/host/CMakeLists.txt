@@ -3,16 +3,33 @@ enable_language(ASM)
 add_executable(lpn-host
     main.cpp
     module.cpp
+    memory.cpp
     linker.cpp
     hle.cpp
     hle_kernel.cpp
     hle_memory.cpp
     hle_pthread.cpp
     hle_file.cpp
+    hle_videoout.cpp
+    hle_gnm.cpp
+    hle_services.cpp
+    equeue.cpp
+    pm4.cpp
+    window.cpp
     tls.cpp
     crash.cpp
     trampoline.S
 )
-target_link_libraries(lpn-host PRIVATE ps4elf)
+find_package(ZLIB REQUIRED)
+target_link_libraries(lpn-host PRIVATE ps4elf ZLIB::ZLIB)
 # The guest TLS slot must sit at a fixed offset from %fs, which the initial-exec model gives.
 target_compile_options(lpn-host PRIVATE -ftls-model=initial-exec)
+
+# The game window is optional so the host still builds and runs headless.
+find_package(SDL2 QUIET)
+if(SDL2_FOUND)
+    target_link_libraries(lpn-host PRIVATE SDL2::SDL2)
+    target_compile_definitions(lpn-host PRIVATE LPN_HAVE_SDL2)
+else()
+    message(STATUS "SDL2 not found: lpn-host will run without a window")
+endif()
