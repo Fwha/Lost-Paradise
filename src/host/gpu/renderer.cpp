@@ -15,6 +15,7 @@
 #include "host/gpu/vk.h"
 #include "host/pm4.h"
 
+#include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -172,6 +173,7 @@ public:
                          d.kind == DrawCall::kDispatch ? "dispatch" : "draw", shaderAddress(r, reg::kPgmLoVs),
                          shaderAddress(r, reg::kPgmLoPs), shaderAddress(r, reg::kPgmLoCs));
         if (d.kind == DrawCall::kDispatch) dispatch(d, r);
+        else if (computeOnly_) return;
         else if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r);
         else warnOnce("indirect draws and dispatches are not rendered yet");
     }
@@ -337,6 +339,9 @@ private:
     }
 
     bool importRange(uint64_t start, uint64_t end, Import& out) {
+        // Some drivers (lavapipe) accept any pointer, so make sure every page is mapped.
+        std::vector<unsigned char> residency((end - start + 4095) / 4096);
+        if (mincore(reinterpret_cast<void*>(start), end - start, residency.data()) != 0) return false;
         VkMemoryHostPointerPropertiesEXT hp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
         void* ptr = reinterpret_cast<void*>(start);
         if (vk_.getMemoryHostPointerProperties(vk_.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, ptr,
@@ -1083,18 +1088,19 @@ private:
             size = std::min<uint64_t>(size ? size : 16, std::min<uint64_t>(vk_.props.limits.maxStorageBufferRange, 64ull << 20));
             BufferRange r;
             VkDeviceSize off = 0;
-            if (guestBuffer(b.base(), size, r.buffer, off)) {
+            if (b.known && guestBuffer(b.base(), size, r.buffer, off)) {
                 r.offset = off & ~(storageAlign_ - 1);
                 r.byteOffset = uint32_t(off - r.offset);
                 r.range = std::min<VkDeviceSize>(size + r.byteOffset, vk_.props.limits.maxStorageBufferRange);
                 p.data[b.data] = r.byteOffset;
                 p.data[b.data + 1] = b.stride();
                 p.data[b.data + 2] = b.numRecords();
+                p.data[b.data + 3] = uint32_t(r.range);
             } else {
                 r.buffer = dummyBuffer_;
                 r.offset = 0;
                 r.range = 4096;
-                p.data[b.data] = p.data[b.data + 1] = p.data[b.data + 2] = 0;
+                p.data[b.data] = p.data[b.data + 1] = p.data[b.data + 2] = p.data[b.data + 3] = 0;
             }
             bufInfos.push_back({r.buffer, r.offset, r.range});
             VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1474,6 +1480,11 @@ private:
     std::set<std::string> warned_;
     uint64_t frame_ = 0, drawIndex_ = 0, traceFrame_ = ~0ull;
     bool trace_ = false, snap_ = false;
+
+public:
+    bool computeOnly_ = false;
+
+private:
     struct {
         uint64_t draws = 0, dispatches = 0;
     } stats_;
@@ -1483,8 +1494,9 @@ Renderer* gRenderer = nullptr;
 
 } // namespace
 
-bool startRenderer() {
+bool startRenderer(bool computeOnly) {
     auto* r = new Renderer;
+    r->computeOnly_ = computeOnly;
     if (!r->init()) {
         delete r;
         return false;

@@ -9,7 +9,9 @@ namespace host::render {
 
 // Starts the renderer and registers it as a draw listener. Returns false (and logs why)
 // when no usable Vulkan device exists; the game then runs without rendering.
-bool startRenderer();
+// computeOnly runs compute dispatches (whose results the game may read back) but skips draws:
+// much faster on a software Vulkan driver, for runs that only need the game to progress.
+bool startRenderer(bool computeOnly = false);
 
 // Copies the image the GPU rendered at a display buffer's address, in the buffer's memory
 // layout as linear rows of `width` 32-bit pixels. False when nothing was rendered there.

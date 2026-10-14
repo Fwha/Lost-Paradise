@@ -10,6 +10,7 @@
 #include <memory>
 
 extern "C" void lpn_unimplemented_stub();
+extern "C" void lpn_trace_stub();
 
 namespace host {
 
@@ -25,9 +26,10 @@ std::vector<Module*> gModules;
 
 // Executable memory for per-import trampolines:
 //   movabs rax, ImportInfo* ; movabs r11, lpn_unimplemented_stub ; jmp r11
+// Traced imports use r10 instead of rax, which carries the vector count of varargs calls.
 class TrampolinePool {
 public:
-    void* make(ImportInfo* info) {
+    void* make(ImportInfo* info, bool traced = false) {
         constexpr size_t kSize = 32;
         if (!page_ || used_ + kSize > kPage) {
             void* p = mmap(nullptr, kPage, PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -39,8 +41,8 @@ public:
         uint8_t* t = page_ + used_;
         used_ += kSize;
         const uint64_t infoAddr = uint64_t(info);
-        const uint64_t stubAddr = uint64_t(&lpn_unimplemented_stub);
-        t[0] = 0x48; t[1] = 0xB8; std::memcpy(t + 2, &infoAddr, 8);
+        const uint64_t stubAddr = uint64_t(traced ? &lpn_trace_stub : &lpn_unimplemented_stub);
+        t[0] = traced ? 0x49 : 0x48; t[1] = traced ? 0xBA : 0xB8; std::memcpy(t + 2, &infoAddr, 8);
         t[10] = 0x49; t[11] = 0xBB; std::memcpy(t + 12, &stubAddr, 8);
         t[20] = 0x41; t[21] = 0xFF; t[22] = 0xE3;
         return t;
@@ -73,6 +75,7 @@ bool linkModules(const std::vector<Module*>& modules, const ps4elf::NidDb& nids,
     static TrampolinePool pool;
     static std::map<std::string, std::unique_ptr<ImportInfo>> infos;    // one per library#nid
     static std::map<std::string, void*> unimplementedTargets;
+    static std::map<std::string, void*> tracedTargets;
     LinkStats st;
 
     std::map<std::string, Target> exports;
@@ -105,6 +108,15 @@ bool linkModules(const std::vector<Module*>& modules, const ps4elf::NidDb& nids,
             // Imports missing from the NID database are registered under their NID.
             if (void* fn = findHle(imp.library, name.empty() ? imp.nid : name)) {
                 ++st.toHle;
+                if (hleOptions().traceHle && s.type() != STT_OBJECT) {
+                    void*& traced = tracedTargets[k];
+                    if (!traced) {
+                        auto& info = infos[k];
+                        info = std::make_unique<ImportInfo>(ImportInfo{imp.library, imp.nid, name, 0, fn});
+                        traced = pool.make(info.get(), true);
+                    }
+                    return resolved[index] = {uint64_t(traced), nullptr};
+                }
                 return resolved[index] = {uint64_t(fn), nullptr};
             }
             ++st.unimplemented;

@@ -116,6 +116,8 @@ bool Vk::init(std::string* error) {
     auto& f = want.features;
     const auto& h = have.features;
     f.geometryShader = VK_TRUE;
+    // Out-of-range buffer accesses read zero instead of faulting, as on the PS4.
+    f.robustBufferAccess = h.robustBufferAccess;
     f.independentBlend = h.independentBlend;
     f.dualSrcBlend = h.dualSrcBlend;
     f.samplerAnisotropy = h.samplerAnisotropy;

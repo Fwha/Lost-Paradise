@@ -34,9 +34,13 @@ int usage() {
                  "  --trace-files  log every file the game opens\n"
                  "  --dump-frame N write frame N's draws and shaders to ./gpu-dump\n"
                  "  --screenshot N save the Nth displayed frame as screenshot.ppm\n"
+                 "  --screenshot-every N  save every Nth displayed frame as screenshot-<frame>.ppm\n"
+                 "  --press LIST   scripted button presses, e.g. cross@1800,options@2400 (frame numbers)\n"
                  "  --no-gpu       do not render (no Vulkan)\n"
+                 "  --compute-only run GPU compute work but skip draws (fast; the game still progresses)\n"
                  "  --vblank HZ    display refresh rate (default 59.94)\n"
                  "  --data DIR     host folder for saves and downloads (default ./lpn-data)\n"
+                 "  --trace-hle N  log each system call's first use, and its first use after frame N\n"
                  "  --strict       stop at the first call to an unimplemented import\n"
                  "  --log-limit N  log the first N calls to each unimplemented import (default 3)\n"
                  "  --list-unimplemented  print every import still bound to a logging stub\n");
@@ -55,17 +59,29 @@ void onGuestExit() { std::fprintf(stderr, "[host] guest exit handler called\n");
 
 int main(int argc, char** argv) {
     std::string gameDir, nidPath, dataDir = "lpn-data";
-    bool listUnimplemented = false, headless = false, gpu = true;
+    bool listUnimplemented = false, headless = false, gpu = true, computeOnly = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--nids") && i + 1 < argc) nidPath = argv[++i];
         else if (!std::strcmp(argv[i], "--data") && i + 1 < argc) dataDir = argv[++i];
         else if (!std::strcmp(argv[i], "--strict")) host::hleOptions().abortOnUnimplemented = true;
+        else if (!std::strcmp(argv[i], "--trace-hle") && i + 1 < argc) {
+            host::hleOptions().traceHle = true;
+            host::hleOptions().traceFrom = std::strtoull(argv[++i], nullptr, 0);
+        }
         else if (!std::strcmp(argv[i], "--headless")) headless = true;
         else if (!std::strcmp(argv[i], "--dump-frame") && i + 1 < argc)
             host::enableFrameDump(unsigned(std::strtoul(argv[++i], nullptr, 0)), "gpu-dump");
+        else if (!std::strcmp(argv[i], "--press") && i + 1 < argc) {
+            if (!host::addScriptedPresses(argv[++i])) {
+                std::fprintf(stderr, "bad --press list: %s\n", argv[i]);
+                return 1;
+            }
+        } else if (!std::strcmp(argv[i], "--screenshot-every") && i + 1 < argc)
+            host::setScreenshotEvery(std::strtoull(argv[++i], nullptr, 0));
         else if (!std::strcmp(argv[i], "--screenshot") && i + 1 < argc)
             host::setScreenshot(std::strtoull(argv[++i], nullptr, 0), "screenshot.ppm");
         else if (!std::strcmp(argv[i], "--no-gpu")) gpu = false;
+        else if (!std::strcmp(argv[i], "--compute-only")) computeOnly = true;
         else if (!std::strcmp(argv[i], "--trace-files")) host::process().traceFiles = true;
         else if (!std::strcmp(argv[i], "--vblank") && i + 1 < argc) host::setVblankRate(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--list-unimplemented")) listUnimplemented = true;
@@ -138,7 +154,7 @@ int main(int argc, char** argv) {
         }
     host::createGuestTls();
     host::startPresenter(headless);
-    if (gpu) host::render::startRenderer();
+    if (gpu) host::render::startRenderer(computeOnly);
     std::atexit(host::printUnimplementedSummary);
 
     // Start the bundled libraries the way the PS4 loader does: module_start(0, nullptr).
