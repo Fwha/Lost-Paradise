@@ -1,6 +1,7 @@
 // Vulkan renderer. Every draw and dispatch is recorded as it arrives, with full barriers
-// between them, and a submission is flushed (submitted and waited for) when the game's own
-// submission ends. Correctness first: batching and finer synchronisation come later.
+// between them, and a batch is submitted when the game's own submission ends. Submission
+// does not wait: fences and interrupts the game waits on fire once the GPU has finished
+// (see afterGpuWork), with up to two batches in flight.
 //
 // Guest memory is shared with the GPU by importing it (VK_EXT_external_memory_host), so
 // shader buffer reads and writes go straight to the game's memory. Render targets and depth
@@ -21,6 +22,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <thread>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstdio>
@@ -74,11 +80,110 @@ bool readGuest(uint64_t addr, void* dst, size_t size) {
 uint64_t shaderAddress(const GpuRegs& r, uint32_t lo) { return ((uint64_t(r.sh[lo + 1]) << 32) | r.sh[lo]) << 8; }
 
 uint64_t hashBytes(const void* p, size_t n) {
-    // FNV-1a over 8-byte words; good enough to notice a changed texture.
+    // FNV-1a over 8-byte words in four independent lanes (a single multiply chain is the
+    // bottleneck on large textures); good enough to notice a changed texture.
     const auto* w = static_cast<const uint64_t*>(p);
-    uint64_t h = 0xcbf29ce484222325ull;
-    for (size_t i = 0; i < n / 8; ++i) h = (h ^ w[i]) * 0x100000001b3ull;
-    return h;
+    const size_t words = n / 8;
+    uint64_t h[4] = {0xcbf29ce484222325ull, 0x84222325cbf29ce4ull, 0x9ce484222325cbf2ull, 0x2325cbf29ce48422ull};
+    size_t i = 0;
+    for (; i + 4 <= words; i += 4)
+        for (int l = 0; l < 4; ++l) h[l] = (h[l] ^ w[i + l]) * 0x100000001b3ull;
+    for (; i < words; ++i) h[0] = (h[0] ^ w[i]) * 0x100000001b3ull;
+    return ((h[0] * 31 + h[1]) * 31 + h[2]) * 31 + h[3];
+}
+
+// Guest reads for shader analysis, a page at a time. Analysis reads instruction by
+// instruction, and a syscall each made it the renderer's main cost. Memory a submission
+// references cannot change until the GPU is done with it, so pages stay valid until the
+// submission ends.
+class PageCache {
+public:
+    bool read(uint64_t addr, void* dst, size_t size) {
+        auto* out = static_cast<uint8_t*>(dst);
+        while (size) {
+            const uint64_t page = addr & ~uint64_t(kPage - 1);
+            const size_t off = size_t(addr - page), n = std::min(size, kPage - off);
+            const uint8_t* src = lookup(page);
+            if (!src) return readGuest(addr, out, size); // unmapped page or mapping edge: exact read
+            std::memcpy(out, src + off, n);
+            out += n;
+            addr += n;
+            size -= n;
+        }
+        return true;
+    }
+    void clear() { pages_.clear(); }
+
+    // Records the pages read until stopRecording; false if a read missed the cache.
+    void startRecording() {
+        recording_ = true;
+        recordOk_ = true;
+        recorded_.clear();
+    }
+    bool stopRecording(std::vector<std::pair<uint64_t, uint64_t>>& pages) {
+        recording_ = false;
+        pages.clear();
+        for (uint64_t page : recorded_) pages.emplace_back(page, hash(page));
+        return recordOk_;
+    }
+    // Hash of a page's current contents (0 if unreadable).
+    uint64_t hash(uint64_t page) {
+        if (!lookup(page)) return 0;
+        Page& p = pages_[page];
+        if (!p.hashed) {
+            p.hash = hashBytes(p.data->data(), kPage) | 1;
+            p.hashed = true;
+        }
+        return p.hash;
+    }
+
+private:
+    static constexpr size_t kPage = 4096;
+    struct Page {
+        std::unique_ptr<std::array<uint8_t, kPage>> data;
+        uint64_t hash = 0;
+        bool hashed = false;
+    };
+    const uint8_t* lookup(uint64_t page) {
+        if (recording_) recorded_.insert(page);
+        if (auto it = pages_.find(page); it != pages_.end()) return it->second.data ? it->second.data->data() : nullptr;
+        Page p;
+        p.data = std::make_unique<std::array<uint8_t, kPage>>();
+        if (!readGuest(page, p.data->data(), kPage)) {
+            p.data.reset();
+            if (recording_) recordOk_ = false;
+        }
+        return (pages_[page] = std::move(p)).data ? pages_[page].data->data() : nullptr;
+    }
+    std::unordered_map<uint64_t, Page> pages_;
+    bool recording_ = false, recordOk_ = true;
+    std::set<uint64_t> recorded_;
+};
+
+// Identifies an analysis: the launch state (every field analysis or translation reads).
+std::string launchKey(const gcn::LaunchState& l, uint32_t bindingBase) {
+    std::string k;
+    auto put = [&](const void* p, size_t n) { k.append(static_cast<const char*>(p), n); };
+    put(&bindingBase, 4);
+    put(&l.stage, 1);
+    put(&l.entry, 8);
+    put(l.userData, sizeof(l.userData));
+    put(&l.rsrc1, 4);
+    put(&l.rsrc2, 4);
+    put(&l.glClipZ, 1);
+    if (l.stage == gcn::Stage::Pixel) {
+        put(&l.psInputEna, 4);
+        put(l.psInputCntl, sizeof(l.psInputCntl));
+        put(&l.numInterp, 4);
+        put(&l.colorFormat, 4);
+        put(&l.colorUint, 4);
+        put(&l.colorSint, 4);
+        put(l.colorSwap, sizeof(l.colorSwap));
+        put(l.colorComps, sizeof(l.colorComps));
+        put(&l.depthExport, 1);
+    }
+    if (l.stage == gcn::Stage::Compute) put(l.localSize, sizeof(l.localSize));
+    return k;
 }
 
 std::string bytesKey(const void* p, size_t n) { return std::string(static_cast<const char*>(p), n); }
@@ -129,6 +234,42 @@ struct BufferRange {
     uint32_t byteOffset = 0; // guest base relative to `offset`
 };
 
+// An analysed program, reused while the guest pages it read are unchanged.
+struct CachedProgram {
+    gcn::Program prog;
+    std::vector<uint32_t> data; // prog.data as analysed; the renderer fills resource fields in
+    std::vector<std::pair<uint64_t, uint64_t>> pages; // page address, content hash
+    ShaderModule* module = nullptr;
+    bool valid = false;
+};
+
+// LPN_PROFILE=1: where the renderer's time goes, printed every 300 frames.
+enum ProfSlot { kProfRenderer, kProfAnalyze, kProfShaderLookup, kProfTexRead, kProfTexUpload, kProfPipeline, kProfGpuWait, kProfCount };
+constexpr const char* kProfNames[kProfCount] = {"renderer", "analyze", "shader-lookup", "tex-read", "tex-upload", "pipeline", "gpu-wait"};
+
+struct Profiler {
+    bool on = false;
+    uint64_t ns[kProfCount] = {};
+    uint64_t calls = 0, analysisHits = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0;
+    std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+};
+
+class ProfScope {
+public:
+    ProfScope(Profiler& p, ProfSlot s) : p_(p.on ? &p : nullptr), s_(s) {
+        if (p_) t0_ = std::chrono::steady_clock::now();
+    }
+    ~ProfScope() {
+        if (p_)
+            p_->ns[s_] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0_).count());
+    }
+
+private:
+    Profiler* p_;
+    ProfSlot s_;
+    std::chrono::steady_clock::time_point t0_;
+};
+
 class Renderer final : public DrawListener {
 public:
     bool init() {
@@ -145,27 +286,35 @@ public:
         pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         pci.queueFamilyIndex = vk_.family;
         VK_CHECK(vkCreateCommandPool(vk_.device, &pci, nullptr, &pool_));
-        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cai.commandPool = pool_;
-        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cai.commandBufferCount = 1;
-        VK_CHECK(vkAllocateCommandBuffers(vk_.device, &cai, &cmd_));
-        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        VK_CHECK(vkCreateFence(vk_.device, &fci, nullptr, &fence_));
-
-        ring_ = createHostBuffer(kRingSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                                                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                 &ringMemory_, &ringPtr_);
+        for (Batch& b : batches_) {
+            VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            cai.commandPool = pool_;
+            cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cai.commandBufferCount = 1;
+            VK_CHECK(vkAllocateCommandBuffers(vk_.device, &cai, &b.cmd));
+            VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            VK_CHECK(vkCreateFence(vk_.device, &fci, nullptr, &b.fence));
+            b.ring = createHostBuffer(kRingSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                                     VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                      &b.ringMemory, &b.ringPtr);
+            if (!b.ring) return false;
+        }
+        useBatch(0);
         dummyBuffer_ = createHostBuffer(4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &dummyMemory_, nullptr);
-        if (!ring_ || !dummyBuffer_) return false;
+        if (!dummyBuffer_) return false;
+        sync_ = getenv("LPN_GPU_SYNC") != nullptr;
+        std::thread([this] { completeBatches(); }).detach();
         storageAlign_ = std::max<VkDeviceSize>(vk_.props.limits.minStorageBufferOffsetAlignment, 16);
         if (const char* t = getenv("LPN_GPU_TRACE")) traceFrame_ = std::strtoull(t, nullptr, 0);
         snap_ = getenv("LPN_GPU_SNAP") != nullptr;
+        prof_.on = getenv("LPN_PROFILE") != nullptr;
         return true;
     }
 
     void onDraw(const DrawCall& d, const GpuRegs& r) override {
         std::lock_guard lock(m_);
+        ProfScope ps(prof_, kProfRenderer);
+        ++prof_.calls;
         ++drawIndex_;
         trace_ = frame_ == traceFrame_;
         if (trace_)
@@ -180,20 +329,82 @@ public:
 
     void onSubmitEnd() override {
         std::lock_guard lock(m_);
+        ProfScope ps(prof_, kProfRenderer);
         flush();
+        codePages_.clear();
     }
 
     void onFrameEnd() override {
         std::lock_guard lock(m_);
-        flush();
+        {
+            ProfScope ps(prof_, kProfRenderer);
+            flush();
+            codePages_.clear();
+        }
         if (frame_ == traceFrame_) dumpSurfaces();
+        if (programs_.size() > 20000) programs_.clear();
         ++frame_;
+        if (prof_.on && frame_ % 300 == 0) reportProfile();
         drawIndex_ = 0;
     }
 
+    void reportProfile() {
+        const auto now = std::chrono::steady_clock::now();
+        const double wall = std::chrono::duration<double>(now - prof_.windowStart).count();
+        std::fprintf(stderr, "[prof] frames %" PRIu64 "-%" PRIu64 ": %.1f fps, %.1f ms/frame;", frame_ - 300, frame_,
+                     300 / wall, wall * 1000 / 300);
+        for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.2f", kProfNames[i], prof_.ns[i] / 1e6 / 300);
+        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes per frame\n",
+                     prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0);
+        const bool on = prof_.on;
+        prof_ = Profiler{};
+        prof_.on = on;
+        prof_.windowStart = now;
+    }
+
+    // Called from the display thread. Only recording the copy holds the renderer; waiting for
+    // the GPU does not, so the game keeps submitting meanwhile.
     bool readDisplay(uint64_t addr, uint32_t width, uint32_t height, std::vector<uint32_t>& pixels) {
-        std::lock_guard lock(m_);
-        return readSurface(addr, width, height, pixels);
+        uint32_t w, h;
+        uint64_t seq;
+        {
+            std::lock_guard lock(m_);
+            auto it = colors_.find(addr);
+            if (it == colors_.end()) {
+                warnOnce("display buffer 0x" + hex(addr) + " was not rendered to");
+                return false;
+            }
+            Surface& s = it->second;
+            if (s.elementBytes != 4) return false;
+            w = std::min(width, s.img.width), h = std::min(height, s.img.height);
+            const VkDeviceSize bytes = VkDeviceSize(w) * h * 4;
+            if (bytes > displaySize_) {
+                if (display_) {
+                    vkDestroyBuffer(vk_.device, display_, nullptr);
+                    vkFreeMemory(vk_.device, displayMemory_, nullptr);
+                }
+                display_ = createHostBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &displayMemory_, &displayPtr_, true);
+                displaySize_ = display_ ? bytes : 0;
+                if (!display_) return false;
+            }
+            begin();
+            fullBarrier();
+            VkBufferImageCopy c{};
+            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            c.imageExtent = {w, h, 1};
+            vkCmdCopyImageToBuffer(cmd_, s.img.image, VK_IMAGE_LAYOUT_GENERAL, display_, 1, &c);
+            flush();
+            std::lock_guard dl(doneMutex_);
+            seq = submitted_;
+        }
+        {
+            std::unique_lock lock(doneMutex_);
+            doneCv_.wait(lock, [&] { return completed_ >= seq; });
+        }
+        const auto* src = static_cast<const uint8_t*>(displayPtr_);
+        pixels.assign(size_t(width) * height, 0);
+        for (uint32_t y = 0; y < h; ++y) std::memcpy(&pixels[size_t(y) * width], src + size_t(y) * w * 4, w * 4);
+        return true;
     }
 
 private:
@@ -249,22 +460,43 @@ private:
         begin();
         fullBarrier();
         VkBufferImageCopy c{};
-        c.bufferOffset = 0;
         c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         c.imageExtent = {w, h, 1};
+        const VkDeviceSize at = ringAlloc(bytes, 16);
+        c.bufferOffset = at;
         vkCmdCopyImageToBuffer(cmd_, s.img.image, VK_IMAGE_LAYOUT_GENERAL, ring_, 1, &c);
-        ringUsed_ = bytes;
-        flush();
+        const auto* src = static_cast<const uint8_t*>(ringPtr_) + at;
+        waitIdle();
         pixels.assign(size_t(width) * height, 0);
-        for (uint32_t y = 0; y < h; ++y)
-            std::memcpy(&pixels[size_t(y) * width], static_cast<const uint8_t*>(ringPtr_) + size_t(y) * w * 4, w * 4);
+        for (uint32_t y = 0; y < h; ++y) std::memcpy(&pixels[size_t(y) * width], src + size_t(y) * w * 4, w * 4);
         return true;
     }
 
     // ---- recording -----------------------------------------------------------------------------
 
+    // Work is recorded into one of two batches (command buffer, fence, upload ring). A flush
+    // submits the current one without waiting and moves to the other, which first has to
+    // finish its previous submission; a completion thread waits on the fences and then runs
+    // what was deferred until the GPU is done (fences the game polls, interrupts, deletions).
+    // LPN_GPU_SYNC=1 waits after every submission instead.
+    void useBatch(uint32_t i) {
+        cur_ = i;
+        cmd_ = batches_[i].cmd;
+        ring_ = batches_[i].ring;
+        ringPtr_ = batches_[i].ringPtr;
+        ringUsed_ = 0;
+    }
+
     void begin() {
         if (recording_) return;
+        Batch& b = batches_[cur_];
+        {
+            ProfScope ps(prof_, kProfGpuWait);
+            std::unique_lock lock(doneMutex_);
+            doneCv_.wait(lock, [&] { return !b.busy; });
+        }
+        VK_CHECK(vkResetFences(vk_.device, 1, &b.fence));
+        VK_CHECK(vkResetCommandBuffer(cmd_, 0));
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK(vkBeginCommandBuffer(cmd_, &bi));
@@ -272,20 +504,95 @@ private:
     }
 
     void flush() {
-        if (!recording_) return;
+        if (!recording_) {
+            if (!pendingDone_.empty()) {
+                // Nothing new to submit: due when the last submission finishes.
+                std::vector<std::function<void()>> now;
+                {
+                    std::lock_guard lock(doneMutex_);
+                    if (!inFlight_.empty()) {
+                        auto& done = batches_[inFlight_.back()].done;
+                        for (auto& f : pendingDone_) done.push_back(std::move(f));
+                    } else {
+                        now.swap(pendingDone_);
+                    }
+                    pendingDone_.clear();
+                }
+                for (auto& f : now) f();
+            }
+            if (sync_) waitSubmitted();
+            return;
+        }
+        ++prof_.flushes;
+        Batch& b = batches_[cur_];
         VK_CHECK(vkEndCommandBuffer(cmd_));
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1;
         si.pCommandBuffers = &cmd_;
-        VK_CHECK(vkQueueSubmit(vk_.queue, 1, &si, fence_));
-        VK_CHECK(vkWaitForFences(vk_.device, 1, &fence_, VK_TRUE, UINT64_MAX));
-        VK_CHECK(vkResetFences(vk_.device, 1, &fence_));
-        VK_CHECK(vkResetCommandBuffer(cmd_, 0));
-        recording_ = false;
-        ringUsed_ = 0;
-        for (auto& f : afterFlush_) f();
+        VK_CHECK(vkQueueSubmit(vk_.queue, 1, &si, b.fence));
+        {
+            std::lock_guard lock(doneMutex_);
+            b.busy = true;
+            ++submitted_;
+            for (auto& f : afterFlush_) b.done.push_back(std::move(f));
+            for (auto& f : pendingDone_) b.done.push_back(std::move(f));
+            inFlight_.push_back(cur_);
+        }
         afterFlush_.clear();
+        pendingDone_.clear();
+        doneCv_.notify_all();
+        recording_ = false;
+        useBatch(cur_ ^ 1);
+        if (sync_) waitSubmitted();
     }
+
+    // Submits what is recorded and waits until the GPU (and the deferred work) is done.
+    void waitIdle() {
+        flush();
+        waitSubmitted();
+    }
+    void waitSubmitted() {
+        ProfScope ps(prof_, kProfGpuWait);
+        std::unique_lock lock(doneMutex_);
+        doneCv_.wait(lock, [&] { return inFlight_.empty() && !completing_; });
+    }
+
+    void completeBatches() {
+        for (;;) {
+            uint32_t i;
+            {
+                std::unique_lock lock(doneMutex_);
+                doneCv_.wait(lock, [&] { return !inFlight_.empty(); });
+                i = inFlight_.front();
+            }
+            Batch& b = batches_[i];
+            VK_CHECK(vkWaitForFences(vk_.device, 1, &b.fence, VK_TRUE, UINT64_MAX));
+            std::vector<std::function<void()>> done;
+            {
+                std::lock_guard lock(doneMutex_);
+                done.swap(b.done);
+                b.busy = false;
+                inFlight_.pop_front();
+                ++completed_;
+                completing_ = true;
+            }
+            for (auto& f : done) f();
+            {
+                std::lock_guard lock(doneMutex_);
+                completing_ = false;
+            }
+            doneCv_.notify_all();
+        }
+    }
+
+public:
+    bool afterGpuWork(std::function<void()>& fn) override {
+        std::lock_guard lock(m_);
+        pendingDone_.push_back(std::move(fn));
+        return true;
+    }
+
+private:
 
     void fullBarrier() {
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -314,7 +621,8 @@ private:
 
     // ---- memory --------------------------------------------------------------------------------
 
-    VkBuffer createHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkDeviceMemory* mem, void** map) {
+    VkBuffer createHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkDeviceMemory* mem, void** map,
+                              bool cpuReads = false) {
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bci.size = size;
         bci.usage = usage;
@@ -324,8 +632,11 @@ private:
         vkGetBufferMemoryRequirements(vk_.device, b, &req);
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         mai.allocationSize = req.size;
-        mai.memoryTypeIndex =
-            vk_.memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        constexpr VkMemoryPropertyFlags kHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        // Uncached memory is slow for the CPU to read: prefer cached memory for readbacks.
+        mai.memoryTypeIndex = cpuReads ? vk_.memoryType(req.memoryTypeBits, kHost | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+                                       : UINT32_MAX;
+        if (mai.memoryTypeIndex == UINT32_MAX) mai.memoryTypeIndex = vk_.memoryType(req.memoryTypeBits, kHost);
         VK_CHECK(vkAllocateMemory(vk_.device, &mai, nullptr, mem));
         VK_CHECK(vkBindBufferMemory(vk_.device, b, *mem, 0));
         if (map) VK_CHECK(vkMapMemory(vk_.device, *mem, 0, size, 0, map));
@@ -987,14 +1298,22 @@ private:
         const size_t tiled = slice * slices;
         const VkDeviceSize bytes = VkDeviceSize(ew) * eh * bpe * slices;
         if (!bytes || bytes > kRingSize / 2 || tiled > (256u << 20)) return nullptr;
-        scratch_.resize(tiled);
-        if (!readGuest(t.base(), scratch_.data(), tiled)) {
-            warnOnce("texture at 0x" + hex(t.base()) + " is not readable");
-            return nullptr;
+        uint64_t h64;
+        {
+            ProfScope ps(prof_, kProfTexRead);
+            ++prof_.texChecks;
+            scratch_.resize(tiled);
+            if (!readGuest(t.base(), scratch_.data(), tiled)) {
+                warnOnce("texture at 0x" + hex(t.base()) + " is not readable");
+                return nullptr;
+            }
+            h64 = hashBytes(scratch_.data(), tiled);
         }
-        const uint64_t h64 = hashBytes(scratch_.data(), tiled);
         tex.checkedFrame = frame_;
         if (tex.img.image && tex.hash == h64) return &tex;
+        ProfScope pu(prof_, kProfTexUpload);
+        ++prof_.texUploads;
+        prof_.texBytes += bytes;
         if (!ringFits(bytes)) {
             flush();
             begin();
@@ -1181,12 +1500,42 @@ private:
         return l;
     }
 
+    // The program a launch runs, analysed (or reused) with its shader module; the returned
+    // program's data is fresh for this draw. Null when there is no shader.
+    CachedProgram* analyzed(const gcn::LaunchState& l, uint32_t bindingBase) {
+        if (!l.entry) return nullptr;
+        ProfScope ps(prof_, kProfAnalyze);
+        const std::string key = launchKey(l, bindingBase);
+        CachedProgram& c = programs_[key];
+        if (c.valid) {
+            bool same = true;
+            for (const auto& [page, h] : c.pages)
+                if (codePages_.hash(page) != h) {
+                    same = false;
+                    break;
+                }
+            if (same) {
+                ++prof_.analysisHits;
+                c.prog.data = c.data;
+                return &c;
+            }
+        }
+        codePages_.startRecording();
+        c.prog = gcn::analyze(l, readCached_);
+        c.valid = codePages_.stopRecording(c.pages);
+        c.data = c.prog.data;
+        ProfScope pl(prof_, kProfShaderLookup);
+        c.module = c.prog.launch.entry ? shader(c.prog, bindingBase) : nullptr;
+        return c.prog.launch.entry ? &c : nullptr;
+    }
+
     void dispatch(const DrawCall& d, const GpuRegs& r) {
-        gcn::Program cs = gcn::analyze(launch(r, gcn::Stage::Compute), readGuest);
-        if (!cs.launch.entry) return;
+        CachedProgram* csc = analyzed(launch(r, gcn::Stage::Compute), 0);
+        if (!csc) return;
+        gcn::Program& cs = csc->prog;
         if (!ringFits(1 << 20)) flush();
         begin();
-        ShaderModule* m = shader(cs, 0);
+        ShaderModule* m = csc->module;
         std::vector<VkDescriptorSetLayoutBinding> lb;
         addBindings(lb, cs, 0, VK_SHADER_STAGE_COMPUTE_BIT);
         Layout& lay = layout(lb);
@@ -1222,8 +1571,9 @@ private:
             return;
         }
 
-        gcn::Program vs = gcn::analyze(launch(r, gcn::Stage::Vertex), readGuest);
-        if (!vs.launch.entry) return;
+        CachedProgram* vsc = analyzed(launch(r, gcn::Stage::Vertex), 0);
+        if (!vsc) return;
+        gcn::Program& vs = vsc->prog;
         const bool hasPs = shaderAddress(r, reg::kPgmLoPs) != 0;
 
         // Render targets.
@@ -1304,13 +1654,11 @@ private:
 
         if (!ringFits(1 << 20)) flush();
         begin();
-        ShaderModule* vsm = shader(vs, 0);
-        gcn::Program ps;
-        ShaderModule* psm = nullptr;
-        if (hasPs) {
-            ps = gcn::analyze(psLaunch, readGuest);
-            psm = shader(ps, kPsBindingBase);
-        }
+        ShaderModule* vsm = vsc->module;
+        CachedProgram* psc = hasPs ? analyzed(psLaunch, kPsBindingBase) : nullptr;
+        gcn::Program noPs;
+        gcn::Program& ps = psc ? psc->prog : noPs;
+        ShaderModule* psm = psc ? psc->module : nullptr;
         gs.vs = vsm->id;
         gs.ps = psm ? psm->id : 0;
         gs.topology = prim;
@@ -1320,9 +1668,15 @@ private:
         std::vector<VkDescriptorSetLayoutBinding> lb;
         addBindings(lb, vs, 0, VK_SHADER_STAGE_VERTEX_BIT);
         if (psm) addBindings(lb, ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT);
-        Layout& lay = layout(lb);
-        VkPipeline pipe = graphicsPipeline(gs, vsm, psm, lay.pipeline);
+        Layout* layp;
+        VkPipeline pipe;
+        {
+            ProfScope pp(prof_, kProfPipeline);
+            layp = &layout(lb);
+            pipe = graphicsPipeline(gs, vsm, psm, layp->pipeline);
+        }
         if (!pipe) return;
+        Layout& lay = *layp;
 
         std::vector<VkWriteDescriptorSet> writes;
         std::vector<VkDescriptorBufferInfo> bufs;
@@ -1455,11 +1809,32 @@ private:
     Vk vk_;
     std::mutex m_;
     VkCommandPool pool_ = VK_NULL_HANDLE;
-    VkCommandBuffer cmd_ = VK_NULL_HANDLE;
-    VkFence fence_ = VK_NULL_HANDLE;
+    struct Batch {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        VkBuffer ring = VK_NULL_HANDLE;
+        VkDeviceMemory ringMemory = VK_NULL_HANDLE;
+        void* ringPtr = nullptr;
+        bool busy = false;                     // submitted and not yet finished
+        std::vector<std::function<void()>> done; // runs once it has finished
+    };
+    Batch batches_[2];
+    uint32_t cur_ = 0;
+    std::mutex doneMutex_; // guards Batch::busy and done, inFlight_, completing_, the counters
+    std::condition_variable doneCv_;
+    std::deque<uint32_t> inFlight_;
+    bool completing_ = false;
+    uint64_t submitted_ = 0, completed_ = 0; // batches
+    VkBuffer display_ = VK_NULL_HANDLE; // display readback, written and read by the display thread
+    VkDeviceMemory displayMemory_ = VK_NULL_HANDLE;
+    void* displayPtr_ = nullptr;
+    VkDeviceSize displaySize_ = 0;
+    std::vector<std::function<void()>> pendingDone_; // due after the batch being recorded
+    bool sync_ = false;
+    VkCommandBuffer cmd_ = VK_NULL_HANDLE; // the current batch's
     bool recording_ = false;
     VkBuffer ring_ = VK_NULL_HANDLE, dummyBuffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory ringMemory_ = VK_NULL_HANDLE, dummyMemory_ = VK_NULL_HANDLE;
+    VkDeviceMemory dummyMemory_ = VK_NULL_HANDLE;
     void* ringPtr_ = nullptr;
     VkDeviceSize ringUsed_ = 0, storageAlign_ = 16;
     std::vector<std::function<void()>> afterFlush_;
@@ -1488,6 +1863,10 @@ private:
     struct {
         uint64_t draws = 0, dispatches = 0;
     } stats_;
+    Profiler prof_;
+    PageCache codePages_;
+    std::unordered_map<std::string, CachedProgram> programs_;
+    const gcn::ReadMemory readCached_ = [this](uint64_t a, void* d, size_t n) { return codePages_.read(a, d, n); };
 };
 
 Renderer* gRenderer = nullptr;

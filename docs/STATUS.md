@@ -74,7 +74,8 @@ Last updated 2026-10-13.
   first unimplemented call, `--list-unimplemented` lists what is still stubbed,
   `--trace-files` logs every file opened, `--headless` skips the window,
   `--dump-frame N` writes ./gpu-dump; Ctrl+C prints the stub summary).
-- Progress runs: `--compute-only --trace-files --press cross@1500,...` (frame numbers);
+- Progress runs: `--compute-only --trace-files --press cross@1500,...` (frame numbers; on a real GPU
+  `cross@1500,cross@1800,cross@2100,cross@2400` reaches gameplay in Shin's Castle by frame ~3300);
   `--trace-hle N` logs each system call's first use, and first use after frame N;
   `--screenshot-every N` saves every Nth frame (needs full rendering, ~1 fps on lavapipe).
 - `lpn-gcn shader.bin` disassembles; `lpn-gcn --stats gpu-dump/shaders/*` counts instructions;
@@ -82,6 +83,8 @@ Last updated 2026-10-13.
 - Rendering needs Vulkan 1.3 with VK_EXT_external_memory_host (any current Linux driver;
   lavapipe works for testing) and glslang to build (`libvulkan-dev glslang-dev`).
   `--no-gpu` skips it, `--screenshot N` saves the Nth frame as screenshot.ppm,
+  `LPN_PROFILE=1` prints fps and where the renderer's time goes every 300 frames,
+  `LPN_GPU_SYNC=1` waits for the GPU after every submission (to rule out async issues),
   `LPN_GPU_TRACE=<frame>` logs every draw of that frame and dumps its render targets,
   adding `LPN_GPU_SNAP=1` saves the target after each draw.
 - Controls: arrows = d-pad, WASD/IJKL = sticks, Enter = Cross, Backspace = Circle,

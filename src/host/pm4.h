@@ -9,6 +9,7 @@
 #include "host/gpu/registers.h"
 
 #include <cstdint>
+#include <functional>
 
 namespace host {
 
@@ -46,6 +47,10 @@ public:
     virtual void onDraw(const DrawCall& draw, const GpuRegs& regs) = 0;
     virtual void onSubmitEnd() {} // a submission's command buffers have all been processed
     virtual void onFrameEnd() {}
+    // Runs `fn` once the GPU work handed over so far has finished, for fences and interrupts
+    // that must not fire before it. False when the listener runs work synchronously (the
+    // caller then runs `fn` itself).
+    virtual bool afterGpuWork(std::function<void()>&) { return false; }
 };
 void addDrawListener(DrawListener* l);
 void notifySubmitEnd();
