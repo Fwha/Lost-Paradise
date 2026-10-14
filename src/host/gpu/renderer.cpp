@@ -30,6 +30,8 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstdio>
+#include <bit>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -59,6 +61,7 @@ constexpr uint32_t kSpiPsInputCntl = 0x191, kSpiPsInputEna = 0x1B3, kSpiPsInCont
 constexpr uint32_t kCbBlendControl = 0x1E0, kDbDepthControl = 0x200, kCbColorControl = 0x202,
                    kDbShaderControl = 0x203, kPaClClipCntl = 0x204, kPaSuScModeCntl = 0x205, kPaClVteCntl = 0x206;
 constexpr uint32_t kCbColorBase = 0x318, kCbColorStride = 0xF;
+constexpr uint32_t kCbColorCmask = 7, kCbColorClearWord0 = 11, kCbColorClearWord1 = 12; // within a target's block
 // sh window
 constexpr uint32_t kPgmLoPs = 0x08, kRsrc1Ps = 0x0A, kRsrc2Ps = 0x0B, kUserDataPs = 0x0C;
 constexpr uint32_t kPgmLoVs = 0x48, kRsrc1Vs = 0x4A, kRsrc2Vs = 0x4B, kUserDataVs = 0x4C;
@@ -306,7 +309,20 @@ public:
         std::thread([this] { completeBatches(); }).detach();
         storageAlign_ = std::max<VkDeviceSize>(vk_.props.limits.minStorageBufferOffsetAlignment, 16);
         if (const char* t = getenv("LPN_GPU_TRACE")) traceFrame_ = std::strtoull(t, nullptr, 0);
-        snap_ = getenv("LPN_GPU_SNAP") != nullptr;
+        if (const char* sn = getenv("LPN_GPU_SNAP")) {
+            // "1": every draw; otherwise a list of draw numbers and ranges ("2752,2860-2870").
+            snap_ = true;
+            if (std::strcmp(sn, "1") != 0) {
+                for (const char* q = sn; *q;) {
+                    char* end;
+                    const uint64_t a = std::strtoull(q, &end, 10);
+                    uint64_t b = a;
+                    if (*end == '-') b = std::strtoull(end + 1, &end, 10);
+                    snapDraws_.emplace_back(a, b);
+                    q = *end ? end + 1 : end;
+                }
+            }
+        }
         prof_.on = getenv("LPN_PROFILE") != nullptr;
         return true;
     }
@@ -432,6 +448,18 @@ private:
             if (s.elementBytes != 4) continue;
             std::vector<uint32_t> px;
             if (!readSurface(addr, s.img.width, s.img.height, px)) continue;
+            if (s.img.format == VK_FORMAT_R32_SFLOAT) {
+                float lo = INFINITY, hi = -INFINITY, first;
+                double sum = 0;
+                std::memcpy(&first, px.data(), 4);
+                for (uint32_t p : px) {
+                    float f;
+                    std::memcpy(&f, &p, 4);
+                    lo = std::min(lo, f), hi = std::max(hi, f), sum += f;
+                }
+                std::fprintf(stderr, "[gpu] r32f 0x%" PRIx64 " first %g min %g max %g mean %g\n", addr, first, lo, hi,
+                             sum / px.size());
+            }
             const std::string name = "gpu-rt-" + hex(addr) + ".ppm";
             FILE* f = std::fopen(name.c_str(), "wb");
             if (!f) continue;
@@ -1222,11 +1250,9 @@ private:
 
     static VkImageViewType viewType(uint32_t type) {
         switch (type) {
-        case 8: return VK_IMAGE_VIEW_TYPE_1D;
         case 10: return VK_IMAGE_VIEW_TYPE_3D;
         case 11: return VK_IMAGE_VIEW_TYPE_CUBE;
-        case 12: return VK_IMAGE_VIEW_TYPE_1D_ARRAY;
-        case 13: return VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        case 12: case 13: return VK_IMAGE_VIEW_TYPE_2D_ARRAY; // 1D images are 2D, one row (as in the shaders)
         default: return VK_IMAGE_VIEW_TYPE_2D;
         }
     }
@@ -1552,17 +1578,152 @@ private:
         vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
         vk_.cmdPushDescriptorSet(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, lay.pipeline, 0, uint32_t(writes.size()),
                                  writes.data());
+        if (trace_)
+            for (const auto& b : cs.buffers) {
+                uint32_t first = 0;
+                readGuest(b.base(), &first, 4);
+                std::fprintf(stderr, "[trace]   buffer 0x%" PRIx64 " stride %u records %u first 0x%x%s\n", b.base(),
+                             b.stride(), b.numRecords(), first, b.store ? " (written)" : "");
+            }
         vkCmdDispatch(cmd_, d.groups[0], d.groups[1], d.groups[2]);
         ++stats_.dispatches;
+        for (const auto& im : cs.images)
+            if (im.storage && im.tileMode() == kTileLinearAligned) writeBack(im);
+        for (const auto& b : cs.buffers)
+            if (b.store) fastClear(b.base());
+    }
+
+    // ---- fast clears -----------------------------------------------------------------------------
+    // The game clears depth buffers and render targets by filling their HTILE or CMASK metadata
+    // from a compute shader; the hardware then reads untouched tiles as the clear value (and a
+    // fast-clear-eliminate pass writes it to memory). Surfaces here have no metadata, so a fill
+    // of a surface's HTILE/CMASK clears the surface itself.
+    struct Metadata {
+        uint64_t surface = 0;
+        bool depth = false;
+        uint32_t clear[2] = {}; // depth (float bits) and stencil, or CB_COLOR_CLEAR_WORD0/1
+    };
+
+    void noteMetadata(uint64_t meta, uint64_t surface, bool depth, uint32_t c0, uint32_t c1) {
+        if (!meta || meta == surface) return;
+        Metadata& m = metadata_[meta];
+        m.surface = surface;
+        m.depth = depth;
+        m.clear[0] = c0;
+        m.clear[1] = c1;
+    }
+
+    void fastClear(uint64_t meta) {
+        auto it = metadata_.find(meta);
+        if (it == metadata_.end()) return;
+        // Zero low bits (ZMASK for HTILE, the first tile for CMASK) mean "cleared". Memory holds what
+        // the last fill wrote, as nothing else writes metadata here.
+        uint32_t word = 0;
+        if (readGuest(meta, &word, 4) && (word & 0xF)) return;
+        const Metadata& m = it->second;
+        auto& surfaces = m.depth ? depths_ : colors_;
+        auto s = surfaces.find(m.surface);
+        if (s == surfaces.end()) return;
+        Image& img = s->second.img;
+        fullBarrier();
+        VkImageSubresourceRange range{img.aspect, 0, 1, 0, img.layers};
+        if (m.depth) {
+            VkClearDepthStencilValue v{std::bit_cast<float>(m.clear[0]), m.clear[1] & 0xFF};
+            vkCmdClearDepthStencilImage(cmd_, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+        } else {
+            VkClearColorValue v;
+            if (!clearColor(img.format, m.clear, v)) {
+                warnOnce("fast clear of a render target in format " + std::to_string(img.format));
+                return;
+            }
+            vkCmdClearColorImage(cmd_, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+        }
+        if (trace_)
+            std::fprintf(stderr, "[trace]   fast clear of %s 0x%" PRIx64 "\n", m.depth ? "depth" : "target", m.surface);
+    }
+
+    // CB_COLOR_CLEAR_WORD0/1 hold one element in memory order, which is the images' component
+    // order here (shader exports apply COMP_SWAP).
+    static bool clearColor(VkFormat f, const uint32_t w[2], VkClearColorValue& v) {
+        v = {};
+        auto byte = [&](int i) { return float((w[0] >> (8 * i)) & 0xFF) / 255.0f; };
+        auto half = [&](int i) { return unpackHalf(uint16_t(w[i / 2] >> (16 * (i % 2)))); };
+        switch (f) {
+        case VK_FORMAT_R8G8B8A8_UNORM:
+            for (int i = 0; i < 4; ++i) v.float32[i] = byte(i);
+            return true;
+        case VK_FORMAT_R8G8B8A8_SRGB: // the clear value is given in linear space
+            for (int i = 0; i < 4; ++i) {
+                const float c = byte(i);
+                v.float32[i] = i == 3 ? c : c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+            }
+            return true;
+        case VK_FORMAT_R8G8_UNORM: v.float32[1] = byte(1); [[fallthrough]];
+        case VK_FORMAT_R8_UNORM: v.float32[0] = byte(0); return true;
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+            for (int i = 0; i < 3; ++i) v.float32[i] = float((w[0] >> (10 * i)) & 0x3FF) / 1023.0f;
+            v.float32[3] = float(w[0] >> 30) / 3.0f;
+            return true;
+        case VK_FORMAT_R32_SFLOAT: v.float32[0] = std::bit_cast<float>(w[0]); return true;
+        case VK_FORMAT_R32G32_SFLOAT:
+            v.float32[0] = std::bit_cast<float>(w[0]);
+            v.float32[1] = std::bit_cast<float>(w[1]);
+            return true;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: v.float32[2] = half(2), v.float32[3] = half(3); [[fallthrough]];
+        case VK_FORMAT_R16G16_SFLOAT: v.float32[1] = half(1); [[fallthrough]];
+        case VK_FORMAT_R16_SFLOAT: v.float32[0] = half(0); return true;
+        case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: v.uint32[0] = w[0]; return true;
+        case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: v.uint32[0] = w[0], v.uint32[1] = w[1]; return true;
+        default: return false;
+        }
+    }
+
+    static float unpackHalf(uint16_t h) {
+        const uint32_t sign = uint32_t(h >> 15) << 31, e = (h >> 10) & 0x1F, m = h & 0x3FF;
+        if (e == 0) return (sign ? -1.0f : 1.0f) * std::ldexp(float(m), -24);
+        if (e == 31) return std::bit_cast<float>(sign | 0x7F800000u | (m << 13));
+        return std::bit_cast<float>(sign | ((e + 112) << 23) | (m << 13));
+    }
+
+    // Images in the linear layout are how the game reads GPU results on the CPU (the measured
+    // scene luminance behind auto exposure, for one): copy what a shader stored into one back to
+    // guest memory. The game waits for the frame's fences before reading, which fire after the
+    // GPU has finished, copy included.
+    static constexpr uint32_t kTileLinearAligned = 8;
+    void writeBack(const gcn::ImageResource& t) {
+        auto it = colors_.find(t.base());
+        if (it == colors_.end()) return;
+        Surface& s = it->second;
+        const uint32_t w = std::min(t.width(), s.img.width), h = std::min(t.height(), s.img.height);
+        const uint32_t pitch = std::max(t.pitch(), w);
+        const uint64_t bytes = (uint64_t(pitch) * (h - 1) + w) * s.elementBytes;
+        VkBuffer buffer;
+        VkDeviceSize offset = 0;
+        if (!guestBuffer(t.base(), bytes, buffer, offset)) return;
+        if (offset % std::max<uint32_t>(s.elementBytes, 4)) {
+            warnOnce("linear image at 0x" + hex(t.base()) + " is not aligned for a copy back");
+            return;
+        }
+        fullBarrier();
+        VkBufferImageCopy c{};
+        c.bufferOffset = offset;
+        c.bufferRowLength = pitch;
+        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        c.imageExtent = {w, h, 1};
+        vkCmdCopyImageToBuffer(cmd_, s.img.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &c);
+        if (trace_)
+            std::fprintf(stderr, "[trace]   copied %ux%u back to 0x%" PRIx64 "\n", w, h, t.base());
     }
 
     void draw(const DrawCall& d, const GpuRegs& r) {
         const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
         const uint32_t dbRender = r.ctx[reg::kDbRenderControl];
         if (trace_)
-            std::fprintf(stderr, "[trace]   cb mode %u db render 0x%x depth control 0x%x z info 0x%x prim %u count %u\n",
+            std::fprintf(stderr, "[trace]   cb mode %u db render 0x%x depth control 0x%x z info 0x%x z base 0x%" PRIx64
+                                 " htile 0x%" PRIx64 " clear %g prim %u count %u\n",
                          cbMode, dbRender, r.ctx[reg::kDbDepthControl], r.ctx[reg::kDbZInfo],
-                         r.uconfig[reg::kPrimitiveType], d.count);
+                         uint64_t(r.ctx[reg::kDbZReadBase]) << 8, uint64_t(r.ctx[reg::kDbHtileDataBase]) << 8,
+                         std::bit_cast<float>(r.ctx[reg::kDbDepthClear]), r.uconfig[reg::kPrimitiveType], d.count);
         if (cbMode > 1) return;           // fast-clear eliminate, resolve, decompress: nothing to do here
         if (dbRender & 0x1C) return;      // depth/stencil copy, resummarize
         const uint32_t prim = r.uconfig[reg::kPrimitiveType];
@@ -1604,9 +1765,10 @@ private:
             colors[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             colorCount = i + 1;
             if (trace_)
-                std::fprintf(stderr, "[trace]   rt%u 0x%" PRIx64 " %ux%u fmt %u/%u swap %u mask 0x%x blend 0x%x\n", i,
+                std::fprintf(stderr, "[trace]   rt%u 0x%" PRIx64 " %ux%u fmt %u/%u swap %u mask 0x%x blend 0x%x info 0x%x cmask 0x%" PRIx64 "\n", i,
                              uint64_t(cb[0]) << 8, s->img.width, s->img.height, fmt, num, (info >> 11) & 3,
-                             (targetMask >> (i * 4)) & 0xF, r.ctx[reg::kCbBlendControl + i]);
+                             (targetMask >> (i * 4)) & 0xF, r.ctx[reg::kCbBlendControl + i], info,
+                             uint64_t(cb[reg::kCbColorCmask]) << 8);
             width = std::min(width, s->img.width);
             height = std::min(height, s->img.height);
             gs.colorFormats[i] = vf;
@@ -1615,6 +1777,9 @@ private:
             if (num == 4) psLaunch.colorUint |= 1u << i;
             if (num == 5) psLaunch.colorSint |= 1u << i;
             psLaunch.colorSwap[i] = (info >> 11) & 3;
+            if ((info >> 13) & 1) // FAST_CLEAR: a CMASK fill clears it (see dispatch)
+                noteMetadata(uint64_t(cb[reg::kCbColorCmask]) << 8, uint64_t(cb[0]) << 8, false,
+                             cb[reg::kCbColorClearWord0], cb[reg::kCbColorClearWord1]);
             static const uint8_t kComps[32] = {0, 1, 1, 2, 1, 2, 3, 3, 4, 4, 4, 2, 4, 3, 4, 0,
                                                3, 4, 4, 4, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0};
             psLaunch.colorComps[i] = kComps[fmt];
@@ -1647,6 +1812,9 @@ private:
                 width = std::min(width, dw);
                 height = std::min(height, dh);
                 clearDepth = dbRender & 1;
+                if ((zInfo >> 29) & 1) // TILE_SURFACE_ENABLE: an HTILE fill clears it (see dispatch)
+                    noteMetadata(uint64_t(r.ctx[reg::kDbHtileDataBase]) << 8, uint64_t(r.ctx[reg::kDbZReadBase]) << 8,
+                                 true, r.ctx[reg::kDbDepthClear], r.ctx[reg::kDbStencilClear]);
                 gs.depthWriteOff = clearDepth;
             }
         }
@@ -1746,7 +1914,7 @@ private:
         }
         vkCmdEndRendering(cmd_);
         ++stats_.draws;
-        if (trace_ && snap_ && colorCount) snapshot(uint64_t(r.ctx[reg::kCbColorBase]) << 8);
+        if (trace_ && snap_ && colorCount && snapWanted()) snapshot(uint64_t(r.ctx[reg::kCbColorBase]) << 8);
     }
 
     void setViewportScissor(const GpuRegs& r, uint32_t width, uint32_t height) {
@@ -1842,6 +2010,7 @@ private:
 
     std::map<uint64_t, Import> imports_;
     std::unordered_map<uint64_t, Surface> colors_, depths_;
+    std::unordered_map<uint64_t, Metadata> metadata_; // by HTILE/CMASK address
     std::unordered_map<std::string, GuestTexture> textures_;
     std::map<std::array<uint32_t, 5>, VkSampler> samplers_;
     std::unordered_map<std::string, std::unique_ptr<ShaderModule>> shaders_;
@@ -1855,6 +2024,13 @@ private:
     std::set<std::string> warned_;
     uint64_t frame_ = 0, drawIndex_ = 0, traceFrame_ = ~0ull;
     bool trace_ = false, snap_ = false;
+    std::vector<std::pair<uint64_t, uint64_t>> snapDraws_;
+    bool snapWanted() const {
+        if (snapDraws_.empty()) return true;
+        for (auto [a, b] : snapDraws_)
+            if (drawIndex_ >= a && drawIndex_ <= b) return true;
+        return false;
+    }
 
 public:
     bool computeOnly_ = false;

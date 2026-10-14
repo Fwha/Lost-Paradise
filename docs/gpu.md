@@ -49,10 +49,16 @@ screen loop). Addresses are guest addresses and change between runs.
 - **Display.** At flip the display buffer's image is read back and shown by the existing SDL
   window.
 
-Known gaps: tile mode 14 (2D thin) textures are read as linear; HTILE/CMASK fast clears are
-ignored (cleared surfaces keep old contents); indirect draws are skipped; cube maps, MSAA and
-some formats are not handled. The boot frame is unaffected by these.
+- **Fast clears.** The game clears depth buffers and render targets by filling their HTILE or
+  CMASK from a compute shader. Draws remember each surface's metadata address and clear value
+  (DB_DEPTH_CLEAR, CB_COLOR_CLEAR_WORD0/1); a later fill of that address clears the surface.
+- **CPU readbacks.** A compute shader storing into a linear (tile mode 8) image is followed by a
+  copy of the image back to guest memory: the game reads the measured scene luminance this way
+  for auto exposure. 1D images are treated as 2D images of one row, in shaders and views.
+
+Known gaps: tile mode 14 (2D thin) textures are read as linear; draws into linear targets are
+not copied back; indirect draws are skipped; cube maps, MSAA and some formats are not handled.
 
 ## Next
 
-2D-tiled detiling, fast clears, a swapchain, and batching draws per render pass.
+2D-tiled detiling, a swapchain, and batching draws per render pass.

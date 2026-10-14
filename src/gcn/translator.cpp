@@ -235,13 +235,13 @@ private:
         }
     }
 
+    // 1D images are declared 2D (one row): the host keeps every surface as a 2D image, and a
+    // 1D T# often points at a render target (a 1x1 luminance result, for one).
     static const char* dimName(uint32_t type) {
         switch (type) {
-        case 8: return "1D";
         case 10: return "3D";
         case 11: return "Cube";
-        case 12: return "1DArray";
-        case 13: return "2DArray";
+        case 12: case 13: return "2DArray";
         default: return "2D";
         }
     }
@@ -968,7 +968,8 @@ bool cmpClass(float x, uint mask) {
         case 13: dims = 2; array = true; break;
         default: break;
         }
-        const unsigned coords = dims + (array ? 1 : 0);
+        const unsigned coords = dims + (array ? 1 : 0); // address registers
+        const bool oneD = dims == 1;                     // declared 2D: y is row 0
         const char pfx = typePrefix(im);
         const bool isInt = pfx != ' ';
         auto fv = [&](uint32_t r) { return "F(" + vreg(r) + ")"; };
@@ -986,12 +987,17 @@ bool cmpClass(float x, uint mask) {
                 if ((dmask >> c) & 1) writeV(r++, isInt ? fmt("t_[%d]", c) : fmt("U(t_[%d])", c));
             out("}\n");
         };
+        // Integer texel coordinates in the GLSL image's dimensions.
+        auto texel = [&](uint32_t first) {
+            if (!oneD) return vecOf(first, coords, true);
+            return array ? "ivec3(" + iv(first) + ", 0, " + iv(first + 1) + ")" : "ivec2(" + iv(first) + ", 0)";
+        };
         const std::string cast = isInt ? "uvec4" : "vec4";
 
         if (in.op <= 1) { // image_load, image_load_mip
             const std::string lod = in.op == 1 ? iv(vaddr + coords) : "0";
-            if (im.storage) writeResult(cast + "(imageLoad(" + tn + ", " + vecOf(vaddr, coords, true) + "))");
-            else writeResult(cast + "(texelFetch(" + tn + ", " + vecOf(vaddr, coords, true) + ", " + lod + "))");
+            if (im.storage) writeResult(cast + "(imageLoad(" + tn + ", " + texel(vaddr) + "))");
+            else writeResult(cast + "(texelFetch(" + tn + ", " + texel(vaddr) + ", " + lod + "))");
             return;
         }
         if (in.op == 8 || in.op == 9) { // image_store, image_store_mip
@@ -1004,13 +1010,14 @@ bool cmpClass(float x, uint mask) {
             }
             v += ")";
             if (pfx == 'i') v = "ivec4(" + v + ")";
-            out(guard() + "imageStore(" + tn + ", " + vecOf(vaddr, coords, true) + ", " + v + ");\n");
+            out(guard() + "imageStore(" + tn + ", " + texel(vaddr) + ", " + v + ");\n");
             return;
         }
         if (in.op == 14) { // image_get_resinfo
             std::string size = "textureSize(" + tn + ", " + iv(vaddr) + ")";
             std::string v;
-            if (coords == 1) v = "uvec4(uint(" + size + "), 1u, 1u, uint(textureQueryLevels(" + tn + ")))";
+            if (oneD && array) v = "uvec4(uint(" + size + ".x), uint(" + size + ".z), 1u, uint(textureQueryLevels(" + tn + ")))";
+            else if (oneD) v = "uvec4(uint(" + size + ".x), 1u, 1u, uint(textureQueryLevels(" + tn + ")))";
             else if (coords == 2) v = "uvec4(uvec2(" + size + "), 1u, uint(textureQueryLevels(" + tn + ")))";
             else v = "uvec4(uvec3(" + size + "), uint(textureQueryLevels(" + tn + ")))";
             out("{ uvec4 t_ = " + v + ";\n");
@@ -1061,27 +1068,30 @@ bool cmpClass(float x, uint mask) {
 
         if (type == 11) warn("cube sampling");
         out("{\n");
-        out("vec" + std::to_string(std::max(coords, 2u)) + " uv_ = " +
-            (coords == 1 ? "vec2(" + fv(cReg) + ", 0.0)" : vecOf(cReg, coords, false)) + ";\n");
-        const std::string sizeExpr = coords == 1 ? "vec2(textureSize(" + tn + ", 0), 1.0)" :
-                                     dims == 3 ? "vec3(textureSize(" + tn + ", 0))" :
-                                                 "vec2(textureSize(" + tn + ", 0).xy)";
-        if (unorm) out("uv_.xy /= " + sizeExpr + ".xy;\n");
+        const unsigned glslCoords = oneD ? coords + 1 : coords;
+        out("vec" + std::to_string(glslCoords) + " uv_ = " +
+            (!oneD ? vecOf(cReg, coords, false)
+                   : array ? "vec3(" + fv(cReg) + ", 0.0, " + fv(cReg + 1) + ")" : "vec2(" + fv(cReg) + ", 0.0)") +
+            ";\n");
+        const std::string sizeExpr = dims == 3 ? "vec3(textureSize(" + tn + ", 0))" : "vec2(textureSize(" + tn + ", 0).xy)";
+        if (unorm) out("uv_.x" + std::string(oneD ? "" : "y") + " /= " + sizeExpr + ".x" + (oneD ? "" : "y") + ";\n");
+        else if (oneD) out(fmt("uv_.x *= F(D[%u]);\n", im.data));
         else if (dims == 2) out(fmt("uv_.xy *= vec2(F(D[%u]), F(D[%u]));\n", im.data, im.data + 1));
         if (hasOffset) {
             out(fmt("{ uint o_ = %s; vec2 oo_ = vec2(float(bitfieldExtract(int(o_), 0, 6)), float(bitfieldExtract(int(o_), 8, 6)));\n",
                     vreg(offReg).c_str()));
             out("uv_.xy += oo_ / " + sizeExpr + ".xy; }\n");
         }
-        std::string uv = coords == 1 ? "uv_.x" : "uv_";
+        if (oneD) out("uv_.y = 0.5 / " + sizeExpr + ".y;\n"); // the middle of row 0
+        const std::string uv = "uv_";
+        auto grad = [&](uint32_t first) { return oneD ? "vec2(" + fv(first) + ", 0.0)" : vecOf(first, dims, false); };
         std::string call;
         const bool fragment = p_.launch.stage == Stage::Pixel;
         if (compare) {
-            std::string uvz = coords == 1 ? "vec3(uv_.x, 0.0, " + fv(zReg) + ")" :
-                              coords == 2 ? "vec3(uv_, " + fv(zReg) + ")" : "vec4(uv_, " + fv(zReg) + ")";
+            std::string uvz = glslCoords == 2 ? "vec3(uv_, " + fv(zReg) + ")" : "vec4(uv_, " + fv(zReg) + ")";
             if (gather) call = "textureGather(" + tn + ", " + uv + ", " + fv(zReg) + ")";
             else if (lod || lz || !fragment) call = "vec4(textureLod(" + tn + ", " + uvz + ", " + (lod ? fv(lodReg) : "0.0") + "), 0.0, 0.0, 0.0)";
-            else if (deriv) call = "vec4(textureGrad(" + tn + ", " + uvz + ", " + vecOf(dReg, dims, false) + ", " + vecOf(dReg + dims, dims, false) + "), 0.0, 0.0, 0.0)";
+            else if (deriv) call = "vec4(textureGrad(" + tn + ", " + uvz + ", " + grad(dReg) + ", " + grad(dReg + dims) + "), 0.0, 0.0, 0.0)";
             else call = "vec4(texture(" + tn + ", " + uvz + (bias ? ", " + fv(biasReg) : "") + "), 0.0, 0.0, 0.0)";
         } else if (gather) {
             int compIdx = 0;
@@ -1090,7 +1100,7 @@ bool cmpClass(float x, uint mask) {
         } else if (lod || lz || !fragment) {
             call = cast + "(textureLod(" + tn + ", " + uv + ", " + (lod ? fv(lodReg) : "0.0") + "))";
         } else if (deriv) {
-            call = cast + "(textureGrad(" + tn + ", " + uv + ", " + vecOf(dReg, dims, false) + ", " + vecOf(dReg + dims, dims, false) + "))";
+            call = cast + "(textureGrad(" + tn + ", " + uv + ", " + grad(dReg) + ", " + grad(dReg + dims) + "))";
         } else {
             call = cast + "(texture(" + tn + ", " + uv + (bias ? ", " + fv(biasReg) : "") + "))";
         }
