@@ -299,15 +299,29 @@ private:
             st.scc = r != 0;
             return;
         }
-        uint32_t a, b;
+        uint32_t a = 0, b = 0;
         const bool k = src(st, s0, in, a) & src(st, s1, in, b);
         uint32_t r = 0;
         bool ok = k, setsScc = true;
         switch (in.op) {
         case 0: r = a + b; st.scc = r < a; break;
         case 1: r = a - b; st.scc = b > a; break;
-        case 2: r = a + b; break;
-        case 3: r = a - b; break;
+        case 2: r = a + b; st.scc = ((~(a ^ b) & (a ^ r)) >> 31) != 0; break; // signed overflow
+        case 3: r = a - b; st.scc = (((a ^ b) & (a ^ r)) >> 31) != 0; break;
+        case 4: { // s_addc_u32
+            ok = k && st.sccKnown;
+            const uint64_t r64 = uint64_t(a) + b + st.scc;
+            r = uint32_t(r64);
+            st.scc = r64 >> 32;
+            break;
+        }
+        case 5: { // s_subb_u32
+            ok = k && st.sccKnown;
+            const uint64_t sub = uint64_t(b) + st.scc;
+            r = uint32_t(a - sub);
+            st.scc = sub > a;
+            break;
+        }
         case 6: r = int32_t(a) < int32_t(b) ? a : b; break;
         case 7: r = a < b ? a : b; break;
         case 8: r = int32_t(a) > int32_t(b) ? a : b; break;
@@ -331,7 +345,7 @@ private:
         if (ok) set(st, d, r);
         else unknown(st, d);
         if (setsScc) {
-            if (in.op > 1) st.scc = r != 0;
+            if (in.op > 5) st.scc = r != 0;
             st.sccKnown = ok;
         }
     }

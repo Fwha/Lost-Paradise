@@ -48,8 +48,12 @@ void submit(uint32_t count, void* const* dcb, const uint32_t* dcbBytes, void* co
             gSubmitNs = 0;
         }
     }
-    if (++gSubmits == 300 && getenv("LPN_GPU_STATS")) {
-        std::fprintf(stderr, "[gnm] PM4 opcodes over 300 frames:\n");
+    // LPN_GPU_STATS=N: PM4 opcode counts over the 300 submissions ending at submission N (default 300).
+    static const uint64_t statsAt = getenv("LPN_GPU_STATS") ? std::max(300ul, std::strtoul(getenv("LPN_GPU_STATS"), nullptr, 0)) : 0;
+    ++gSubmits;
+    if (statsAt && gSubmits == statsAt - 300) gStats = Pm4Stats{};
+    if (statsAt && gSubmits == statsAt) {
+        std::fprintf(stderr, "[gnm] PM4 opcodes over submissions %lu-%lu:\n", statsAt - 300, statsAt);
         for (int op = 0; op < 256; ++op)
             if (gStats.opcodes[op]) std::fprintf(stderr, "  0x%02x %10lu\n", op, gStats.opcodes[op]);
     }

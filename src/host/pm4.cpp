@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -14,6 +15,8 @@ namespace {
 using namespace gpu;
 
 GpuRegs gRegs; // the graphics ring's state; submissions are serialised by the caller
+uint64_t gFrame = 0;
+const uint64_t gTraceFrame = getenv("LPN_PM4_TRACE") ? std::strtoull(getenv("LPN_PM4_TRACE"), nullptr, 0) : ~0ull;
 std::vector<DrawListener*> gListeners;
 
 void draw(const DrawCall& d, Pm4Stats* st) {
@@ -143,7 +146,17 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
                 draw(d, st);
                 break;
             }
-            case kOpDmaData: dmaData(b); break;
+            case kOpDmaData:
+                if (gFrame == gTraceFrame)
+                    std::fprintf(stderr, "[pm4] dma control 0x%x src 0x%x%08x dst 0x%x%08x bytes 0x%x\n", b[0], b[2], b[1], b[4],
+                                 b[3], b[5]);
+                dmaData(b);
+                break;
+            case kOpEventWrite:
+                if (gFrame == gTraceFrame)
+                    std::fprintf(stderr, "[pm4] event 0x%x%s 0x%x%08x\n", b[0] & 0x3F, count >= 2 ? " addr" : "",
+                                 count >= 2 ? b[2] : 0, count >= 2 ? b[1] : 0);
+                break;
             case kOpIndirectBuffer:
             case kOpIndirectBufferConst:
                 if (depth < 4) {
@@ -193,6 +206,7 @@ void notifySubmitEnd() {
     for (DrawListener* l : gListeners) l->onSubmitEnd();
 }
 void notifyFrameEnd() {
+    ++gFrame;
     for (DrawListener* l : gListeners) l->onFrameEnd();
 }
 
