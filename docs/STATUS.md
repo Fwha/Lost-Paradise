@@ -86,7 +86,8 @@ Last updated 2026-10-13.
   `LPN_PROFILE=1` prints fps and where the renderer's time goes every 300 frames,
   `LPN_GPU_SYNC=1` waits for the GPU after every submission (to rule out async issues),
   `LPN_GPU_TRACE=<frame>` logs every draw of that frame and dumps its render targets,
-  adding `LPN_GPU_SNAP=1` saves the target after each draw.
+  adding `LPN_GPU_SNAP=1` saves the target after each draw (or `LPN_GPU_SNAP=2750-2760,2886` for
+  just those draws); 32-bit float targets also get their min/max/mean logged.
 - Controls: arrows = d-pad, WASD/IJKL = sticks, Enter = Cross, Backspace = Circle,
   Z = Square, X = Triangle, Q/E = L1/R1, 1/3 = L2/R2, Esc = Options, Tab = touchpad;
   any SDL game controller works too.
