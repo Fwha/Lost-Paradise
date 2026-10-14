@@ -88,6 +88,32 @@ int main() {
         ++failures;
     }
 
+    // A V# built from the program counter (a constant table inside the shader, as the game's AO
+    // upsample does): s_getpc_b64, s_add_u32 and s_addc_u32 must leave the address known.
+    const std::vector<uint32_t> pcRel = {
+        0xbe9c1f00,             // s_getpc_b64 s[28:29]
+        0x801c1cff, 0x00000328, // s_add_u32 s28, 0x328, s28
+        0x821d1d80,             // s_addc_u32 s29, 0, s29
+        0xbe9e03c0,             // s_mov_b32 s30, 64
+        0xbe9f03ff, 0x2000c004, // s_mov_b32 s31, 0x2000c004
+        0xebf31030, 0x8007000d, // tbuffer_load_format_xyzw v0, v13, s[28:31], 0 offset:48 offen
+        0xbf810000,             // s_endpgm
+    };
+    gcn::LaunchState pl = l;
+    pl.entry = 0x3'0000'1000ull; // above 4 GiB so the add's carry matters
+    auto readPcRel = [&](uint64_t addr, void* dst, size_t size) {
+        if (addr < pl.entry || addr + size > pl.entry + pcRel.size() * 4) return false;
+        std::memcpy(dst, reinterpret_cast<const char*>(pcRel.data()) + (addr - pl.entry), size);
+        return true;
+    };
+    const gcn::Program pp = gcn::analyze(pl, readPcRel);
+    if (pp.buffers.size() != 1 || !pp.buffers[0].known || pp.buffers[0].base() != pl.entry + 4 + 0x328) {
+        std::fprintf(stderr, "pc-relative buffer: %zu buffers, known %d, base 0x%llx\n", pp.buffers.size(),
+                     pp.buffers.empty() ? 0 : int(pp.buffers[0].known),
+                     pp.buffers.empty() ? 0ull : (unsigned long long)pp.buffers[0].base());
+        ++failures;
+    }
+
     if (failures) std::fprintf(stderr, "%d failure(s)\n", failures);
     return failures ? 1 : 0;
 }

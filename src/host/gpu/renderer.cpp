@@ -324,6 +324,7 @@ public:
             }
         }
         prof_.on = getenv("LPN_PROFILE") != nullptr;
+        dumpGlsl_ = getenv("LPN_GPU_GLSL") != nullptr;
         return true;
     }
 
@@ -894,8 +895,44 @@ private:
         const gcn::GlslStage stage = p.launch.stage == gcn::Stage::Pixel     ? gcn::GlslStage::Fragment
                                      : p.launch.stage == gcn::Stage::Compute ? gcn::GlslStage::Compute
                                                                              : gcn::GlslStage::Vertex;
+        // Debugging: LPN_DBG_PS=<entry>[,<entry>...] rewrites those pixel shaders' color output to
+        // LPN_DBG_OUT (a GLSL vec4 argument list). dbgT<n> holds image n's last sample, and
+        // LPN_DBG_CAP="<line text>|<expr>" stores vec4(expr) in dbgC after the first matching line.
+        if (const char* dp = getenv("LPN_DBG_PS"); dp && *dp && getenv("LPN_DBG_OUT") && stage == gcn::GlslStage::Fragment &&
+                                                   std::strstr(dp, hex(p.launch.entry).c_str())) {
+            std::string& g = m->translation.glsl;
+            for (int i = 15; i >= 0; --i) {
+                const std::string pat = "vec4 t_ = vec4(texture(img" + std::to_string(i) + ",";
+                for (size_t q = g.find(pat); q != std::string::npos; q = g.find(pat, q + 1)) {
+                    const size_t e = g.find(";\n", q);
+                    g.insert(e + 1, " dbgT" + std::to_string(i) + " = t_;");
+                }
+            }
+            if (const char* cap = getenv("LPN_DBG_CAP"); cap && std::strchr(cap, '|')) {
+                const std::string c = cap;
+                const size_t bar = c.find('|');
+                const size_t q = g.find(c.substr(0, bar));
+                if (q != std::string::npos) g.insert(g.find('\n', q) + 1, "dbgC = vec4(" + c.substr(bar + 1) + ");\n");
+            }
+            std::string decl = "vec4 dbgC = vec4(0.0);\n";
+            for (int i = 0; i < 16; ++i) decl += "vec4 dbgT" + std::to_string(i) + " = vec4(0.0);\n";
+            g.insert(g.find("void main()"), decl);
+            const size_t at = g.find("\noC0 = ");
+            if (at != std::string::npos) {
+                const size_t end = g.find('\n', at + 1);
+                g.replace(at + 1, end - at - 1, std::string("oC0 = vec4(") + getenv("LPN_DBG_OUT") + ");");
+            }
+        }
         m->module = module(m->translation.glsl, stage);
         m->id = uint32_t(shaders_.size() + 1);
+        if (dumpGlsl_) { // debugging: every translation as gpu-glsl-<stage>-<entry>-<id>.glsl
+            const char* st = stage == gcn::GlslStage::Fragment ? "ps" : stage == gcn::GlslStage::Compute ? "cs" : "vs";
+            const std::string name = std::string("gpu-glsl-") + st + "-" + hex(p.launch.entry) + "-" + std::to_string(m->id) + ".glsl";
+            if (FILE* f = std::fopen(name.c_str(), "wb")) {
+                std::fwrite(m->translation.glsl.data(), 1, m->translation.glsl.size(), f);
+                std::fclose(f);
+            }
+        }
         return (shaders_[key] = std::move(m)).get();
     }
 
@@ -1639,7 +1676,8 @@ private:
             vkCmdClearColorImage(cmd_, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
         }
         if (trace_)
-            std::fprintf(stderr, "[trace]   fast clear of %s 0x%" PRIx64 "\n", m.depth ? "depth" : "target", m.surface);
+            std::fprintf(stderr, "[trace]   fast clear of %s 0x%" PRIx64 " to 0x%x 0x%x\n", m.depth ? "depth" : "target",
+                         m.surface, m.clear[0], m.clear[1]);
     }
 
     // CB_COLOR_CLEAR_WORD0/1 hold one element in memory order, which is the images' component
@@ -1724,6 +1762,12 @@ private:
                          cbMode, dbRender, r.ctx[reg::kDbDepthControl], r.ctx[reg::kDbZInfo],
                          uint64_t(r.ctx[reg::kDbZReadBase]) << 8, uint64_t(r.ctx[reg::kDbHtileDataBase]) << 8,
                          std::bit_cast<float>(r.ctx[reg::kDbDepthClear]), r.uconfig[reg::kPrimitiveType], d.count);
+        if (trace_ && cbMode > 1) {
+            const uint32_t* cb = &r.ctx[reg::kCbColorBase];
+            std::fprintf(stderr, "[trace]   eliminate 0x%" PRIx64 " info 0x%x cmask 0x%" PRIx64 " clear 0x%x 0x%x\n",
+                         uint64_t(cb[0]) << 8, cb[::gpu::ctx::kCbColorInfo], uint64_t(cb[reg::kCbColorCmask]) << 8,
+                         cb[reg::kCbColorClearWord0], cb[reg::kCbColorClearWord1]);
+        }
         if (cbMode > 1) return;           // fast-clear eliminate, resolve, decompress: nothing to do here
         if (dbRender & 0x1C) return;      // depth/stencil copy, resummarize
         const uint32_t prim = r.uconfig[reg::kPrimitiveType];
@@ -2023,7 +2067,7 @@ private:
     std::vector<std::unique_ptr<Image>> dummyImages_;
     std::set<std::string> warned_;
     uint64_t frame_ = 0, drawIndex_ = 0, traceFrame_ = ~0ull;
-    bool trace_ = false, snap_ = false;
+    bool trace_ = false, snap_ = false, dumpGlsl_ = false;
     std::vector<std::pair<uint64_t, uint64_t>> snapDraws_;
     bool snapWanted() const {
         if (snapDraws_.empty()) return true;

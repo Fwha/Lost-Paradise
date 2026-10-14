@@ -56,8 +56,17 @@ screen loop). Addresses are guest addresses and change between runs.
   copy of the image back to guest memory: the game reads the measured scene luminance this way
   for auto exposure. 1D images are treated as 2D images of one row, in shaders and views.
 
-Known gaps: tile mode 14 (2D thin) textures are read as linear; draws into linear targets are
-not copied back; indirect draws are skipped; cube maps, MSAA and some formats are not handled.
+- **Cube maps.** `v_cubeid/sc/tc/ma` are translated, and a cube sample's (s, t, face) coordinates
+  are turned back into a direction for `samplerCube`. Character shaders use them.
+- **Constants inside shader code.** Some shaders build a V# from `s_getpc_b64` plus an offset to
+  read a table stored after their code (the AO upsample's bilateral weights). The analysis
+  tracks `s_add_u32`/`s_addc_u32` so that address stays known; when it was lost, the AO term read
+  zero and every environment material in Shin's Castle shaded black.
+
+Known gaps: tile mode 14 (2D thin) textures are read as linear (in gameplay only render targets,
+which are sampled from their images, use it); draws into linear targets are not copied back;
+indirect draws are skipped; cube arrays, MSAA and some formats are not handled;
+`ds_swizzle_b32`, `v_mad_u64_u32` and `v_cvt_off_f32_i4` are not translated yet.
 
 ## Next
 

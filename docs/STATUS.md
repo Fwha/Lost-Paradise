@@ -1,6 +1,6 @@
 # Status and handoff notes
 
-Last updated 2026-10-13.
+Last updated 2026-10-14.
 
 ## Plan
 
@@ -40,6 +40,9 @@ Last updated 2026-10-13.
 - GPU rendering (Vulkan): GCN shaders are recompiled to GLSL/SPIR-V at draw time and every
   draw and dispatch of the frame is replayed. The boot now shows the game's own loading
   screen (black, with the Lost Paradise logo). See `docs/gpu.md` for how it works.
+- Gameplay renders lit (branch fix-black-env): the white-out came from ignored HTILE/CMASK fast
+  clears; the black environment from a PC-relative constant table the shader analysis lost
+  (`s_addc_u32`), which zeroed ambient occlusion. Cube-map sampling is translated.
 - Boot reaches the title, main menu and difficulty select, and starts a new game (the
   opening cutscene `auth/a00_0100_before.par` loads in Southern Town). Scripted presses
   (`--press`) drive menus in headless runs.
@@ -88,6 +91,12 @@ Last updated 2026-10-13.
   `LPN_GPU_TRACE=<frame>` logs every draw of that frame and dumps its render targets,
   adding `LPN_GPU_SNAP=1` saves the target after each draw (or `LPN_GPU_SNAP=2750-2760,2886` for
   just those draws); 32-bit float targets also get their min/max/mean logged.
+  `LPN_GPU_GLSL=1` writes every translated shader as gpu-glsl-<stage>-<entry>-<id>.glsl.
+  `LPN_DBG_PS=<entry>[,<entry>...] LPN_DBG_OUT="<vec4 args>"` replaces those pixel shaders' color
+  output (e.g. `"iA4.xyz * 4.0, 1.0"`); `dbgT<n>` holds image n's last sample and
+  `LPN_DBG_CAP="<GLSL line text>|<expr>"` captures `vec4(expr)` into `dbgC` after that line.
+  `LPN_PM4_TRACE=<frame>` logs that frame's DMA_DATA and EVENT_WRITE packets;
+  `LPN_GPU_STATS=<n>` prints PM4 opcode counts for the 300 submissions ending at submission n.
 - Controls: arrows = d-pad, WASD/IJKL = sticks, Enter = Cross, Backspace = Circle,
   Z = Square, X = Triangle, Q/E = L1/R1, 1/3 = L2/R2, Esc = Options, Tab = touchpad;
   any SDL game controller works too.

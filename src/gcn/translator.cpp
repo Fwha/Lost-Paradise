@@ -279,6 +279,43 @@ bool cmpClass(float x, uint mask) {
     else cls = neg ? 3u : 8u;
     return ((mask >> cls) & 1u) != 0u;
 }
+// v_cube*: face id, face s/t and 2x the major axis of a direction (GCN face order +x -x +y -y +z -z).
+float cubeId(vec3 d) {
+    vec3 a = abs(d);
+    if (a.z >= a.x && a.z >= a.y) return d.z < 0.0 ? 5.0 : 4.0;
+    if (a.y >= a.x) return d.y < 0.0 ? 3.0 : 2.0;
+    return d.x < 0.0 ? 1.0 : 0.0;
+}
+float cubeSc(vec3 d) {
+    vec3 a = abs(d);
+    if (a.z >= a.x && a.z >= a.y) return d.z < 0.0 ? -d.x : d.x;
+    if (a.y >= a.x) return d.x;
+    return d.x < 0.0 ? d.z : -d.z;
+}
+float cubeTc(vec3 d) {
+    vec3 a = abs(d);
+    if (a.z >= a.x && a.z >= a.y) return -d.y;
+    if (a.y >= a.x) return d.y < 0.0 ? -d.z : d.z;
+    return -d.y;
+}
+float cubeMa(vec3 d) {
+    vec3 a = abs(d);
+    if (a.z >= a.x && a.z >= a.y) return 2.0 * d.z;
+    if (a.y >= a.x) return 2.0 * d.y;
+    return 2.0 * d.x;
+}
+// Cube image coordinates (s, t in [1, 2] as v_cube* produce them, face id) back to a direction.
+vec3 cubeDir(vec3 c) {
+    float u = 2.0 * c.x - 3.0, v = 2.0 * c.y - 3.0;
+    switch (int(c.z + 0.5) & 7) {
+    case 0: return vec3(1.0, -v, -u);
+    case 1: return vec3(-1.0, -v, u);
+    case 2: return vec3(u, 1.0, v);
+    case 3: return vec3(u, -1.0, -v);
+    case 4: return vec3(u, -v, 1.0);
+    default: return vec3(-u, -v, -1.0);
+    }
+}
 )";
     }
 
@@ -401,6 +438,7 @@ bool cmpClass(float x, uint mask) {
         case 2: writeS(d, a + " + " + b); break;
         case 3: writeS(d, a + " - " + b); break;
         case 4: out(fmt("{ uint a_ = %s; uint r_ = a_ + %s + uint(scc); scc = r_ < a_ || (scc && r_ == a_); ", a.c_str(), b.c_str()) + sreg(d) + " = r_; }\n"); break;
+        case 5: out(fmt("{ uint a_ = %s; uint b_ = %s; uint c_ = uint(scc); scc = b_ > a_ || (c_ != 0u && b_ == a_); ", a.c_str(), b.c_str()) + sreg(d) + " = a_ - b_ - c_; }\n"); break;
         case 6: writeS(d, "uint(min(int(" + a + "), int(" + b + ")))"); break;
         case 7: writeS(d, "min(" + a + ", " + b + ")"); break;
         case 8: writeS(d, "uint(max(int(" + a + "), int(" + b + ")))"); break;
@@ -620,6 +658,10 @@ bool cmpClass(float x, uint mask) {
         case 320: case 321: fres(fa + " * " + fb + " + " + fc); break;
         case 322: ures("uint(int(i24(" + a + ")) * int(i24(" + b + "))) + " + c); break;
         case 323: ures("(" + a + " & 0xffffffu) * (" + b + " & 0xffffffu) + " + c); break;
+        case 324: fres("cubeId(vec3(" + fa + ", " + fb + ", " + fc + "))"); break;
+        case 325: fres("cubeSc(vec3(" + fa + ", " + fb + ", " + fc + "))"); break;
+        case 326: fres("cubeTc(vec3(" + fa + ", " + fb + ", " + fc + "))"); break;
+        case 327: fres("cubeMa(vec3(" + fa + ", " + fb + ", " + fc + "))"); break;
         case 328: ures("bfeU(" + a + ", " + b + ", " + c + ")"); break;
         case 329: ures("bfeI(" + a + ", " + b + ", " + c + ")"); break;
         case 330: ures("(" + a + " & " + b + ") | (~" + a + " & " + c + ")"); break;
@@ -1066,7 +1108,6 @@ bool cmpClass(float x, uint mask) {
         r += coords;
         const uint32_t lodReg = r;
 
-        if (type == 11) warn("cube sampling");
         out("{\n");
         const unsigned glslCoords = oneD ? coords + 1 : coords;
         out("vec" + std::to_string(glslCoords) + " uv_ = " +
@@ -1083,6 +1124,7 @@ bool cmpClass(float x, uint mask) {
             out("uv_.xy += oo_ / " + sizeExpr + ".xy; }\n");
         }
         if (oneD) out("uv_.y = 0.5 / " + sizeExpr + ".y;\n"); // the middle of row 0
+        if (type == 11) out("uv_ = cubeDir(uv_);\n"); // samplerCube wants a direction
         const std::string uv = "uv_";
         auto grad = [&](uint32_t first) { return oneD ? "vec2(" + fv(first) + ", 0.0)" : vecOf(first, dims, false); };
         std::string call;
