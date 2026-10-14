@@ -42,20 +42,29 @@ uint64_t gpuClock() {
 
 uint64_t address(uint32_t lo, uint32_t hi) { return uint64_t(lo) | (uint64_t(hi & 0xFFFF) << 32); }
 
-// Shared tail of EVENT_WRITE_EOP and RELEASE_MEM.
+// Runs fn when the GPU work submitted before it is done (now, without an asynchronous renderer).
+void afterGpuWork(std::function<void()> fn) {
+    for (DrawListener* l : gListeners)
+        if (l->afterGpuWork(fn)) return;
+    fn();
+}
+
+// Shared tail of EVENT_WRITE_EOP and RELEASE_MEM: the fence and interrupt fire once the
+// draws before them have run, so the game never sees a label for unfinished work.
 void endOfPipe(uint64_t addr, uint32_t dataSel, uint32_t intSel, uint32_t dataLo, uint32_t dataHi, Pm4Stats* st) {
-    if (addr) switch (dataSel) {
-        case 1: *reinterpret_cast<volatile uint32_t*>(addr) = dataLo; break;
-        case 2: *reinterpret_cast<volatile uint64_t*>(addr) = uint64_t(dataLo) | (uint64_t(dataHi) << 32); break;
-        case 3:
-        case 4: *reinterpret_cast<volatile uint64_t*>(addr) = gpuClock(); break;
-        default: break;
-        }
     if (dataSel) ++st->fences;
-    if (intSel) {
-        ++st->interrupts;
-        triggerEvent(kEqEventGfxEop, kFilterGraphicsCore, 0);
-    }
+    if (intSel) ++st->interrupts;
+    if (!(addr && dataSel) && !intSel) return;
+    afterGpuWork([=] {
+        if (addr) switch (dataSel) {
+            case 1: *reinterpret_cast<volatile uint32_t*>(addr) = dataLo; break;
+            case 2: *reinterpret_cast<volatile uint64_t*>(addr) = uint64_t(dataLo) | (uint64_t(dataHi) << 32); break;
+            case 3:
+            case 4: *reinterpret_cast<volatile uint64_t*>(addr) = gpuClock(); break;
+            default: break;
+            }
+        if (intSel) triggerEvent(kEqEventGfxEop, kFilterGraphicsCore, 0);
+    });
 }
 
 void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
@@ -159,7 +168,9 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
                 break;
             case kOpEventWriteEos:
                 if ((b[2] >> 29) == 2) {
-                    *reinterpret_cast<volatile uint32_t*>(address(b[1], b[2])) = b[3];
+                    const uint64_t addr = address(b[1], b[2]);
+                    const uint32_t value = b[3];
+                    afterGpuWork([=] { *reinterpret_cast<volatile uint32_t*>(addr) = value; });
                     ++st->fences;
                 }
                 break;

@@ -13,6 +13,7 @@
 #include <sys/mman.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -28,13 +29,25 @@ std::mutex gSubmitMutex;
 Pm4Stats gStats;
 uint64_t gSubmits = 0;
 
+// LPN_PROFILE=1: time spent inside submissions (PM4 processing plus the renderer).
+const bool gProfile = getenv("LPN_PROFILE") != nullptr;
+uint64_t gSubmitNs = 0;
+
 void submit(uint32_t count, void* const* dcb, const uint32_t* dcbBytes, void* const* ccb, const uint32_t* ccbBytes) {
     std::lock_guard lock(gSubmitMutex);
+    const auto t0 = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < count; ++i) {
         if (ccb && ccb[i] && ccbBytes[i]) executePm4(static_cast<const uint32_t*>(ccb[i]), ccbBytes[i] / 4, &gStats);
         if (dcb && dcb[i] && dcbBytes[i]) executePm4(static_cast<const uint32_t*>(dcb[i]), dcbBytes[i] / 4, &gStats);
     }
     notifySubmitEnd();
+    if (gProfile) {
+        gSubmitNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        if ((gSubmits + 1) % 900 == 0) {
+            std::fprintf(stderr, "[prof] submissions: %.2f ms each\n", gSubmitNs / 1e6 / 900);
+            gSubmitNs = 0;
+        }
+    }
     if (++gSubmits == 300 && getenv("LPN_GPU_STATS")) {
         std::fprintf(stderr, "[gnm] PM4 opcodes over 300 frames:\n");
         for (int op = 0; op < 256; ++op)
