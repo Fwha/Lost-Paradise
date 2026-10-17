@@ -25,21 +25,32 @@ void registerGnmPacketHle();
 
 namespace {
 
-std::mutex gSubmitMutex;
-Pm4Stats gStats;
+std::mutex gSubmitMutex; // guards gComputeQueues
+Pm4Stats gStats; // the command processor thread's
 uint64_t gSubmits = 0;
 
 // LPN_PROFILE=1: time spent inside submissions (PM4 processing plus the renderer).
 const bool gProfile = getenv("LPN_PROFILE") != nullptr;
 uint64_t gSubmitNs = 0;
 
-void submit(uint32_t count, void* const* dcb, const uint32_t* dcbBytes, void* const* ccb, const uint32_t* ccbBytes) {
-    std::lock_guard lock(gSubmitMutex);
-    const auto t0 = std::chrono::steady_clock::now();
-    for (uint32_t i = 0; i < count; ++i) {
-        if (ccb && ccb[i] && ccbBytes[i]) executePm4(static_cast<const uint32_t*>(ccb[i]), ccbBytes[i] / 4, &gStats);
-        if (dcb && dcb[i] && dcbBytes[i]) executePm4(static_cast<const uint32_t*>(dcb[i]), dcbBytes[i] / 4, &gStats);
+// A submission's command buffers in execution order. The game keeps them intact until the GPU
+// signals it is done with them, so only the list is copied.
+struct CommandBuffers {
+    std::vector<std::pair<const uint32_t*, uint32_t>> list; // address, dwords
+
+    CommandBuffers(uint32_t count, void* const* dcb, const uint32_t* dcbBytes, void* const* ccb,
+                   const uint32_t* ccbBytes) {
+        for (uint32_t i = 0; i < count; ++i) {
+            if (ccb && ccb[i] && ccbBytes[i]) list.push_back({static_cast<const uint32_t*>(ccb[i]), ccbBytes[i] / 4});
+            if (dcb && dcb[i] && dcbBytes[i]) list.push_back({static_cast<const uint32_t*>(dcb[i]), dcbBytes[i] / 4});
+        }
     }
+};
+
+// Runs on the command processor thread.
+void execute(const CommandBuffers& cbs) {
+    const auto t0 = std::chrono::steady_clock::now();
+    for (const auto& [cmds, dwords] : cbs.list) executePm4(cmds, dwords, &gStats);
     notifySubmitEnd();
     if (gProfile) {
         gSubmitNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
@@ -64,16 +75,20 @@ void submit(uint32_t count, void* const* dcb, const uint32_t* dcbBytes, void* co
 
 int32_t sceGnmSubmitCommandBuffers(uint32_t count, void* const* dcb, const uint32_t* dcbBytes, void* const* ccb,
                                    const uint32_t* ccbBytes) {
-    submit(count, dcb, dcbBytes, ccb, ccbBytes);
+    if (timelineOn()) timeline("game: submit");
+    queueCommandProcessor([cbs = CommandBuffers(count, dcb, dcbBytes, ccb, ccbBytes)] { execute(cbs); });
     return 0;
 }
 
 int32_t sceGnmSubmitAndFlipCommandBuffers(uint32_t count, void* const* dcb, const uint32_t* dcbBytes,
                                           void* const* ccb, const uint32_t* ccbBytes, int32_t videoOut,
                                           int32_t bufferIndex, int32_t flipMode, int64_t flipArg) {
-    submit(count, dcb, dcbBytes, ccb, ccbBytes);
-    notifyFrameEnd();
-    return videoOutSubmitFlip(videoOut, bufferIndex, flipMode, flipArg);
+    if (timelineOn()) timeline("game: submit and flip");
+    queueCommandProcessor([cbs = CommandBuffers(count, dcb, dcbBytes, ccb, ccbBytes)] {
+        execute(cbs);
+        notifyFrameEnd();
+    });
+    return videoOutSubmitFlip(videoOut, bufferIndex, flipMode, flipArg); // shown once that work is done
 }
 
 int32_t sceGnmSubmitCommandBuffersForWorkload(uint64_t, uint32_t count, void* const* dcb, const uint32_t* dcbBytes,
@@ -127,15 +142,20 @@ void sceGnmDingDong(uint32_t vqid, uint32_t nextDw) {
     std::lock_guard lock(gSubmitMutex);
     if (vqid == 0 || vqid > gComputeQueues.size()) return;
     auto& q = gComputeQueues[vqid - 1];
+    // The packets are copied now: the game may refill the ring once it is kicked. A wrapped
+    // range is stitched so packets crossing the end stay whole.
+    std::vector<uint32_t> packets;
     if (nextDw >= q.readDw) {
-        executePm4(q.ring + q.readDw, nextDw - q.readDw, &gStats);
-    } else { // wrapped: stitch the two halves so packets crossing the end stay whole
-        std::vector<uint32_t> tmp(q.ring + q.readDw, q.ring + q.sizeDw);
-        tmp.insert(tmp.end(), q.ring, q.ring + nextDw);
-        executePm4(tmp.data(), uint32_t(tmp.size()), &gStats);
+        packets.assign(q.ring + q.readDw, q.ring + nextDw);
+    } else {
+        packets.assign(q.ring + q.readDw, q.ring + q.sizeDw);
+        packets.insert(packets.end(), q.ring, q.ring + nextDw);
     }
-    notifySubmitEnd();
     q.readDw = nextDw % q.sizeDw;
+    queueCommandProcessor([packets = std::move(packets)] {
+        executePm4(packets.data(), uint32_t(packets.size()), &gStats);
+        notifySubmitEnd();
+    });
 }
 void sceGnmDingDongForWorkload(uint32_t vqid, uint32_t nextDw, uint64_t) { sceGnmDingDong(vqid, nextDw); }
 

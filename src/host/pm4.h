@@ -53,12 +53,32 @@ public:
     virtual bool afterGpuWork(std::function<void()>&) { return false; }
     // The command processor wrote guest memory (DMA_DATA, WRITE_DATA) between draws.
     virtual void onMemoryWrite(uint64_t /*addr*/, uint64_t /*size*/) {}
+    // The command processor is about to wait (WAIT_REG_MEM): hand the GPU what was recorded,
+    // since the value waited for may come from its fences.
+    virtual void onWait() {}
+    // CP DMA from memory (or a fill) to memory: true when the listener runs it on the GPU timeline,
+    // in order with the draws around it; otherwise the command processor copies it now.
+    virtual bool onDmaCopy(uint64_t /*dst*/, uint64_t /*src*/, uint64_t /*bytes*/, bool /*fill*/, uint32_t /*value*/) {
+        return false;
+    }
 };
 void addDrawListener(DrawListener* l);
 void notifySubmitEnd();
 void notifyFrameEnd();
 
 void executePm4(const uint32_t* cmds, uint32_t numDwords, Pm4Stats* stats);
+
+// The command processor runs on a thread of its own, as on the console: submissions return at
+// once and their packets are executed there, in order. Queues `fn` to run on that thread after
+// everything queued before it. LPN_SYNC_SUBMIT=1 runs it on the caller's thread instead.
+void queueCommandProcessor(std::function<void()> fn);
+// From the command processor thread: runs `fn` once the commands handed over so far have been
+// recorded (draws go to the listeners on a recorder thread of their own).
+void afterCommandsRecorded(std::function<void()> fn);
+
+// LPN_TIMELINE=<seconds>: logs what happens on the GPU side for 100 ms from then, with times.
+bool timelineOn();
+void timeline(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
 // A PM4 NOP occupying exactly numDwords (used where GNM would emit real packets).
 void writePm4Nop(uint32_t* cmds, uint32_t numDwords);

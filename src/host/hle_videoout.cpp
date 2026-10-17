@@ -7,6 +7,7 @@
 #include "host/gpu/renderer.h"
 #include "host/hle.h"
 #include "host/kernel.h"
+#include "host/pm4.h"
 #include "host/window.h"
 
 #include <algorithm>
@@ -61,7 +62,8 @@ struct Flip {
     int32_t index;
     int64_t arg;
     uint64_t submitTime;
-    uint64_t gpuMark; // the GPU work that renders it
+    uint64_t id;
+    uint64_t gpuMark = ~0ull; // the GPU work that renders it, once the command processor has recorded it
 };
 
 struct Display {
@@ -240,6 +242,7 @@ void vblankThread() {
         gDisplay.vblank.notify_all();
         triggerEvent(kEventVblank, kFilterVideoOut, int64_t(vblank));
         if (flipped) {
+            if (timelineOn()) timeline("display: flip %" PRIu64, n);
             queueShow(frame, n);
             triggerEvent(kEventFlip, kFilterVideoOut, flipArg);
             if (gPacingStats) {
@@ -348,6 +351,7 @@ int32_t sceVideoOutIsFlipPending(int32_t handle) {
 }
 
 int32_t sceVideoOutWaitVblank(int32_t handle) {
+    if (timelineOn()) timeline("game: wait vblank");
     if (handle != kHandle) return kErrInvalidHandle;
     std::unique_lock lock(gDisplay.m);
     const uint64_t target = gDisplay.vblankCount + 1;
@@ -372,10 +376,24 @@ int32_t ok() { return 0; }
 int32_t videoOutSubmitFlip(int32_t handle, int32_t index, int32_t, int64_t arg) {
     if (handle != kHandle) return kErrInvalidHandle;
     if (index < -1 || index >= 16) return kErrInvalidIndex;
-    const uint64_t mark = render::gpuMark();
-    std::lock_guard lock(gDisplay.m);
-    if (gDisplay.pending.size() >= 16) return kErrFlipQueueFull;
-    gDisplay.pending.push_back({index, arg, nowUs(), mark});
+    static uint64_t nextId = 0;
+    uint64_t id;
+    {
+        std::lock_guard lock(gDisplay.m);
+        if (gDisplay.pending.size() >= 16) return kErrFlipQueueFull;
+        id = ++nextId;
+        gDisplay.pending.push_back({index, arg, nowUs(), id});
+    }
+    // The submissions before the flip are still on their way through the command processor:
+    // its rendering is known once they have been recorded.
+    queueCommandProcessor([id] {
+        afterCommandsRecorded([id] {
+            const uint64_t mark = render::gpuMark();
+            std::lock_guard lock(gDisplay.m);
+            for (Flip& f : gDisplay.pending)
+                if (f.id == id) f.gpuMark = mark;
+        });
+    });
     return 0;
 }
 

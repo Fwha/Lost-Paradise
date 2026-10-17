@@ -2,10 +2,18 @@
 
 #include "host/equeue.h"
 
+#include <atomic>
 #include <chrono>
+#include <cstdarg>
+#include <condition_variable>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace host {
@@ -14,8 +22,8 @@ namespace {
 
 using namespace gpu;
 
-GpuRegs gRegs; // the graphics ring's state; submissions are serialised by the caller
-uint64_t gFrame = 0;
+GpuRegs gRegs; // the graphics ring's state; only the command processor thread uses it
+std::atomic<uint64_t> gFrame{0};
 const uint64_t gTraceFrame = getenv("LPN_PM4_TRACE") ? std::strtoull(getenv("LPN_PM4_TRACE"), nullptr, 0) : ~0ull;
 std::vector<DrawListener*> gListeners;
 
@@ -24,12 +32,16 @@ void draw(const DrawCall& d, Pm4Stats* st) {
     for (DrawListener* l : gListeners) l->onDraw(d, gRegs);
 }
 
-// CP DMA: copies or fills memory on the GPU timeline, which is now.
+// CP DMA: copies or fills memory on the GPU timeline: by the renderer, in order with the draws,
+// or here and now without one.
 void dmaData(const uint32_t* b) {
     const uint32_t control = b[0], bytes = b[5] & 0x1FFFFF;
     const uint32_t srcSel = (control >> 29) & 3, dstSel = (control >> 20) & 3;
     const uint64_t src = uint64_t(b[1]) | (uint64_t(b[2]) << 32), dst = uint64_t(b[3]) | (uint64_t(b[4]) << 32);
     if (dstSel != 0 || !dst || !bytes) return; // only memory destinations matter to the CPU
+    if ((srcSel == 0 && src) || srcSel == 2)
+        for (DrawListener* l : gListeners)
+            if (l->onDmaCopy(dst, srcSel == 0 ? src : 0, bytes, srcSel == 2, b[1])) return;
     if (srcSel == 0 && src) std::memmove(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), bytes);
     else if (srcSel == 2) { // fill with the immediate in src_lo
         auto* d = reinterpret_cast<uint32_t*>(dst);
@@ -48,6 +60,102 @@ uint64_t gpuClock() {
 
 uint64_t address(uint32_t lo, uint32_t hi) { return uint64_t(lo) | (uint64_t(hi & 0xFFFF) << 32); }
 
+void queueRecorder(std::function<void()> fn);
+
+bool commandProcessorIsAsync() {
+    static const bool async = getenv("LPN_SYNC_SUBMIT") == nullptr;
+    return async;
+}
+
+// WAIT_REG_MEM on memory: the game makes the GPU wait for a value, often one the CPU writes
+// once it has filled the data the next draws read. On the command processor thread this
+// waits as the GPU would (up to a limit, in case nothing ever writes it); run synchronously
+// at submit, the CPU could not write it, so the wait is skipped.
+// Values the command stream has the GPU write to memory (labels, WRITE_DATA), by address: the
+// command processor thread notes them as it passes them.
+std::unordered_map<uint64_t, uint32_t> gGpuWillWrite;
+
+void noteGpuWrite(uint64_t addr, uint32_t value) {
+    if (gGpuWillWrite.size() > 4096) gGpuWillWrite.clear();
+    gGpuWillWrite[addr] = value;
+}
+
+// selfOk: a value the stream has already asked the GPU to write counts as written.
+void waitRegMem(const uint32_t* b, Pm4Stats* st, bool selfOk = true) {
+    const uint32_t control = b[0], func = control & 7;
+    if (!(control & 0x10) || func == 0) return; // registers, or "always"
+    const auto* mem = reinterpret_cast<volatile uint32_t*>(address(b[1] & ~3u, b[2]));
+    const uint32_t ref = b[3], mask = b[4];
+    auto test = [&](uint32_t v) {
+        v &= mask;
+        switch (func) {
+        case 1: return v < ref;
+        case 2: return v <= ref;
+        case 3: return v == ref;
+        case 4: return v != ref;
+        case 5: return v >= ref;
+        case 6: return v > ref;
+        default: return true;
+        }
+    };
+    auto met = [&] { return test(*mem); };
+    if (met()) return;
+    // Mostly the GPU waits for its own end-of-pipe label (a pipeline drain between passes). The
+    // renderer runs everything in order behind full barriers, so a value the stream has already
+    // asked the GPU to write is as good as written: only values from elsewhere (the CPU) are
+    // waited for.
+    if (commandProcessorIsAsync() && selfOk) {
+        auto it = gGpuWillWrite.find(uint64_t(reinterpret_cast<uintptr_t>(mem)));
+        if (it != gGpuWillWrite.end() && test(it->second)) return;
+    }
+    if (!commandProcessorIsAsync()) {
+        ++st->skippedWaits;
+        return;
+    }
+    queueRecorder([] {
+        for (DrawListener* l : gListeners) l->onWait();
+    });
+    const auto start = std::chrono::steady_clock::now();
+    struct WaitStats {
+        uint64_t waits = 0, ns = 0, maxNs = 0, maxAddr = 0;
+    };
+    static WaitStats ws;
+    static const bool profile = getenv("LPN_PROFILE") != nullptr;
+    struct Done {
+        decltype(start) t0;
+        const volatile uint32_t* mem;
+        ~Done() {
+            if (!profile) return;
+            const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+            ++ws.waits, ws.ns += ns;
+            if (ns > ws.maxNs) ws.maxNs = ns, ws.maxAddr = uint64_t(reinterpret_cast<uintptr_t>(mem));
+            static uint64_t reportedFrame = 0;
+            if (gFrame >= reportedFrame + 300) {
+                std::fprintf(stderr, "[pm4] frames to %" PRIu64 ": %" PRIu64 " waits, %.2f ms per frame, longest %.2f ms on 0x%" PRIx64 "\n",
+                             gFrame.load(), ws.waits, ws.ns / 1e6 / double(gFrame - reportedFrame), ws.maxNs / 1e6, ws.maxAddr);
+                reportedFrame = gFrame;
+                ws = {};
+            }
+        }
+    } done{start, mem};
+    const bool tl = timelineOn();
+    if (tl) timeline("cp: wait for 0x%" PRIx64 " (now 0x%x)", uint64_t(reinterpret_cast<uintptr_t>(mem)), *mem);
+    const auto deadline = start + std::chrono::seconds(2);
+    for (uint32_t spins = 0; !met(); ++spins) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            static uint32_t warned = 0;
+            if (warned++ < 5)
+                std::fprintf(stderr, "[pm4] gave up waiting for 0x%" PRIx64 " (func %u ref 0x%x, now 0x%x)\n",
+                             uint64_t(reinterpret_cast<uintptr_t>(mem)), func, ref, *mem);
+            ++st->skippedWaits;
+            return;
+        }
+        if (spins < 64) std::this_thread::yield();
+        else std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    if (tl) timeline("cp: wait for 0x%" PRIx64 " done", uint64_t(reinterpret_cast<uintptr_t>(mem)));
+}
+
 // Runs fn when the GPU work submitted before it is done (now, without an asynchronous renderer).
 void afterGpuWork(std::function<void()> fn) {
     for (DrawListener* l : gListeners)
@@ -62,6 +170,7 @@ void endOfPipe(uint64_t addr, uint32_t dataSel, uint32_t intSel, uint32_t dataLo
     if (intSel) ++st->interrupts;
     if (!(addr && dataSel) && !intSel) return;
     afterGpuWork([=] {
+        if (timelineOn()) timeline("gpu: end-of-pipe label 0x%" PRIx64 " = 0x%x%s", addr, dataLo, intSel ? " + interrupt" : "");
         if (addr) switch (dataSel) {
             case 1: *reinterpret_cast<volatile uint32_t*>(addr) = dataLo; break;
             case 2: *reinterpret_cast<volatile uint64_t*>(addr) = uint64_t(dataLo) | (uint64_t(dataHi) << 32); break;
@@ -169,6 +278,9 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
                 break;
             case kOpWriteData: {
                 const uint32_t dstSel = (b[0] >> 8) & 0xF;
+                if (gFrame == gTraceFrame)
+                    std::fprintf(stderr, "[pm4] write data control 0x%x addr 0x%" PRIx64 " dwords %u first 0x%x (draws so far %" PRIu64 ")\n",
+                                 b[0], address(b[1], b[2]), count - 2, count >= 3 ? b[3] : 0, st->draws);
                 if (dstSel == 2 || dstSel == 5) {
                     auto* dst = reinterpret_cast<volatile uint32_t*>(address(b[1], b[2]));
                     for (uint32_t i = 3; i < count + 1; ++i) dst[i - 3] = b[i];
@@ -178,9 +290,15 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
                 break;
             }
             case kOpEventWriteEop:
+                if (gFrame == gTraceFrame)
+                    std::fprintf(stderr, "[pm4] eop addr 0x%" PRIx64 " data sel %u int %u value 0x%x (draws so far %" PRIu64 ")\n",
+                                 address(b[1], b[2]), b[2] >> 29, (b[2] >> 24) & 3, b[3], st->draws);
                 endOfPipe(address(b[1], b[2]), b[2] >> 29, (b[2] >> 24) & 3, b[3], b[4], st);
                 break;
             case kOpReleaseMem:
+                if (gFrame == gTraceFrame)
+                    std::fprintf(stderr, "[pm4] release mem addr 0x%" PRIx64 " data sel %u int %u value 0x%x (draws so far %" PRIu64 ")\n",
+                                 address(b[2], b[3]), b[1] >> 29, (b[1] >> 24) & 3, b[4], st->draws);
                 endOfPipe(address(b[2], b[3]), b[1] >> 29, (b[1] >> 24) & 3, b[4], b[5], st);
                 break;
             case kOpEventWriteEos:
@@ -191,11 +309,7 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
                     ++st->fences;
                 }
                 break;
-            case kOpWaitRegMem:
-                // Commands run synchronously at submit, so whatever this waits for has either
-                // happened already or comes from the CPU later; don't block on it.
-                ++st->skippedWaits;
-                break;
+            case kOpWaitRegMem: waitRegMem(b, st); break; // only without the command processor thread
             default: break;
             }
         }
@@ -203,20 +317,178 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
     }
 }
 
+// The command processor thread's half: walks the packets (into indirect buffers), waits where
+// the game told the GPU to wait, and hands everything else, flattened, to the recorder thread,
+// which executes it as before. Recording thus carries on while the command processor waits.
+void scan(const uint32_t* p, const uint32_t* end, std::vector<uint32_t>& out, Pm4Stats* st, int depth) {
+    const uint32_t* drain = nullptr; // the last wait skipped as self-satisfied, until a draw
+    while (p < end) {
+        const uint32_t h = *p;
+        const uint32_t type = h >> 30;
+        if (type == 2) {
+            ++p;
+            continue;
+        }
+        const uint32_t count = (h >> 16) & 0x3FFF;
+        const uint32_t len = count + 2;
+        if (type == 1 || p + len > end) {
+            std::fprintf(stderr, "[pm4] malformed packet 0x%08x, skipping rest of buffer\n", h);
+            return;
+        }
+        const uint32_t op = type == 3 ? (h >> 8) & 0xFF : 0;
+        const uint32_t* b = p + 1;
+        if (type == 3 && (op == kOpIndirectBuffer || op == kOpIndirectBufferConst)) {
+            if (depth < 4) {
+                const auto* ib = reinterpret_cast<const uint32_t*>(address(b[0] & ~3u, b[1]));
+                scan(ib, ib + (b[2] & 0xFFFFF), out, st, depth + 1);
+            }
+        } else if (type == 3 && op == kOpWaitRegMem) {
+            if (gFrame == gTraceFrame)
+                std::fprintf(stderr, "[pm4] wait reg mem control 0x%x addr 0x%" PRIx64 " ref 0x%x mask 0x%x now 0x%x\n", b[0],
+                             address(b[1], b[2]), b[3], b[4],
+                             (b[0] & 0x10) ? *reinterpret_cast<volatile uint32_t*>(address(b[1] & ~3u, b[2])) : 0);
+            if (!out.empty()) // what comes before is recorded meanwhile
+                queueRecorder([chunk = std::move(out), st] { execute(chunk.data(), chunk.data() + chunk.size(), st, 0); });
+            out.clear();
+            waitRegMem(b, st);
+            drain = b;
+        } else {
+            // A wait the GPU satisfies itself (a drain) is skipped, but memory the command
+            // processor writes after it, before the next draw, is the game's signal that the GPU
+            // got past the drain: the CPU may then reuse what the draws before it read. Such a
+            // WRITE_DATA is done once the GPU has finished the work before it. (A DMA after a
+            // drain runs on the GPU timeline anyway: see onDmaCopy.)
+            if (drain && type == 3 && op == kOpWriteData && (((b[0] >> 8) & 0xF) == 2 || ((b[0] >> 8) & 0xF) == 5)) {
+                std::vector<uint32_t> values(b + 3, b + count + 1);
+                const uint64_t addr = address(b[1], b[2]);
+                noteGpuWrite(addr, values.empty() ? 0 : values[0]);
+                if (!out.empty())
+                    queueRecorder([chunk = std::move(out), st] { execute(chunk.data(), chunk.data() + chunk.size(), st, 0); });
+                out.clear();
+                queueRecorder([addr, values = std::move(values)] {
+                    afterGpuWork([addr, values] {
+                        auto* dst = reinterpret_cast<volatile uint32_t*>(addr);
+                        for (size_t i = 0; i < values.size(); ++i) dst[i] = values[i];
+                    });
+                });
+                ++st->fences;
+                p += len;
+                continue;
+            }
+            if (drain && type == 3) {
+                if (op == kOpDrawIndex2 || op == kOpDrawIndexOffset2 || op == kOpDrawIndexAuto ||
+                           op == kOpDrawIndexIndirect || op == kOpDrawIndirect || op == kOpDispatchDirect ||
+                           op == kOpDispatchIndirect) {
+                    drain = nullptr;
+                }
+            }
+            if (type == 3) switch (op) { // the values this will have the GPU write
+                case kOpEventWriteEop:
+                    if ((b[2] >> 29) == 1 || (b[2] >> 29) == 2) noteGpuWrite(address(b[1], b[2]), b[3]);
+                    break;
+                case kOpReleaseMem:
+                    if ((b[1] >> 29) == 1 || (b[1] >> 29) == 2) noteGpuWrite(address(b[2], b[3]), b[4]);
+                    break;
+                case kOpEventWriteEos:
+                    if ((b[2] >> 29) == 2) noteGpuWrite(address(b[1], b[2]), b[3]);
+                    break;
+                case kOpWriteData:
+                    if (((b[0] >> 8) & 0xF) == 2 || ((b[0] >> 8) & 0xF) == 5)
+                        for (uint32_t i = 3; i < count + 1; ++i) noteGpuWrite(address(b[1], b[2]) + (i - 3) * 4, b[i]);
+                    break;
+                default: break;
+                }
+            out.insert(out.end(), p, p + len);
+        }
+        p += len;
+    }
+}
+
+struct {
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::function<void()>> work;
+    bool started = false;
+} gRec;
+
+constexpr size_t kRecQueueLimit = 1024;
+
+void recorderThread() {
+    for (;;) {
+        std::function<void()> fn;
+        {
+            std::unique_lock lock(gRec.m);
+            gRec.cv.wait(lock, [] { return !gRec.work.empty(); });
+            fn = std::move(gRec.work.front());
+            gRec.work.pop_front();
+        }
+        gRec.cv.notify_all();
+        fn();
+    }
+}
+
+void queueRecorder(std::function<void()> fn) {
+    if (!commandProcessorIsAsync()) {
+        fn();
+        return;
+    }
+    std::unique_lock lock(gRec.m);
+    if (!gRec.started) {
+        gRec.started = true;
+        std::thread(recorderThread).detach();
+    }
+    gRec.cv.wait(lock, [] { return gRec.work.size() < kRecQueueLimit; });
+    gRec.work.push_back(std::move(fn));
+    gRec.cv.notify_all();
+}
+
 } // namespace
+
+bool timelineOn() {
+    static const double at = getenv("LPN_TIMELINE") ? std::atof(getenv("LPN_TIMELINE")) : -1;
+    static const auto start = std::chrono::steady_clock::now();
+    if (at < 0) return false;
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    return t >= at && t < at + 0.1;
+}
+
+void timeline(const char* fmt, ...) {
+    static const auto start = std::chrono::steady_clock::now();
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    std::fprintf(stderr, "[tl] %9.3f %s\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), buf);
+}
 
 void addDrawListener(DrawListener* l) { gListeners.push_back(l); }
 void notifySubmitEnd() {
-    for (DrawListener* l : gListeners) l->onSubmitEnd();
+    queueRecorder([] {
+        if (timelineOn()) timeline("rec: submission recorded");
+        for (DrawListener* l : gListeners) l->onSubmitEnd();
+    });
 }
 void notifyFrameEnd() {
-    ++gFrame;
-    for (DrawListener* l : gListeners) l->onFrameEnd();
+    queueRecorder([] {
+        if (timelineOn()) timeline("rec: frame %" PRIu64 " recorded", gFrame.load() + 1);
+        ++gFrame;
+        for (DrawListener* l : gListeners) l->onFrameEnd();
+    });
 }
+void afterCommandsRecorded(std::function<void()> fn) { queueRecorder(std::move(fn)); }
 
 void executePm4(const uint32_t* cmds, uint32_t numDwords, Pm4Stats* stats) {
-    Pm4Stats local;
-    execute(cmds, cmds + numDwords, stats ? stats : &local, 0);
+    static Pm4Stats local;
+    if (!stats) stats = &local;
+    if (!commandProcessorIsAsync()) {
+        execute(cmds, cmds + numDwords, stats, 0);
+        return;
+    }
+    std::vector<uint32_t> out;
+    scan(cmds, cmds + numDwords, out, stats, 0);
+    if (!out.empty())
+        queueRecorder([chunk = std::move(out), stats] { execute(chunk.data(), chunk.data() + chunk.size(), stats, 0); });
 }
 
 void writePm4Nop(uint32_t* cmds, uint32_t numDwords) {
@@ -227,6 +499,54 @@ void writePm4Nop(uint32_t* cmds, uint32_t numDwords) {
     }
     cmds[0] = (3u << 30) | ((numDwords - 2) << 16) | (kOpNop << 8);
     std::memset(cmds + 1, 0, (numDwords - 1) * 4);
+}
+
+namespace {
+
+struct {
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::function<void()>> work;
+    bool started = false;
+} gCp;
+
+// How far the game may get ahead of the command processor; on the console the ring fills up.
+constexpr size_t kCpQueueLimit = 64;
+
+void commandProcessorThread() {
+    for (;;) {
+        std::function<void()> fn;
+        {
+            std::unique_lock lock(gCp.m);
+            gCp.cv.wait(lock, [] { return !gCp.work.empty(); });
+            fn = std::move(gCp.work.front());
+        }
+        fn();
+        {
+            std::lock_guard lock(gCp.m);
+            gCp.work.pop_front(); // popped after running, so the queue's length counts it
+        }
+        gCp.cv.notify_all();
+    }
+}
+
+} // namespace
+
+void queueCommandProcessor(std::function<void()> fn) {
+    if (!commandProcessorIsAsync()) {
+        static std::mutex m;
+        std::lock_guard lock(m);
+        fn();
+        return;
+    }
+    std::unique_lock lock(gCp.m);
+    if (!gCp.started) {
+        gCp.started = true;
+        std::thread(commandProcessorThread).detach();
+    }
+    gCp.cv.wait(lock, [] { return gCp.work.size() < kCpQueueLimit; });
+    gCp.work.push_back(std::move(fn));
+    gCp.cv.notify_all();
 }
 
 } // namespace host
