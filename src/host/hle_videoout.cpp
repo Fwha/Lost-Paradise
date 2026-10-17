@@ -8,10 +8,14 @@
 #include "host/kernel.h"
 #include "host/window.h"
 
+#include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -75,6 +79,7 @@ double gVblankHz = 59.94;
 uint64_t gScreenshotFlip = 0;
 uint64_t gScreenshotEvery = 0;
 std::string gScreenshotPath;
+std::atomic<bool> gCaptureRequested{false};
 
 // Pixels in memory order are B, G, R, A for the formats the game uses.
 void writeScreenshot(const Frame& f, const std::string& path) {
@@ -143,6 +148,17 @@ void vblankThread() {
             }
             const uint64_t n = gDisplay.status.count;
             if (frame.pixels && gScreenshotFlip && n == gScreenshotFlip) writeScreenshot(frame, gScreenshotPath);
+            static const uint64_t captureAt = getenv("LPN_CAPTURE_AT") ? std::strtoull(getenv("LPN_CAPTURE_AT"), nullptr, 0) : 0;
+            if (n == captureAt) gCaptureRequested = true; // a capture without pressing F12
+            if (frame.pixels && gCaptureRequested.exchange(false)) {
+                std::string dir;
+                for (int i = 1; dir.empty() || std::filesystem::exists(dir); ++i) dir = "lpn-captures/capture-" + std::to_string(i);
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
+                writeScreenshot(frame, dir + "/screenshot.ppm");
+                std::fprintf(stderr, "[capture] flip %" PRIu64 " -> %s (tracing the next frame)\n", n, dir.c_str());
+                render::captureNextFrame(dir);
+            }
             if (frame.pixels && gScreenshotEvery && n % gScreenshotEvery == 0)
                 writeScreenshot(frame, "screenshot-" + std::to_string(n) + ".ppm");
             presentFrame(frame);
@@ -159,6 +175,7 @@ void setScreenshot(uint64_t flip, const char* path) {
 }
 
 void setScreenshotEvery(uint64_t flips) { gScreenshotEvery = flips; }
+void requestCapture() { gCaptureRequested = true; }
 
 uint64_t flipCount() {
     std::lock_guard lock(gDisplay.m);

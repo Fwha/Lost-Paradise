@@ -133,6 +133,7 @@ void presenterThread() {
                 printUnimplementedSummary();
                 std::_Exit(0);
             }
+            if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F12 && !e.key.repeat) requestCapture();
             if (e.type == SDL_CONTROLLERDEVICEADDED && !gc) gc = SDL_GameControllerOpen(e.cdevice.which);
             if (e.type == SDL_CONTROLLERDEVICEREMOVED && gc) {
                 SDL_GameControllerClose(gc);

@@ -111,7 +111,11 @@ Last updated 2026-10-16.
   `LPN_DBG_CAP="<GLSL line text>|<expr>"` captures `vec4(expr)` into `dbgC` after that line.
   `LPN_PM4_TRACE=<frame>` logs that frame's DMA_DATA and EVENT_WRITE packets;
   `LPN_GPU_STATS=<n>` prints PM4 opcode counts for the 300 submissions ending at submission n.
+- Captures while playing: F12 saves the displayed frame and a GPU trace of the next one (every
+  draw, its shaders' resources, all render targets) to `lpn-captures/capture-<n>/`;
+  `LPN_CAPTURE_AT=<flip>` does the same in scripted runs. Run with `LPN_PROFILE=1 ... 2> play.log`
+  to also log every frame over 50 ms.
 - Controls: arrows = d-pad, WASD/IJKL = sticks, Enter = Cross, Backspace = Circle,
-  Z = Square, X = Triangle, Q/E = L1/R1, 1/3 = L2/R2, Esc = Options, Tab = touchpad;
+  Z = Square, X = Triangle, Q/E = L1/R1, 1/3 = L2/R2, Esc = Options, Tab = touchpad, F12 = capture;
   any SDL game controller works too.
 - Building the window needs SDL2 (`pacman -S sdl2`); without it the host runs headless.

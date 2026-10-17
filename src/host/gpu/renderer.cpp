@@ -410,7 +410,7 @@ public:
         ++drawIndex_;
         trace_ = frame_ == traceFrame_;
         if (trace_)
-            std::fprintf(stderr, "[trace] #%" PRIu64 " %s vs 0x%" PRIx64 " ps 0x%" PRIx64 " cs 0x%" PRIx64 "\n", drawIndex_,
+            std::fprintf(traceOut_, "[trace] #%" PRIu64 " %s vs 0x%" PRIx64 " ps 0x%" PRIx64 " cs 0x%" PRIx64 "\n", drawIndex_,
                          d.kind == DrawCall::kDispatch ? "dispatch" : "draw", shaderAddress(r, reg::kPgmLoVs),
                          shaderAddress(r, reg::kPgmLoPs), shaderAddress(r, reg::kPgmLoCs));
         if (d.kind == DrawCall::kDispatch) dispatch(d, r);
@@ -443,13 +443,27 @@ public:
             codePages_.clear();
             ++submit_;
         }
-        if (frame_ == traceFrame_) dumpSurfaces();
+        if (frame_ == traceFrame_) {
+            dumpSurfaces();
+            if (traceOut_ != stderr) {
+                std::fclose(traceOut_);
+                traceOut_ = stderr;
+                std::fprintf(stderr, "[capture] saved %s\n", traceDir_.c_str());
+            }
+        }
         if (programCount_ > 20000) {
             programs_.clear();
             programCount_ = 0;
         }
         if (prof_.on) reportSlowFrame();
         ++frame_;
+        if (!pendingCapture_.empty()) { // F12: trace this frame into the capture folder
+            traceDir_ = pendingCapture_ + "/";
+            pendingCapture_.clear();
+            traceFrame_ = frame_;
+            traceOut_ = std::fopen((traceDir_ + "trace.txt").c_str(), "w");
+            if (!traceOut_) traceOut_ = stderr;
+        }
         if (prof_.on && frame_ % 300 == 0) reportProfile();
         drawIndex_ = 0;
     }
@@ -466,6 +480,11 @@ public:
         lastFrameEnd_ = now;
         std::copy(std::begin(prof_.ns), std::end(prof_.ns), frameNs_);
         frameAnalyses_ = prof_.analyses;
+    }
+
+    void captureNextFrame(const std::string& dir) {
+        std::lock_guard lock(m_);
+        pendingCapture_ = dir;
     }
 
     void reportProfile() {
@@ -537,7 +556,7 @@ private:
         std::vector<uint32_t> px;
         const uint32_t w = it->second.img.width, h = it->second.img.height;
         if (!readSurface(addr, w, h, px)) return;
-        const std::string name = "gpu-draw-" + std::to_string(drawIndex_) + ".ppm";
+        const std::string name = traceDir_ + "gpu-draw-" + std::to_string(drawIndex_) + ".ppm";
         if (FILE* f = std::fopen(name.c_str(), "wb")) {
             std::fprintf(f, "P6\n%u %u\n255\n", w, h);
             for (uint32_t p : px) {
@@ -566,7 +585,7 @@ private:
                 std::fprintf(stderr, "[gpu] r32f 0x%" PRIx64 " first %g min %g max %g mean %g\n", addr, first, lo, hi,
                              sum / px.size());
             }
-            const std::string name = "gpu-rt-" + hex(addr) + ".ppm";
+            const std::string name = traceDir_ + "gpu-rt-" + hex(addr) + ".ppm";
             FILE* f = std::fopen(name.c_str(), "wb");
             if (!f) continue;
             std::fprintf(f, "P6\n%u %u\n255\n", s.img.width, s.img.height);
@@ -1663,7 +1682,7 @@ private:
         for (auto& im : p.images) {
             const ImageBinding ib = resolveImage(im);
             if (trace_)
-                std::fprintf(stderr, "[trace]   tex 0x%" PRIx64 " %ux%u fmt %u/%u type %u tile %u sel %03o pc 0x%" PRIx64 "%s\n",
+                std::fprintf(traceOut_, "[trace]   tex 0x%" PRIx64 " %ux%u fmt %u/%u type %u tile %u sel %03o pc 0x%" PRIx64 "%s\n",
                              im.base(), im.width(), im.height(), im.dataFormat(), im.numFormat(), im.type(), im.tileMode(),
                              im.dstSel(), im.pc,
                              colors_.count(im.base()) ? " (render target)" : depths_.count(im.base()) ? " (depth)" : "");
@@ -1837,7 +1856,7 @@ private:
             for (const auto& b : cs.buffers) {
                 uint32_t first = 0;
                 readGuest(b.base(), &first, 4);
-                std::fprintf(stderr, "[trace]   buffer 0x%" PRIx64 " stride %u records %u first 0x%x%s\n", b.base(),
+                std::fprintf(traceOut_, "[trace]   buffer 0x%" PRIx64 " stride %u records %u first 0x%x%s\n", b.base(),
                              b.stride(), b.numRecords(), first, b.store ? " (written)" : "");
             }
         vkCmdDispatch(cmd_, d.groups[0], d.groups[1], d.groups[2]);
@@ -1894,7 +1913,7 @@ private:
             vkCmdClearColorImage(cmd_, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
         }
         if (trace_)
-            std::fprintf(stderr, "[trace]   fast clear of %s 0x%" PRIx64 " to 0x%x 0x%x\n", m.depth ? "depth" : "target",
+            std::fprintf(traceOut_, "[trace]   fast clear of %s 0x%" PRIx64 " to 0x%x 0x%x\n", m.depth ? "depth" : "target",
                          m.surface, m.clear[0], m.clear[1]);
     }
 
@@ -1968,14 +1987,14 @@ private:
         c.imageExtent = {w, h, 1};
         vkCmdCopyImageToBuffer(cmd_, s.img.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &c);
         if (trace_)
-            std::fprintf(stderr, "[trace]   copied %ux%u back to 0x%" PRIx64 "\n", w, h, t.base());
+            std::fprintf(traceOut_, "[trace]   copied %ux%u back to 0x%" PRIx64 "\n", w, h, t.base());
     }
 
     void draw(const DrawCall& d, const GpuRegs& r) {
         const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
         const uint32_t dbRender = r.ctx[reg::kDbRenderControl];
         if (trace_)
-            std::fprintf(stderr, "[trace]   cb mode %u db render 0x%x depth control 0x%x z info 0x%x stencil info 0x%x control 0x%x"
+            std::fprintf(traceOut_, "[trace]   cb mode %u db render 0x%x depth control 0x%x z info 0x%x stencil info 0x%x control 0x%x"
                                  " ref/mask 0x%x z base 0x%" PRIx64 " htile 0x%" PRIx64 " clear %g prim %u count %u\n",
                          cbMode, dbRender, r.ctx[reg::kDbDepthControl], r.ctx[reg::kDbZInfo], r.ctx[reg::kDbStencilInfo],
                          r.ctx[reg::kDbStencilControl], r.ctx[reg::kDbStencilRefMask],
@@ -1983,7 +2002,7 @@ private:
                          std::bit_cast<float>(r.ctx[reg::kDbDepthClear]), r.uconfig[reg::kPrimitiveType], d.count);
         if (trace_ && cbMode > 1) {
             const uint32_t* cb = &r.ctx[reg::kCbColorBase];
-            std::fprintf(stderr, "[trace]   eliminate 0x%" PRIx64 " info 0x%x cmask 0x%" PRIx64 " clear 0x%x 0x%x\n",
+            std::fprintf(traceOut_, "[trace]   eliminate 0x%" PRIx64 " info 0x%x cmask 0x%" PRIx64 " clear 0x%x 0x%x\n",
                          uint64_t(cb[0]) << 8, cb[::gpu::ctx::kCbColorInfo], uint64_t(cb[reg::kCbColorCmask]) << 8,
                          cb[reg::kCbColorClearWord0], cb[reg::kCbColorClearWord1]);
         }
@@ -2030,7 +2049,7 @@ private:
             colors[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             colorCount = i + 1;
             if (trace_)
-                std::fprintf(stderr, "[trace]   rt%u 0x%" PRIx64 " %ux%u fmt %u/%u swap %u mask 0x%x blend 0x%x info 0x%x cmask 0x%" PRIx64 "\n", i,
+                std::fprintf(traceOut_, "[trace]   rt%u 0x%" PRIx64 " %ux%u fmt %u/%u swap %u mask 0x%x blend 0x%x info 0x%x cmask 0x%" PRIx64 "\n", i,
                              uint64_t(cb[0]) << 8, s->img.width, s->img.height, fmt, num, (info >> 11) & 3,
                              (targetMask >> (i * 4)) & 0xF, r.ctx[reg::kCbBlendControl + i], info,
                              uint64_t(cb[reg::kCbColorCmask]) << 8);
@@ -2121,14 +2140,14 @@ private:
         if (trace_) {
             for (const auto* prog : {&vs, &ps}) {
                 if (prog->data.size() <= gcn::data::kSmrd) continue;
-                std::fprintf(stderr, "[trace]   %s smrd:", prog == &vs ? "vs" : "ps");
+                std::fprintf(traceOut_, "[trace]   %s smrd:", prog == &vs ? "vs" : "ps");
                 for (size_t i = gcn::data::kSmrd; i < prog->data.size() && i < gcn::data::kSmrd + 24; ++i) {
                     float f;
                     std::memcpy(&f, &prog->data[i], 4);
-                    std::fprintf(stderr, " %g", f);
+                    std::fprintf(traceOut_, " %g", f);
                 }
-                std::fprintf(stderr, "\n");
-                for (const auto& w : prog->warnings) std::fprintf(stderr, "[trace]   warning: %s\n", w.c_str());
+                std::fprintf(traceOut_, "\n");
+                for (const auto& w : prog->warnings) std::fprintf(traceOut_, "[trace]   warning: %s\n", w.c_str());
             }
         }
         if (!(r.ctx[reg::kPaClVteCntl] & 0xF)) {
@@ -2261,12 +2280,12 @@ private:
         if ((r.ctx[0x292] >> 1) & 1) clip(r.ctx[reg::kVportScissorTl], r.ctx[reg::kVportScissorBr]);
         VkRect2D sc{{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
         if (trace_)
-            std::fprintf(stderr, "[trace]   scissors screen %x %x window %x %x generic %x %x vport %x %x mode0 %x\n",
+            std::fprintf(traceOut_, "[trace]   scissors screen %x %x window %x %x generic %x %x vport %x %x mode0 %x\n",
                          r.ctx[reg::kScreenScissorTl], r.ctx[reg::kScreenScissorBr], r.ctx[reg::kWindowScissorTl],
                          r.ctx[reg::kWindowScissorBr], r.ctx[reg::kGenericScissorTl], r.ctx[reg::kGenericScissorBr],
                          r.ctx[reg::kVportScissorTl], r.ctx[reg::kVportScissorBr], r.ctx[0x292]);
         if (trace_)
-            std::fprintf(stderr, "[trace]   viewport %.1f,%.1f %.1fx%.1f z %.2f..%.2f scissor %d,%d %ux%u vte 0x%x colfmt 0x%x\n",
+            std::fprintf(traceOut_, "[trace]   viewport %.1f,%.1f %.1fx%.1f z %.2f..%.2f scissor %d,%d %ux%u vte 0x%x colfmt 0x%x\n",
                          vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth, sc.offset.x, sc.offset.y,
                          sc.extent.width, sc.extent.height, vte, r.ctx[reg::kSpiShaderColFormat]);
         vkCmdSetScissor(cmd_, 0, 1, &sc);
@@ -2324,6 +2343,9 @@ private:
     std::vector<std::unique_ptr<Image>> dummyImages_;
     std::set<std::string> warned_;
     uint64_t frame_ = 0, drawIndex_ = 0, traceFrame_ = ~0ull;
+    FILE* traceOut_ = stderr;   // LPN_GPU_TRACE output; a capture's trace.txt
+    std::string traceDir_;      // where trace dumps go ("" = working directory, else ends in /)
+    std::string pendingCapture_; // folder of a requested capture (see captureNextFrame)
     bool trace_ = false, snap_ = false, dumpGlsl_ = false;
     std::vector<std::pair<uint64_t, uint64_t>> snapDraws_;
     bool snapWanted() const {
@@ -2381,6 +2403,10 @@ bool startRenderer(bool computeOnly) {
 
 bool readDisplayBuffer(uint64_t address, uint32_t width, uint32_t height, std::vector<uint32_t>& pixels) {
     return gRenderer && gRenderer->readDisplay(address, width, height, pixels);
+}
+
+void captureNextFrame(const std::string& dir) {
+    if (gRenderer) gRenderer->captureNextFrame(dir);
 }
 
 } // namespace host::render

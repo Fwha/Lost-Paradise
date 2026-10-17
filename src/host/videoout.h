@@ -15,6 +15,9 @@ void setVblankRate(double hz);
 void setScreenshot(uint64_t flip, const char* path);
 // Saves every Nth displayed frame as screenshot-<N>.ppm.
 void setScreenshotEvery(uint64_t flips);
+// F12: saves the next displayed frame and a GPU trace of the frame after it to
+// lpn-captures/capture-<n>/.
+void requestCapture();
 // Frames displayed so far.
 uint64_t flipCount();
 
