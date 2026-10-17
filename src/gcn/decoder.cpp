@@ -401,7 +401,8 @@ std::string disassemble(const Instruction& in, uint32_t pc) {
         break;
     case Format::VOP3: {
         const uint32_t neg = w1 >> 29, abs = (w >> 8) & 7, omod = (w1 >> 27) & 3;
-        const bool b3 = (in.op >= 256 + 37 && in.op <= 256 + 42) || in.op == 365 || in.op == 366;
+        const bool b3 = (in.op >= 256 + 37 && in.op <= 256 + 42) || in.op == 365 || in.op == 366 || in.op == 374 ||
+                        in.op == 375;
         std::string dst = in.op < 256 ? sreg(w & 0xFF) : vreg(w & 0xFF);
         if (b3) dst += ", " + sreg((w >> 8) & 0x7F);
         auto src = [&](int i) {

@@ -64,6 +64,7 @@ public:
         // Assemble the module.
         std::string g = "#version 450\n";
         if (need64_) g += "#extension GL_ARB_gpu_shader_int64 : require\n";
+        if (needQuad_) g += "#extension GL_KHR_shader_subgroup_quad : require\n";
         if (stage == Stage::Compute)
             g += fmt("layout(local_size_x = %u, local_size_y = %u, local_size_z = %u) in;\n", p_.launch.localSize[0],
                      p_.launch.localSize[1], p_.launch.localSize[2]);
@@ -74,6 +75,13 @@ public:
             g += stage == Stage::Compute ? "uint laneId() { return gl_LocalInvocationIndex & 63u; }\n"
                  : stage == Stage::Vertex ? "uint laneId() { return uint(gl_VertexIndex) & 63u; }\n"
                                           : "uint laneId() { return 0u; }\n";
+        if (needQuad_)
+            g += "uint quadSwizzle(uint v, uint sel) {\n"
+                 "    uint q0 = subgroupQuadBroadcast(v, 0u), q1 = subgroupQuadBroadcast(v, 1u);\n"
+                 "    uint q2 = subgroupQuadBroadcast(v, 2u), q3 = subgroupQuadBroadcast(v, 3u);\n"
+                 "    uint s = (sel >> ((gl_SubgroupInvocationID & 3u) * 2u)) & 3u;\n"
+                 "    return s == 0u ? q0 : s == 1u ? q1 : s == 2u ? q2 : q3;\n"
+                 "}\n";
         g += "void main() {\n";
         for (const auto& r : regs_) g += "uint " + r + " = 0u;\n";
         g += "bool scc = false;\n";
@@ -339,6 +347,7 @@ vec3 cubeDir(vec3 c) {
         case Format::MUBUF:
         case Format::MTBUF: buffer(in); break;
         case Format::MIMG: image(in); break;
+        case Format::DS: ds(in); break;
         default: warn("%s", mnemonic(in).c_str()); break;
         }
     }
@@ -531,7 +540,7 @@ vec3 cubeDir(vec3 c) {
             s2 = (w1 >> 18) & 0x1FF;
             omod = (w1 >> 27) & 3;
             neg = w1 >> 29;
-            if ((op >= 293 && op <= 298) || op == 365 || op == 366) {
+            if ((op >= 293 && op <= 298) || op == 365 || op == 366 || op == 374 || op == 375) {
                 sdst = (w >> 8) & 0x7F;
             } else {
                 abs = (w >> 8) & 7;
@@ -688,11 +697,21 @@ vec3 cubeDir(vec3 c) {
             out(guard() + vd + " = " + a + "; " + sreg(sdst) + " = 0u; " + sreg(sdst + 1) + " = 0u;\n");
             break;
         case 367: fres(fa + " * " + fb + " + " + fc); break; // v_div_fmas_f32
+        case 374: { // v_mad_u64_u32: v[dst:dst+1] = a * b + c (64-bit c), carry out to sdst
+            const std::string ch = s2 >= 256 ? vreg(s2 - 255) : srcHi(s2);
+            out(fmt("{ uint h_, l_, c0_, c1_, c2_; umulExtended(%s, %s, h_, l_); l_ = uaddCarry(l_, %s, c0_); ",
+                    a.c_str(), b.c_str(), c.c_str()));
+            out(fmt("h_ = uaddCarry(uaddCarry(h_, %s, c1_), c0_, c2_); ", ch.c_str()));
+            out(guard() + "{ " + vd + " = l_; " + vreg(dst + 1) + " = h_; } " + sreg(sdst) + " = c1_ | c2_; " +
+                sreg(sdst + 1) + " = 0u; }\n");
+            break;
+        }
         // VOP1
         case 384: break;
         case 385: ures(a); break;
         case 386: writeS(dst, a); break; // v_readfirstlane_b32 (lane-local)
         case 389: fres("float(int(" + a + "))"); break;
+        case 398: fres("float(bitfieldExtract(int(" + a + "), 0, 4)) * 0.0625"); break; // v_cvt_off_f32_i4
         case 390: fres("float(" + a + ")"); break;
         case 391: ures("uint(clamp(" + fa + ", 0.0, 4294967040.0))"); break;
         case 392: ures("uint(int(clamp(" + fa + ", -2147483648.0, 2147483520.0)))"); break;
@@ -727,6 +746,25 @@ vec3 cubeDir(vec3 c) {
     }
 
     // ---- interpolation and exports -------------------------------------------------------------
+
+    // LDS and GDS are not emulated; ds_swizzle_b32 only moves data between lanes.
+    void ds(const Instruction& in) {
+        const uint32_t w = in.words[0], w1 = in.words[1];
+        const uint32_t offset = w & 0xFFFF; // offset1:offset0
+        if (in.op != 53 || !(offset & 0x8000)) { // the bit-mask mode would need GCN's lane layout
+            warn("%s", mnemonic(in).c_str());
+            return;
+        }
+        // Quad mode: lane i of each quad reads lane (offset >> 2i) & 3 of its quad. GCN and Vulkan
+        // number a fragment quad's pixels alike (top-left, top-right, bottom-left, bottom-right).
+        // The broadcast runs outside the exec guard so the whole quad takes part.
+        const std::string v = vreg(w1 & 0xFF);
+        const uint32_t sel = offset & 0xFF;
+        needQuad_ = true;
+        const std::string e = sel == (sel & 3) * 0x55 ? fmt("subgroupQuadBroadcast(%s, %uu)", v.c_str(), sel & 3)
+                                                      : fmt("quadSwizzle(%s, %uu)", v.c_str(), sel);
+        out("{ uint q_ = " + e + "; " + guard() + vreg(w1 >> 24) + " = q_; }\n");
+    }
 
     void vintrp(const Instruction& in) {
         const uint32_t w = in.words[0];
@@ -1165,7 +1203,7 @@ vec3 cubeDir(vec3 c) {
     uint64_t pc_ = 0, next_ = 0;
     uint32_t literal_ = 0;
     bool exec_ = false;
-    bool needLane_ = false, need64_ = false, depthDeclared_ = false;
+    bool needLane_ = false, need64_ = false, needQuad_ = false, depthDeclared_ = false;
 };
 
 } // namespace
