@@ -277,7 +277,8 @@ struct Surface {
 struct GuestTexture {
     Image img;
     uint64_t hash = 0;
-    uint64_t checkedFrame = ~0ull;
+    uint64_t checkedFrame = ~0ull, checkedSubmit = ~0ull; // contents last verified (see submit_)
+    uint64_t changedFrame = ~0ull; // the contents last changed (re-uploaded) in this frame
 };
 
 struct Import {
@@ -1560,7 +1561,13 @@ private:
         const uint32_t key[] = {t.t[0], t.t[1], t.t[2], t.t[3] & ~0xFFFu, t.t[4], t.t[5]};
         const std::string k = bytesKey(key, sizeof(key));
         GuestTexture& tex = textures_[k];
-        if (tex.img.image && tex.checkedFrame == frame_) return &tex;
+        // Textures whose contents changed recently are checked once per submission: the game
+        // rewrites small tables (particle colours) between the submissions of a frame, and a
+        // per-frame check gave later draws the earlier contents (flames took the colour of the
+        // last attack effect). Others are checked once per frame: hashing every texture in each
+        // submission costs ~4 ms a frame.
+        const bool dynamic = tex.changedFrame != ~0ull && frame_ - tex.changedFrame < 120;
+        if (tex.img.image && (dynamic ? tex.checkedSubmit == submit_ : tex.checkedFrame == frame_)) return &tex;
         uint32_t mode = t.tileMode();
         size_t slice = tiledSliceSize(mode, ep, eh, bpe);
         if (!slice) {
@@ -1581,8 +1588,10 @@ private:
                 return nullptr;
             }
         }
+        tex.checkedSubmit = submit_;
         tex.checkedFrame = frame_;
         if (tex.img.image && tex.hash == h64) return &tex;
+        if (tex.img.image) tex.changedFrame = frame_;
         ProfScope pu(prof_, kProfTexUpload);
         scratch_.resize(tiled);
         if (!readGuest(t.base(), scratch_.data(), tiled)) return nullptr;
@@ -1797,6 +1806,7 @@ private:
                 if (gcn::adopt(shapes[j]->prog, r)) {
                     ++prof_.analysisHits;
                     if (j) std::rotate(shapes.begin(), shapes.begin() + ptrdiff_t(j), shapes.begin() + ptrdiff_t(j) + 1);
+                    if (trace_) checkReuse(*shapes.front(), l);
                     return shapes.front().get();
                 }
             // The same branches with other resource formats (a material with other textures).
@@ -1821,6 +1831,36 @@ private:
     // Only the bytes of the instructions count: a shader's last page often holds other data that
     // changes. Memory cannot change within a submission (see PageCache), so one check per
     // submission is enough.
+    // Captures: compares a reused analysis with a fresh one, which must match exactly.
+    void checkReuse(const CachedProgram& c, const gcn::LaunchState& l) {
+        const gcn::Program fresh = gcn::analyze(l, readCached_);
+        std::string diff;
+        if (fresh.key() != c.prog.key()) diff += " key";
+        if (fresh.data != c.prog.data) {
+            diff += " data";
+            for (size_t i = 0; i < std::min(fresh.data.size(), c.prog.data.size()); ++i)
+                if (fresh.data[i] != c.prog.data[i]) {
+                    diff += fmtHex(" [%zu]", i) + hex(c.prog.data[i]) + "->" + hex(fresh.data[i]);
+                    break;
+                }
+        }
+        if (fresh.smrd != c.prog.smrd) diff += " smrd-slots";
+        if (fresh.labels != c.prog.labels) diff += " labels";
+        bool res = fresh.buffers.size() == c.prog.buffers.size() && fresh.images.size() == c.prog.images.size();
+        for (size_t i = 0; res && i < fresh.buffers.size(); ++i)
+            res = !std::memcmp(fresh.buffers[i].sharp, c.prog.buffers[i].sharp, 16) && fresh.buffers[i].data == c.prog.buffers[i].data;
+        for (size_t i = 0; res && i < fresh.images.size(); ++i)
+            res = !std::memcmp(fresh.images[i].t, c.prog.images[i].t, 32) && !std::memcmp(fresh.images[i].s, c.prog.images[i].s, 16);
+        if (!res) diff += " resources";
+        if (!diff.empty())
+            std::fprintf(traceOut_, "[trace]   reuse mismatch 0x%" PRIx64 ":%s\n", l.entry, diff.c_str());
+    }
+    static std::string fmtHex(const char* f, size_t v) {
+        char b[32];
+        std::snprintf(b, sizeof b, f, v);
+        return b;
+    }
+
     bool codeUnchanged(CachedProgram& c) {
         if (!c.valid) return false;
         if (c.checkedSubmit == submit_) return true;
@@ -2396,7 +2436,7 @@ private:
     std::unordered_map<std::string, ProgramVariants> programs_;
     size_t programCount_ = 0;
     const gcn::ReadMemory readCached_ = [this](uint64_t a, void* d, size_t n) { return codePages_.read(a, d, n); };
-    uint64_t submit_ = 0; // counts codePages_ clears
+    uint64_t submit_ = 0; // counts submissions (and command-processor writes): codePages_ clears
     std::vector<uint8_t> codeBytes_;
     // The open render pass (see draw) and the render-target surfaces the current draw samples.
     struct Pass {
