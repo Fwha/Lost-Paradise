@@ -106,6 +106,15 @@ uint64_t hashBytes(const void* p, size_t n) {
 // copied nor hashed on the renderer thread alone.
 // A cheap fingerprint of [addr, addr + size): 64 samples of 64 bytes spread over it (read
 // in one syscall). It catches a texture rewritten as a whole (a video frame) between full hashes.
+// Hash of guest memory, 0 when it is not readable.
+uint64_t memoryHash(uint64_t addr, size_t size) {
+    thread_local std::vector<uint8_t> buf;
+    buf.resize(size);
+    iovec local{buf.data(), size}, remote{reinterpret_cast<void*>(addr), size};
+    if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != ssize_t(size)) return 0;
+    return hashBytes(buf.data(), size) | 1;
+}
+
 uint64_t sampleHash(uint64_t addr, size_t size) {
     constexpr size_t kSample = 64, kMax = 64;
     const size_t stride = std::max<size_t>(kSample, (size / kMax + kSample - 1) & ~(kSample - 1));
@@ -203,6 +212,43 @@ private:
 class PageCache {
 public:
     bool read(uint64_t addr, void* dst, size_t size) {
+        if (!readPages(addr, dst, size)) return false;
+        if (addr < hi_.load(std::memory_order_relaxed) && lo_.load(std::memory_order_relaxed) < addr + size) {
+            std::lock_guard lock(overlayMutex_);
+            for (const Overlay& o : overlays_) { // oldest first
+                const uint64_t a = std::max(addr, o.addr), b = std::min(addr + size, o.addr + o.bytes.size());
+                if (a < b) std::memcpy(static_cast<uint8_t*>(dst) + (a - addr), o.bytes.data() + (a - o.addr), b - a);
+            }
+        }
+        return true;
+    }
+    void clear() {
+        pages_.clear();
+        lastPage_ = ~0ull;
+    }
+    // Bytes a GPU copy recorded but not yet run will write: reads see them already, as they
+    // would on the console where the copy runs before the draws recorded after it.
+    void overlay(uint64_t addr, std::vector<uint8_t> bytes, uint64_t id) {
+        std::lock_guard lock(overlayMutex_);
+        lo_ = std::min(lo_.load(), addr);
+        hi_ = std::max(hi_.load(), addr + bytes.size());
+        overlays_.push_back({addr, std::move(bytes), id});
+    }
+    void dropOverlay(uint64_t id) {
+        std::lock_guard lock(overlayMutex_);
+        std::erase_if(overlays_, [&](const Overlay& o) { return o.id == id; });
+        uint64_t lo = ~0ull, hi = 0;
+        for (const Overlay& o : overlays_) lo = std::min(lo, o.addr), hi = std::max(hi, o.addr + o.bytes.size());
+        lo_ = lo, hi_ = hi;
+    }
+    // Forgets the pages of [addr, addr + size), which changed.
+    void invalidate(uint64_t addr, uint64_t size) {
+        for (uint64_t page = addr & ~uint64_t(kPage - 1); page < addr + size; page += kPage) pages_.erase(page);
+        lastPage_ = ~0ull;
+    }
+
+private:
+    bool readPages(uint64_t addr, void* dst, size_t size) {
         auto* out = static_cast<uint8_t*>(dst);
         while (size) {
             const uint64_t page = addr & ~uint64_t(kPage - 1);
@@ -216,17 +262,15 @@ public:
         }
         return true;
     }
-    void clear() {
-        pages_.clear();
-        lastPage_ = ~0ull;
-    }
-    // Forgets the pages of [addr, addr + size), which changed.
-    void invalidate(uint64_t addr, uint64_t size) {
-        for (uint64_t page = addr & ~uint64_t(kPage - 1); page < addr + size; page += kPage) pages_.erase(page);
-        lastPage_ = ~0ull;
-    }
+    struct Overlay {
+        uint64_t addr;
+        std::vector<uint8_t> bytes;
+        uint64_t id;
+    };
+    std::mutex overlayMutex_;
+    std::vector<Overlay> overlays_;
+    std::atomic<uint64_t> lo_{~0ull}, hi_{0};
 
-private:
     static constexpr size_t kPage = 4096;
     const uint8_t* lookup(uint64_t page) {
         if (page == lastPage_) return lastData_;
@@ -401,6 +445,15 @@ public:
                                       &b.ringMemory, &b.ringPtr);
             if (!b.ring) return false;
         }
+        if (getenv("LPN_PROFILE")) { // GPU time per batch, from timestamps at its start and end
+            VkPhysicalDeviceProperties props;
+            vkGetPhysicalDeviceProperties(vk_.phys, &props);
+            gpuTickNs_ = props.limits.timestampPeriod;
+            VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qci.queryCount = 2 * kBatches;
+            if (vkCreateQueryPool(vk_.device, &qci, nullptr, &timestamps_) != VK_SUCCESS) timestamps_ = VK_NULL_HANDLE;
+        }
         useBatch(0);
         dummyBuffer_ = createHostBuffer(4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &dummyMemory_, nullptr);
         if (!dummyBuffer_) return false;
@@ -438,6 +491,7 @@ public:
             std::fprintf(traceOut_, "[trace] #%" PRIu64 " %s vs 0x%" PRIx64 " ps 0x%" PRIx64 " cs 0x%" PRIx64 "\n", drawIndex_,
                          d.kind == DrawCall::kDispatch ? "dispatch" : "draw", shaderAddress(r, reg::kPgmLoVs),
                          shaderAddress(r, reg::kPgmLoPs), shaderAddress(r, reg::kPgmLoCs));
+        if (raceCheck_) raceShader_ = shaderAddress(r, d.kind == DrawCall::kDispatch ? reg::kPgmLoCs : reg::kPgmLoPs);
         if (d.kind == DrawCall::kDispatch) dispatch(d, r);
         else if (computeOnly_) return;
         else if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r);
@@ -450,8 +504,46 @@ public:
     // after it must not see the page cache's older copy.
     void onMemoryWrite(uint64_t addr, uint64_t size) override {
         std::lock_guard lock(m_);
+        if (raceCheck_) noteWrite(addr, size);
         codePages_.invalidate(addr, size);
         ++submit_; // and re-verify shader code before reuse
+    }
+
+    bool onDmaCopy(uint64_t dst, uint64_t src, uint64_t bytes, bool fill, uint32_t value) override {
+        static const bool cpuDma = getenv("LPN_CPU_DMA") != nullptr; // the old way, for comparison
+        if (cpuDma) return false;
+        std::lock_guard lock(m_);
+        VkBuffer db, sb = VK_NULL_HANDLE;
+        VkDeviceSize doff, soff = 0;
+        if (!guestBuffer(dst, bytes, db, doff)) return false;
+        std::vector<uint8_t> data(bytes);
+        if (fill) {
+            if (dst % 4 || bytes % 4) return false;
+            for (uint64_t i = 0; i < bytes; i += 4) std::memcpy(&data[i], &value, 4);
+        } else {
+            if (src < dst + bytes && dst < src + bytes) return false; // overlapping: copied by the CPU
+            if (!guestBuffer(src, bytes, sb, soff) || !codePages_.read(src, data.data(), bytes)) return false;
+        }
+        begin();
+        fullBarrier();
+        if (fill) {
+            vkCmdFillBuffer(cmd_, db, doff, bytes, value);
+        } else {
+            const VkBufferCopy c{soff, doff, bytes};
+            vkCmdCopyBuffer(cmd_, sb, db, 1, &c);
+        }
+        if (raceCheck_) noteWrite(dst, bytes);
+        codePages_.invalidate(dst, bytes);
+        ++submit_; // and re-verify shader code before reuse
+        const uint64_t id = ++overlayIds_;
+        codePages_.overlay(dst, std::move(data), id);
+        pendingDone_.push_back([this, id] { codePages_.dropOverlay(id); });
+        return true;
+    }
+
+    void onWait() override {
+        std::lock_guard lock(m_);
+        flush();
     }
 
     void onSubmitEnd() override {
@@ -521,6 +613,8 @@ public:
         std::fprintf(stderr, "[prof] frames %" PRIu64 "-%" PRIu64 ": %.1f fps, %.1f ms/frame;", frame_ - 300, frame_,
                      300 / wall, wall * 1000 / 300);
         for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.2f", kProfNames[i], prof_.ns[i] / 1e6 / 300);
+        std::fprintf(stderr, " gpu-busy %.2f", gpuBusyNs_.exchange(0) / 1e6 / 300);
+        if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
         std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes per frame\n",
                      prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.analyses / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0, prof_.passes / 300.0);
         const bool on = prof_.on;
@@ -700,6 +794,10 @@ private:
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK(vkBeginCommandBuffer(cmd_, &bi));
         recording_ = true;
+        if (timestamps_) {
+            vkCmdResetQueryPool(cmd_, timestamps_, 2 * cur_, 2);
+            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamps_, 2 * cur_);
+        }
     }
 
     void flush() {
@@ -724,12 +822,19 @@ private:
         }
         ++prof_.flushes;
         endPass();
+        if (raceCheck_ && !raceReads_.empty()) {
+            auto reads = std::make_shared<std::unordered_map<uint64_t, RaceRead>>(std::move(raceReads_));
+            raceReads_.clear();
+            afterFlush_.insert(afterFlush_.begin(), [this, reads] { checkReads(*reads); });
+        }
         Batch& b = batches_[cur_];
+        if (timestamps_) vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamps_, 2 * cur_ + 1);
         VK_CHECK(vkEndCommandBuffer(cmd_));
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1;
         si.pCommandBuffers = &cmd_;
         VK_CHECK(vkQueueSubmit(vk_.queue, 1, &si, b.fence));
+        if (timelineOn()) timeline("rec: batch %" PRIu64 " submitted", submitted_ + 1);
         {
             std::lock_guard lock(doneMutex_);
             b.busy = true;
@@ -768,6 +873,13 @@ private:
             }
             Batch& b = batches_[i];
             VK_CHECK(vkWaitForFences(vk_.device, 1, &b.fence, VK_TRUE, UINT64_MAX));
+            if (timelineOn()) timeline("gpu: batch %" PRIu64 " done", completed_ + 1);
+            if (timestamps_) {
+                uint64_t t[2];
+                if (vkGetQueryPoolResults(vk_.device, timestamps_, 2 * i, 2, sizeof(t), t, sizeof(uint64_t),
+                                          VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
+                    gpuBusyNs_ += uint64_t(double(t[1] - t[0]) * gpuTickNs_);
+            }
             std::vector<std::function<void()>> done;
             {
                 std::lock_guard lock(doneMutex_);
@@ -1775,6 +1887,55 @@ private:
     }
 
     // Binds a stage's resources: draw data, buffers and images.
+    // LPN_RACE_CHECK=1: guest buffers the GPU reads straight from memory are hashed when a draw
+    // is recorded and again once the GPU has finished, before the batch's fences fire. A
+    // change means the CPU rewrote them while the GPU could still be reading them.
+    struct RaceRead {
+        uint64_t size, hash, frame, draw, shader;
+        char kind; // 'b' buffer, 'i' index buffer
+        uint64_t batch;
+    };
+    struct GpuWrite {
+        uint64_t addr, size, batch;
+    };
+    std::mutex raceMutex_;
+    std::deque<GpuWrite> gpuWrites_; // memory the GPU (shaders, the command processor) wrote lately
+    uint64_t raceShader_ = 0;        // the draw's pixel or compute shader
+    void noteWrite(uint64_t addr, uint64_t size) {
+        std::lock_guard lock(raceMutex_);
+        gpuWrites_.push_back({addr, size, submitted_ + 1});
+        while (gpuWrites_.size() > 65536) gpuWrites_.pop_front();
+    }
+    const bool raceCheck_ = getenv("LPN_RACE_CHECK") != nullptr;
+    std::unordered_map<uint64_t, RaceRead> raceReads_; // by address, in the batch being recorded
+    std::atomic<uint64_t> raceChanged_{0}, raceChecked_{0};
+    void noteRead(uint64_t addr, uint64_t size, char kind) {
+        if (size > (1u << 20)) return;
+        auto [it, fresh] = raceReads_.try_emplace(addr);
+        if (!fresh && it->second.size >= size) return;
+        it->second = {size, memoryHash(addr, size), frame_, drawIndex_, raceShader_, kind, submitted_ + 1};
+    }
+    void checkReads(std::unordered_map<uint64_t, RaceRead>& reads) {
+        for (auto& [addr, r] : reads) {
+            ++raceChecked_;
+            if (!r.hash || memoryHash(addr, r.size) == r.hash) continue;
+            bool gpu = false; // written by the GPU itself since
+            {
+                std::lock_guard lock(raceMutex_);
+                for (const GpuWrite& w : gpuWrites_)
+                    if (w.batch >= r.batch && w.addr < addr + r.size && addr < w.addr + w.size) {
+                        gpu = true;
+                        break;
+                    }
+            }
+            if (gpu) continue;
+            if (raceChanged_++ < 60)
+                std::fprintf(stderr, "[race] %s 0x%" PRIx64 " (%" PRIu64 " bytes) read by draw %" PRIu64 " of frame %" PRIu64
+                                     " (shader 0x%" PRIx64 ") changed before the GPU finished\n",
+                             r.kind == 'i' ? "index buffer" : "buffer", addr, r.size, r.draw, r.frame, r.shader);
+        }
+    }
+
     void bindResources(gcn::Program& p, uint32_t base, VkShaderStageFlags, std::vector<VkWriteDescriptorSet>& writes,
                        std::vector<VkDescriptorBufferInfo>& bufInfos, std::vector<VkDescriptorImageInfo>& imgInfos) {
         ProfScope pb(prof_, kProfBind);
@@ -1785,6 +1946,7 @@ private:
             BufferRange r;
             VkDeviceSize off = 0;
             if (b.known && guestBuffer(b.base(), size, r.buffer, off)) {
+                if (raceCheck_) b.store ? noteWrite(b.base(), size) : noteRead(b.base(), size, 'b');
                 r.offset = off & ~(storageAlign_ - 1);
                 r.byteOffset = uint32_t(off - r.offset);
                 r.range = std::min<VkDeviceSize>(size + r.byteOffset, vk_.props.limits.maxStorageBufferRange);
@@ -2095,6 +2257,7 @@ private:
     void writeBack(const gcn::ImageResource& t) {
         auto it = colors_.find(t.base());
         if (it == colors_.end()) return;
+        if (raceCheck_) noteWrite(t.base(), uint64_t(std::max(t.pitch(), t.width())) * t.height() * it->second.elementBytes);
         Surface& s = it->second;
         const uint32_t w = std::min(t.width(), s.img.width), h = std::min(t.height(), s.img.height);
         const uint32_t pitch = std::max(t.pitch(), w);
@@ -2291,6 +2454,7 @@ private:
         if (d.kind == DrawCall::kIndexed) {
             const uint32_t isz = r.indexType ? 4 : 2;
             if (!guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset)) return;
+            if (raceCheck_) noteRead(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, 'i');
         }
 
         // Consecutive draws into the same targets share a render pass. A new pass starts behind a
@@ -2433,6 +2597,9 @@ private:
     Batch batches_[kBatches];
     uint32_t cur_ = 0;
     uint32_t drawsSinceFlush_ = 0;
+    VkQueryPool timestamps_ = VK_NULL_HANDLE; // LPN_PROFILE: two per batch
+    double gpuTickNs_ = 1;
+    std::atomic<uint64_t> gpuBusyNs_{0};
     std::mutex doneMutex_; // guards Batch::busy and done, inFlight_, completing_, the counters
     std::condition_variable doneCv_;
     std::deque<uint32_t> inFlight_;
@@ -2495,6 +2662,7 @@ private:
     } stats_;
     Profiler prof_;
     PageCache codePages_;
+    uint64_t overlayIds_ = 0;
     std::unordered_map<std::string, ProgramVariants> programs_;
     size_t programCount_ = 0;
     const gcn::ReadMemory readCached_ = [this](uint64_t a, void* d, size_t n) { return codePages_.read(a, d, n); };
