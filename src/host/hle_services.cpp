@@ -242,6 +242,9 @@ const char* saveDataSystemMessage(int32_t type) {
 
 // SceSaveDataDialogParam after the 48-byte common base: size, mode, dispType, then pointers
 // (animation, items, user message, system message, ...).
+// The save a list dialog "chose": with no UI, the newest of the listed saves (see GetResult).
+std::string gDialogChoice;
+
 int32_t sceSaveDataDialogOpen(const uint8_t* p) {
     int32_t mode, disp;
     std::memcpy(&mode, p + 52, 4);
@@ -249,7 +252,26 @@ int32_t sceSaveDataDialogOpen(const uint8_t* p) {
     const uint8_t* ptrs[6];
     std::memcpy(ptrs, p + 64, sizeof ptrs);
     const char* what = disp == 1 ? "save" : disp == 2 ? "load" : disp == 3 ? "delete" : "save data";
-    if (mode == 2 && ptrs[2]) { // user message: buttonType, msgType, msg
+    if (mode == 1 && ptrs[1]) { // list: items are userId, pad, titleId*, dirName*, dirNameNum
+        const char* dirs = nullptr;
+        uint32_t count = 0;
+        std::memcpy(&dirs, ptrs[1] + 16, 8);
+        std::memcpy(&count, ptrs[1] + 24, 4);
+        gDialogChoice.clear();
+        fs::file_time_type newest{};
+        for (uint32_t i = 0; dirs && i < count; ++i) {
+            const std::string name(dirs + i * 32, strnlen(dirs + i * 32, 32));
+            std::error_code ec;
+            const auto t = fs::last_write_time(saveRoot() + "/" + name + "/data.saveps4", ec);
+            if (disp == 1 && gDialogChoice.empty()) gDialogChoice = name; // saving: the first slot offered
+            if (!ec && (disp != 1 && (gDialogChoice.empty() || t > newest))) {
+                gDialogChoice = name;
+                newest = t;
+            }
+        }
+        std::fprintf(stderr, "[dialog] %s: %u saves listed, choosing %s\n", what, count,
+                     gDialogChoice.empty() ? "none" : gDialogChoice.c_str());
+    } else if (mode == 2 && ptrs[2]) { // user message: buttonType, msgType, msg
         const char* msg = nullptr;
         std::memcpy(&msg, ptrs[2] + 8, 8);
         if (msg) std::fprintf(stderr, "[dialog] %s: %s\n", what, msg);
@@ -278,6 +300,16 @@ int32_t sceMsgDialogOpen(const uint8_t* p) {
 
 constexpr int32_t kDialogFinished = 3;
 int32_t dialogFinished() { return kDialogFinished; }
+// SceSaveDataDialogResult: mode, result, buttonId, pad, dirName*, param*, userData.
+int32_t saveDataDialogResult(int32_t* r) {
+    std::memset(r, 0, 12);
+    r[2] = 1; // YES / OK
+    char* dir = nullptr;
+    std::memcpy(&dir, reinterpret_cast<uint8_t*>(r) + 16, 8);
+    if (dir && !gDialogChoice.empty()) std::snprintf(dir, 32, "%s", gDialogChoice.c_str());
+    return 0;
+}
+
 int32_t dialogResultOk(int32_t* r) {
     std::memset(r, 0, 12); // mode, result OK, buttonId set below
     r[2] = 1;              // YES / OK
@@ -529,7 +561,7 @@ void registerServicesHle() {
     HLE(sdd, sceSaveDataDialogOpen);
     regs(sdd, {"sceSaveDataDialogUpdateStatus"}, finished);
     regs(sdd, {"sceSaveDataDialogIsReadyToDisplay"}, positive);
-    regs(sdd, {"sceSaveDataDialogGetResult"}, resultOk);
+    regs(sdd, {"sceSaveDataDialogGetResult"}, reinterpret_cast<void*>(&saveDataDialogResult));
     const char* ime = "libSceImeDialog";
     regs(ime, {"sceImeDialogInit", "sceImeDialogTerm", "sceImeDialogGetPanelSize"}, zero);
     regs(ime, {"sceImeDialogGetStatus"}, finished);
