@@ -76,6 +76,7 @@ constexpr uint32_t kPrimitiveType = 0x242;
 constexpr uint32_t kPsBindingBase = 32;
 constexpr VkDeviceSize kRingSize = 64ull << 20;
 constexpr uint64_t kImportGranule = 2ull << 20;
+constexpr size_t kTexCheckStride = 8; // a large texture's chunks are checked over this many frames
 
 bool readGuest(uint64_t addr, void* dst, size_t size) {
     if (!addr || addr >= (1ull << 40)) return false;
@@ -100,7 +101,8 @@ uint64_t hashBytes(const void* p, size_t n) {
 
 // Hashes guest memory for texture checks: 128 KiB chunks, read into a cache-sized buffer and
 // hashed on worker threads, so the textures a frame samples (~100 MB in gameplay) are neither
-// copied nor hashed on the renderer thread alone.
+// copied nor hashed on the renderer thread alone. Large textures are only partly hashed each
+// frame (see guestTexture).
 class GuestHasher {
 public:
     GuestHasher() {
@@ -108,20 +110,28 @@ public:
         for (unsigned i = 0; i < n; ++i) std::thread([this] { worker(); }).detach();
     }
 
-    // Hash of [addr, addr + size), or 0 when part of it is unreadable.
-    uint64_t hash(uint64_t addr, size_t size) {
-        const size_t chunks = (size + kChunk - 1) / kChunk;
+    static constexpr size_t kChunk = 128 << 10;
+
+    // Hashes the chunks phase, phase + stride, ... of [addr, addr + size) into out[chunk], which
+    // holds one hash per chunk. False when part of it is unreadable.
+    bool hashChunks(uint64_t addr, size_t size, std::vector<uint64_t>& out, size_t stride = 1, size_t phase = 0) {
+        const size_t total = (size + kChunk - 1) / kChunk;
+        out.resize(total);
+        const size_t jobs = phase < total ? (total - phase + stride - 1) / stride : 0;
+        if (!jobs) return true;
         {
             std::unique_lock l(m_);
             idle_.wait(l, [&] { return active_ == 0; }); // no worker is still in the last job
             addr_ = addr;
             size_ = size;
-            chunks_ = chunks;
-            results_.assign(chunks, 0);
+            stride_ = stride;
+            phase_ = phase;
+            chunks_ = jobs;
+            results_ = out.data();
             next_ = 0;
             done_ = 0;
             failed_ = false;
-            if (chunks > 2) {
+            if (jobs > 2) {
                 ++job_;
                 wake_.notify_all();
             }
@@ -129,15 +139,10 @@ public:
         work();
         std::unique_lock l(m_);
         idle_.wait(l, [&] { return done_ == chunks_; });
-        if (failed_) return 0;
-        uint64_t h = 0xcbf29ce484222325ull ^ size;
-        for (uint64_t r : results_) h = (h ^ r) * 0x100000001b3ull;
-        return h | 1;
+        return !failed_;
     }
 
 private:
-    static constexpr size_t kChunk = 128 << 10;
-
     void worker() {
         uint64_t seen = 0;
         std::unique_lock l(m_);
@@ -154,7 +159,8 @@ private:
 
     void work() {
         thread_local std::vector<uint8_t> buf(kChunk);
-        for (size_t i; (i = next_.fetch_add(1)) < chunks_;) {
+        for (size_t j; (j = next_.fetch_add(1)) < chunks_;) {
+            const size_t i = phase_ + j * stride_;
             const size_t off = i * kChunk, n = std::min(kChunk, size_ - off);
             if (readGuest(addr_ + off, buf.data(), n)) results_[i] = hashBytes(buf.data(), n);
             else failed_ = true;
@@ -170,8 +176,8 @@ private:
     uint64_t job_ = 0;
     unsigned active_ = 0;
     uint64_t addr_ = 0;
-    size_t size_ = 0, chunks_ = 0;
-    std::vector<uint64_t> results_;
+    size_t size_ = 0, chunks_ = 0, stride_ = 1, phase_ = 0;
+    uint64_t* results_ = nullptr;
     std::atomic<size_t> next_{0}, done_{0};
     std::atomic<bool> failed_{false};
 };
@@ -277,7 +283,7 @@ struct Surface {
 
 struct GuestTexture {
     Image img;
-    uint64_t hash = 0;
+    std::vector<uint64_t> chunks; // hash of each GuestHasher chunk at the last upload
     uint64_t checkedFrame = ~0ull;
 };
 
@@ -1602,18 +1608,36 @@ private:
         const size_t tiled = slice * slices;
         const VkDeviceSize bytes = VkDeviceSize(ew) * eh * bpe * slices;
         if (!bytes || bytes > kRingSize / 2 || tiled > (256u << 20)) return nullptr;
-        uint64_t h64;
         {
+            // A texture the game rewrites changes everywhere, so a large one is checked a slice of
+            // its chunks per frame and fully hashed only when a slice differs. A partial update
+            // outside the slice shows up within kTexCheckStride frames.
             ProfScope ps(prof_, kProfTexRead);
             ++prof_.texChecks;
-            h64 = hasher_.hash(t.base(), tiled);
-            if (!h64) {
+            const size_t chunks = (tiled + GuestHasher::kChunk - 1) / GuestHasher::kChunk;
+            bool same = false;
+            if (tex.img.image && tex.chunks.size() == chunks && chunks > kTexCheckStride && !fullTexChecks_) {
+                texSlice_ = tex.chunks;
+                const size_t phase = size_t(frame_ % kTexCheckStride);
+                if (!hasher_.hashChunks(t.base(), tiled, texSlice_, kTexCheckStride, phase)) {
+                    warnOnce("texture at 0x" + hex(t.base()) + " is not readable");
+                    return nullptr;
+                }
+                same = texSlice_ == tex.chunks;
+            } else if (tex.img.image) {
+                if (!hasher_.hashChunks(t.base(), tiled, texSlice_)) {
+                    warnOnce("texture at 0x" + hex(t.base()) + " is not readable");
+                    return nullptr;
+                }
+                same = texSlice_ == tex.chunks;
+            }
+            tex.checkedFrame = frame_;
+            if (same) return &tex;
+            if (!hasher_.hashChunks(t.base(), tiled, tex.chunks)) {
                 warnOnce("texture at 0x" + hex(t.base()) + " is not readable");
                 return nullptr;
             }
         }
-        tex.checkedFrame = frame_;
-        if (tex.img.image && tex.hash == h64) return &tex;
         ProfScope pu(prof_, kProfTexUpload);
         scratch_.resize(tiled);
         if (!readGuest(t.base(), scratch_.data(), tiled)) return nullptr;
@@ -1633,7 +1657,6 @@ private:
                              vt, slices))
                 return nullptr;
         }
-        tex.hash = h64;
         fullBarrier();
         VkBufferImageCopy c{};
         c.bufferOffset = at;
@@ -2381,6 +2404,8 @@ private:
     std::vector<std::function<void()>> afterFlush_;
     std::vector<uint8_t> scratch_;
     GuestHasher hasher_;
+    std::vector<uint64_t> texSlice_;
+    const bool fullTexChecks_ = getenv("LPN_FULL_TEXCHECK") != nullptr; // hash whole textures every frame
     std::chrono::steady_clock::time_point lastFrameEnd_ = std::chrono::steady_clock::now();
     uint64_t frameNs_[kProfCount] = {}, frameAnalyses_ = 0;
 
