@@ -589,6 +589,7 @@ public:
             traceDir_ = pendingCapture_ + "/";
             pendingCapture_.clear();
             traceFrame_ = frame_;
+            timingFrame_ = frame_ + 1; // and times the one after it (see reportTiming)
             traceOut_ = std::fopen((traceDir_ + "trace.txt").c_str(), "w");
             if (!traceOut_) traceOut_ = stderr;
         }
@@ -612,15 +613,15 @@ public:
         frameAnalyses_ = prof_.analyses;
     }
 
-    // LPN_GPU_TIMING=<frame>: GPU time of every draw and dispatch in that frame (a timestamp
-    // after each), with the time a new render pass's barrier adds, summed by shader.
+    // LPN_GPU_TIMING=<frame>, or the frame after an F12 capture: GPU time of every draw and
+    // dispatch in that frame (a timestamp after each), summed by shader, printed to the log.
     static constexpr uint32_t kTimingQueries = 16384;
     struct TimingMeta {
         uint64_t draw, shader;
         bool dispatch, newPass;
         uint32_t count;
     };
-    const uint64_t timingFrame_ = getenv("LPN_GPU_TIMING") ? std::strtoull(getenv("LPN_GPU_TIMING"), nullptr, 0) : ~0ull;
+    uint64_t timingFrame_ = getenv("LPN_GPU_TIMING") ? std::strtoull(getenv("LPN_GPU_TIMING"), nullptr, 0) : ~0ull;
     VkQueryPool timing_ = VK_NULL_HANDLE;
     std::vector<TimingMeta> timingMeta_;
     void startTiming() {
