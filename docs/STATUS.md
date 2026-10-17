@@ -1,6 +1,6 @@
 # Status and handoff notes
 
-Last updated 2026-10-14.
+Last updated 2026-10-16.
 
 ## Plan
 
@@ -40,9 +40,14 @@ Last updated 2026-10-14.
 - GPU rendering (Vulkan): GCN shaders are recompiled to GLSL/SPIR-V at draw time and every
   draw and dispatch of the frame is replayed. The boot now shows the game's own loading
   screen (black, with the Lost Paradise logo). See `docs/gpu.md` for how it works.
-- Gameplay renders lit (branch fix-black-env): the white-out came from ignored HTILE/CMASK fast
+- Gameplay renders lit (PRs #10, #11): the white-out came from ignored HTILE/CMASK fast
   clears; the black environment from a PC-relative constant table the shader analysis lost
   (`s_addc_u32`), which zeroed ambient occlusion. Cube-map sampling is translated.
+- Performance (RTX 4070 Ti SUPER, `LPN_PROFILE=1`, headless): gameplay in Shin's Castle
+  (~1,500 draws) runs at 40 fps, up from 15 (shader analyses are replayed instead of redone,
+  texture checks hashed in parallel); menus reach the game's 30 fps cap, the opening cutscene
+  50-60 fps. Gameplay frames now spend ~5 ms on analysis, ~5.5 ms on texture checks and ~8 ms
+  waiting for the GPU.
 - Boot reaches the title, main menu and difficulty select, and starts a new game (the
   opening cutscene `auth/a00_0100_before.par` loads in Southern Town). Scripted presses
   (`--press`) drive menus in headless runs.
@@ -63,10 +68,14 @@ Last updated 2026-10-14.
 
 1. Keep booting with the full data folder (the container only has the files staged so far;
    the next one the game asks for is `data/chara/ps4/face/c_cm_f_zco_a/tex00.par`).
-2. Rendering: 2D-tiled texture detiling (tile mode 14), HTILE/CMASK fast clears, indirect
-   draws, a real swapchain instead of reading frames back, then performance (batching).
-   `docs/gpu.md` lists what is known to be missing.
-3. Audio through SDL, C++ exceptions (`sceKernelGetModuleInfoForUnwind`) if the game uses them.
+2. Rendering: 2D-tiled texture detiling (tile mode 14), indirect draws, a real swapchain
+   instead of reading frames back, and the untranslated `ds_swizzle_b32`, `v_mad_u64_u32` and
+   `v_cvt_off_f32_i4`. `docs/gpu.md` lists what is known to be missing.
+3. Performance headroom above 30 fps: every draw is its own render pass behind a full barrier
+   (batching draws per render pass should cut the GPU wait); texture checks still read every
+   sampled texture each frame (page-dirty tracking would avoid that, but soft-dirty bits are
+   never cleared on pages pinned by the Vulkan host-memory import).
+4. Audio through SDL, C++ exceptions (`sceKernelGetModuleInfoForUnwind`) if the game uses them.
 
 ## Working setup
 
@@ -78,7 +87,9 @@ Last updated 2026-10-14.
   `--trace-files` logs every file opened, `--headless` skips the window,
   `--dump-frame N` writes ./gpu-dump; Ctrl+C prints the stub summary).
 - Progress runs: `--compute-only --trace-files --press cross@1500,...` (frame numbers; on a real GPU
-  `cross@1500,cross@1800,cross@2100,cross@2400` reaches gameplay in Shin's Castle by frame ~3300);
+  `cross@1500,cross@1800,cross@2100,cross@2400` reaches gameplay in Shin's Castle by frame
+  ~3300-4500, depending on how fast the opening cutscene plays; use a fresh `--data` folder, as a
+  save file changes the menus);
   `--trace-hle N` logs each system call's first use, and first use after frame N;
   `--screenshot-every N` saves every Nth frame (needs full rendering, ~1 fps on lavapipe).
 - `lpn-gcn shader.bin` disassembles; `lpn-gcn --stats gpu-dump/shaders/*` counts instructions;

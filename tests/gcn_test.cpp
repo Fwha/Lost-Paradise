@@ -114,6 +114,50 @@ int main() {
         ++failures;
     }
 
+    // Reuse across launches: a V# loaded through a user pointer, then a branch on a loaded flag.
+    const std::vector<uint32_t> loads = {
+        0xc0820100,             // s_load_dwordx4 s[4:7], s[0:1], 0x0
+        0xc0040104,             // s_load_dword s8, s[0:1], 0x4
+        0xbf068008,             // s_cmp_eq_u32 s8, 0
+        0xbf850002,             // s_cbranch_scc1 +2
+        0xebf31030, 0x8001000d, // tbuffer_load_format_xyzw v0, v13, s[4:7], 0 offset:48 offen
+        0xbf810000,             // s_endpgm
+    };
+    uint32_t table[2][8] = {{0x10000, 0, 64, 0x2000c004, 1}, {0x20000, 0, 64, 0x2000c004, 1}};
+    gcn::LaunchState ll = l;
+    ll.rsrc2 = 2 << 1;
+    ll.userData[0] = 0x8000;
+    auto readLoads = [&](uint64_t addr, void* dst, size_t size) {
+        if (addr >= ll.entry && addr + size <= ll.entry + loads.size() * 4) {
+            std::memcpy(dst, reinterpret_cast<const char*>(loads.data()) + (addr - ll.entry), size);
+            return true;
+        }
+        if (addr >= 0x8000 && addr + size <= 0x8000 + sizeof(table)) {
+            std::memcpy(dst, reinterpret_cast<const char*>(table) + (addr - 0x8000), size);
+            return true;
+        }
+        return false;
+    };
+    gcn::Program lp = gcn::analyze(ll, readLoads);
+    gcn::LaunchState other = ll;
+    other.userData[0] = 0x8000 + sizeof(table[0]); // the next draw's table
+    if (lp.buffers.size() != 1 || lp.buffers[0].base() != 0x10000 || !gcn::refresh(lp, other, readLoads) ||
+        lp.buffers[0].base() != 0x20000 || lp.data[0] != other.userData[0]) {
+        std::fprintf(stderr, "refresh did not re-target the program to another table\n");
+        ++failures;
+    }
+    table[0][4] = 0; // the branch now skips the load
+    if (gcn::refresh(lp, ll, readLoads)) {
+        std::fprintf(stderr, "refresh accepted a different branch\n");
+        ++failures;
+    }
+    table[0][4] = 1;
+    table[0][3] ^= 0x7; // another dst_sel: another translation
+    if (gcn::refresh(lp, ll, readLoads)) {
+        std::fprintf(stderr, "refresh accepted a different buffer format\n");
+        ++failures;
+    }
+
     if (failures) std::fprintf(stderr, "%d failure(s)\n", failures);
     return failures ? 1 : 0;
 }

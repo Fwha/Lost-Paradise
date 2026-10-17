@@ -26,10 +26,72 @@ struct Work {
 
 class Analyzer {
 public:
-    Analyzer(const LaunchState& l, const ReadMemory& r) : read_(r) { p_.launch = l; }
+    Analyzer(const LaunchState& l, const ReadMemory& code, const ReadMemory& data, const Program* prior = nullptr)
+        : readCode_(code), readData_(data), prior_(prior) {
+        p_.launch = l;
+    }
 
     Program run() {
         p_.data.assign(data::kSmrd, 0);
+        std::deque<Work> work{{p_.launch.entry, start()}};
+        p_.labels.insert(p_.launch.entry);
+        unsigned steps = 0;
+        while (!work.empty() && steps < 100000) {
+            Work w = std::move(work.front());
+            work.pop_front();
+            p_.trace.push_back({w.pc, {}, true, false});
+            while (++steps < 100000) {
+                if (p_.code.count(w.pc)) break; // already walked from here
+                uint32_t words[3] = {};
+                if (!readCode_(w.pc, words, 8) && !readCode_(w.pc, words, 4)) {
+                    warn("unreadable code at 0x%llx", (unsigned long long)w.pc);
+                    break;
+                }
+                Instruction in = decode(words, 2);
+                if (in.size > 8 && !readCode_(w.pc, words, in.size)) break;
+                in = decode(words, in.size / 4);
+                p_.code[w.pc] = in;
+                const uint64_t next = w.pc + in.size;
+                const bool more = step(in, w.pc, w.st, next, work);
+                if (!more || !inert(in)) p_.trace.push_back({w.pc, in, false, more});
+                if (!more) break;
+                w.pc = next;
+            }
+        }
+        if (steps >= 100000) {
+            warn("analysis did not terminate");
+            p_.trace.clear();
+        }
+        return std::move(p_);
+    }
+
+    // Re-evaluates prior_'s trace for this launch; false when the walk would differ.
+    bool replay() {
+        const Program& prior = *prior_;
+        p_.data.assign(prior.data.size(), 0);
+        p_.buffers = prior.buffers;
+        p_.images = prior.images;
+        seenBuffers_.assign(p_.buffers.size(), false);
+        seenImages_.assign(p_.images.size(), false);
+        std::deque<Work> work{{p_.launch.entry, start()}};
+        State st;
+        for (const Program::TraceStep& t : prior.trace) {
+            if (t.start) {
+                if (work.empty() || work.front().pc != t.pc) return false;
+                st = std::move(work.front().st);
+                work.pop_front();
+            } else if (step(t.in, t.pc, st, t.pc + t.in.size, work) != t.result || diverged_) {
+                return false;
+            }
+        }
+        return work.empty();
+    }
+
+    Program& program() { return p_; }
+
+private:
+    // The state at the entry point; also fills in the launch's part of the draw data.
+    State start() {
         std::memcpy(p_.data.data(), p_.launch.userData, sizeof(p_.launch.userData));
         const float one = 1.0f;
         std::memcpy(&p_.data[data::kPosTransform], &one, 4);
@@ -40,34 +102,11 @@ public:
             st.s[i] = p_.launch.userData[i];
             st.known[i] = true;
         }
-        std::deque<Work> work{{p_.launch.entry, st}};
-        p_.labels.insert(p_.launch.entry);
-        unsigned steps = 0;
-        while (!work.empty() && steps < 100000) {
-            Work w = std::move(work.front());
-            work.pop_front();
-            while (++steps < 100000) {
-                if (p_.code.count(w.pc)) break; // already walked from here
-                uint32_t words[3] = {};
-                if (!read_(w.pc, words, 8) && !read_(w.pc, words, 4)) {
-                    warn("unreadable code at 0x%llx", (unsigned long long)w.pc);
-                    break;
-                }
-                Instruction in = decode(words, 2);
-                if (in.size > 8 && !read_(w.pc, words, in.size)) break;
-                in = decode(words, in.size / 4);
-                p_.code[w.pc] = in;
-                const uint64_t next = w.pc + in.size;
-                if (!step(in, w.pc, w.st, next, work)) break;
-                w.pc = next;
-            }
-        }
-        if (steps >= 100000) warn("analysis did not terminate");
-        return std::move(p_);
+        return st;
     }
 
-private:
     template <typename... A> void warn(const char* fmt, A... a) {
+        if (prior_) return; // a replay reports nothing new
         char b[256];
         std::snprintf(b, sizeof b, fmt, a...);
         p_.warnings.emplace_back(b);
@@ -117,9 +156,24 @@ private:
     }
 
     void branchTo(uint64_t target, const State& st, std::deque<Work>& work) {
-        p_.labels.insert(target);
+        label(target);
         p_.controlFlow = true;
         work.push_back({target, st});
+    }
+    void label(uint64_t pc) {
+        if (!prior_) p_.labels.insert(pc); // a replay keeps the prior labels
+    }
+
+    // Instructions step() does nothing for: a replay can skip them.
+    static bool inert(const Instruction& in) {
+        switch (in.format) {
+        case Format::VOP1: return in.op != 2;
+        case Format::VOP2: return in.op != 1 && !(in.op >= 37 && in.op <= 42);
+        case Format::EXP:
+        case Format::VINTRP:
+        case Format::DS: return true;
+        default: return false;
+        }
     }
 
     // Returns false when this path ends.
@@ -142,7 +196,7 @@ private:
                 [[fallthrough]];
             case 6: case 7: case 8: case 9: // vccz/vccnz/execz/execnz: lane-dependent
                 branchTo(target, st, work);
-                p_.labels.insert(next);
+                label(next);
                 return true;
             default: return true;
             }
@@ -150,7 +204,7 @@ private:
         case Format::SOP1: return sop1(in, pc, st, next, work);
         case Format::SOP2: sop2(in, st); return true;
         case Format::SOPC: {
-            uint32_t a, b;
+            uint32_t a = 0, b = 0;
             const bool k = src(st, w & 0xFF, in, a) & src(st, (w >> 8) & 0xFF, in, b);
             st.sccKnown = k;
             if (k) st.scc = sopc(in.op, a, b);
@@ -244,9 +298,9 @@ private:
         case 33: { // s_swappc_b64
             const bool k = src64(st, s0, in, a64) && a64 != 0;
             set64(st, d, next);
-            p_.labels.insert(next);
+            label(next);
             if (k) {
-                p_.calls[pc] = a64 & 0xFFFFFFFFFFFFull;
+                if (!prior_) p_.calls[pc] = a64 & 0xFFFFFFFFFFFFull;
                 branchTo(a64 & 0xFFFFFFFFFFFFull, st, work);
             } else {
                 warn("call to unknown address at 0x%llx (fetch shader skipped)", (unsigned long long)pc);
@@ -275,7 +329,7 @@ private:
         const uint32_t d = (w >> 16) & 0x7F, s0 = w & 0xFF, s1 = (w >> 8) & 0xFF;
         const bool wide = in.op >= 15 && in.op <= 37 && (in.op & 1);
         if (wide || in.op == 11 || in.op == 41 || in.op == 42) {
-            uint64_t a, b;
+            uint64_t a = 0, b = 0;
             const bool k = src64(st, s0, in, a) & src64(st, s1, in, b);
             uint64_t r = 0;
             bool ok = k;
@@ -365,13 +419,23 @@ private:
         else known = src(st, w & 0xFF, in, off);
 
         uint32_t at;
-        auto it = p_.smrd.find(pc);
-        if (it == p_.smrd.end()) {
+        if (prior_) {
+            auto pit = prior_->smrd.find(pc);
+            if (pit == prior_->smrd.end()) {
+                diverged_ = true;
+                return;
+            }
+            at = pit->second;
+        } else if (auto it = p_.smrd.find(pc); it == p_.smrd.end()) {
             at = uint32_t(p_.data.size());
             p_.smrd[pc] = at;
             p_.data.resize(at + n, 0);
         } else {
             at = it->second;
+        }
+        if (at + n > p_.data.size()) {
+            diverged_ = true;
+            return;
         }
 
         uint32_t lo, hi;
@@ -393,13 +457,15 @@ private:
             addr = (lo | (uint64_t(hi & 0xFFFF) << 32)) & ~3ull;
         }
         uint32_t vals[16] = {};
-        for (unsigned i = 0; i < n; ++i) {
-            const uint32_t byte = off + i * 4;
-            if (buf && byte + 4 > limit) continue;
-            if (!read_(addr + byte, &vals[i], 4)) {
-                warn("scalar load from unreadable 0x%llx", (unsigned long long)(addr + byte));
-                break;
-            }
+        unsigned inside = n; // dwords within the buffer
+        if (buf) inside = off >= limit ? 0 : std::min<unsigned>(n, (limit - off) / 4);
+        if (inside && !readData_(addr + off, vals, inside * 4)) { // else find the unreadable dword
+            std::memset(vals, 0, sizeof vals);
+            for (unsigned i = 0; i < inside; ++i)
+                if (!readData_(addr + off + i * 4, &vals[i], 4)) {
+                    warn("scalar load from unreadable 0x%llx", (unsigned long long)(addr + off + i * 4));
+                    break;
+                }
         }
         for (unsigned i = 0; i < n; ++i) {
             p_.data[at + i] = vals[i];
@@ -419,8 +485,16 @@ private:
 
     void buffer(const Instruction& in, uint64_t pc, State& st) {
         const uint32_t w = in.words[0], w1 = in.words[1];
-        for (const auto& b : p_.buffers)
-            if (b.pc == pc) return;
+        int found = -1;
+        for (size_t i = 0; i < p_.buffers.size(); ++i)
+            if (p_.buffers[i].pc == pc) found = int(i);
+        if (prior_) { // the first visit in a replay re-resolves the prior resource
+            if (found < 0) diverged_ = true;
+            if (found < 0 || seenBuffers_[found]) return;
+            seenBuffers_[found] = true;
+        } else if (found >= 0) {
+            return;
+        }
         BufferResource r;
         r.pc = pc;
         r.known = sharp(st, ((w1 >> 16) & 0x1F) * 4, 4, r.sharp, pc, "buffer");
@@ -433,6 +507,11 @@ private:
             r.nfmt = (r.sharp[3] >> 12) & 7;
             r.store = (in.op >= 4 && in.op <= 7) || (in.op >= 24 && in.op <= 31) || (in.op >= 48 && in.op < 112);
         }
+        if (prior_) {
+            r.data = p_.buffers[found].data;
+            p_.buffers[found] = r;
+            return;
+        }
         r.data = uint32_t(p_.data.size());
         p_.data.resize(r.data + 4, 0);
         p_.buffers.push_back(r);
@@ -440,8 +519,16 @@ private:
 
     void image(const Instruction& in, uint64_t pc, State& st) {
         const uint32_t w1 = in.words[1];
-        for (const auto& i : p_.images)
-            if (i.pc == pc) return;
+        int found = -1;
+        for (size_t i = 0; i < p_.images.size(); ++i)
+            if (p_.images[i].pc == pc) found = int(i);
+        if (prior_) {
+            if (found < 0) diverged_ = true;
+            if (found < 0 || seenImages_[found]) return;
+            seenImages_[found] = true;
+        } else if (found >= 0) {
+            return;
+        }
         ImageResource r;
         r.pc = pc;
         sharp(st, ((w1 >> 16) & 0x1F) * 4, 8, r.t, pc, "image");
@@ -450,18 +537,53 @@ private:
         r.storage = in.op >= 8 && in.op <= 11;
         if (in.op >= 32 && in.op < 64) r.compare = (in.op & 15) >= 8;
         if (in.op >= 64 && in.op < 96) r.compare = (in.op & 15) >= 6;
+        if (prior_) {
+            r.data = p_.images[found].data;
+            p_.images[found] = r;
+            return;
+        }
         r.data = uint32_t(p_.data.size());
         p_.data.resize(r.data + 4, 0);
         p_.images.push_back(r);
     }
 
-    const ReadMemory& read_;
+    const ReadMemory& readCode_;
+    const ReadMemory& readData_;
+    const Program* prior_; // replaying this program's trace
+    bool diverged_ = false;
+    std::vector<bool> seenBuffers_, seenImages_;
     Program p_;
 };
 
 } // namespace
 
-Program analyze(const LaunchState& launch, const ReadMemory& read) { return Analyzer(launch, read).run(); }
+Program analyze(const LaunchState& launch, const ReadMemory& readCode, const ReadMemory& readData) {
+    return Analyzer(launch, readCode, readData).run();
+}
+
+bool refresh(Program& p, const LaunchState& launch, const ReadMemory& readData) {
+    if (p.trace.empty()) return false;
+    Analyzer a(launch, readData, readData, &p);
+    if (!a.replay()) return false;
+    Program& r = a.program();
+    // The translation depends on these (see Program::key).
+    for (size_t i = 0; i < p.buffers.size(); ++i) {
+        const BufferResource &x = p.buffers[i], &y = r.buffers[i];
+        if (x.dfmt != y.dfmt || x.nfmt != y.nfmt || (x.sharp[3] & 0xFFF) != (y.sharp[3] & 0xFFF) || x.known != y.known)
+            return false;
+    }
+    for (size_t i = 0; i < p.images.size(); ++i) {
+        const ImageResource &x = p.images[i], &y = r.images[i];
+        if (x.type() != y.type() || x.dataFormat() != y.dataFormat() || x.numFormat() != y.numFormat() ||
+            x.dstSel() != y.dstSel())
+            return false;
+    }
+    p.launch = launch;
+    p.data = std::move(r.data);
+    p.buffers = std::move(r.buffers);
+    p.images = std::move(r.images);
+    return true;
+}
 
 std::string Program::key() const {
     std::string k;
