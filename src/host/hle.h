@@ -3,11 +3,29 @@
 // The PS4 uses the same System V x86-64 calling convention as Linux, so an HLE function is
 // an ordinary C++ function with the guest's signature, bound directly into the import slot.
 #pragma once
+#include <algorithm>
+#include <cstdlib>
+#include <cstdio>
+#include <chrono>
 
 #include <cstdint>
 #include <string>
 
 namespace host {
+
+// LPN_WAITLOG=1 (debugging): a blocking call that waited over 100 ms (or LPN_WAITLOG=<ms>) logs
+// its name and timeout.
+struct WaitLog {
+    const char* what;
+    int64_t timeoutUs;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~WaitLog() {
+        static const long limit = std::getenv("LPN_WAITLOG") ? std::max(1L, std::atol(std::getenv("LPN_WAITLOG"))) : 0;
+        if (!limit) return;
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+        if (ms > (limit == 1 ? 100 : limit)) std::fprintf(stderr, "[wait] %s %lld ms (timeout %lld us)\n", what, (long long)ms, (long long)timeoutUs);
+    }
+};
 
 // Everything the trampoline for an unimplemented import needs to report it.
 struct ImportInfo {

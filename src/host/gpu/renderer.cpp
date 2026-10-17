@@ -41,6 +41,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace host::render {
@@ -399,6 +400,7 @@ public:
             }
         }
         prof_.on = getenv("LPN_PROFILE") != nullptr;
+        openPipelineCache();
         dumpGlsl_ = getenv("LPN_GPU_GLSL") != nullptr;
         return true;
     }
@@ -456,6 +458,7 @@ public:
             programCount_ = 0;
         }
         if (prof_.on) reportSlowFrame();
+        savePipelineCache();
         ++frame_;
         if (!pendingCapture_.empty()) { // F12: trace this frame into the capture folder
             traceDir_ = pendingCapture_ + "/";
@@ -1087,19 +1090,7 @@ private:
     // in $LPN_SHADER_CACHE (default ~/.cache/lpn-host/spirv; "off" disables), named by a hash of
     // the source.
     std::string spirvCachePath(const std::string& glsl, gcn::GlslStage stage) {
-        if (spirvDir_.empty()) {
-            const char* env = getenv("LPN_SHADER_CACHE");
-            if (env && !std::strcmp(env, "off")) spirvDir_ = "-";
-            else if (env && *env) spirvDir_ = env;
-            else if (const char* x = getenv("XDG_CACHE_HOME"); x && *x) spirvDir_ = std::string(x) + "/lpn-host/spirv";
-            else if (const char* h = getenv("HOME"); h && *h) spirvDir_ = std::string(h) + "/.cache/lpn-host/spirv";
-            else spirvDir_ = "-";
-            if (spirvDir_ != "-") {
-                std::error_code ec;
-                std::filesystem::create_directories(spirvDir_, ec);
-                if (ec) spirvDir_ = "-";
-            }
-        }
+        cacheDir();
         if (spirvDir_ == "-") return {};
         std::string text = glsl;
         text += char('0' + int(stage));
@@ -1111,6 +1102,69 @@ private:
         std::snprintf(name, sizeof name, "%016" PRIx64 "%016" PRIx64 ".spv", a, b);
         return spirvDir_ + "/" + name;
     }
+    // The on-disk caches' folder: $LPN_SHADER_CACHE (default ~/.cache/lpn-host/spirv; "off": none).
+    void cacheDir() {
+        if (!spirvDir_.empty()) return;
+        const char* env = getenv("LPN_SHADER_CACHE");
+        if (env && !std::strcmp(env, "off")) spirvDir_ = "-";
+        else if (env && *env) spirvDir_ = env;
+        else if (const char* x = getenv("XDG_CACHE_HOME"); x && *x) spirvDir_ = std::string(x) + "/lpn-host/spirv";
+        else if (const char* h = getenv("HOME"); h && *h) spirvDir_ = std::string(h) + "/.cache/lpn-host/spirv";
+        else spirvDir_ = "-";
+        if (spirvDir_ != "-") {
+            std::error_code ec;
+            std::filesystem::create_directories(spirvDir_, ec);
+            if (ec) spirvDir_ = "-";
+        }
+    }
+
+    // Pipelines (the driver compiling SPIR-V for the GPU, ~50 ms a frame when an area appears)
+    // are kept in pipelines.bin next to the SPIR-V; the driver ignores data from another GPU or
+    // driver version.
+    void openPipelineCache() {
+        cacheDir();
+        std::vector<char> data;
+        if (spirvDir_ != "-") {
+            pipelineCachePath_ = spirvDir_ + "/pipelines.bin";
+            if (FILE* f = std::fopen(pipelineCachePath_.c_str(), "rb")) {
+                std::fseek(f, 0, SEEK_END);
+                const long n = std::ftell(f);
+                std::fseek(f, 0, SEEK_SET);
+                if (n > 0) {
+                    data.resize(size_t(n));
+                    if (std::fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
+                }
+                std::fclose(f);
+            }
+        }
+        VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        ci.initialDataSize = data.size();
+        ci.pInitialData = data.empty() ? nullptr : data.data();
+        if (vkCreatePipelineCache(vk_.device, &ci, nullptr, &pipelineCache_) != VK_SUCCESS) {
+            ci.initialDataSize = 0;
+            ci.pInitialData = nullptr;
+            VK_CHECK(vkCreatePipelineCache(vk_.device, &ci, nullptr, &pipelineCache_));
+        }
+    }
+    // Called at frame end: writes the cache once some new pipelines have been made.
+    void savePipelineCache() {
+        if (pipelineCachePath_.empty() || newPipelines_ < 16) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastPipelineSave_ < std::chrono::seconds(5)) return;
+        size_t n = 0;
+        if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, nullptr) != VK_SUCCESS || !n) return;
+        std::vector<char> data(n);
+        if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, data.data()) != VK_SUCCESS) return;
+        const std::string tmp = pipelineCachePath_ + ".tmp" + std::to_string(getpid());
+        if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+            const bool ok = std::fwrite(data.data(), 1, n, f) == n;
+            if (std::fclose(f) == 0 && ok) std::rename(tmp.c_str(), pipelineCachePath_.c_str());
+            else std::remove(tmp.c_str());
+        }
+        newPipelines_ = 0;
+        lastPipelineSave_ = now;
+    }
+
     static std::vector<uint32_t> loadSpirv(const std::string& path) {
         std::vector<uint32_t> words;
         if (path.empty()) return words;
@@ -1405,7 +1459,8 @@ private:
         gci.pDynamicState = &dy;
         gci.layout = layout;
         VkPipeline p = VK_NULL_HANDLE;
-        const VkResult r = vkCreateGraphicsPipelines(vk_.device, VK_NULL_HANDLE, 1, &gci, nullptr, &p);
+        const VkResult r = vkCreateGraphicsPipelines(vk_.device, pipelineCache_, 1, &gci, nullptr, &p);
+        ++newPipelines_;
         if (r != VK_SUCCESS) std::fprintf(stderr, "[gpu] graphics pipeline creation failed: %s\n", vkResultName(r));
         return pipelines_[key] = p;
     }
@@ -1433,7 +1488,8 @@ private:
             ci.stage.module = cs->module;
             ci.stage.pName = "main";
             ci.layout = layout;
-            VK_CHECK(vkCreateComputePipelines(vk_.device, VK_NULL_HANDLE, 1, &ci, nullptr, &p));
+            VK_CHECK(vkCreateComputePipelines(vk_.device, pipelineCache_, 1, &ci, nullptr, &p));
+            ++newPipelines_;
         }
         return computePipelines_[cs->id] = p;
     }
@@ -2383,6 +2439,10 @@ private:
     } pass_;
     std::vector<VkImage> sampledSurfaces_;
     std::string spirvDir_; // "-": no SPIR-V cache
+    VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
+    std::string pipelineCachePath_;
+    uint32_t newPipelines_ = 0;
+    std::chrono::steady_clock::time_point lastPipelineSave_{};
 };
 
 Renderer* gRenderer = nullptr;
