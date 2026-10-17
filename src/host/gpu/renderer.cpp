@@ -101,6 +101,22 @@ uint64_t hashBytes(const void* p, size_t n) {
 // Hashes guest memory for texture checks: 128 KiB chunks, read into a cache-sized buffer and
 // hashed on worker threads, so the textures a frame samples (~100 MB in gameplay) are neither
 // copied nor hashed on the renderer thread alone.
+// A cheap fingerprint of [addr, addr + size): 64 samples of 64 bytes spread over it (read
+// in one syscall). It catches a texture rewritten as a whole (a video frame) between full hashes.
+uint64_t sampleHash(uint64_t addr, size_t size) {
+    constexpr size_t kSample = 64, kMax = 64;
+    const size_t stride = std::max<size_t>(kSample, (size / kMax + kSample - 1) & ~(kSample - 1));
+    thread_local std::vector<iovec> remote;
+    thread_local std::vector<uint8_t> buf(kSample * kMax);
+    remote.clear();
+    for (size_t off = 0; off + kSample <= size && remote.size() < kMax; off += stride)
+        remote.push_back({reinterpret_cast<void*>(addr + off), kSample});
+    if (remote.empty()) return 0;
+    iovec local{buf.data(), remote.size() * kSample};
+    if (process_vm_readv(getpid(), &local, 1, remote.data(), remote.size(), 0) != ssize_t(local.iov_len)) return 0;
+    return hashBytes(buf.data(), local.iov_len) | 1;
+}
+
 class GuestHasher {
 public:
     GuestHasher() {
@@ -282,6 +298,7 @@ struct GuestTexture {
     uint64_t hash = 0;
     uint64_t checkedFrame = ~0ull;
     uint64_t changedFrame = 0; // the contents were last (re)uploaded in this frame
+    uint64_t sample = 0;       // sampleHash at the last full check
 };
 
 struct Import {
@@ -1608,10 +1625,16 @@ private:
         GuestTexture& tex = textures_[k];
         if (tex.img.image && tex.checkedFrame == frame_) return &tex;
         // Re-reading every sampled texture each frame cost ~8 ms in fights and ~15 ms in crowded
-        // areas, though most never change. One unchanged for 60 frames is checked every 8th frame
-        // (staggered by address); one rewritten in place is then seen up to 8 frames late. A new
-        // texture at the same address with another T# is another entry and is uploaded at once.
-        if (tex.img.image && frame_ - tex.changedFrame >= 60 && (frame_ + (t.base() >> 8)) % 8 != 0) return &tex;
+        // areas, though most never change. One unchanged for 60 frames is fully hashed every 8th
+        // frame (staggered by address) and fingerprinted every other frame in between, which
+        // catches whole rewrites a frame late at most (the title video flickered with no check);
+        // a small partial rewrite is seen up to 8 frames late. Another T# at the same address is another entry.
+        const size_t span = size_t(ew) * eh * bpe * slices;
+        if (tex.img.image && frame_ - tex.changedFrame >= 60 && (frame_ + (t.base() >> 8)) % 8 != 0) {
+            tex.checkedFrame = frame_;
+            if ((frame_ + (t.base() >> 8)) % 2 != 0) return &tex; // fingerprinted every other frame
+            if (sampleHash(t.base(), span) == tex.sample) return &tex;
+        }
         uint32_t mode = t.tileMode();
         size_t slice = tiledSliceSize(mode, ep, eh, bpe);
         if (!slice) {
@@ -1633,6 +1656,7 @@ private:
             }
         }
         tex.checkedFrame = frame_;
+        tex.sample = sampleHash(t.base(), span);
         if (!tex.img.image || tex.hash != h64) tex.changedFrame = frame_;
         if (tex.img.image && tex.hash == h64) return &tex;
         ProfScope pu(prof_, kProfTexUpload);
