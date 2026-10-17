@@ -493,10 +493,16 @@ public:
                          d.kind == DrawCall::kDispatch ? "dispatch" : "draw", shaderAddress(r, reg::kPgmLoVs),
                          shaderAddress(r, reg::kPgmLoPs), shaderAddress(r, reg::kPgmLoCs));
         if (raceCheck_) raceShader_ = shaderAddress(r, d.kind == DrawCall::kDispatch ? reg::kPgmLoCs : reg::kPgmLoPs);
+        const uint64_t passesBefore = prof_.passes;
         if (d.kind == DrawCall::kDispatch) dispatch(d, r);
         else if (computeOnly_) return;
         else if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r);
         else warnOnce("indirect draws and dispatches are not rendered yet");
+        if (frame_ == timingFrame_ && timing_ && recording_ && timingMeta_.size() + 1 < kTimingQueries) {
+            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timing_, uint32_t(timingMeta_.size() + 1));
+            timingMeta_.push_back({drawIndex_, shaderAddress(r, d.kind == DrawCall::kDispatch ? reg::kPgmLoCs : reg::kPgmLoPs),
+                                   d.kind == DrawCall::kDispatch, prof_.passes != passesBefore, d.count});
+        }
         static const uint32_t flushDraws = getenv("LPN_FLUSH_DRAWS") ? std::atoi(getenv("LPN_FLUSH_DRAWS")) : 400;
         if (flushDraws && recording_ && ++drawsSinceFlush_ >= flushDraws) flush();
     }
@@ -587,6 +593,8 @@ public:
             if (!traceOut_) traceOut_ = stderr;
         }
         if (prof_.on && frame_ % 300 == 0) reportProfile();
+        if (frame_ == timingFrame_ + 1) reportTiming();
+        if (frame_ == timingFrame_) startTiming();
         drawIndex_ = 0;
     }
 
@@ -602,6 +610,69 @@ public:
         lastFrameEnd_ = now;
         std::copy(std::begin(prof_.ns), std::end(prof_.ns), frameNs_);
         frameAnalyses_ = prof_.analyses;
+    }
+
+    // LPN_GPU_TIMING=<frame>: GPU time of every draw and dispatch in that frame (a timestamp
+    // after each), with the time a new render pass's barrier adds, summed by shader.
+    static constexpr uint32_t kTimingQueries = 16384;
+    struct TimingMeta {
+        uint64_t draw, shader;
+        bool dispatch, newPass;
+        uint32_t count;
+    };
+    const uint64_t timingFrame_ = getenv("LPN_GPU_TIMING") ? std::strtoull(getenv("LPN_GPU_TIMING"), nullptr, 0) : ~0ull;
+    VkQueryPool timing_ = VK_NULL_HANDLE;
+    std::vector<TimingMeta> timingMeta_;
+    void startTiming() {
+        VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qci.queryCount = kTimingQueries;
+        if (vkCreateQueryPool(vk_.device, &qci, nullptr, &timing_) != VK_SUCCESS) return;
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(vk_.phys, &props);
+        gpuTickNs_ = props.limits.timestampPeriod;
+        begin();
+        endPass();
+        vkCmdResetQueryPool(cmd_, timing_, 0, kTimingQueries);
+        vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timing_, 0);
+        timingMeta_.clear();
+    }
+    void reportTiming() {
+        if (!timing_) return;
+        waitIdle();
+        const uint32_t n = uint32_t(timingMeta_.size()) + 1;
+        std::vector<uint64_t> t(n);
+        if (vkGetQueryPoolResults(vk_.device, timing_, 0, n, n * 8, t.data(), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS)
+            return;
+        struct Row { double ms; size_t i; };
+        std::vector<Row> rows;
+        std::map<uint64_t, std::pair<double, uint32_t>> byShader;
+        double total = 0, passMs = 0;
+        uint32_t passes = 0;
+        for (size_t i = 0; i < timingMeta_.size(); ++i) {
+            const double ms = t[i + 1] >= t[i] ? double(t[i + 1] - t[i]) * gpuTickNs_ / 1e6 : 0;
+            total += ms;
+            if (timingMeta_[i].newPass) passMs += ms, ++passes;
+            rows.push_back({ms, i});
+            auto& b = byShader[timingMeta_[i].shader];
+            b.first += ms, ++b.second;
+        }
+        std::fprintf(stderr, "[timing] frame %" PRIu64 ": %zu draws/dispatches, %.2f ms on the GPU; draws that start a pass (%u): %.2f ms\n",
+                     timingFrame_, timingMeta_.size(), total, passes, passMs);
+        std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.ms > b.ms; });
+        for (size_t k = 0; k < std::min<size_t>(25, rows.size()); ++k) {
+            const TimingMeta& m = timingMeta_[rows[k].i];
+            std::fprintf(stderr, "[timing]   %.3f ms  #%" PRIu64 " %s 0x%" PRIx64 " count %u%s\n", rows[k].ms, m.draw,
+                         m.dispatch ? "cs" : "ps", m.shader, m.count, m.newPass ? " (new pass)" : "");
+        }
+        std::vector<std::pair<double, uint64_t>> shaders;
+        for (auto& [sh, v] : byShader) shaders.push_back({v.first, sh});
+        std::sort(shaders.rbegin(), shaders.rend());
+        for (size_t k = 0; k < std::min<size_t>(15, shaders.size()); ++k)
+            std::fprintf(stderr, "[timing]   shader 0x%" PRIx64 ": %.2f ms in %u uses\n", shaders[k].second, shaders[k].first,
+                         byShader[shaders[k].second].second);
+        vkDestroyQueryPool(vk_.device, timing_, nullptr);
+        timing_ = VK_NULL_HANDLE;
     }
 
     void captureNextFrame(const std::string& dir) {
