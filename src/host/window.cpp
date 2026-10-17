@@ -42,6 +42,9 @@ enum : uint32_t {
     kL3 = 0x2, kR3 = 0x4, kOptions = 0x8, kUp = 0x10, kRight = 0x20, kDown = 0x40, kLeft = 0x80, kL2 = 0x100,
     kR2 = 0x200, kL1 = 0x400, kR1 = 0x800, kTriangle = 0x1000, kCircle = 0x2000, kCross = 0x4000,
     kSquare = 0x8000, kTouchPad = 0x100000,
+    // Scripted stick pushes (not pad bits): left stick, then right stick (camera).
+    kLsLeft = 1u << 24, kLsRight = 1u << 25, kLsUp = 1u << 26, kLsDown = 1u << 27,
+    kRsLeft = 1u << 28, kRsRight = 1u << 29, kRsUp = 1u << 30, kRsDown = 1u << 31,
 };
 
 #ifdef LPN_HAVE_SDL2
@@ -183,6 +186,15 @@ PadState padState() {
         const uint64_t now = flipCount();
         for (const auto& p : gScript)
             if (now >= p.frame && now < p.frame + kPressFrames) s.buttons |= p.button;
+        if (s.buttons & kLsLeft) s.lx = 0x00;
+        if (s.buttons & kLsRight) s.lx = 0xFF;
+        if (s.buttons & kLsUp) s.ly = 0x00;
+        if (s.buttons & kLsDown) s.ly = 0xFF;
+        if (s.buttons & kRsLeft) s.rx = 0x00;
+        if (s.buttons & kRsRight) s.rx = 0xFF;
+        if (s.buttons & kRsUp) s.ry = 0x00;
+        if (s.buttons & kRsDown) s.ry = 0xFF;
+        s.buttons &= 0xFFFFFF;
     }
     return s;
 }
@@ -193,7 +205,9 @@ bool addScriptedPresses(const char* spec) {
         uint32_t bit;
     } names[] = {{"cross", kCross},   {"circle", kCircle}, {"square", kSquare}, {"triangle", kTriangle},
                  {"options", kOptions}, {"up", kUp},       {"down", kDown},     {"left", kLeft},
-                 {"right", kRight},   {"l1", kL1},         {"r1", kR1},         {"touchpad", kTouchPad}};
+                 {"right", kRight},   {"l1", kL1},         {"r1", kR1},         {"touchpad", kTouchPad},
+                 {"lsleft", kLsLeft}, {"lsright", kLsRight}, {"lsup", kLsUp},     {"lsdown", kLsDown},
+                 {"rsleft", kRsLeft}, {"rsright", kRsRight}, {"rsup", kRsUp},     {"rsdown", kRsDown}};
     std::string all(spec);
     size_t pos = 0;
     while (pos <= all.size()) {

@@ -25,7 +25,8 @@ struct PadState {
 PadState padState();
 
 // Scripted presses for headless runs: "cross@1800,options@2400" holds each button for 10
-// displayed frames starting at that frame. Returns false on a bad spec.
+// displayed frames starting at that frame; lsleft/lsright/lsup/lsdown and rsleft/... push a
+// stick fully instead. Returns false on a bad spec.
 bool addScriptedPresses(const char* spec);
 
 } // namespace host

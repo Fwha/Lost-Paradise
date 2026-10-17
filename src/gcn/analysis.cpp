@@ -24,6 +24,21 @@ struct Work {
     State st;
 };
 
+// Work items in order. A deque allocates per item here (they are large), and a replay runs for
+// every draw: a vector with a read position allocates once.
+class WorkQueue {
+public:
+    WorkQueue(std::initializer_list<Work> init) : items_(init) { items_.reserve(16); }
+    bool empty() const { return head_ == items_.size(); }
+    Work& front() { return items_[head_]; }
+    void pop_front() { ++head_; }
+    void push_back(Work w) { items_.push_back(std::move(w)); }
+
+private:
+    std::vector<Work> items_;
+    size_t head_ = 0;
+};
+
 class Analyzer {
 public:
     Analyzer(const LaunchState& l, const ReadMemory& code, const ReadMemory& data, const Program* prior = nullptr)
@@ -33,7 +48,7 @@ public:
 
     Program run() {
         p_.data.assign(data::kSmrd, 0);
-        std::deque<Work> work{{p_.launch.entry, start()}};
+        WorkQueue work{{p_.launch.entry, start()}};
         p_.labels.insert(p_.launch.entry);
         unsigned steps = 0;
         while (!work.empty() && steps < 100000) {
@@ -78,7 +93,7 @@ public:
         p_.images = prior.images;
         seenBuffers_.assign(p_.buffers.size(), false);
         seenImages_.assign(p_.images.size(), false);
-        std::deque<Work> work{{p_.launch.entry, start()}};
+        WorkQueue work{{p_.launch.entry, start()}};
         State st;
         for (const Program::TraceStep& t : prior.trace) {
             if (t.start) {
@@ -160,7 +175,7 @@ private:
         for (unsigned i = 0; i < n; ++i) set(st, d + i, 0, false);
     }
 
-    void branchTo(uint64_t target, const State& st, std::deque<Work>& work) {
+    void branchTo(uint64_t target, const State& st, WorkQueue& work) {
         label(target);
         p_.controlFlow = true;
         work.push_back({target, st});
@@ -182,7 +197,7 @@ private:
     }
 
     // Returns false when this path ends.
-    bool step(const Instruction& in, uint64_t pc, State& st, uint64_t next, std::deque<Work>& work) {
+    bool step(const Instruction& in, uint64_t pc, State& st, uint64_t next, WorkQueue& work) {
         const uint32_t w = in.words[0];
         switch (in.format) {
         case Format::SOPP: {
@@ -287,7 +302,7 @@ private:
         }
     }
 
-    bool sop1(const Instruction& in, uint64_t pc, State& st, uint64_t next, std::deque<Work>& work) {
+    bool sop1(const Instruction& in, uint64_t pc, State& st, uint64_t next, WorkQueue& work) {
         const uint32_t w = in.words[0];
         const uint32_t d = (w >> 16) & 0x7F, s0 = w & 0xFF;
         uint32_t a;
