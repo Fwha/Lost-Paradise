@@ -155,7 +155,8 @@ void showFrame(Shown& s) {
         std::fprintf(stderr, "[capture] flip %" PRIu64 " -> %s (tracing the next frame)\n", n, dir.c_str());
         render::captureNextFrame(dir);
     }
-    if (frame.pixels && gScreenshotEvery && n % gScreenshotEvery == 0)
+    static const uint64_t shotsFrom = getenv("LPN_SCREENSHOTS_FROM") ? std::strtoull(getenv("LPN_SCREENSHOTS_FROM"), nullptr, 0) : 0;
+    if (frame.pixels && gScreenshotEvery && n % gScreenshotEvery == 0 && n >= shotsFrom)
         writeScreenshot(frame, "screenshot-" + std::to_string(n) + ".ppm");
     presentFrame(frame);
 }

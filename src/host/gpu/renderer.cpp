@@ -116,7 +116,7 @@ uint64_t memoryHash(uint64_t addr, size_t size) {
 }
 
 uint64_t sampleHash(uint64_t addr, size_t size) {
-    constexpr size_t kSample = 64, kMax = 64;
+    constexpr size_t kSample = 64, kMax = 32;
     const size_t stride = std::max<size_t>(kSample, (size / kMax + kSample - 1) & ~(kSample - 1));
     thread_local std::vector<iovec> remote;
     thread_local std::vector<uint8_t> buf(kSample * kMax);
@@ -346,6 +346,7 @@ struct GuestTexture {
     uint64_t checkedFrame = ~0ull;
     uint64_t changedFrame = 0; // the contents were last (re)uploaded in this frame
     uint64_t sample = 0;       // sampleHash at the last full check
+    uint32_t uses = 0;         // frames it was used in while unchanged
 };
 
 struct Import {
@@ -396,7 +397,7 @@ constexpr const char* kProfNames[kProfCount] = {"renderer", "analyze", "shader-l
 struct Profiler {
     bool on = false;
     uint64_t ns[kProfCount] = {};
-    uint64_t calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0;
+    uint64_t calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -535,6 +536,7 @@ public:
         if (raceCheck_) noteWrite(dst, bytes);
         codePages_.invalidate(dst, bytes);
         ++submit_; // and re-verify shader code before reuse
+        ++prof_.dmas, prof_.dmaBytes += bytes;
         const uint64_t id = ++overlayIds_;
         codePages_.overlay(dst, std::move(data), id);
         pendingDone_.push_back([this, id] { codePages_.dropOverlay(id); });
@@ -613,7 +615,8 @@ public:
         std::fprintf(stderr, "[prof] frames %" PRIu64 "-%" PRIu64 ": %.1f fps, %.1f ms/frame;", frame_ - 300, frame_,
                      300 / wall, wall * 1000 / 300);
         for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.2f", kProfNames[i], prof_.ns[i] / 1e6 / 300);
-        std::fprintf(stderr, " gpu-busy %.2f", gpuBusyNs_.exchange(0) / 1e6 / 300);
+        std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / 300, prof_.dmas / 300.0,
+                     prof_.dmaBytes / 300.0 / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
         std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes per frame\n",
                      prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.analyses / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0, prof_.passes / 300.0);
@@ -1761,14 +1764,14 @@ private:
         GuestTexture& tex = textures_[k];
         if (tex.img.image && tex.checkedFrame == frame_) return &tex;
         // Re-reading every sampled texture each frame cost ~8 ms in fights and ~15 ms in crowded
-        // areas, though most never change. One unchanged for 60 frames is fully hashed every 8th
-        // frame (staggered by address) and fingerprinted every other frame in between, which
-        // catches whole rewrites a frame late at most (the title video flickered with no check);
-        // a small partial rewrite is seen up to 8 frames late. Another T# at the same address is another entry.
+        // areas, though most never change. One unchanged for 60 frames is fully hashed on every
+        // 8th frame it is used and fingerprinted on the others, which catches whole rewrites at
+        // once; a small partial rewrite is seen up to 8 uses late. Counting uses rather than
+        // frames matters: the title video alternates two textures frame by frame, and a schedule
+        // by frame number never checked one of them. Another T# at the same address is another entry.
         const size_t span = size_t(ew) * eh * bpe * slices;
-        if (tex.img.image && frame_ - tex.changedFrame >= 60 && (frame_ + (t.base() >> 8)) % 8 != 0) {
+        if (tex.img.image && frame_ - tex.changedFrame >= 60 && ++tex.uses % 8 != 0) {
             tex.checkedFrame = frame_;
-            if ((frame_ + (t.base() >> 8)) % 2 != 0) return &tex; // fingerprinted every other frame
             if (sampleHash(t.base(), span) == tex.sample) return &tex;
         }
         uint32_t mode = t.tileMode();
