@@ -39,7 +39,7 @@ int usage() {
                  "  --no-gpu       do not render (no Vulkan)\n"
                  "  --compute-only run GPU compute work but skip draws (fast; the game still progresses)\n"
                  "  --vblank HZ    display refresh rate (default 59.94)\n"
-                 "  --fps-cap N    show at most N frames a second, at even intervals (e.g. 30)\n"
+                 "  --fps-cap N    show at most N frames a second, at even intervals (default 30; 0: uncapped)\n"
                  "  --data DIR     host folder for saves and downloads (default ./lpn-data)\n"
                  "  --trace-hle N  log each system call's first use, and its first use after frame N\n"
                  "  --strict       stop at the first call to an unimplemented import\n"

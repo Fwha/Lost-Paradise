@@ -79,8 +79,8 @@ struct Display {
 } gDisplay;
 
 double gVblankHz = 59.94;
-double gFpsCap = 0;
-int32_t gMinFlipRate = 0; // from the cap
+double gFpsCap = 30;   // even 30 fps; uncapped, crowded areas swing between 20 and 30
+int32_t gMinFlipRate = 1; // from the cap
 uint64_t gScreenshotFlip = 0;
 uint64_t gScreenshotEvery = 0;
 std::string gScreenshotPath;
