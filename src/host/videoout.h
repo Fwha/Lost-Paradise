@@ -10,6 +10,9 @@ int32_t videoOutSubmitFlip(int32_t handle, int32_t bufferIndex, int32_t flipMode
 
 // Display refresh rate the vblank clock runs at (59.94 by default).
 void setVblankRate(double hz);
+// Caps the frame rate at the refresh rate divided by a whole number (60 or 30 at 59.94 Hz):
+// steadier motion than an uneven rate between them on a fixed-refresh screen.
+void setFpsCap(double fps);
 
 // Write flip number `flip` (counting from 1) to `path` as a PPM image.
 void setScreenshot(uint64_t flip, const char* path);

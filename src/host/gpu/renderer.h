@@ -14,9 +14,24 @@ namespace host::render {
 // much faster on a software Vulkan driver, for runs that only need the game to progress.
 bool startRenderer(bool computeOnly = false);
 
-// Copies the image the GPU rendered at a display buffer's address, in the buffer's memory
-// layout as linear rows of `width` 32-bit pixels. False when nothing was rendered there.
-bool readDisplayBuffer(uint64_t address, uint32_t width, uint32_t height, std::vector<uint32_t>& pixels);
+// Reading back what the GPU rendered at a display buffer's address takes two steps, so the
+// vblank clock never waits for the GPU: queueDisplayCopy records the copy into one of
+// kDisplaySlots readback slots (c.slot, chosen by the caller and not in use) and returns false
+// when nothing was rendered there; fetchDisplayCopy waits for it and returns the pixels in the
+// buffer's memory layout, as linear rows of `width` 32-bit pixels.
+constexpr int kDisplaySlots = 3;
+struct DisplayCopy {
+    int slot = 0;
+    uint64_t seq = 0; // the batch holding the copy
+    uint32_t w = 0, h = 0;
+};
+bool queueDisplayCopy(uint64_t address, uint32_t width, uint32_t height, DisplayCopy& c);
+void fetchDisplayCopy(const DisplayCopy& c, uint32_t width, uint32_t height, std::vector<uint32_t>& pixels);
+
+// A mark for all GPU work recorded so far, and whether the GPU has finished it: a flip shows
+// its buffer only once the frame's rendering is done, as on the console.
+uint64_t gpuMark();
+bool gpuDone(uint64_t mark);
 
 // Traces the next frame (as LPN_GPU_TRACE does) into `dir`: trace.txt and every render target.
 void captureNextFrame(const std::string& dir);
