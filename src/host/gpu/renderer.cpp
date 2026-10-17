@@ -226,9 +226,11 @@ private:
 };
 
 // Identifies a shader launch: the launch state analysis or translation reads, except user data
-// (an analysis is re-targeted to other user data by gcn::refresh).
-std::string launchKey(const gcn::LaunchState& l, uint32_t bindingBase) {
-    std::string k;
+// (an analysis is re-targeted to other user data by gcn::refresh). Built in a reused buffer: it
+// runs for every launch.
+const std::string& launchKey(const gcn::LaunchState& l, uint32_t bindingBase) {
+    thread_local std::string k;
+    k.clear();
     auto put = [&](const void* p, size_t n) { k.append(static_cast<const char*>(p), n); };
     put(&bindingBase, 4);
     put(&l.stage, 1);
@@ -279,6 +281,7 @@ struct GuestTexture {
     Image img;
     uint64_t hash = 0;
     uint64_t checkedFrame = ~0ull;
+    uint64_t changedFrame = 0; // the contents were last (re)uploaded in this frame
 };
 
 struct Import {
@@ -323,8 +326,8 @@ struct ProgramVariants {
 constexpr size_t kMaxWalks = 8, kMaxShapes = 32;
 
 // LPN_PROFILE=1: where the renderer's time goes, printed every 300 frames.
-enum ProfSlot { kProfRenderer, kProfAnalyze, kProfShaderLookup, kProfTexRead, kProfTexUpload, kProfPipeline, kProfGpuWait, kProfCount };
-constexpr const char* kProfNames[kProfCount] = {"renderer", "analyze", "shader-lookup", "tex-read", "tex-upload", "pipeline", "gpu-wait"};
+enum ProfSlot { kProfRenderer, kProfAnalyze, kProfShaderLookup, kProfTexRead, kProfTexUpload, kProfPipeline, kProfGpuWait, kProfBind, kProfLaunch, kProfCount };
+constexpr const char* kProfNames[kProfCount] = {"renderer", "analyze", "shader-lookup", "tex-read", "tex-upload", "pipeline", "gpu-wait", "bind", "launch"};
 
 struct Profiler {
     bool on = false;
@@ -848,12 +851,24 @@ private:
     bool guestBuffer(uint64_t addr, uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) {
         if (!addr || addr >= (1ull << 40) || !size) return false;
         const uint64_t end = addr + size;
-        for (const auto& [start, im] : imports_)
-            if (start <= addr && im.end >= end) {
+        // The import starting closest below `addr` usually covers it (imports are aligned granules);
+        // a scan of all of them is the fallback.
+        if (auto it = imports_.upper_bound(addr); it != imports_.begin()) {
+            --it;
+            if (it->second.end >= end) {
+                buffer = it->second.buffer;
+                offset = addr - it->first;
+                return true;
+            }
+        }
+        for (const auto& [start, im] : imports_) {
+            if (start > addr) break;
+            if (im.end >= end) {
                 buffer = im.buffer;
                 offset = addr - start;
                 return true;
             }
+        }
         const uint64_t align = std::max<uint64_t>(vk_.hostPointerAlignment, 4096);
         Import im;
         const uint64_t gs = addr & ~(kImportGranule - 1), ge = (end + kImportGranule - 1) & ~(kImportGranule - 1);
@@ -1592,6 +1607,11 @@ private:
         const std::string k = bytesKey(key, sizeof(key));
         GuestTexture& tex = textures_[k];
         if (tex.img.image && tex.checkedFrame == frame_) return &tex;
+        // Re-reading every sampled texture each frame cost ~8 ms in fights and ~15 ms in crowded
+        // areas, though most never change. One unchanged for 60 frames is checked every 8th frame
+        // (staggered by address); one rewritten in place is then seen up to 8 frames late. A new
+        // texture at the same address with another T# is another entry and is uploaded at once.
+        if (tex.img.image && frame_ - tex.changedFrame >= 60 && (frame_ + (t.base() >> 8)) % 8 != 0) return &tex;
         uint32_t mode = t.tileMode();
         size_t slice = tiledSliceSize(mode, ep, eh, bpe);
         if (!slice) {
@@ -1613,6 +1633,7 @@ private:
             }
         }
         tex.checkedFrame = frame_;
+        if (!tex.img.image || tex.hash != h64) tex.changedFrame = frame_;
         if (tex.img.image && tex.hash == h64) return &tex;
         ProfScope pu(prof_, kProfTexUpload);
         scratch_.resize(tiled);
@@ -1708,6 +1729,7 @@ private:
     // Binds a stage's resources: draw data, buffers and images.
     void bindResources(gcn::Program& p, uint32_t base, VkShaderStageFlags, std::vector<VkWriteDescriptorSet>& writes,
                        std::vector<VkDescriptorBufferInfo>& bufInfos, std::vector<VkDescriptorImageInfo>& imgInfos) {
+        ProfScope pb(prof_, kProfBind);
         uint32_t n = base + 1;
         for (auto& b : p.buffers) {
             uint64_t size = b.stride() ? uint64_t(b.stride()) * b.numRecords() : b.numRecords();
@@ -1776,6 +1798,7 @@ private:
     // ---- draws ---------------------------------------------------------------------------------
 
     gcn::LaunchState launch(const GpuRegs& r, gcn::Stage stage) {
+        ProfScope pl(prof_, kProfLaunch);
         gcn::LaunchState l;
         l.stage = stage;
         switch (stage) {

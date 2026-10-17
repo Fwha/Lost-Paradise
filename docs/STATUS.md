@@ -68,16 +68,19 @@ Last updated 2026-10-16.
 
 ## Next steps
 
-1. Keep booting with the full data folder (the container only has the files staged so far;
-   the next one the game asks for is `data/chara/ps4/face/c_cm_f_zco_a/tex00.par`).
-2. Rendering: 2D-tiled texture detiling (tile mode 14), indirect draws, a real swapchain
-   instead of reading frames back. `docs/gpu.md` lists what is known to be missing. Gameplay
-   runs with no untranslated-instruction warnings.
-3. Performance in fights (~28 fps with ~2,800 draws): per frame ~10 ms analysis replays, ~9 ms
-   texture checks (every sampled texture is re-read each frame; soft-dirty page tracking does
-   not work on pages pinned by the Vulkan host-memory import), ~10 ms recording draws.
-   Reported by the owner: wall flames turn green or vanish (not reproduced yet).
-4. Audio through SDL, C++ exceptions (`sceKernelGetModuleInfoForUnwind`) if the game uses them.
+1. Performance in crowded areas (Eden plaza: ~3,600 draws, 12.5 fps before the 2026-10-17 work).
+   In the first fight (2,800 draws) the frame is now ~25 ms: ~8 ms shader-analysis replays,
+   ~8 ms waiting for the GPU (~900 render passes, a full barrier before each), ~3 ms binding.
+   Static textures are re-checked every 8th frame; recently changed ones every frame.
+2. Slow loading after Continue (~45-75 s): the loading screen is 20 fps by the game's choice, file
+   reads come in fast bursts and the CPU idles in between; not a sleep, lock or disk wait. Use
+   `LPN_IOSTATS=1`, `LPN_WAITLOG=30`, `--trace-files`.
+3. Fight glitches: a one-frame black wedge over the HP bar (gone with `LPN_GPU_SYNC=1`, so likely
+   a race between the game rewriting HUD data and our asynchronous GPU); the kick trail and torch
+   flames sometimes draw green (particle colour tables; parked, see the 2026-10-17 session notes).
+4. Rendering: 2D-tiled texture detiling (tile mode 14), indirect draws, a real swapchain.
+   `docs/gpu.md` lists what is known to be missing.
+5. Audio through SDL.
 
 ## Working setup
 
