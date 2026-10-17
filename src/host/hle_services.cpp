@@ -225,6 +225,57 @@ int32_t sceSaveDataDirNameSearch(const void*, DirNameSearchResult* r) {
 
 // --- Common dialogs: no UI, each finishes immediately with "OK" -------------------------
 
+// There is no dialog UI: what the game would show goes to the terminal instead, so a message like
+// "no saved data" is not silently swallowed.
+const char* saveDataSystemMessage(int32_t type) {
+    switch (type) {
+    case 1: return "There is no saved data.";
+    case 2: return "Confirm the operation.";
+    case 3: return "Overwrite the saved data?";
+    case 4: return "Not enough free space.";
+    case 5: return "Processing...";
+    case 6: return "The saved data is corrupted.";
+    case 7: return "Done.";
+    default: return nullptr;
+    }
+}
+
+// SceSaveDataDialogParam after the 48-byte common base: size, mode, dispType, then pointers
+// (animation, items, user message, system message, ...).
+int32_t sceSaveDataDialogOpen(const uint8_t* p) {
+    int32_t mode, disp;
+    std::memcpy(&mode, p + 52, 4);
+    std::memcpy(&disp, p + 56, 4);
+    const uint8_t* ptrs[6];
+    std::memcpy(ptrs, p + 64, sizeof ptrs);
+    const char* what = disp == 1 ? "save" : disp == 2 ? "load" : disp == 3 ? "delete" : "save data";
+    if (mode == 2 && ptrs[2]) { // user message: buttonType, msgType, msg
+        const char* msg = nullptr;
+        std::memcpy(&msg, ptrs[2] + 8, 8);
+        if (msg) std::fprintf(stderr, "[dialog] %s: %s\n", what, msg);
+    } else if (mode == 3 && ptrs[3]) { // system message: sysMsgType
+        int32_t type;
+        std::memcpy(&type, ptrs[3], 4);
+        const char* msg = saveDataSystemMessage(type);
+        if (msg) std::fprintf(stderr, "[dialog] %s: %s\n", what, msg);
+        else std::fprintf(stderr, "[dialog] %s: system message %d\n", what, type);
+    }
+    return 0;
+}
+
+// SceMsgDialogParam: base (48 bytes), size, mode, then user message, progress bar and system
+// message pointers. A user message holds buttonType and the text.
+int32_t sceMsgDialogOpen(const uint8_t* p) {
+    int32_t mode;
+    std::memcpy(&mode, p + 56, 4);
+    const uint8_t* user = nullptr;
+    std::memcpy(&user, p + 64, 8);
+    const char* msg = nullptr;
+    if (mode == 1 && user) std::memcpy(&msg, user + 8, 8);
+    if (msg) std::fprintf(stderr, "[dialog] %s\n", msg);
+    return 0;
+}
+
 constexpr int32_t kDialogFinished = 3;
 int32_t dialogFinished() { return kDialogFinished; }
 int32_t dialogResultOk(int32_t* r) {
@@ -463,7 +514,8 @@ void registerServicesHle() {
     void* resultOk = reinterpret_cast<void*>(&dialogResultOk);
     regs("libSceCommonDialog", {"sceCommonDialogInitialize"}, zero);
     const char* md = "libSceMsgDialog";
-    regs(md, {"sceMsgDialogInitialize", "sceMsgDialogOpen", "sceMsgDialogTerminate"}, zero);
+    regs(md, {"sceMsgDialogInitialize", "sceMsgDialogTerminate"}, zero);
+    HLE(md, sceMsgDialogOpen);
     regs(md, {"sceMsgDialogUpdateStatus"}, finished);
     regs(md, {"sceMsgDialogGetResult"}, resultOk);
     const char* ed = "libSceErrorDialog";
@@ -471,9 +523,10 @@ void registerServicesHle() {
     regs(ed, {"sceErrorDialogUpdateStatus"}, finished);
     const char* sdd = "libSceSaveDataDialog";
     regs(sdd,
-         {"sceSaveDataDialogInitialize", "sceSaveDataDialogOpen", "sceSaveDataDialogClose",
+         {"sceSaveDataDialogInitialize", "sceSaveDataDialogClose",
           "sceSaveDataDialogTerminate", "sceSaveDataDialogProgressBarSetValue"},
          zero);
+    HLE(sdd, sceSaveDataDialogOpen);
     regs(sdd, {"sceSaveDataDialogUpdateStatus"}, finished);
     regs(sdd, {"sceSaveDataDialogIsReadyToDisplay"}, positive);
     regs(sdd, {"sceSaveDataDialogGetResult"}, resultOk);
