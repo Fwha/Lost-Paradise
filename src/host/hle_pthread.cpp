@@ -264,8 +264,12 @@ int32_t scePthreadCondDestroy(Cond** slot) {
     }
     return 0;
 }
-int32_t scePthreadCondWait(Cond** c, Mutex** m) { return ret(pthread_cond_wait(&getCond(c)->c, &getMutex(m)->m)); }
+int32_t scePthreadCondWait(Cond** c, Mutex** m) {
+    WaitLog w{"cond wait", -1};
+    return ret(pthread_cond_wait(&getCond(c)->c, &getMutex(m)->m));
+}
 int32_t scePthreadCondTimedwait(Cond** c, Mutex** m, uint32_t usec) {
+    WaitLog w{"cond timedwait", usec};
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     ts.tv_sec += usec / 1000000;
@@ -354,6 +358,7 @@ int32_t sceKernelDeleteSema(Sema* s) {
 }
 int32_t sceKernelWaitSema(Sema* s, int32_t need, uint32_t* timeoutUs) {
     if (!s || need <= 0 || need > s->max) return sceError(ps4errno::kEINVAL);
+    WaitLog w{"sema wait", timeoutUs ? int64_t(*timeoutUs) : -1};
     std::unique_lock lock(s->m);
     auto ready = [&] { return s->count >= need; };
     if (timeoutUs) {

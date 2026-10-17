@@ -150,10 +150,12 @@ uint64_t sceKernelGetProcessTimeCounter() {
 uint64_t sceKernelGetProcessTimeCounterFrequency() { return 1000000000ull; }
 
 int32_t sceKernelUsleep(uint32_t us) {
+    WaitLog w{"usleep", us};
     usleep(us);
     return 0;
 }
 int32_t nanosleep_(const Timespec* req, Timespec* rem) {
+    WaitLog w{"nanosleep", int64_t(req->sec) * 1000000 + req->nsec / 1000};
     timespec r{req->sec, req->nsec}, left{};
     const int ret = ::nanosleep(&r, &left);
     if (rem) *rem = {left.tv_sec, left.tv_nsec};

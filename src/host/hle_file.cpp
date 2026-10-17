@@ -10,6 +10,8 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <chrono>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -93,12 +95,34 @@ int32_t sceKernelOpen(const char* path, int32_t flags, uint16_t mode) {
     return check(fd);
 }
 int32_t sceKernelClose(int32_t fd) { return check(::close(fd)); }
-int64_t sceKernelRead(int32_t fd, void* buf, uint64_t n) { return check64(::read(fd, buf, n)); }
+// LPN_IOSTATS=1 (debugging): file reads per 2 seconds.
+void ioStat(int64_t got) {
+    static const bool on = getenv("LPN_IOSTATS") != nullptr;
+    if (!on || got < 0) return;
+    static std::atomic<uint64_t> bytes{0}, calls{0};
+    static std::atomic<int64_t> last{0};
+    bytes += uint64_t(got);
+    ++calls;
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t prev = last.load();
+    if (now - prev >= 2000 && last.compare_exchange_strong(prev, now))
+        std::fprintf(stderr, "[io] %.1f MB in %llu reads (flip %llu)\n", bytes.exchange(0) / 1e6, (unsigned long long)calls.exchange(0),
+                     (unsigned long long)flipCount());
+}
+int64_t sceKernelRead(int32_t fd, void* buf, uint64_t n) {
+    const int64_t r = check64(::read(fd, buf, n));
+    ioStat(r);
+    return r;
+}
 int64_t sceKernelWrite(int32_t fd, const void* buf, uint64_t n) {
     if (fd == 1 || fd == 2) return ::write(fd, buf, n);
     return check64(::write(fd, buf, n));
 }
-int64_t sceKernelPread(int32_t fd, void* buf, uint64_t n, int64_t off) { return check64(::pread(fd, buf, n, off)); }
+int64_t sceKernelPread(int32_t fd, void* buf, uint64_t n, int64_t off) {
+    const int64_t r = check64(::pread(fd, buf, n, off));
+    ioStat(r);
+    return r;
+}
 int64_t sceKernelPwrite(int32_t fd, const void* buf, uint64_t n, int64_t off) {
     return check64(::pwrite(fd, buf, n, off));
 }

@@ -218,6 +218,9 @@ int32_t sceVideoOutUnregisterBuffers(int32_t, int32_t) { return 0; }
 int32_t sceVideoOutSetFlipRate(int32_t handle, int32_t rate) {
     if (handle != kHandle) return kErrInvalidHandle;
     std::lock_guard lock(gDisplay.m);
+    if (rate != gDisplay.flipRate)
+        std::fprintf(stderr, "[videoout] flip rate %d (every %d vblanks) at flip %llu\n", rate, rate + 1,
+                     (unsigned long long)gDisplay.status.count);
     gDisplay.flipRate = rate;
     return 0;
 }
