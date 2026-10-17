@@ -282,6 +282,7 @@ struct GuestTexture {
     uint64_t hash = 0;
     uint64_t checkedFrame = ~0ull;
     uint64_t changedFrame = 0; // the contents were last (re)uploaded in this frame
+    bool rewritten = false;    // the game has changed it in place since its first upload
 };
 
 struct Import {
@@ -1611,7 +1612,10 @@ private:
         // areas, though most never change. One unchanged for 60 frames is checked every 8th frame
         // (staggered by address); one rewritten in place is then seen up to 8 frames late. A new
         // texture at the same address with another T# is another entry and is uploaded at once.
-        if (tex.img.image && frame_ - tex.changedFrame >= 60 && (frame_ + (t.base() >> 8)) % 8 != 0) return &tex;
+        // One the game has ever rewritten (a movie frame, a pool of streamed images) is checked
+        // every frame: the title movie pauses longer than that and showed stale frames.
+        if (tex.img.image && !tex.rewritten && frame_ - tex.changedFrame >= 60 && (frame_ + (t.base() >> 8)) % 8 != 0)
+            return &tex;
         uint32_t mode = t.tileMode();
         size_t slice = tiledSliceSize(mode, ep, eh, bpe);
         if (!slice) {
@@ -1634,6 +1638,7 @@ private:
         }
         tex.checkedFrame = frame_;
         if (!tex.img.image || tex.hash != h64) tex.changedFrame = frame_;
+        if (tex.img.image && tex.hash != h64) tex.rewritten = true;
         if (tex.img.image && tex.hash == h64) return &tex;
         ProfScope pu(prof_, kProfTexUpload);
         scratch_.resize(tiled);
