@@ -41,7 +41,13 @@ screen loop). Addresses are guest addresses and change between runs.
   its walk (work items and the instructions that touch scalar state); a later launch of the same
   code replays that walk with its own user data and memory (`gcn::refresh`, ~1.5 us) and keeps
   the analysis if every branch goes the same way and every resource keeps its format, else it is
-  analysed again (up to 8 variants per shader).
+  analysed again. Variants are grouped by walk (up to 8 branch patterns per shader), each with
+  up to 32 resource-format shapes (one material shader with BC1 or BC3 textures), so a launch
+  replays one trace and then only compares formats. Reuse is checked against the hash of the
+  exact code bytes, not whole pages: a shader's last page often holds data that changes.
+- **SPIR-V cache.** Compiling a shader's GLSL takes ~10 ms and a new attack effect brings dozens,
+  so SPIR-V is kept in `~/.cache/lpn-host/spirv` (`LPN_SHADER_CACHE=<dir>`, or `off`), named by
+  a hash of the GLSL. Only the first time an effect is seen anywhere hitches.
 - **Memory.** Guest memory is imported into Vulkan (VK_EXT_external_memory_host), so shader
   buffer reads and writes hit the game's memory directly.
 - **Surfaces.** Render targets and depth buffers are Vulkan images keyed by guest address; a
@@ -51,8 +57,11 @@ screen loop). Addresses are guest addresses and change between runs.
   once per frame, in 128 KiB chunks on worker threads (~90 MB per gameplay frame).
 - **Draws.** RECTLIST and QUADLIST go through a generated geometry shader; GNM's
   decompress/eliminate passes are skipped; screen-space draws (viewport transform off) are
-  mapped by the vertex shader. Each draw is its own render pass with a full barrier, and the
-  queue is drained at the end of each submission (correct first, fast later).
+  mapped by the vertex shader. Consecutive draws into the same targets share a render pass; a
+  new pass (behind a full barrier) starts when the targets change, a draw samples one of the
+  open pass's attachments, after a draw that stores to memory, or when anything else (a copy,
+  clear, dispatch) is recorded. The command processor's DMA_DATA/WRITE_DATA copies between draws
+  invalidate the renderer's cached guest pages.
 - **Display.** At flip the display buffer's image is read back and shown by the existing SDL
   window.
 
@@ -69,6 +78,10 @@ screen loop). Addresses are guest addresses and change between runs.
   (GCN and Vulkan order a quad's pixels alike); the shadow-map pixel shader uses it for its
   slope-scaled depth bias. `v_mad_u64_u32` (integer division sequences in cutscene vertex
   shaders) and `v_cvt_off_f32_i4` are translated too.
+- **Image stores apply DST_SEL.** A T#'s DST_SEL swizzles stores inversely, as it does loads;
+  storage image views cannot swizzle, so the translator applies it. The game copies the scene
+  colour with a compute shader through BGRA-swizzled T#s; without this the copy swapped red and
+  blue, and the anti-aliasing pass that reads it turned every edge (outlines, ink lines) blue.
 - **Constants inside shader code.** Some shaders build a V# from `s_getpc_b64` plus an offset to
   read a table stored after their code (the AO upsample's bilateral weights). The analysis
   tracks `s_add_u32`/`s_addc_u32` so that address stays known; when it was lost, the AO term read

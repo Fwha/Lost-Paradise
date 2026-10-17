@@ -34,7 +34,10 @@ void dmaData(const uint32_t* b) {
     else if (srcSel == 2) { // fill with the immediate in src_lo
         auto* d = reinterpret_cast<uint32_t*>(dst);
         for (uint32_t i = 0; i < bytes / 4; ++i) d[i] = b[1];
+    } else {
+        return;
     }
+    for (DrawListener* l : gListeners) l->onMemoryWrite(dst, bytes);
 }
 
 uint64_t gpuClock() {
@@ -169,6 +172,7 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
                 if (dstSel == 2 || dstSel == 5) {
                     auto* dst = reinterpret_cast<volatile uint32_t*>(address(b[1], b[2]));
                     for (uint32_t i = 3; i < count + 1; ++i) dst[i - 3] = b[i];
+                    for (DrawListener* l : gListeners) l->onMemoryWrite(address(b[1], b[2]), uint64_t(count - 2) * 4);
                     ++st->fences;
                 }
                 break;

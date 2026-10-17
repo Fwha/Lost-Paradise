@@ -42,13 +42,18 @@ public:
             p_.trace.push_back({w.pc, {}, true, false});
             while (++steps < 100000) {
                 if (p_.code.count(w.pc)) break; // already walked from here
+                // Read only the instruction's own bytes: the page after a shader's last
+                // instruction may hold data that changes, and the analysis depends on what it reads.
                 uint32_t words[3] = {};
-                if (!readCode_(w.pc, words, 8) && !readCode_(w.pc, words, 4)) {
+                if (!readCode_(w.pc, words, 4)) {
                     warn("unreadable code at 0x%llx", (unsigned long long)w.pc);
                     break;
                 }
-                Instruction in = decode(words, 2);
-                if (in.size > 8 && !readCode_(w.pc, words, in.size)) break;
+                Instruction in = decode(words, 1);
+                if (in.size > 4 && !readCode_(w.pc, words, in.size)) {
+                    warn("unreadable code at 0x%llx", (unsigned long long)w.pc);
+                    break;
+                }
                 in = decode(words, in.size / 4);
                 p_.code[w.pc] = in;
                 const uint64_t next = w.pc + in.size;
@@ -562,11 +567,17 @@ Program analyze(const LaunchState& launch, const ReadMemory& readCode, const Rea
     return Analyzer(launch, readCode, readData).run();
 }
 
-bool refresh(Program& p, const LaunchState& launch, const ReadMemory& readData) {
+bool replay(const Program& p, const LaunchState& launch, const ReadMemory& readData, Program& out) {
     if (p.trace.empty()) return false;
     Analyzer a(launch, readData, readData, &p);
     if (!a.replay()) return false;
-    Program& r = a.program();
+    out = std::move(a.program());
+    return true;
+}
+
+bool adopt(Program& p, Program& r) {
+    if (p.buffers.size() != r.buffers.size() || p.images.size() != r.images.size() || p.data.size() != r.data.size())
+        return false;
     // The translation depends on these (see Program::key).
     for (size_t i = 0; i < p.buffers.size(); ++i) {
         const BufferResource &x = p.buffers[i], &y = r.buffers[i];
@@ -579,11 +590,16 @@ bool refresh(Program& p, const LaunchState& launch, const ReadMemory& readData) 
             x.dstSel() != y.dstSel())
             return false;
     }
-    p.launch = launch;
+    p.launch = r.launch;
     p.data = std::move(r.data);
     p.buffers = std::move(r.buffers);
     p.images = std::move(r.images);
     return true;
+}
+
+bool refresh(Program& p, const LaunchState& launch, const ReadMemory& readData) {
+    Program r;
+    return replay(p, launch, readData, r) && adopt(p, r);
 }
 
 std::string Program::key() const {

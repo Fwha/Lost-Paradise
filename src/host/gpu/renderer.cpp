@@ -26,6 +26,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <thread>
 #include <cinttypes>
@@ -176,17 +177,17 @@ private:
 
 // Guest reads for shader analysis, a page at a time. Analysis reads instruction by
 // instruction, and a syscall each made it the renderer's main cost. Memory a submission
-// references cannot change until the GPU is done with it, so pages stay valid until the
+// references cannot change until the GPU is done with it, except where the command processor
+// writes it between draws (onMemoryWrite drops those pages), so pages stay valid until the
 // submission ends.
 class PageCache {
 public:
-    // `record`: count the page as one the result depends on (see startRecording).
-    bool read(uint64_t addr, void* dst, size_t size, bool record = true) {
+    bool read(uint64_t addr, void* dst, size_t size) {
         auto* out = static_cast<uint8_t*>(dst);
         while (size) {
             const uint64_t page = addr & ~uint64_t(kPage - 1);
             const size_t off = size_t(addr - page), n = std::min(size, kPage - off);
-            const uint8_t* src = lookup(page, record);
+            const uint8_t* src = lookup(page);
             if (!src) return readGuest(addr, out, size); // unmapped page or mapping edge: exact read
             std::memcpy(out, src + off, n);
             out += n;
@@ -199,62 +200,26 @@ public:
         pages_.clear();
         lastPage_ = ~0ull;
     }
-
-    // Records the pages read until stopRecording; false if a read missed the cache.
-    void startRecording() {
-        recording_ = true;
-        recordOk_ = true;
-        recorded_.clear();
-        lastRecorded_ = ~0ull;
-    }
-    bool stopRecording(std::vector<std::pair<uint64_t, uint64_t>>& pages) {
-        recording_ = false;
-        pages.clear();
-        for (uint64_t page : recorded_) pages.emplace_back(page, hash(page));
-        return recordOk_;
-    }
-    // Hash of a page's current contents (0 if unreadable).
-    uint64_t hash(uint64_t page) {
-        if (!lookup(page, false)) return 0;
-        Page& p = pages_[page];
-        if (!p.hashed) {
-            p.hash = hashBytes(p.data->data(), kPage) | 1;
-            p.hashed = true;
-        }
-        return p.hash;
+    // Forgets the pages of [addr, addr + size), which changed.
+    void invalidate(uint64_t addr, uint64_t size) {
+        for (uint64_t page = addr & ~uint64_t(kPage - 1); page < addr + size; page += kPage) pages_.erase(page);
+        lastPage_ = ~0ull;
     }
 
 private:
     static constexpr size_t kPage = 4096;
-    struct Page {
-        std::unique_ptr<std::array<uint8_t, kPage>> data;
-        uint64_t hash = 0;
-        bool hashed = false;
-    };
-    const uint8_t* lookup(uint64_t page, bool record) {
-        record &= recording_;
-        if (record && page != lastRecorded_) {
-            recorded_.insert(page);
-            lastRecorded_ = page;
-        }
+    const uint8_t* lookup(uint64_t page) {
         if (page == lastPage_) return lastData_;
         lastPage_ = page;
-        return lastData_ = find(page, record);
-    }
-    const uint8_t* find(uint64_t page, bool record) {
-        if (auto it = pages_.find(page); it != pages_.end()) return it->second.data ? it->second.data->data() : nullptr;
-        Page p;
-        p.data = std::make_unique<std::array<uint8_t, kPage>>();
-        if (!readGuest(page, p.data->data(), kPage)) {
-            p.data.reset();
-            if (record) recordOk_ = false;
+        auto it = pages_.find(page);
+        if (it == pages_.end()) {
+            auto data = std::make_unique<std::array<uint8_t, kPage>>();
+            if (!readGuest(page, data->data(), kPage)) data.reset();
+            it = pages_.emplace(page, std::move(data)).first;
         }
-        return (pages_[page] = std::move(p)).data ? pages_[page].data->data() : nullptr;
+        return lastData_ = it->second ? it->second->data() : nullptr;
     }
-    std::unordered_map<uint64_t, Page> pages_;
-    bool recording_ = false, recordOk_ = true;
-    std::set<uint64_t> recorded_;
-    uint64_t lastRecorded_ = ~0ull;
+    std::unordered_map<uint64_t, std::unique_ptr<std::array<uint8_t, kPage>>> pages_; // null: unreadable
     uint64_t lastPage_ = ~0ull; // the last page looked up, and its data
     const uint8_t* lastData_ = nullptr;
 };
@@ -333,20 +298,28 @@ struct BufferRange {
     uint32_t byteOffset = 0; // guest base relative to `offset`
 };
 
-// An analysed program, reused while its code pages are unchanged and gcn::refresh can re-target
-// it to the launch. The renderer fills resource fields into prog.data per draw.
+// An analysed program, reused while its code is unchanged and gcn::refresh can re-target it to
+// the launch. The renderer fills resource fields into prog.data per draw.
 struct CachedProgram {
     gcn::Program prog;
-    std::vector<std::pair<uint64_t, uint64_t>> pages; // code page address, content hash
+    std::vector<std::pair<uint64_t, uint64_t>> code; // [start, end) of the code analysed
+    uint64_t codeHash = 0;
+    uint64_t checkedSubmit = ~0ull; // the submission codeHash was last verified in
     ShaderModule* module = nullptr;
     bool valid = false;
 };
 
-// The analyses of one shader launch key (user data or memory can send the code down different
-// branches or change a resource's format), most recently used first.
-struct ProgramVariants {
-    std::vector<std::unique_ptr<CachedProgram>> list;
+// The analyses of one shader launch key, most recently used first: user data or memory can send
+// the code down other branches (walks), and a walk can meet resources of other formats (shapes,
+// e.g. one material shader with BC1 or BC3 textures), each its own translation. A launch replays
+// one trace per walk and then only compares formats.
+struct ProgramWalk {
+    std::vector<std::unique_ptr<CachedProgram>> shapes; // all with the same trace
 };
+struct ProgramVariants {
+    std::vector<ProgramWalk> walks;
+};
+constexpr size_t kMaxWalks = 8, kMaxShapes = 32;
 
 // LPN_PROFILE=1: where the renderer's time goes, printed every 300 frames.
 enum ProfSlot { kProfRenderer, kProfAnalyze, kProfShaderLookup, kProfTexRead, kProfTexUpload, kProfPipeline, kProfGpuWait, kProfCount };
@@ -355,7 +328,7 @@ constexpr const char* kProfNames[kProfCount] = {"renderer", "analyze", "shader-l
 struct Profiler {
     bool on = false;
     uint64_t ns[kProfCount] = {};
-    uint64_t calls = 0, analysisHits = 0, analyses = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0;
+    uint64_t calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -446,11 +419,20 @@ public:
         else warnOnce("indirect draws and dispatches are not rendered yet");
     }
 
+    // The command processor copies descriptors and constants between draws (DMA_DATA): draws
+    // after it must not see the page cache's older copy.
+    void onMemoryWrite(uint64_t addr, uint64_t size) override {
+        std::lock_guard lock(m_);
+        codePages_.invalidate(addr, size);
+        ++submit_; // and re-verify shader code before reuse
+    }
+
     void onSubmitEnd() override {
         std::lock_guard lock(m_);
         ProfScope ps(prof_, kProfRenderer);
         flush();
         codePages_.clear();
+        ++submit_;
     }
 
     void onFrameEnd() override {
@@ -459,15 +441,31 @@ public:
             ProfScope ps(prof_, kProfRenderer);
             flush();
             codePages_.clear();
+            ++submit_;
         }
         if (frame_ == traceFrame_) dumpSurfaces();
         if (programCount_ > 20000) {
             programs_.clear();
             programCount_ = 0;
         }
+        if (prof_.on) reportSlowFrame();
         ++frame_;
         if (prof_.on && frame_ % 300 == 0) reportProfile();
         drawIndex_ = 0;
+    }
+
+    // A frame over 50 ms (a visible hitch): where its time went.
+    void reportSlowFrame() {
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - lastFrameEnd_).count();
+        if (ms > 50 && frame_ > 0) {
+            std::fprintf(stderr, "[prof] slow frame %" PRIu64 ": %.1f ms;", frame_, ms);
+            for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.1f", kProfNames[i], (prof_.ns[i] - frameNs_[i]) / 1e6);
+            std::fprintf(stderr, "; %" PRIu64 " analyses\n", prof_.analyses - frameAnalyses_);
+        }
+        lastFrameEnd_ = now;
+        std::copy(std::begin(prof_.ns), std::end(prof_.ns), frameNs_);
+        frameAnalyses_ = prof_.analyses;
     }
 
     void reportProfile() {
@@ -476,9 +474,11 @@ public:
         std::fprintf(stderr, "[prof] frames %" PRIu64 "-%" PRIu64 ": %.1f fps, %.1f ms/frame;", frame_ - 300, frame_,
                      300 / wall, wall * 1000 / 300);
         for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.2f", kProfNames[i], prof_.ns[i] / 1e6 / 300);
-        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes per frame\n",
-                     prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.analyses / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0);
+        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes per frame\n",
+                     prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.analyses / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0, prof_.passes / 300.0);
         const bool on = prof_.on;
+        std::fill(std::begin(frameNs_), std::end(frameNs_), 0);
+        frameAnalyses_ = 0;
         prof_ = Profiler{};
         prof_.on = on;
         prof_.windowStart = now;
@@ -658,6 +658,7 @@ private:
             return;
         }
         ++prof_.flushes;
+        endPass();
         Batch& b = batches_[cur_];
         VK_CHECK(vkEndCommandBuffer(cmd_));
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -729,6 +730,7 @@ public:
 private:
 
     void fullBarrier() {
+        endPass();
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -878,6 +880,7 @@ private:
 
         // Everything stays in GENERAL; start it there.
         begin();
+        endPass();
         VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         ib.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -1042,11 +1045,16 @@ private:
     }
 
     VkShaderModule module(const std::string& glsl, gcn::GlslStage stage) {
-        std::string error;
-        const auto spirv = gcn::compileGlsl(glsl, stage, &error);
+        const std::string cached = spirvCachePath(glsl, stage);
+        std::vector<uint32_t> spirv = loadSpirv(cached);
         if (spirv.empty()) {
-            std::fprintf(stderr, "[gpu] shader compile failed:\n%s\n--- source ---\n%s\n", error.c_str(), glsl.c_str());
-            return VK_NULL_HANDLE;
+            std::string error;
+            spirv = gcn::compileGlsl(glsl, stage, &error);
+            if (spirv.empty()) {
+                std::fprintf(stderr, "[gpu] shader compile failed:\n%s\n--- source ---\n%s\n", error.c_str(), glsl.c_str());
+                return VK_NULL_HANDLE;
+            }
+            saveSpirv(cached, spirv);
         }
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         ci.codeSize = spirv.size() * 4;
@@ -1054,6 +1062,59 @@ private:
         VkShaderModule m = VK_NULL_HANDLE;
         VK_CHECK(vkCreateShaderModule(vk_.device, &ci, nullptr, &m));
         return m;
+    }
+
+    // Compiling GLSL takes ~10 ms a shader, and a new effect brings dozens: SPIR-V is kept on disk
+    // in $LPN_SHADER_CACHE (default ~/.cache/lpn-host/spirv; "off" disables), named by a hash of
+    // the source.
+    std::string spirvCachePath(const std::string& glsl, gcn::GlslStage stage) {
+        if (spirvDir_.empty()) {
+            const char* env = getenv("LPN_SHADER_CACHE");
+            if (env && !std::strcmp(env, "off")) spirvDir_ = "-";
+            else if (env && *env) spirvDir_ = env;
+            else if (const char* x = getenv("XDG_CACHE_HOME"); x && *x) spirvDir_ = std::string(x) + "/lpn-host/spirv";
+            else if (const char* h = getenv("HOME"); h && *h) spirvDir_ = std::string(h) + "/.cache/lpn-host/spirv";
+            else spirvDir_ = "-";
+            if (spirvDir_ != "-") {
+                std::error_code ec;
+                std::filesystem::create_directories(spirvDir_, ec);
+                if (ec) spirvDir_ = "-";
+            }
+        }
+        if (spirvDir_ == "-") return {};
+        std::string text = glsl;
+        text += char('0' + int(stage));
+        text.resize((text.size() + 7) & ~size_t(7), '\0');
+        const uint64_t a = hashBytes(text.data(), text.size());
+        for (char& c : text) c = char(c ^ 0x5a); // a second, independent hash
+        const uint64_t b = hashBytes(text.data(), text.size());
+        char name[40];
+        std::snprintf(name, sizeof name, "%016" PRIx64 "%016" PRIx64 ".spv", a, b);
+        return spirvDir_ + "/" + name;
+    }
+    static std::vector<uint32_t> loadSpirv(const std::string& path) {
+        std::vector<uint32_t> words;
+        if (path.empty()) return words;
+        FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) return words;
+        std::fseek(f, 0, SEEK_END);
+        const long n = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        if (n > 20 && n % 4 == 0) {
+            words.resize(size_t(n) / 4);
+            if (std::fread(words.data(), 4, words.size(), f) != words.size() || words[0] != 0x07230203) words.clear();
+        }
+        std::fclose(f);
+        return words;
+    }
+    static void saveSpirv(const std::string& path, const std::vector<uint32_t>& words) {
+        if (path.empty()) return;
+        const std::string tmp = path + ".tmp" + std::to_string(getpid());
+        FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (!f) return;
+        const bool ok = std::fwrite(words.data(), 4, words.size(), f) == words.size();
+        if (std::fclose(f) == 0 && ok) std::rename(tmp.c_str(), path.c_str()); // never a partial file
+        else std::remove(tmp.c_str());
     }
 
     static std::string hex(uint64_t v) {
@@ -1526,6 +1587,7 @@ private:
 
         if (auto it = depths_.find(addr); it != depths_.end()) {
             Image& img = it->second.img;
+            sampledSurfaces_.push_back(img.image);
             b.view = view(img, img.format == VK_FORMAT_D32_SFLOAT_S8_UINT ? img.format : img.format, vt,
                           kIdentity, VK_IMAGE_ASPECT_DEPTH_BIT);
             b.scale[0] = float(t.width()) / float(img.width);
@@ -1539,6 +1601,7 @@ private:
         }
         if (auto it = colors_.find(addr); it != colors_.end()) {
             Surface& s = it->second;
+            sampledSurfaces_.push_back(s.img.image);
             if (format == VK_FORMAT_UNDEFINED || bytesPerElement(t.dataFormat()) != s.elementBytes) {
                 warnOnce("texture format " + std::to_string(t.dataFormat()) + " over a render target of different size");
                 format = s.img.format;
@@ -1600,8 +1663,9 @@ private:
         for (auto& im : p.images) {
             const ImageBinding ib = resolveImage(im);
             if (trace_)
-                std::fprintf(stderr, "[trace]   tex 0x%" PRIx64 " %ux%u fmt %u/%u type %u tile %u%s\n", im.base(), im.width(),
-                             im.height(), im.dataFormat(), im.numFormat(), im.type(), im.tileMode(),
+                std::fprintf(stderr, "[trace]   tex 0x%" PRIx64 " %ux%u fmt %u/%u type %u tile %u sel %03o pc 0x%" PRIx64 "%s\n",
+                             im.base(), im.width(), im.height(), im.dataFormat(), im.numFormat(), im.type(), im.tileMode(),
+                             im.dstSel(), im.pc,
                              colors_.count(im.base()) ? " (render target)" : depths_.count(im.base()) ? " (depth)" : "");
             float scale[2] = {ib.scale[0], ib.scale[1]};
             std::memcpy(&p.data[im.data], scale, 8);
@@ -1674,41 +1738,73 @@ private:
     CachedProgram* analyzed(const gcn::LaunchState& l, uint32_t bindingBase) {
         if (!l.entry) return nullptr;
         ProfScope ps(prof_, kProfAnalyze);
-        auto& list = programs_[launchKey(l, bindingBase)].list;
-        for (size_t i = 0; i < list.size(); ++i) {
-            CachedProgram& c = *list[i];
-            if (!c.valid) continue;
-            bool same = true;
-            for (const auto& [page, h] : c.pages)
-                if (codePages_.hash(page) != h) {
-                    same = false;
-                    break;
-                }
-            if (!same) {
-                c.valid = false;
+        auto& walks = programs_[launchKey(l, bindingBase)].walks;
+        gcn::Program r;
+        for (size_t i = 0; i < walks.size(); ++i) {
+            if (!codeUnchanged(*walks[i].shapes.front())) {
+                programCount_ -= walks[i].shapes.size();
+                walks.erase(walks.begin() + ptrdiff_t(i--));
                 continue;
             }
-            if (!gcn::refresh(c.prog, l, readData_)) continue;
-            ++prof_.analysisHits;
-            if (i) std::rotate(list.begin(), list.begin() + i, list.begin() + i + 1);
-            return list.front().get();
-        }
-        // Replace an invalid variant, else add one (dropping the least recently used past 8).
-        auto slot = std::find_if(list.begin(), list.end(), [](const auto& c) { return !c->valid; });
-        if (slot == list.end()) {
-            if (list.size() >= 8) slot = list.end() - 1;
-            else {
-                list.push_back(std::make_unique<CachedProgram>());
-                slot = list.end() - 1;
-                ++programCount_;
+            if (!gcn::replay(walks[i].shapes.front()->prog, l, readCached_, r)) continue;
+            if (i) std::rotate(walks.begin(), walks.begin() + ptrdiff_t(i), walks.begin() + ptrdiff_t(i) + 1);
+            auto& shapes = walks.front().shapes;
+            for (size_t j = 0; j < shapes.size(); ++j)
+                if (gcn::adopt(shapes[j]->prog, r)) {
+                    ++prof_.analysisHits;
+                    if (j) std::rotate(shapes.begin(), shapes.begin() + ptrdiff_t(j), shapes.begin() + ptrdiff_t(j) + 1);
+                    return shapes.front().get();
+                }
+            // The same branches with other resource formats (a material with other textures).
+            if (shapes.size() >= kMaxShapes) {
+                shapes.pop_back();
+                --programCount_;
             }
+            shapes.insert(shapes.begin(), std::make_unique<CachedProgram>());
+            ++programCount_;
+            return analyze(*shapes.front(), l, bindingBase);
         }
-        std::rotate(list.begin(), slot, slot + 1);
-        CachedProgram& c = *list.front();
+        if (walks.size() >= kMaxWalks) {
+            programCount_ -= walks.back().shapes.size();
+            walks.pop_back();
+        }
+        walks.insert(walks.begin(), ProgramWalk{});
+        walks.front().shapes.push_back(std::make_unique<CachedProgram>());
+        ++programCount_;
+        return analyze(*walks.front().shapes.front(), l, bindingBase);
+    }
+
+    // Only the bytes of the instructions count: a shader's last page often holds other data that
+    // changes. Memory cannot change within a submission (see PageCache), so one check per
+    // submission is enough.
+    bool codeUnchanged(CachedProgram& c) {
+        if (!c.valid) return false;
+        if (c.checkedSubmit == submit_) return true;
+        if (hashCode(c.code) != c.codeHash) return false;
+        c.checkedSubmit = submit_;
+        return true;
+    }
+    uint64_t hashCode(const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (const auto& [start, end] : ranges) {
+            codeBytes_.assign((end - start + 7) & ~7ull, 0);
+            if (!codePages_.read(start, codeBytes_.data(), end - start)) return 0;
+            h = (h ^ hashBytes(codeBytes_.data(), codeBytes_.size())) * 0x100000001b3ull;
+        }
+        return h | 1;
+    }
+
+    CachedProgram* analyze(CachedProgram& c, const gcn::LaunchState& l, uint32_t bindingBase) {
         ++prof_.analyses;
-        codePages_.startRecording();
-        c.prog = gcn::analyze(l, readCode_, readData_);
-        c.valid = codePages_.stopRecording(c.pages);
+        c.prog = gcn::analyze(l, readCached_);
+        c.code.clear();
+        for (const auto& [pc, in] : c.prog.code) {
+            if (!c.code.empty() && c.code.back().second == pc) c.code.back().second = pc + in.size;
+            else c.code.emplace_back(pc, pc + in.size);
+        }
+        c.codeHash = hashCode(c.code);
+        c.checkedSubmit = submit_;
+        c.valid = c.codeHash != 0;
         ProfScope pl(prof_, kProfShaderLookup);
         c.module = c.prog.launch.entry ? shader(c.prog, bindingBase) : nullptr;
         return c.prog.launch.entry ? &c : nullptr;
@@ -1879,9 +1975,10 @@ private:
         const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
         const uint32_t dbRender = r.ctx[reg::kDbRenderControl];
         if (trace_)
-            std::fprintf(stderr, "[trace]   cb mode %u db render 0x%x depth control 0x%x z info 0x%x z base 0x%" PRIx64
-                                 " htile 0x%" PRIx64 " clear %g prim %u count %u\n",
-                         cbMode, dbRender, r.ctx[reg::kDbDepthControl], r.ctx[reg::kDbZInfo],
+            std::fprintf(stderr, "[trace]   cb mode %u db render 0x%x depth control 0x%x z info 0x%x stencil info 0x%x control 0x%x"
+                                 " ref/mask 0x%x z base 0x%" PRIx64 " htile 0x%" PRIx64 " clear %g prim %u count %u\n",
+                         cbMode, dbRender, r.ctx[reg::kDbDepthControl], r.ctx[reg::kDbZInfo], r.ctx[reg::kDbStencilInfo],
+                         r.ctx[reg::kDbStencilControl], r.ctx[reg::kDbStencilRefMask],
                          uint64_t(r.ctx[reg::kDbZReadBase]) << 8, uint64_t(r.ctx[reg::kDbHtileDataBase]) << 8,
                          std::bit_cast<float>(r.ctx[reg::kDbDepthClear]), r.uconfig[reg::kPrimitiveType], d.count);
         if (trace_ && cbMode > 1) {
@@ -1904,6 +2001,7 @@ private:
         const bool hasPs = shaderAddress(r, reg::kPgmLoPs) != 0;
 
         // Render targets.
+        Pass pass;
         GraphicsState gs{};
         VkRenderingAttachmentInfo colors[8]{};
         uint32_t colorCount = 0;
@@ -1926,6 +2024,7 @@ private:
             if (!s) continue;
             colors[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
             colors[i].imageView = view(s->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
+            pass.images.push_back(s->img.image);
             colors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             colors[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             colors[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -1966,6 +2065,7 @@ private:
             if (Surface* s = depthSurface(uint64_t(r.ctx[reg::kDbZReadBase]) << 8, dw, dh, f)) {
                 hasDepth = true;
                 depth.imageView = view(s->img, f, VK_IMAGE_VIEW_TYPE_2D, kIdentity, s->img.aspect);
+                pass.images.push_back(s->img.image);
                 depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
                 depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
                 depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -2017,6 +2117,7 @@ private:
         std::vector<VkDescriptorImageInfo> imgs;
         bufs.reserve(64);
         imgs.reserve(64);
+        sampledSurfaces_.clear();
         if (trace_) {
             for (const auto* prog : {&vs, &ps}) {
                 if (prog->data.size() <= gcn::data::kSmrd) continue;
@@ -2046,17 +2147,35 @@ private:
             if (!guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset)) return;
         }
 
-        fullBarrier();
-        VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-        ri.renderArea = {{0, 0}, {width, height}};
-        ri.layerCount = 1;
-        ri.colorAttachmentCount = colorCount;
-        ri.pColorAttachments = colors;
-        if (hasDepth) {
-            ri.pDepthAttachment = &depth;
-            if (gs.stencil) ri.pStencilAttachment = &depth;
+        // Consecutive draws into the same targets share a render pass. A new pass starts behind a
+        // full barrier, as before every draw, so earlier passes, copies and dispatches are visible.
+        // Inside a pass only its own attachments change, so a draw sampling one of them (or one
+        // after a draw that wrote memory from a shader) needs a new pass.
+        for (uint32_t i = 0; i < colorCount; ++i) pass.views[i] = colors[i].imageView;
+        pass.depth = hasDepth ? depth.imageView : VK_NULL_HANDLE;
+        pass.colorCount = colorCount;
+        pass.stencil = hasDepth && gs.stencil;
+        pass.width = width;
+        pass.height = height;
+        bool feedback = false;
+        for (VkImage im : sampledSurfaces_)
+            feedback |= std::find(pass.images.begin(), pass.images.end(), im) != pass.images.end();
+        if (!pass_.open || feedback || !pass_.sameTargets(pass)) {
+            fullBarrier();
+            VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            ri.renderArea = {{0, 0}, {width, height}};
+            ri.layerCount = 1;
+            ri.colorAttachmentCount = colorCount;
+            ri.pColorAttachments = colors;
+            if (hasDepth) {
+                ri.pDepthAttachment = &depth;
+                if (gs.stencil) ri.pStencilAttachment = &depth;
+            }
+            vkCmdBeginRendering(cmd_, &ri);
+            pass_ = std::move(pass);
+            pass_.open = true;
+            ++prof_.passes;
         }
-        vkCmdBeginRendering(cmd_, &ri);
         vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         vk_.cmdPushDescriptorSet(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, lay.pipeline, 0, uint32_t(writes.size()),
                                  writes.data());
@@ -2078,9 +2197,22 @@ private:
         } else {
             vkCmdDraw(cmd_, d.count, std::max(r.numInstances, 1u), 0, 0);
         }
-        vkCmdEndRendering(cmd_);
+        auto stores = [](const gcn::Program& p) {
+            for (const auto& b : p.buffers)
+                if (b.store) return true;
+            for (const auto& i : p.images)
+                if (i.storage) return true;
+            return false;
+        };
+        if (stores(vs) || (psm && stores(ps))) endPass();
         ++stats_.draws;
         if (trace_ && snap_ && colorCount && snapWanted()) snapshot(uint64_t(r.ctx[reg::kCbColorBase]) << 8);
+    }
+
+    void endPass() {
+        if (!pass_.open) return;
+        vkCmdEndRendering(cmd_);
+        pass_.open = false;
     }
 
     void setViewportScissor(const GpuRegs& r, uint32_t width, uint32_t height) {
@@ -2174,6 +2306,8 @@ private:
     std::vector<std::function<void()>> afterFlush_;
     std::vector<uint8_t> scratch_;
     GuestHasher hasher_;
+    std::chrono::steady_clock::time_point lastFrameEnd_ = std::chrono::steady_clock::now();
+    uint64_t frameNs_[kProfCount] = {}, frameAnalyses_ = 0;
 
     std::map<uint64_t, Import> imports_;
     std::unordered_map<uint64_t, Surface> colors_, depths_;
@@ -2210,8 +2344,23 @@ private:
     PageCache codePages_;
     std::unordered_map<std::string, ProgramVariants> programs_;
     size_t programCount_ = 0;
-    const gcn::ReadMemory readCode_ = [this](uint64_t a, void* d, size_t n) { return codePages_.read(a, d, n); };
-    const gcn::ReadMemory readData_ = [this](uint64_t a, void* d, size_t n) { return codePages_.read(a, d, n, false); };
+    const gcn::ReadMemory readCached_ = [this](uint64_t a, void* d, size_t n) { return codePages_.read(a, d, n); };
+    uint64_t submit_ = 0; // counts codePages_ clears
+    std::vector<uint8_t> codeBytes_;
+    // The open render pass (see draw) and the render-target surfaces the current draw samples.
+    struct Pass {
+        bool open = false;
+        VkImageView views[8] = {}, depth = VK_NULL_HANDLE;
+        uint32_t colorCount = 0, width = 0, height = 0;
+        bool stencil = false;
+        std::vector<VkImage> images; // attachments
+        bool sameTargets(const Pass& o) const {
+            return colorCount == o.colorCount && depth == o.depth && stencil == o.stencil && width == o.width &&
+                   height == o.height && std::equal(views, views + colorCount, o.views);
+        }
+    } pass_;
+    std::vector<VkImage> sampledSurfaces_;
+    std::string spirvDir_; // "-": no SPIR-V cache
 };
 
 Renderer* gRenderer = nullptr;

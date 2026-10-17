@@ -181,6 +181,30 @@ int main() {
         ++failures;
     }
 
+    // A copy shader storing into a BGRA render target through a T# whose DST_SEL swaps red and
+    // blue: the store applies DST_SEL inversely, so memory stays BGRA.
+    const std::vector<uint32_t> store = {
+        0xf0200f00, 0x00020004, // image_store v0, v4, s[8:15], s[0:3] dmask:0xf
+        0xbf810000,             // s_endpgm
+    };
+    gcn::LaunchState sl;
+    sl.stage = gcn::Stage::Compute;
+    sl.entry = 0x2000;
+    sl.rsrc2 = 16 << 1;
+    sl.userData[8 + 1] = 10u << 20;           // 8_8_8_8 unorm
+    sl.userData[8 + 3] = 07456u | (9u << 28); // DST_SEL zyxw (B, G, R, A), 2D
+    auto readStore = [&](uint64_t addr, void* dst, size_t size) {
+        if (addr < sl.entry || addr + size > sl.entry + store.size() * 4) return false;
+        std::memcpy(dst, reinterpret_cast<const char*>(store.data()) + (addr - sl.entry), size);
+        return true;
+    };
+    const gcn::Translation st = gcn::translate(gcn::analyze(sl, readStore), 0);
+    if (st.glsl.find("vec4(s_[2], s_[1], s_[0], s_[3])") == std::string::npos ||
+        gcn::compileGlsl(st.glsl, gcn::GlslStage::Compute, &error).empty()) {
+        std::fprintf(stderr, "swizzled image store:\n%s\n%s\n", error.c_str(), st.glsl.c_str());
+        ++failures;
+    }
+
     if (failures) std::fprintf(stderr, "%d failure(s)\n", failures);
     return failures ? 1 : 0;
 }

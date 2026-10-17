@@ -47,8 +47,9 @@ Last updated 2026-10-16.
 - Performance (RTX 4070 Ti SUPER, `LPN_PROFILE=1`, headless): gameplay in Shin's Castle
   (~1,500 draws) runs at 40 fps, up from 15 (shader analyses are replayed instead of redone,
   texture checks hashed in parallel); menus reach the game's 30 fps cap, the opening cutscene
-  50-60 fps. Gameplay frames now spend ~5 ms on analysis, ~5.5 ms on texture checks and ~8 ms
-  waiting for the GPU.
+  50-60 fps. In the first fight (Rush Combos tutorial, ~2,800 draws) about 28 fps, up from 19,
+  after sharing render passes between draws; first-time effects no longer hitch on later runs
+  (SPIR-V cache).
 - Boot reaches the title, main menu and difficulty select, and starts a new game (the
   opening cutscene `auth/a00_0100_before.par` loads in Southern Town). Scripted presses
   (`--press`) drive menus in headless runs.
@@ -72,10 +73,10 @@ Last updated 2026-10-16.
 2. Rendering: 2D-tiled texture detiling (tile mode 14), indirect draws, a real swapchain
    instead of reading frames back. `docs/gpu.md` lists what is known to be missing. Gameplay
    runs with no untranslated-instruction warnings.
-3. Performance headroom above 30 fps: every draw is its own render pass behind a full barrier
-   (batching draws per render pass should cut the GPU wait); texture checks still read every
-   sampled texture each frame (page-dirty tracking would avoid that, but soft-dirty bits are
-   never cleared on pages pinned by the Vulkan host-memory import).
+3. Performance in fights (~28 fps with ~2,800 draws): per frame ~10 ms analysis replays, ~9 ms
+   texture checks (every sampled texture is re-read each frame; soft-dirty page tracking does
+   not work on pages pinned by the Vulkan host-memory import), ~10 ms recording draws.
+   Reported by the owner: wall flames turn green or vanish (not reproduced yet).
 4. Audio through SDL, C++ exceptions (`sceKernelGetModuleInfoForUnwind`) if the game uses them.
 
 ## Working setup
@@ -98,7 +99,8 @@ Last updated 2026-10-16.
 - Rendering needs Vulkan 1.3 with VK_EXT_external_memory_host (any current Linux driver;
   lavapipe works for testing) and glslang to build (`libvulkan-dev glslang-dev`).
   `--no-gpu` skips it, `--screenshot N` saves the Nth frame as screenshot.ppm,
-  `LPN_PROFILE=1` prints fps and where the renderer's time goes every 300 frames,
+  `LPN_PROFILE=1` prints fps and where the renderer's time goes every 300 frames, and each frame
+  over 50 ms (`[prof] slow frame`),
   `LPN_GPU_SYNC=1` waits for the GPU after every submission (to rule out async issues),
   `LPN_GPU_TRACE=<frame>` logs every draw of that frame and dumps its render targets,
   adding `LPN_GPU_SNAP=1` saves the target after each draw (or `LPN_GPU_SNAP=2750-2760,2886` for

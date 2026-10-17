@@ -51,6 +51,8 @@ public:
     // that must not fire before it. False when the listener runs work synchronously (the
     // caller then runs `fn` itself).
     virtual bool afterGpuWork(std::function<void()>&) { return false; }
+    // The command processor wrote guest memory (DMA_DATA, WRITE_DATA) between draws.
+    virtual void onMemoryWrite(uint64_t /*addr*/, uint64_t /*size*/) {}
 };
 void addDrawListener(DrawListener* l);
 void notifySubmitEnd();

@@ -1073,10 +1073,28 @@ vec3 cubeDir(vec3 c) {
             return array ? "ivec3(" + iv(first) + ", 0, " + iv(first + 1) + ")" : "ivec2(" + iv(first) + ", 0)";
         };
         const std::string cast = isInt ? "uvec4" : "vec4";
+        // The T#'s DST_SEL swizzles stores (inversely) as well as loads. Storage image views cannot
+        // swizzle, so it is applied here; a store with BGRA DST_SEL into a BGRA-swapped render
+        // target keeps memory in BGRA order, which a copy shader relies on.
+        const uint32_t sel = im.dstSel();
+        uint32_t used = 0; // memory components DST_SEL names; only a full permutation is applied
+        for (int c = 0; c < 4; ++c)
+            if (((sel >> (3 * c)) & 7) >= 4) used |= 1u << (((sel >> (3 * c)) & 7) - 4);
+        const bool swizzled = im.storage && sel != 07654 && used == 0xF;
 
         if (in.op <= 1) { // image_load, image_load_mip
             const std::string lod = in.op == 1 ? iv(vaddr + coords) : "0";
-            if (im.storage) writeResult(cast + "(imageLoad(" + tn + ", " + texel(vaddr) + "))");
+            if (swizzled) { // shader component c reads memory component DST_SEL[c]
+                out("{ " + cast + " m_ = " + cast + "(imageLoad(" + tn + ", " + texel(vaddr) + "));\n");
+                std::string r = cast + "(";
+                for (int c = 0; c < 4; ++c) {
+                    const uint32_t s = (sel >> (3 * c)) & 7;
+                    r += c ? ", " : "";
+                    r += s >= 4 ? fmt("m_[%u]", s - 4) : s == 1 ? (isInt ? "1u" : "1.0") : (isInt ? "0u" : "0.0");
+                }
+                writeResult(r + ")");
+                out("}\n");
+            } else if (im.storage) writeResult(cast + "(imageLoad(" + tn + ", " + texel(vaddr) + "))");
             else writeResult(cast + "(texelFetch(" + tn + ", " + texel(vaddr) + ", " + lod + "))");
             return;
         }
@@ -1089,8 +1107,21 @@ vec3 cubeDir(vec3 c) {
                 else v += isInt ? "0u" : "0.0";
             }
             v += ")";
+            if (swizzled) { // memory component j takes the shader component whose DST_SEL is j
+                out("{ " + cast + " s_ = " + v + ";\n");
+                v = cast + "(";
+                for (uint32_t j = 0; j < 4; ++j) {
+                    int from = -1;
+                    for (int c = 0; c < 4; ++c)
+                        if (((sel >> (3 * c)) & 7) == 4 + j) from = c;
+                    v += j ? ", " : "";
+                    v += from >= 0 ? fmt("s_[%d]", from) : (isInt ? "0u" : "0.0");
+                }
+                v += ")";
+            }
             if (pfx == 'i') v = "ivec4(" + v + ")";
             out(guard() + "imageStore(" + tn + ", " + texel(vaddr) + ", " + v + ");\n");
+            if (swizzled) out("}\n");
             return;
         }
         if (in.op == 14) { // image_get_resinfo

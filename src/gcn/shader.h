@@ -122,10 +122,14 @@ struct Program {
 Program analyze(const LaunchState& launch, const ReadMemory& readCode, const ReadMemory& readData);
 inline Program analyze(const LaunchState& launch, const ReadMemory& read) { return analyze(launch, read, read); }
 
-// Re-targets `program` (analysed from the same code and launch registers) to a launch with
-// other user data or memory: replays its trace and, when every branch goes the same way and the
-// resources keep their shape (so the translation is the same), updates `data`, the resources'
-// descriptors and `launch` and returns true. False leaves `program` unchanged.
+// Re-evaluates `program` (analysed from the same code and launch registers) for a launch with
+// other user data or memory by replaying its trace. False when a branch would go another way;
+// otherwise `out` holds the launch's data and resources (and no code).
+bool replay(const Program& program, const LaunchState& launch, const ReadMemory& readData, Program& out);
+// Moves a replay's launch, data and resources into `program` when they translate alike (the
+// resources keep their formats, see Program::key). False leaves both unchanged.
+bool adopt(Program& program, Program& replayed);
+// replay() then adopt(): re-targets `program` to the launch, or returns false leaving it unchanged.
 bool refresh(Program& program, const LaunchState& launch, const ReadMemory& readData);
 
 struct Translation {
