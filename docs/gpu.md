@@ -36,12 +36,19 @@ screen loop). Addresses are guest addresses and change between runs.
   lane's own bit and branches as a loop over a switch on the PC. Scalar load results and
   buffer offsets reach the shader in a per-draw storage buffer; translations are cached by
   code and resource shape.
+- **Analysis reuse.** Most draws launch a known shader with new user data (per-draw pointers),
+  so analysing every launch from scratch cost ~38 ms per gameplay frame. Each analysis records
+  its walk (work items and the instructions that touch scalar state); a later launch of the same
+  code replays that walk with its own user data and memory (`gcn::refresh`, ~1.5 us) and keeps
+  the analysis if every branch goes the same way and every resource keeps its format, else it is
+  analysed again (up to 8 variants per shader).
 - **Memory.** Guest memory is imported into Vulkan (VK_EXT_external_memory_host), so shader
   buffer reads and writes hit the game's memory directly.
 - **Surfaces.** Render targets and depth buffers are Vulkan images keyed by guest address; a
   texture at the same address samples that image (scaled when the T# is smaller than the
   padded target, e.g. 1600x896 inside 1664x896). Other textures are uploaded from guest
-  memory, detiled if needed, and re-uploaded when their bytes change.
+  memory, detiled if needed, and re-uploaded when their bytes change. Each texture is hashed
+  once per frame, in 128 KiB chunks on worker threads (~90 MB per gameplay frame).
 - **Draws.** RECTLIST and QUADLIST go through a generated geometry shader; GNM's
   decompress/eliminate passes are skipped; screen-space draws (viewport transform off) are
   mapped by the vertex shader. Each draw is its own render pass with a full barrier, and the

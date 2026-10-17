@@ -103,11 +103,30 @@ struct Program {
     std::vector<ImageResource> images;
     std::vector<std::string> warnings;
 
+    // The evaluation as it ran (work items started and instructions stepped, in order), so a
+    // launch of the same code with other user data or memory can be re-evaluated without walking
+    // and decoding the code again (see refresh()). Empty when it cannot be replayed.
+    struct TraceStep {
+        uint64_t pc = 0;
+        Instruction in;
+        bool start = false;  // a work item starts at `pc` (no instruction)
+        bool result = false; // whether the path went on after the instruction
+    };
+    std::vector<TraceStep> trace;
+
     // Identifies the translation: equal keys translate to the same GLSL.
     std::string key() const;
 };
 
-Program analyze(const LaunchState& launch, const ReadMemory& read);
+// `readCode` fetches instructions, `readData` scalar loads.
+Program analyze(const LaunchState& launch, const ReadMemory& readCode, const ReadMemory& readData);
+inline Program analyze(const LaunchState& launch, const ReadMemory& read) { return analyze(launch, read, read); }
+
+// Re-targets `program` (analysed from the same code and launch registers) to a launch with
+// other user data or memory: replays its trace and, when every branch goes the same way and the
+// resources keep their shape (so the translation is the same), updates `data`, the resources'
+// descriptors and `launch` and returns true. False leaves `program` unchanged.
+bool refresh(Program& program, const LaunchState& launch, const ReadMemory& readData);
 
 struct Translation {
     std::string glsl;

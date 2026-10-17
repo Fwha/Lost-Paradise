@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -95,18 +96,97 @@ uint64_t hashBytes(const void* p, size_t n) {
     return ((h[0] * 31 + h[1]) * 31 + h[2]) * 31 + h[3];
 }
 
+// Hashes guest memory for texture checks: 128 KiB chunks, read into a cache-sized buffer and
+// hashed on worker threads, so the textures a frame samples (~100 MB in gameplay) are neither
+// copied nor hashed on the renderer thread alone.
+class GuestHasher {
+public:
+    GuestHasher() {
+        const unsigned n = std::clamp(std::thread::hardware_concurrency() / 3, 1u, 6u);
+        for (unsigned i = 0; i < n; ++i) std::thread([this] { worker(); }).detach();
+    }
+
+    // Hash of [addr, addr + size), or 0 when part of it is unreadable.
+    uint64_t hash(uint64_t addr, size_t size) {
+        const size_t chunks = (size + kChunk - 1) / kChunk;
+        {
+            std::unique_lock l(m_);
+            idle_.wait(l, [&] { return active_ == 0; }); // no worker is still in the last job
+            addr_ = addr;
+            size_ = size;
+            chunks_ = chunks;
+            results_.assign(chunks, 0);
+            next_ = 0;
+            done_ = 0;
+            failed_ = false;
+            if (chunks > 2) {
+                ++job_;
+                wake_.notify_all();
+            }
+        }
+        work();
+        std::unique_lock l(m_);
+        idle_.wait(l, [&] { return done_ == chunks_; });
+        if (failed_) return 0;
+        uint64_t h = 0xcbf29ce484222325ull ^ size;
+        for (uint64_t r : results_) h = (h ^ r) * 0x100000001b3ull;
+        return h | 1;
+    }
+
+private:
+    static constexpr size_t kChunk = 128 << 10;
+
+    void worker() {
+        uint64_t seen = 0;
+        std::unique_lock l(m_);
+        for (;;) {
+            wake_.wait(l, [&] { return job_ != seen; });
+            seen = job_;
+            ++active_;
+            l.unlock();
+            work();
+            l.lock();
+            if (--active_ == 0) idle_.notify_all();
+        }
+    }
+
+    void work() {
+        thread_local std::vector<uint8_t> buf(kChunk);
+        for (size_t i; (i = next_.fetch_add(1)) < chunks_;) {
+            const size_t off = i * kChunk, n = std::min(kChunk, size_ - off);
+            if (readGuest(addr_ + off, buf.data(), n)) results_[i] = hashBytes(buf.data(), n);
+            else failed_ = true;
+            if (done_.fetch_add(1) + 1 == chunks_) {
+                std::lock_guard l(m_);
+                idle_.notify_all();
+            }
+        }
+    }
+
+    std::mutex m_;
+    std::condition_variable wake_, idle_;
+    uint64_t job_ = 0;
+    unsigned active_ = 0;
+    uint64_t addr_ = 0;
+    size_t size_ = 0, chunks_ = 0;
+    std::vector<uint64_t> results_;
+    std::atomic<size_t> next_{0}, done_{0};
+    std::atomic<bool> failed_{false};
+};
+
 // Guest reads for shader analysis, a page at a time. Analysis reads instruction by
 // instruction, and a syscall each made it the renderer's main cost. Memory a submission
 // references cannot change until the GPU is done with it, so pages stay valid until the
 // submission ends.
 class PageCache {
 public:
-    bool read(uint64_t addr, void* dst, size_t size) {
+    // `record`: count the page as one the result depends on (see startRecording).
+    bool read(uint64_t addr, void* dst, size_t size, bool record = true) {
         auto* out = static_cast<uint8_t*>(dst);
         while (size) {
             const uint64_t page = addr & ~uint64_t(kPage - 1);
             const size_t off = size_t(addr - page), n = std::min(size, kPage - off);
-            const uint8_t* src = lookup(page);
+            const uint8_t* src = lookup(page, record);
             if (!src) return readGuest(addr, out, size); // unmapped page or mapping edge: exact read
             std::memcpy(out, src + off, n);
             out += n;
@@ -115,13 +195,17 @@ public:
         }
         return true;
     }
-    void clear() { pages_.clear(); }
+    void clear() {
+        pages_.clear();
+        lastPage_ = ~0ull;
+    }
 
     // Records the pages read until stopRecording; false if a read missed the cache.
     void startRecording() {
         recording_ = true;
         recordOk_ = true;
         recorded_.clear();
+        lastRecorded_ = ~0ull;
     }
     bool stopRecording(std::vector<std::pair<uint64_t, uint64_t>>& pages) {
         recording_ = false;
@@ -131,7 +215,7 @@ public:
     }
     // Hash of a page's current contents (0 if unreadable).
     uint64_t hash(uint64_t page) {
-        if (!lookup(page)) return 0;
+        if (!lookup(page, false)) return 0;
         Page& p = pages_[page];
         if (!p.hashed) {
             p.hash = hashBytes(p.data->data(), kPage) | 1;
@@ -147,30 +231,42 @@ private:
         uint64_t hash = 0;
         bool hashed = false;
     };
-    const uint8_t* lookup(uint64_t page) {
-        if (recording_) recorded_.insert(page);
+    const uint8_t* lookup(uint64_t page, bool record) {
+        record &= recording_;
+        if (record && page != lastRecorded_) {
+            recorded_.insert(page);
+            lastRecorded_ = page;
+        }
+        if (page == lastPage_) return lastData_;
+        lastPage_ = page;
+        return lastData_ = find(page, record);
+    }
+    const uint8_t* find(uint64_t page, bool record) {
         if (auto it = pages_.find(page); it != pages_.end()) return it->second.data ? it->second.data->data() : nullptr;
         Page p;
         p.data = std::make_unique<std::array<uint8_t, kPage>>();
         if (!readGuest(page, p.data->data(), kPage)) {
             p.data.reset();
-            if (recording_) recordOk_ = false;
+            if (record) recordOk_ = false;
         }
         return (pages_[page] = std::move(p)).data ? pages_[page].data->data() : nullptr;
     }
     std::unordered_map<uint64_t, Page> pages_;
     bool recording_ = false, recordOk_ = true;
     std::set<uint64_t> recorded_;
+    uint64_t lastRecorded_ = ~0ull;
+    uint64_t lastPage_ = ~0ull; // the last page looked up, and its data
+    const uint8_t* lastData_ = nullptr;
 };
 
-// Identifies an analysis: the launch state (every field analysis or translation reads).
+// Identifies a shader launch: the launch state analysis or translation reads, except user data
+// (an analysis is re-targeted to other user data by gcn::refresh).
 std::string launchKey(const gcn::LaunchState& l, uint32_t bindingBase) {
     std::string k;
     auto put = [&](const void* p, size_t n) { k.append(static_cast<const char*>(p), n); };
     put(&bindingBase, 4);
     put(&l.stage, 1);
     put(&l.entry, 8);
-    put(l.userData, sizeof(l.userData));
     put(&l.rsrc1, 4);
     put(&l.rsrc2, 4);
     put(&l.glClipZ, 1);
@@ -237,13 +333,19 @@ struct BufferRange {
     uint32_t byteOffset = 0; // guest base relative to `offset`
 };
 
-// An analysed program, reused while the guest pages it read are unchanged.
+// An analysed program, reused while its code pages are unchanged and gcn::refresh can re-target
+// it to the launch. The renderer fills resource fields into prog.data per draw.
 struct CachedProgram {
     gcn::Program prog;
-    std::vector<uint32_t> data; // prog.data as analysed; the renderer fills resource fields in
-    std::vector<std::pair<uint64_t, uint64_t>> pages; // page address, content hash
+    std::vector<std::pair<uint64_t, uint64_t>> pages; // code page address, content hash
     ShaderModule* module = nullptr;
     bool valid = false;
+};
+
+// The analyses of one shader launch key (user data or memory can send the code down different
+// branches or change a resource's format), most recently used first.
+struct ProgramVariants {
+    std::vector<std::unique_ptr<CachedProgram>> list;
 };
 
 // LPN_PROFILE=1: where the renderer's time goes, printed every 300 frames.
@@ -253,7 +355,7 @@ constexpr const char* kProfNames[kProfCount] = {"renderer", "analyze", "shader-l
 struct Profiler {
     bool on = false;
     uint64_t ns[kProfCount] = {};
-    uint64_t calls = 0, analysisHits = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0;
+    uint64_t calls = 0, analysisHits = 0, analyses = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -359,7 +461,10 @@ public:
             codePages_.clear();
         }
         if (frame_ == traceFrame_) dumpSurfaces();
-        if (programs_.size() > 20000) programs_.clear();
+        if (programCount_ > 20000) {
+            programs_.clear();
+            programCount_ = 0;
+        }
         ++frame_;
         if (prof_.on && frame_ % 300 == 0) reportProfile();
         drawIndex_ = 0;
@@ -371,8 +476,8 @@ public:
         std::fprintf(stderr, "[prof] frames %" PRIu64 "-%" PRIu64 ": %.1f fps, %.1f ms/frame;", frame_ - 300, frame_,
                      300 / wall, wall * 1000 / 300);
         for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.2f", kProfNames[i], prof_.ns[i] / 1e6 / 300);
-        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes per frame\n",
-                     prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0);
+        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes per frame\n",
+                     prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.analyses / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0);
         const bool on = prof_.on;
         prof_ = Profiler{};
         prof_.on = on;
@@ -1365,16 +1470,17 @@ private:
         {
             ProfScope ps(prof_, kProfTexRead);
             ++prof_.texChecks;
-            scratch_.resize(tiled);
-            if (!readGuest(t.base(), scratch_.data(), tiled)) {
+            h64 = hasher_.hash(t.base(), tiled);
+            if (!h64) {
                 warnOnce("texture at 0x" + hex(t.base()) + " is not readable");
                 return nullptr;
             }
-            h64 = hashBytes(scratch_.data(), tiled);
         }
         tex.checkedFrame = frame_;
         if (tex.img.image && tex.hash == h64) return &tex;
         ProfScope pu(prof_, kProfTexUpload);
+        scratch_.resize(tiled);
+        if (!readGuest(t.base(), scratch_.data(), tiled)) return nullptr;
         ++prof_.texUploads;
         prof_.texBytes += bytes;
         if (!ringFits(bytes)) {
@@ -1568,25 +1674,41 @@ private:
     CachedProgram* analyzed(const gcn::LaunchState& l, uint32_t bindingBase) {
         if (!l.entry) return nullptr;
         ProfScope ps(prof_, kProfAnalyze);
-        const std::string key = launchKey(l, bindingBase);
-        CachedProgram& c = programs_[key];
-        if (c.valid) {
+        auto& list = programs_[launchKey(l, bindingBase)].list;
+        for (size_t i = 0; i < list.size(); ++i) {
+            CachedProgram& c = *list[i];
+            if (!c.valid) continue;
             bool same = true;
             for (const auto& [page, h] : c.pages)
                 if (codePages_.hash(page) != h) {
                     same = false;
                     break;
                 }
-            if (same) {
-                ++prof_.analysisHits;
-                c.prog.data = c.data;
-                return &c;
+            if (!same) {
+                c.valid = false;
+                continue;
+            }
+            if (!gcn::refresh(c.prog, l, readData_)) continue;
+            ++prof_.analysisHits;
+            if (i) std::rotate(list.begin(), list.begin() + i, list.begin() + i + 1);
+            return list.front().get();
+        }
+        // Replace an invalid variant, else add one (dropping the least recently used past 8).
+        auto slot = std::find_if(list.begin(), list.end(), [](const auto& c) { return !c->valid; });
+        if (slot == list.end()) {
+            if (list.size() >= 8) slot = list.end() - 1;
+            else {
+                list.push_back(std::make_unique<CachedProgram>());
+                slot = list.end() - 1;
+                ++programCount_;
             }
         }
+        std::rotate(list.begin(), slot, slot + 1);
+        CachedProgram& c = *list.front();
+        ++prof_.analyses;
         codePages_.startRecording();
-        c.prog = gcn::analyze(l, readCached_);
+        c.prog = gcn::analyze(l, readCode_, readData_);
         c.valid = codePages_.stopRecording(c.pages);
-        c.data = c.prog.data;
         ProfScope pl(prof_, kProfShaderLookup);
         c.module = c.prog.launch.entry ? shader(c.prog, bindingBase) : nullptr;
         return c.prog.launch.entry ? &c : nullptr;
@@ -2051,6 +2173,7 @@ private:
     VkDeviceSize ringUsed_ = 0, storageAlign_ = 16;
     std::vector<std::function<void()>> afterFlush_;
     std::vector<uint8_t> scratch_;
+    GuestHasher hasher_;
 
     std::map<uint64_t, Import> imports_;
     std::unordered_map<uint64_t, Surface> colors_, depths_;
@@ -2085,8 +2208,10 @@ private:
     } stats_;
     Profiler prof_;
     PageCache codePages_;
-    std::unordered_map<std::string, CachedProgram> programs_;
-    const gcn::ReadMemory readCached_ = [this](uint64_t a, void* d, size_t n) { return codePages_.read(a, d, n); };
+    std::unordered_map<std::string, ProgramVariants> programs_;
+    size_t programCount_ = 0;
+    const gcn::ReadMemory readCode_ = [this](uint64_t a, void* d, size_t n) { return codePages_.read(a, d, n); };
+    const gcn::ReadMemory readData_ = [this](uint64_t a, void* d, size_t n) { return codePages_.read(a, d, n, false); };
 };
 
 Renderer* gRenderer = nullptr;
