@@ -1,7 +1,7 @@
 // Vulkan renderer. Every draw and dispatch is recorded as it arrives, with full barriers
 // between them, and a batch is submitted when the game's own submission ends. Submission
 // does not wait: fences and interrupts the game waits on fire once the GPU has finished
-// (see afterGpuWork), with up to two batches in flight.
+// (see afterGpuWork), with up to kBatches batches in flight.
 //
 // Guest memory is shared with the GPU by importing it (VK_EXT_external_memory_host), so
 // shader buffer reads and writes go straight to the game's memory. Render targets and depth
@@ -75,6 +75,9 @@ constexpr uint32_t kPrimitiveType = 0x242;
 
 constexpr uint32_t kPsBindingBase = 32;
 constexpr VkDeviceSize kRingSize = 64ull << 20;
+// Batches in flight. A long submission is cut into several (see kFlushDraws), so the GPU
+// starts on a frame while the rest is still being recorded.
+constexpr uint32_t kBatches = 4;
 constexpr uint64_t kImportGranule = 2ull << 20;
 
 bool readGuest(uint64_t addr, void* dst, size_t size) {
@@ -439,6 +442,8 @@ public:
         else if (computeOnly_) return;
         else if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r);
         else warnOnce("indirect draws and dispatches are not rendered yet");
+        static const uint32_t flushDraws = getenv("LPN_FLUSH_DRAWS") ? std::atoi(getenv("LPN_FLUSH_DRAWS")) : 400;
+        if (flushDraws && recording_ && ++drawsSinceFlush_ >= flushDraws) flush();
     }
 
     // The command processor copies descriptors and constants between draws (DMA_DATA): draws
@@ -528,47 +533,65 @@ public:
 
     // Called from the display thread. Only recording the copy holds the renderer; waiting for
     // the GPU does not, so the game keeps submitting meanwhile.
-    bool readDisplay(uint64_t addr, uint32_t width, uint32_t height, std::vector<uint32_t>& pixels) {
-        uint32_t w, h;
-        uint64_t seq;
-        {
-            std::lock_guard lock(m_);
-            auto it = colors_.find(addr);
-            if (it == colors_.end()) {
-                warnOnce("display buffer 0x" + hex(addr) + " was not rendered to");
-                return false;
-            }
-            Surface& s = it->second;
-            if (s.elementBytes != 4) return false;
-            w = std::min(width, s.img.width), h = std::min(height, s.img.height);
-            const VkDeviceSize bytes = VkDeviceSize(w) * h * 4;
-            if (bytes > displaySize_) {
-                if (display_) {
-                    vkDestroyBuffer(vk_.device, display_, nullptr);
-                    vkFreeMemory(vk_.device, displayMemory_, nullptr);
-                }
-                display_ = createHostBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &displayMemory_, &displayPtr_, true);
-                displaySize_ = display_ ? bytes : 0;
-                if (!display_) return false;
-            }
-            begin();
-            fullBarrier();
-            VkBufferImageCopy c{};
-            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            c.imageExtent = {w, h, 1};
-            vkCmdCopyImageToBuffer(cmd_, s.img.image, VK_IMAGE_LAYOUT_GENERAL, display_, 1, &c);
-            flush();
-            std::lock_guard dl(doneMutex_);
-            seq = submitted_;
+    // Records a copy of the image at display buffer addr into readback slot c.slot and submits it.
+    // The copy sits in GPU order with the game's work, so the caller can wait for it elsewhere.
+    bool queueDisplay(uint64_t addr, uint32_t width, uint32_t height, DisplayCopy& c) {
+        std::lock_guard lock(m_);
+        auto it = colors_.find(addr);
+        if (it == colors_.end()) {
+            warnOnce("display buffer 0x" + hex(addr) + " was not rendered to");
+            return false;
         }
+        Surface& s = it->second;
+        if (s.elementBytes != 4 || c.slot < 0 || c.slot >= kDisplaySlots) return false;
+        c.w = std::min(width, s.img.width), c.h = std::min(height, s.img.height);
+        DisplaySlot& d = displays_[c.slot];
+        const VkDeviceSize bytes = VkDeviceSize(c.w) * c.h * 4;
+        if (bytes > d.size) {
+            if (d.buf) {
+                waitIdle(); // an older copy may still be writing it
+                vkDestroyBuffer(vk_.device, d.buf, nullptr);
+                vkFreeMemory(vk_.device, d.mem, nullptr);
+            }
+            d.buf = createHostBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &d.mem, &d.ptr, true);
+            d.size = d.buf ? bytes : 0;
+            if (!d.buf) return false;
+        }
+        // Mid-submission, the copy rides in the batch being recorded: flushing it here would split
+        // the game's frame and leave the recorder waiting on its own first half.
+        const bool riding = recording_;
+        begin();
+        fullBarrier();
+        VkBufferImageCopy r{};
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageExtent = {c.w, c.h, 1};
+        vkCmdCopyImageToBuffer(cmd_, s.img.image, VK_IMAGE_LAYOUT_GENERAL, d.buf, 1, &r);
+        if (!riding) flush();
+        std::lock_guard dl(doneMutex_);
+        c.seq = riding ? submitted_ + 1 : submitted_;
+        return true;
+    }
+
+    // The batch holding everything recorded so far, and whether the GPU has finished it.
+    uint64_t gpuMark() {
+        std::lock_guard lock(m_);
+        std::lock_guard dl(doneMutex_);
+        return recording_ ? submitted_ + 1 : submitted_;
+    }
+    bool gpuDone(uint64_t mark) {
+        std::lock_guard dl(doneMutex_);
+        return completed_ >= mark;
+    }
+
+    // Waits for a queued copy and returns its pixels as linear rows of `width`.
+    void fetchDisplay(const DisplayCopy& c, uint32_t width, uint32_t height, std::vector<uint32_t>& pixels) {
         {
             std::unique_lock lock(doneMutex_);
-            doneCv_.wait(lock, [&] { return completed_ >= seq; });
+            doneCv_.wait(lock, [&] { return completed_ >= c.seq; });
         }
-        const auto* src = static_cast<const uint8_t*>(displayPtr_);
+        const auto* src = static_cast<const uint8_t*>(displays_[c.slot].ptr);
         pixels.assign(size_t(width) * height, 0);
-        for (uint32_t y = 0; y < h; ++y) std::memcpy(&pixels[size_t(y) * width], src + size_t(y) * w * 4, w * 4);
-        return true;
+        for (uint32_t y = 0; y < c.h; ++y) std::memcpy(&pixels[size_t(y) * width], src + size_t(y) * c.w * 4, c.w * 4);
     }
 
 private:
@@ -650,8 +673,8 @@ private:
 
     // ---- recording -----------------------------------------------------------------------------
 
-    // Work is recorded into one of two batches (command buffer, fence, upload ring). A flush
-    // submits the current one without waiting and moves to the other, which first has to
+    // Work is recorded into one of kBatches batches (command buffer, fence, upload ring). A flush
+    // submits the current one without waiting and moves to the next, which first has to
     // finish its previous submission; a completion thread waits on the fences and then runs
     // what was deferred until the GPU is done (fences the game polls, interrupts, deletions).
     // LPN_GPU_SYNC=1 waits after every submission instead.
@@ -719,7 +742,8 @@ private:
         pendingDone_.clear();
         doneCv_.notify_all();
         recording_ = false;
-        useBatch(cur_ ^ 1);
+        useBatch((cur_ + 1) % kBatches);
+        drawsSinceFlush_ = 0;
         if (sync_) waitSubmitted();
     }
 
@@ -2406,17 +2430,21 @@ private:
         bool busy = false;                     // submitted and not yet finished
         std::vector<std::function<void()>> done; // runs once it has finished
     };
-    Batch batches_[2];
+    Batch batches_[kBatches];
     uint32_t cur_ = 0;
+    uint32_t drawsSinceFlush_ = 0;
     std::mutex doneMutex_; // guards Batch::busy and done, inFlight_, completing_, the counters
     std::condition_variable doneCv_;
     std::deque<uint32_t> inFlight_;
     bool completing_ = false;
     uint64_t submitted_ = 0, completed_ = 0; // batches
-    VkBuffer display_ = VK_NULL_HANDLE; // display readback, written and read by the display thread
-    VkDeviceMemory displayMemory_ = VK_NULL_HANDLE;
-    void* displayPtr_ = nullptr;
-    VkDeviceSize displaySize_ = 0;
+    struct DisplaySlot { // display readback: the GPU copies into it, the display thread reads it
+        VkBuffer buf = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        void* ptr = nullptr;
+        VkDeviceSize size = 0;
+    };
+    DisplaySlot displays_[kDisplaySlots];
     std::vector<std::function<void()>> pendingDone_; // due after the batch being recorded
     bool sync_ = false;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE; // the current batch's
@@ -2508,8 +2536,16 @@ bool startRenderer(bool computeOnly) {
     return true;
 }
 
-bool readDisplayBuffer(uint64_t address, uint32_t width, uint32_t height, std::vector<uint32_t>& pixels) {
-    return gRenderer && gRenderer->readDisplay(address, width, height, pixels);
+bool queueDisplayCopy(uint64_t address, uint32_t width, uint32_t height, DisplayCopy& c) {
+    return gRenderer && gRenderer->queueDisplay(address, width, height, c);
+}
+
+uint64_t gpuMark() { return gRenderer ? gRenderer->gpuMark() : 0; }
+
+bool gpuDone(uint64_t mark) { return !gRenderer || gRenderer->gpuDone(mark); }
+
+void fetchDisplayCopy(const DisplayCopy& c, uint32_t width, uint32_t height, std::vector<uint32_t>& pixels) {
+    if (gRenderer) gRenderer->fetchDisplay(c, width, height, pixels);
 }
 
 void captureNextFrame(const std::string& dir) {

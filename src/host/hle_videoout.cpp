@@ -1,5 +1,6 @@
 // libSceVideoOut. A host thread acts as the display: at each vblank it takes the next
-// queued flip, shows the buffer and fires the flip events the game waits on.
+// queued flip whose rendering the GPU has finished and fires the flip events the game waits
+// on; a second thread reads the buffer back and shows it, so the vblank clock never waits.
 #include "host/videoout.h"
 
 #include "host/equeue.h"
@@ -8,6 +9,7 @@
 #include "host/kernel.h"
 #include "host/window.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -59,6 +61,7 @@ struct Flip {
     int32_t index;
     int64_t arg;
     uint64_t submitTime;
+    uint64_t gpuMark; // the GPU work that renders it
 };
 
 struct Display {
@@ -76,6 +79,8 @@ struct Display {
 } gDisplay;
 
 double gVblankHz = 59.94;
+double gFpsCap = 0;
+int32_t gMinFlipRate = 0; // from the cap
 uint64_t gScreenshotFlip = 0;
 uint64_t gScreenshotEvery = 0;
 std::string gScreenshotPath;
@@ -104,18 +109,114 @@ using Clock = std::chrono::steady_clock;
 const Clock::time_point gStart = Clock::now();
 uint64_t nowUs() { return std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - gStart).count(); }
 
-void vblankThread() {
-    auto next = Clock::now();
+// A flipped frame on its way from the vblank thread to the display thread.
+struct Shown {
+    Frame frame;
+    uint64_t flip = 0;
+    bool rendered = false; // frame.pixels names a display buffer the GPU copy in `copy` reads
+    render::DisplayCopy copy;
+};
+
+// The display thread's queue: one frame waiting and one being shown, each holding a readback
+// slot, so the vblank thread always finds a free slot for the next.
+struct {
+    std::mutex m;
+    std::condition_variable cv;
+    bool waiting = false;
+    Shown next;
+    int showing = -1; // the slot the display thread reads
+} gShow;
+
+// LPN_PROFILE=1: how evenly frames reach the screen, printed every 300 flips.
+const bool gPacingStats = getenv("LPN_PROFILE") != nullptr;
+
+void showFrame(Shown& s) {
+    std::vector<uint32_t> rendered;
+    Frame frame = s.frame;
+    if (s.rendered) {
+        // Show what the GPU rendered into the buffer.
+        render::fetchDisplayCopy(s.copy, frame.width, frame.height, rendered);
+        frame.pixels = rendered.data();
+        frame.pitchPixels = frame.width;
+        frame.tilingMode = 1;
+    }
+    const uint64_t n = s.flip;
+    if (frame.pixels && gScreenshotFlip && n == gScreenshotFlip) writeScreenshot(frame, gScreenshotPath);
+    static const uint64_t captureAt = getenv("LPN_CAPTURE_AT") ? std::strtoull(getenv("LPN_CAPTURE_AT"), nullptr, 0) : 0;
+    if (n == captureAt) gCaptureRequested = true; // a capture without pressing F12
+    if (frame.pixels && gCaptureRequested.exchange(false)) {
+        std::string dir;
+        for (int i = 1; dir.empty() || std::filesystem::exists(dir); ++i) dir = "lpn-captures/capture-" + std::to_string(i);
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        writeScreenshot(frame, dir + "/screenshot.ppm");
+        std::fprintf(stderr, "[capture] flip %" PRIu64 " -> %s (tracing the next frame)\n", n, dir.c_str());
+        render::captureNextFrame(dir);
+    }
+    if (frame.pixels && gScreenshotEvery && n % gScreenshotEvery == 0)
+        writeScreenshot(frame, "screenshot-" + std::to_string(n) + ".ppm");
+    presentFrame(frame);
+}
+
+void displayThread() {
     for (;;) {
-        next += std::chrono::nanoseconds(int64_t(1e9 / gVblankHz));
+        Shown s;
+        {
+            std::unique_lock lock(gShow.m);
+            gShow.cv.wait(lock, [] { return gShow.waiting; });
+            s = gShow.next;
+            gShow.waiting = false;
+            gShow.showing = s.rendered ? s.copy.slot : -1;
+        }
+        gShow.cv.notify_all();
+        showFrame(s);
+        {
+            std::lock_guard lock(gShow.m);
+            gShow.showing = -1;
+        }
+    }
+}
+
+// Hands a flipped frame to the display thread, queueing its GPU readback first. Waits only when
+// the display thread is a whole frame behind.
+void queueShow(const Frame& frame, uint64_t flip) {
+    Shown s{frame, flip};
+    std::unique_lock lock(gShow.m);
+    gShow.cv.wait(lock, [] { return !gShow.waiting; });
+    if (frame.pixels) {
+        for (int i = 0; i < render::kDisplaySlots; ++i)
+            if (i != gShow.showing) {
+                s.copy.slot = i;
+                break;
+            }
+        s.rendered = render::queueDisplayCopy(reinterpret_cast<uint64_t>(frame.pixels), frame.width, frame.height, s.copy);
+    }
+    gShow.next = s;
+    gShow.waiting = true;
+    gShow.cv.notify_all();
+}
+
+void vblankThread() {
+    const auto period = std::chrono::nanoseconds(int64_t(1e9 / gVblankHz));
+    auto next = Clock::now();
+    uint64_t lastFlipVblank = 0, statFrom = 0;
+    uint64_t intervals[5] = {}; // flips 1, 2, 3, 4, 5+ vblanks apart
+    double lateMax = 0;
+    for (;;) {
+        next += period;
         std::this_thread::sleep_until(next);
+        const auto now = Clock::now();
+        if (gPacingStats) lateMax = std::max(lateMax, std::chrono::duration<double, std::milli>(now - next).count());
+        if (now - next > period) next = now; // a stall: don't fire the missed vblanks in a burst
         Frame frame;
         bool flipped = false;
         int64_t flipArg = 0;
+        uint64_t n = 0, vblank = 0;
         {
             std::lock_guard lock(gDisplay.m);
-            ++gDisplay.vblankCount;
-            if (!gDisplay.pending.empty() && gDisplay.vblankCount % (gDisplay.flipRate + 1) == 0) {
+            vblank = ++gDisplay.vblankCount;
+            if (!gDisplay.pending.empty() && gDisplay.vblankCount % (std::max(gDisplay.flipRate, gMinFlipRate) + 1) == 0 &&
+                render::gpuDone(gDisplay.pending.front().gpuMark)) {
                 const Flip f = gDisplay.pending.front();
                 gDisplay.pending.pop_front();
                 auto& s = gDisplay.status;
@@ -128,6 +229,7 @@ void vblankThread() {
                 s.flipPendingNum = int32_t(gDisplay.pending.size());
                 flipArg = f.arg;
                 flipped = true;
+                n = s.count;
                 if (f.index >= 0) {
                     const auto& b = gDisplay.buffers[f.index];
                     frame = {b.address, b.attr.width, b.attr.height, b.attr.pitchInPixel, uint32_t(b.attr.pixelFormat),
@@ -136,33 +238,23 @@ void vblankThread() {
             }
         }
         gDisplay.vblank.notify_all();
-        triggerEvent(kEventVblank, kFilterVideoOut, int64_t(gDisplay.vblankCount));
+        triggerEvent(kEventVblank, kFilterVideoOut, int64_t(vblank));
         if (flipped) {
-            // Show what the GPU rendered into the buffer, when the renderer has it.
-            std::vector<uint32_t> rendered;
-            if (frame.pixels && render::readDisplayBuffer(reinterpret_cast<uint64_t>(frame.pixels), frame.width,
-                                                       frame.height, rendered)) {
-                frame.pixels = rendered.data();
-                frame.pitchPixels = frame.width;
-                frame.tilingMode = 1;
-            }
-            const uint64_t n = gDisplay.status.count;
-            if (frame.pixels && gScreenshotFlip && n == gScreenshotFlip) writeScreenshot(frame, gScreenshotPath);
-            static const uint64_t captureAt = getenv("LPN_CAPTURE_AT") ? std::strtoull(getenv("LPN_CAPTURE_AT"), nullptr, 0) : 0;
-            if (n == captureAt) gCaptureRequested = true; // a capture without pressing F12
-            if (frame.pixels && gCaptureRequested.exchange(false)) {
-                std::string dir;
-                for (int i = 1; dir.empty() || std::filesystem::exists(dir); ++i) dir = "lpn-captures/capture-" + std::to_string(i);
-                std::error_code ec;
-                std::filesystem::create_directories(dir, ec);
-                writeScreenshot(frame, dir + "/screenshot.ppm");
-                std::fprintf(stderr, "[capture] flip %" PRIu64 " -> %s (tracing the next frame)\n", n, dir.c_str());
-                render::captureNextFrame(dir);
-            }
-            if (frame.pixels && gScreenshotEvery && n % gScreenshotEvery == 0)
-                writeScreenshot(frame, "screenshot-" + std::to_string(n) + ".ppm");
-            presentFrame(frame);
+            queueShow(frame, n);
             triggerEvent(kEventFlip, kFilterVideoOut, flipArg);
+            if (gPacingStats) {
+                if (lastFlipVblank) ++intervals[std::min<uint64_t>(vblank - lastFlipVblank, 5) - 1];
+                lastFlipVblank = vblank;
+                if (n % 300 == 0) {
+                    std::fprintf(stderr,
+                                 "[pacing] flips %" PRIu64 "-%" PRIu64 ": vblanks apart 1:%" PRIu64 " 2:%" PRIu64
+                                 " 3:%" PRIu64 " 4:%" PRIu64 " 5+:%" PRIu64 "; vblank late by up to %.1f ms\n",
+                                 statFrom, n, intervals[0], intervals[1], intervals[2], intervals[3], intervals[4], lateMax);
+                    statFrom = n;
+                    std::fill(std::begin(intervals), std::end(intervals), 0);
+                    lateMax = 0;
+                }
+            }
         }
     }
 }
@@ -190,6 +282,7 @@ int32_t sceVideoOutOpen(int32_t, int32_t busType, int32_t, const void*) {
     if (!gDisplay.open) {
         gDisplay.open = true;
         gDisplay.status.currentBuffer = -1;
+        std::thread(displayThread).detach();
         std::thread(vblankThread).detach();
     }
     return kHandle;
@@ -279,13 +372,22 @@ int32_t ok() { return 0; }
 int32_t videoOutSubmitFlip(int32_t handle, int32_t index, int32_t, int64_t arg) {
     if (handle != kHandle) return kErrInvalidHandle;
     if (index < -1 || index >= 16) return kErrInvalidIndex;
+    const uint64_t mark = render::gpuMark();
     std::lock_guard lock(gDisplay.m);
     if (gDisplay.pending.size() >= 16) return kErrFlipQueueFull;
-    gDisplay.pending.push_back({index, arg, nowUs()});
+    gDisplay.pending.push_back({index, arg, nowUs(), mark});
     return 0;
 }
 
-void setVblankRate(double hz) { gVblankHz = hz; }
+void setVblankRate(double hz) {
+    gVblankHz = hz;
+    setFpsCap(gFpsCap);
+}
+
+void setFpsCap(double fps) {
+    gFpsCap = fps;
+    gMinFlipRate = fps > 0 ? std::max(0, int32_t(gVblankHz / fps + 0.5) - 1) : 0;
+}
 
 void registerVideoOutHle() {
     const char* v = "libSceVideoOut";

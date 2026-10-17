@@ -39,6 +39,7 @@ int usage() {
                  "  --no-gpu       do not render (no Vulkan)\n"
                  "  --compute-only run GPU compute work but skip draws (fast; the game still progresses)\n"
                  "  --vblank HZ    display refresh rate (default 59.94)\n"
+                 "  --fps-cap N    show at most N frames a second, at even intervals (e.g. 30)\n"
                  "  --data DIR     host folder for saves and downloads (default ./lpn-data)\n"
                  "  --trace-hle N  log each system call's first use, and its first use after frame N\n"
                  "  --strict       stop at the first call to an unimplemented import\n"
@@ -84,6 +85,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--compute-only")) computeOnly = true;
         else if (!std::strcmp(argv[i], "--trace-files")) host::process().traceFiles = true;
         else if (!std::strcmp(argv[i], "--vblank") && i + 1 < argc) host::setVblankRate(std::atof(argv[++i]));
+        else if (!std::strcmp(argv[i], "--fps-cap") && i + 1 < argc) host::setFpsCap(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--list-unimplemented")) listUnimplemented = true;
         else if (!std::strcmp(argv[i], "--log-limit") && i + 1 < argc)
             host::hleOptions().logLimitPerImport = std::strtoull(argv[++i], nullptr, 0);
