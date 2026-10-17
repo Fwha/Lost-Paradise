@@ -235,7 +235,8 @@ private:
         case Format::SMRD: smrd(in, pc, st); return true;
         case Format::VOP3:
             if (in.op < 256) unknown(st, w & 0xFF, 2); // compare into an SGPR pair
-            else if ((in.op >= 293 && in.op <= 298) || in.op == 365 || in.op == 366) unknown(st, (w >> 8) & 0x7F, 2);
+            else if ((in.op >= 293 && in.op <= 298) || in.op == 365 || in.op == 366 || in.op == 374 || in.op == 375)
+                unknown(st, (w >> 8) & 0x7F, 2); // VOP3b: carry or flags into an SGPR pair
             return true;
         case Format::VOPC:
             if (in.op & 16) p_.writesExec = true; // v_cmpx

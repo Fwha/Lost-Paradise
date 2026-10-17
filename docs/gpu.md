@@ -65,6 +65,10 @@ screen loop). Addresses are guest addresses and change between runs.
 
 - **Cube maps.** `v_cubeid/sc/tc/ma` are translated, and a cube sample's (s, t, face) coordinates
   are turned back into a direction for `samplerCube`. Character shaders use them.
+- **Cross-lane and wide ops.** `ds_swizzle_b32` in quad mode becomes `subgroupQuadBroadcast`
+  (GCN and Vulkan order a quad's pixels alike); the shadow-map pixel shader uses it for its
+  slope-scaled depth bias. `v_mad_u64_u32` (integer division sequences in cutscene vertex
+  shaders) and `v_cvt_off_f32_i4` are translated too.
 - **Constants inside shader code.** Some shaders build a V# from `s_getpc_b64` plus an offset to
   read a table stored after their code (the AO upsample's bilateral weights). The analysis
   tracks `s_add_u32`/`s_addc_u32` so that address stays known; when it was lost, the AO term read
@@ -72,8 +76,8 @@ screen loop). Addresses are guest addresses and change between runs.
 
 Known gaps: tile mode 14 (2D thin) textures are read as linear (in gameplay only render targets,
 which are sampled from their images, use it); draws into linear targets are not copied back;
-indirect draws are skipped; cube arrays, MSAA and some formats are not handled;
-`ds_swizzle_b32`, `v_mad_u64_u32` and `v_cvt_off_f32_i4` are not translated yet.
+indirect draws are skipped; cube arrays, MSAA and some formats are not handled; LDS/GDS memory
+is not emulated, and `ds_swizzle_b32` only in its quad mode.
 
 ## Next
 

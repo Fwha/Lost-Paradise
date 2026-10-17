@@ -42,7 +42,8 @@ Last updated 2026-10-16.
   screen (black, with the Lost Paradise logo). See `docs/gpu.md` for how it works.
 - Gameplay renders lit (PRs #10, #11): the white-out came from ignored HTILE/CMASK fast
   clears; the black environment from a PC-relative constant table the shader analysis lost
-  (`s_addc_u32`), which zeroed ambient occlusion. Cube-map sampling is translated.
+  (`s_addc_u32`), which zeroed ambient occlusion. Cube-map sampling is translated, and so are
+  `ds_swizzle_b32` (quad mode), `v_mad_u64_u32` and `v_cvt_off_f32_i4`.
 - Performance (RTX 4070 Ti SUPER, `LPN_PROFILE=1`, headless): gameplay in Shin's Castle
   (~1,500 draws) runs at 40 fps, up from 15 (shader analyses are replayed instead of redone,
   texture checks hashed in parallel); menus reach the game's 30 fps cap, the opening cutscene
@@ -69,8 +70,8 @@ Last updated 2026-10-16.
 1. Keep booting with the full data folder (the container only has the files staged so far;
    the next one the game asks for is `data/chara/ps4/face/c_cm_f_zco_a/tex00.par`).
 2. Rendering: 2D-tiled texture detiling (tile mode 14), indirect draws, a real swapchain
-   instead of reading frames back, and the untranslated `ds_swizzle_b32`, `v_mad_u64_u32` and
-   `v_cvt_off_f32_i4`. `docs/gpu.md` lists what is known to be missing.
+   instead of reading frames back. `docs/gpu.md` lists what is known to be missing. Gameplay
+   runs with no untranslated-instruction warnings.
 3. Performance headroom above 30 fps: every draw is its own render pass behind a full barrier
    (batching draws per render pass should cut the GPU wait); texture checks still read every
    sampled texture each frame (page-dirty tracking would avoid that, but soft-dirty bits are

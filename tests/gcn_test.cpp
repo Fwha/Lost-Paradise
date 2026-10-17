@@ -158,6 +158,29 @@ int main() {
         ++failures;
     }
 
+    // Cross-lane and wide integer ops seen in gameplay shaders: a depth-slope pixel shader's quad
+    // swizzles, an integer division's 64-bit multiply-add, and a 4-bit offset conversion.
+    const std::vector<uint32_t> misc = {
+        0xd8d48055, 0x03000000, // ds_swizzle_b32 v3, v0 offset0:85 offset1:128 (lane 1 of each quad)
+        0xd2ec0a02, 0x02020300, // v_mad_u64_u32 v[2:3], s[10:11], v0, v1, 0
+        0x7e081c84,             // v_cvt_off_f32_i4 v4, 4
+        0xbf810000,             // s_endpgm
+    };
+    gcn::LaunchState ml = l;
+    auto readMisc = [&](uint64_t addr, void* dst, size_t size) {
+        if (addr < ml.entry || addr + size > ml.entry + misc.size() * 4) return false;
+        std::memcpy(dst, reinterpret_cast<const char*>(misc.data()) + (addr - ml.entry), size);
+        return true;
+    };
+    const gcn::Translation mt = gcn::translate(gcn::analyze(ml, readMisc), 0);
+    if (!mt.warnings.empty() || mt.glsl.find("subgroupQuadBroadcast(v0, 1u)") == std::string::npos ||
+        mt.glsl.find("umulExtended(v0, v1") == std::string::npos ||
+        gcn::compileGlsl(mt.glsl, gcn::GlslStage::Fragment, &error).empty()) {
+        std::fprintf(stderr, "lane/wide ops: %zu warnings (%s)\n%s\n%s\n", mt.warnings.size(),
+                     mt.warnings.empty() ? "" : mt.warnings[0].c_str(), error.c_str(), mt.glsl.c_str());
+        ++failures;
+    }
+
     if (failures) std::fprintf(stderr, "%d failure(s)\n", failures);
     return failures ? 1 : 0;
 }
