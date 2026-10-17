@@ -397,9 +397,16 @@ constexpr const char* kProfNames[kProfCount] = {"renderer", "analyze", "shader-l
 struct Profiler {
     bool on = false;
     uint64_t ns[kProfCount] = {};
+    uint64_t passWhy[4] = {}; // why a new render pass started, by PassWhy
+    uint64_t feedbackOn[2] = {}; // a draw sampled the open pass's depth / color attachment
     uint64_t calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
+
+// Why a draw starts a new render pass: other targets, it samples one of the pass's
+// attachments, the draw before wrote memory from a shader, or the pass was ended by something
+// else (a dispatch, copy, flush or clear).
+enum PassWhy { kPassTargets, kPassFeedback, kPassStore, kPassOther };
 
 class ProfScope {
 public:
@@ -620,11 +627,14 @@ public:
         uint64_t draw, shader;
         bool dispatch, newPass;
         uint32_t count;
+        bool batchStart = false; // not a draw: the start of a batch, after the GPU idled for it
     };
     uint64_t timingFrame_ = getenv("LPN_GPU_TIMING") ? std::strtoull(getenv("LPN_GPU_TIMING"), nullptr, 0) : ~0ull;
     VkQueryPool timing_ = VK_NULL_HANDLE;
     std::vector<TimingMeta> timingMeta_;
     void startTiming() {
+        begin(); // before the pool exists, so begin() writes no timestamp into it yet
+        endPass();
         VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
         qci.queryCount = kTimingQueries;
@@ -632,8 +642,6 @@ public:
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(vk_.phys, &props);
         gpuTickNs_ = props.limits.timestampPeriod;
-        begin();
-        endPass();
         vkCmdResetQueryPool(cmd_, timing_, 0, kTimingQueries);
         vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timing_, 0);
         timingMeta_.clear();
@@ -648,18 +656,23 @@ public:
         struct Row { double ms; size_t i; };
         std::vector<Row> rows;
         std::map<uint64_t, std::pair<double, uint32_t>> byShader;
-        double total = 0, passMs = 0;
-        uint32_t passes = 0;
+        double total = 0, passMs = 0, idle = 0;
+        uint32_t passes = 0, batches = 0;
         for (size_t i = 0; i < timingMeta_.size(); ++i) {
             const double ms = t[i + 1] >= t[i] ? double(t[i + 1] - t[i]) * gpuTickNs_ / 1e6 : 0;
+            if (timingMeta_[i].batchStart) { // the gap since the previous batch ended
+                idle += ms, ++batches;
+                continue;
+            }
             total += ms;
             if (timingMeta_[i].newPass) passMs += ms, ++passes;
             rows.push_back({ms, i});
             auto& b = byShader[timingMeta_[i].shader];
             b.first += ms, ++b.second;
         }
-        std::fprintf(stderr, "[timing] frame %" PRIu64 ": %zu draws/dispatches, %.2f ms on the GPU; draws that start a pass (%u): %.2f ms\n",
-                     timingFrame_, timingMeta_.size(), total, passes, passMs);
+        std::fprintf(stderr, "[timing] frame %" PRIu64 ": %zu draws/dispatches, %.2f ms of GPU work; draws that start a pass (%u): %.2f ms;"
+                             " GPU idle between %u batches: %.2f ms\n",
+                     timingFrame_, timingMeta_.size() - batches, total, passes, passMs, batches, idle);
         std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.ms > b.ms; });
         for (size_t k = 0; k < std::min<size_t>(25, rows.size()); ++k) {
             const TimingMeta& m = timingMeta_[rows[k].i];
@@ -687,6 +700,9 @@ public:
         std::fprintf(stderr, "[prof] frames %" PRIu64 "-%" PRIu64 ": %.1f fps, %.1f ms/frame;", frame_ - 300, frame_,
                      300 / wall, wall * 1000 / 300);
         for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.2f", kProfNames[i], prof_.ns[i] / 1e6 / 300);
+        std::fprintf(stderr, " passes for targets %.0f feedback %.0f (depth %.0f color %.0f) store %.0f other %.0f;",
+                     prof_.passWhy[0] / 300.0, prof_.passWhy[1] / 300.0, prof_.feedbackOn[0] / 300.0,
+                     prof_.feedbackOn[1] / 300.0, prof_.passWhy[2] / 300.0, prof_.passWhy[3] / 300.0);
         std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / 300, prof_.dmas / 300.0,
                      prof_.dmaBytes / 300.0 / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
@@ -869,6 +885,10 @@ private:
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK(vkBeginCommandBuffer(cmd_, &bi));
         recording_ = true;
+        if (frame_ == timingFrame_ && timing_ && timingMeta_.size() + 1 < kTimingQueries) {
+            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timing_, uint32_t(timingMeta_.size() + 1));
+            timingMeta_.push_back({0, 0, false, false, 0, true});
+        }
         if (timestamps_) {
             vkCmdResetQueryPool(cmd_, timestamps_, 2 * cur_, 2);
             vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamps_, 2 * cur_);
@@ -2194,6 +2214,8 @@ private:
     }
 
     void dispatch(const DrawCall& d, const GpuRegs& r) {
+        static const uint64_t skipCs = getenv("LPN_SKIP_CS") ? std::strtoull(getenv("LPN_SKIP_CS"), nullptr, 0) : 0;
+        if (skipCs && shaderAddress(r, reg::kPgmLoCs) == skipCs) return; // debugging: what a shader costs
         CachedProgram* csc = analyzed(launch(r, gcn::Stage::Compute), 0);
         if (!csc) return;
         gcn::Program& cs = csc->prog;
@@ -2450,6 +2472,7 @@ private:
                 hasDepth = true;
                 depth.imageView = view(s->img, f, VK_IMAGE_VIEW_TYPE_2D, kIdentity, s->img.aspect);
                 pass.images.push_back(s->img.image);
+                pass.depthImage = s->img.image;
                 depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
                 depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
                 depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -2542,10 +2565,17 @@ private:
         pass.stencil = hasDepth && gs.stencil;
         pass.width = width;
         pass.height = height;
+        // Sampling an attachment needs a new pass (and its barrier) only once a draw in the open
+        // pass has written it: decals and soft particles that read the depth buffer without
+        // writing it then share one pass.
         bool feedback = false;
         for (VkImage im : sampledSurfaces_)
-            feedback |= std::find(pass.images.begin(), pass.images.end(), im) != pass.images.end();
+            if (std::find(pass_.written.begin(), pass_.written.end(), im) != pass_.written.end()) {
+                feedback = true;
+                if (prof_.on && pass_.open && pass_.sameTargets(pass)) ++prof_.feedbackOn[im == pass_.depthImage ? 0 : 1];
+            }
         if (!pass_.open || feedback || !pass_.sameTargets(pass)) {
+            if (prof_.on) ++prof_.passWhy[!pass_.open ? passClosedBy_ : feedback ? kPassFeedback : kPassTargets];
             fullBarrier();
             VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
             ri.renderArea = {{0, 0}, {width, height}};
@@ -2589,7 +2619,16 @@ private:
                 if (i.storage) return true;
             return false;
         };
-        if (stores(vs) || (psm && stores(ps))) endPass();
+        for (VkImage im : pass_.images) // what this draw wrote
+            if ((im != pass_.depthImage || clearDepth || (((depthControl >> 2) & 1) && ((depthControl >> 1) & 1)) ||
+                 (gs.stencil && (depthControl & 1) && ((r.ctx[reg::kDbStencilRefMask] >> 16) & 0xFF) &&
+                  (r.ctx[reg::kDbStencilControl] & 0xFFFFFF))) &&
+                std::find(pass_.written.begin(), pass_.written.end(), im) == pass_.written.end())
+                pass_.written.push_back(im);
+        if (stores(vs) || (psm && stores(ps))) {
+            endPass();
+            passClosedBy_ = kPassStore;
+        }
         ++stats_.draws;
         if (trace_ && snap_ && colorCount && snapWanted()) snapshot(uint64_t(r.ctx[reg::kCbColorBase]) << 8);
     }
@@ -2598,6 +2637,7 @@ private:
         if (!pass_.open) return;
         vkCmdEndRendering(cmd_);
         pass_.open = false;
+        passClosedBy_ = kPassOther;
     }
 
     void setViewportScissor(const GpuRegs& r, uint32_t width, uint32_t height) {
@@ -2672,6 +2712,7 @@ private:
     Batch batches_[kBatches];
     uint32_t cur_ = 0;
     uint32_t drawsSinceFlush_ = 0;
+    PassWhy passClosedBy_ = kPassOther;
     VkQueryPool timestamps_ = VK_NULL_HANDLE; // LPN_PROFILE: two per batch
     double gpuTickNs_ = 1;
     std::atomic<uint64_t> gpuBusyNs_{0};
@@ -2750,6 +2791,8 @@ private:
         uint32_t colorCount = 0, width = 0, height = 0;
         bool stencil = false;
         std::vector<VkImage> images; // attachments
+        VkImage depthImage = VK_NULL_HANDLE;
+        std::vector<VkImage> written; // attachments a draw in the pass has written
         bool sameTargets(const Pass& o) const {
             return colorCount == o.colorCount && depth == o.depth && stencil == o.stencil && width == o.width &&
                    height == o.height && std::equal(views, views + colorCount, o.views);
