@@ -460,6 +460,7 @@ public:
         if (!pendingCapture_.empty()) { // F12: trace this frame into the capture folder
             traceDir_ = pendingCapture_ + "/";
             pendingCapture_.clear();
+            savedShaders_.clear();
             traceFrame_ = frame_;
             traceOut_ = std::fopen((traceDir_ + "trace.txt").c_str(), "w");
             if (!traceOut_) traceOut_ = stderr;
@@ -480,6 +481,30 @@ public:
         lastFrameEnd_ = now;
         std::copy(std::begin(prof_.ns), std::end(prof_.ns), frameNs_);
         frameAnalyses_ = prof_.analyses;
+    }
+
+    // A capture also keeps each shader: <stage>_<entry>.bin (code from the entry point, for
+    // lpn-gcn) and <stage>_<entry>_<module>.glsl (its translation).
+    void saveShader(const CachedProgram* c, const char* stage) {
+        if (!c || traceDir_.empty() || !c->module || c->code.empty()) return;
+        const std::string base = traceDir_ + stage + "_" + hex(c->prog.launch.entry);
+        const std::string glsl = base + "_" + std::to_string(c->module->id) + ".glsl";
+        if (!savedShaders_.insert(glsl).second) return;
+        if (FILE* f = std::fopen(glsl.c_str(), "wb")) {
+            std::fwrite(c->module->translation.glsl.data(), 1, c->module->translation.glsl.size(), f);
+            std::fclose(f);
+        }
+        const uint64_t start = c->prog.launch.entry;
+        uint64_t end = 0; // the code near the entry (a vertex shader's fetch shader lives elsewhere)
+        for (const auto& range : c->code)
+            if (range.first >= start && range.first < start + 0x10000) end = std::max(end, range.second);
+        if (end <= start || end - start > (1 << 20) || !savedShaders_.insert(base).second) return;
+        std::vector<uint8_t> bytes(end - start);
+        if (!readGuest(start, bytes.data(), bytes.size())) return;
+        if (FILE* f = std::fopen((base + ".bin").c_str(), "wb")) {
+            std::fwrite(bytes.data(), 1, bytes.size(), f);
+            std::fclose(f);
+        }
     }
 
     void captureNextFrame(const std::string& dir) {
@@ -1831,6 +1856,7 @@ private:
 
     void dispatch(const DrawCall& d, const GpuRegs& r) {
         CachedProgram* csc = analyzed(launch(r, gcn::Stage::Compute), 0);
+        if (trace_) saveShader(csc, "cs");
         if (!csc) return;
         gcn::Program& cs = csc->prog;
         if (!ringFits(1 << 20)) flush();
@@ -2015,6 +2041,7 @@ private:
         }
 
         CachedProgram* vsc = analyzed(launch(r, gcn::Stage::Vertex), 0);
+        if (trace_) saveShader(vsc, "vs");
         if (!vsc) return;
         gcn::Program& vs = vsc->prog;
         const bool hasPs = shaderAddress(r, reg::kPgmLoPs) != 0;
@@ -2109,6 +2136,7 @@ private:
         begin();
         ShaderModule* vsm = vsc->module;
         CachedProgram* psc = hasPs ? analyzed(psLaunch, kPsBindingBase) : nullptr;
+        if (trace_) saveShader(psc, "ps");
         gcn::Program noPs;
         gcn::Program& ps = psc ? psc->prog : noPs;
         ShaderModule* psm = psc ? psc->module : nullptr;
@@ -2346,6 +2374,7 @@ private:
     FILE* traceOut_ = stderr;   // LPN_GPU_TRACE output; a capture's trace.txt
     std::string traceDir_;      // where trace dumps go ("" = working directory, else ends in /)
     std::string pendingCapture_; // folder of a requested capture (see captureNextFrame)
+    std::set<std::string> savedShaders_;
     bool trace_ = false, snap_ = false, dumpGlsl_ = false;
     std::vector<std::pair<uint64_t, uint64_t>> snapDraws_;
     bool snapWanted() const {
