@@ -338,6 +338,13 @@ const std::string& launchKey(const gcn::LaunchState& l, uint32_t bindingBase) {
     return k;
 }
 
+constexpr VkWriteDescriptorSet descriptorWrite(VkDescriptorType type) {
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.descriptorCount = 1;
+    w.descriptorType = type;
+    return w;
+}
+
 // Hash map keys of a few words, looked up per draw without building a string.
 struct WordsHash {
     template <size_t N> size_t operator()(const std::array<uint32_t, N>& a) const {
@@ -1353,6 +1360,7 @@ private:
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
         ici.usage = usage;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ++imageGen_; // remembered image bindings may name an image this replaces
         if (vkCreateImage(vk_.device, &ici, nullptr, &img.image) != VK_SUCCESS) return false;
         VkMemoryRequirements req;
         vkGetImageMemoryRequirements(vk_.device, img.image, &req);
@@ -2160,6 +2168,7 @@ private:
     void gpuWrote(Surface& s) {
         s.writtenFrame = frame_;
         s.memSample = 0;
+        if (s.cpuOwned) ++imageGen_; // sampled as a render target again, not from memory
         s.cpuOwned = false;
     }
     // Whether a render target's memory has been rewritten (by the CPU) since the GPU last
@@ -2174,11 +2183,44 @@ private:
         s.checkedFrame = frame_;
         const uint64_t sample = sampleHash(t.base(), size_t(t.pitch()) * t.height() * s.elementBytes);
         if (!s.memSample) s.memSample = sample;
-        else if (sample && sample != s.memSample) s.cpuOwned = true;
+        else if (sample && sample != s.memSample) s.cpuOwned = true, ++imageGen_;
         return s.cpuOwned;
     }
 
+    // Draws in a frame resolve the same few hundred T#/S# pairs over and over (a crowd repeats its
+    // materials): the first resolution in a frame does the checks, later ones reuse its result
+    // until an image is created or a render target goes back to the GPU (imageGen_).
+    struct ImageMemo {
+        uint32_t t[8], s[4];
+        bool compare;
+        uint64_t frame = ~0ull, gen = 0;
+        ImageBinding b;
+        VkImage sampled; // the render target it samples, if any (for feedback checks)
+    };
+    static constexpr size_t kImageMemos = 1024;
     ImageBinding resolveImage(const gcn::ImageResource& t) {
+        if (t.storage || trace_) return resolveImageUncached(t); // storage: marks the target written
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (uint32_t w : t.t) h = (h ^ w) * 0x100000001b3ull;
+        for (uint32_t w : t.s) h = (h ^ w) * 0x100000001b3ull;
+        ImageMemo& m = imageMemos_[(h ^ (h >> 29) ^ t.compare) & (kImageMemos - 1)];
+        if (m.frame == frame_ && m.gen == imageGen_ && m.compare == t.compare && std::equal(t.t, t.t + 8, m.t) &&
+            std::equal(t.s, t.s + 4, m.s)) {
+            if (m.sampled) sampledSurfaces_.push_back(m.sampled);
+            return m.b;
+        }
+        const size_t before = sampledSurfaces_.size();
+        const ImageBinding b = resolveImageUncached(t);
+        std::copy(t.t, t.t + 8, m.t);
+        std::copy(t.s, t.s + 4, m.s);
+        m.compare = t.compare;
+        m.frame = frame_;
+        m.gen = imageGen_;
+        m.b = b;
+        m.sampled = sampledSurfaces_.size() > before ? sampledSurfaces_.back() : VK_NULL_HANDLE;
+        return b;
+    }
+    ImageBinding resolveImageUncached(const gcn::ImageResource& t) {
         ImageBinding b;
         const VkImageViewType vt = viewType(t.type());
         const uint32_t nf = t.numFormat();
@@ -2309,11 +2351,8 @@ private:
                 p.data[b.data] = p.data[b.data + 1] = p.data[b.data + 2] = p.data[b.data + 3] = 0;
             }
             bufInfos.push_back({r.buffer, r.offset, r.range});
-            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            w.dstBinding = n++;
-            w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes.push_back(w);
+            writes.push_back(kBufferWrite); // copied from a constant: built on the stack it stalled on store forwarding
+            writes.back().dstBinding = n++;
         }
         for (auto& im : p.images) {
             const ImageBinding ib = resolveImage(im);
@@ -2325,23 +2364,20 @@ private:
             float scale[2] = {ib.scale[0], ib.scale[1]};
             std::memcpy(&p.data[im.data], scale, 8);
             imgInfos.push_back({ib.sampler, ib.view, VK_IMAGE_LAYOUT_GENERAL});
-            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            w.dstBinding = n++;
-            w.descriptorCount = 1;
-            w.descriptorType = im.storage ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes.push_back(w);
+            writes.push_back(im.storage ? kStorageImageWrite : kSampledImageWrite);
+            writes.back().dstBinding = n++;
         }
         // Draw data last: resource resolution above fills parts of it.
         const VkDeviceSize bytes = p.data.size() * 4;
         const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
         std::memcpy(static_cast<uint8_t*>(ringPtr_) + at, p.data.data(), bytes);
         bufInfos.push_back({ring_, at, bytes});
-        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        w.dstBinding = base;
-        w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes.push_back(w);
+        writes.push_back(kBufferWrite);
+        writes.back().dstBinding = base;
     }
+    static constexpr VkWriteDescriptorSet kBufferWrite = descriptorWrite(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    static constexpr VkWriteDescriptorSet kStorageImageWrite = descriptorWrite(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+    static constexpr VkWriteDescriptorSet kSampledImageWrite = descriptorWrite(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
 
     // Points each write at its info entry (the vectors are complete by now).
     static void linkWrites(std::vector<VkWriteDescriptorSet>& writes, std::vector<VkDescriptorBufferInfo>& bufs,
@@ -3147,6 +3183,8 @@ private:
     std::vector<VkDescriptorBufferInfo> drawBufs_;
     std::vector<VkDescriptorImageInfo> drawImgs_;
     std::vector<VkImage> sampledSurfaces_;
+    std::array<ImageMemo, kImageMemos> imageMemos_{};
+    uint64_t imageGen_ = 1;
     // Since the last barrier: images draws wrote and sampled, and whether anything else (a copy,
     // dispatch, upload, clear, shader store or new batch) needs one before the next pass.
     std::vector<VkImage> drawWritten_, drawSampled_;
