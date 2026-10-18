@@ -56,27 +56,7 @@ void layoutStaticTls(const std::vector<Module*>& modules) {
     gStaticSize = alignUp(offset, gStaticAlign);
 }
 
-namespace {
-
-// Experiment: LPN_MXCSR / LPN_FPUCW (hex) set the SSE and x87 control words of every guest
-// thread, to test whether the game depends on the PS4's floating-point defaults.
-void setGuestFpu() {
-    static const char* mxcsr = std::getenv("LPN_MXCSR");
-    static const char* fpucw = std::getenv("LPN_FPUCW");
-    if (mxcsr) {
-        uint32_t v = uint32_t(std::strtoul(mxcsr, nullptr, 16));
-        asm volatile("ldmxcsr %0" : : "m"(v));
-    }
-    if (fpucw) {
-        uint16_t v = uint16_t(std::strtoul(fpucw, nullptr, 16));
-        asm volatile("fldcw %0" : : "m"(v));
-    }
-}
-
-} // namespace
-
 void* createGuestTls() {
-    setGuestFpu();
     uint8_t* mem = static_cast<uint8_t*>(std::aligned_alloc(gStaticAlign, gStaticSize + kTcbSize));
     std::memset(mem, 0, gStaticSize + kTcbSize);
     uint8_t* tp = mem + gStaticSize;
