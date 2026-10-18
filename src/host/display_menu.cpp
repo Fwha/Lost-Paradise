@@ -1,10 +1,12 @@
 #include "host/display_menu.h"
 
 #include "host/display_settings.h"
+#include "host/hle.h"
 #include "host/save_menu.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -22,7 +24,7 @@ bool displayMenuOpen() { return gOpen; }
 namespace {
 
 std::mutex gM;
-int gRow = 0;         // 0 window mode, 1 resolution
+int gRow = 0;         // 0 window mode, 1 resolution, 2 exit game
 bool gList = false;   // a drop-down is open under gRow
 int gItem = 0;        // highlighted drop-down entry
 
@@ -68,6 +70,11 @@ void pick(SDL_Window* win) {
 
 void select(SDL_Window* win) {
     if (gList) return pick(win);
+    if (gRow == 2) { // as closing the window does
+        std::fprintf(stderr, "[window] exit from the display menu\n");
+        printUnimplementedSummary();
+        std::_Exit(0);
+    }
     const DisplaySettings& s = displaySettings();
     gItem = gRow == 0 ? int(s.window) : std::max(0, resIndex(s.width, s.height));
     gList = true;
@@ -80,7 +87,7 @@ void back() {
 
 void move(int d) {
     if (gList) gItem = (gItem + d + itemCount()) % itemCount();
-    else gRow = (gRow + d + 2) % 2;
+    else gRow = (gRow + d + 3) % 3;
 }
 
 } // namespace
@@ -152,7 +159,7 @@ void drawDisplayMenu(SDL_Renderer* ren) {
     const std::string values[2] = {kModes[int(s.window)], resLabel(s.width, s.height)};
     const char* const labels[2] = {"WINDOW MODE", "RESOLUTION"};
     const int listRows = gList ? itemCount() : 0;
-    const int panelW = std::min(w - 4 * px, 230 * px), panelH = (6 + listRows + (restart ? 1 : 0)) * line;
+    const int panelW = std::min(w - 4 * px, 230 * px), panelH = (7 + listRows + (restart ? 1 : 0)) * line;
     const int x0 = (w - panelW) / 2, y0 = (h - panelH) / 2;
     const int xv = x0 + 6 * px + menuTextWidth("WINDOW MODE  ", px);
 
@@ -192,6 +199,14 @@ void drawDisplayMenu(SDL_Renderer* ren) {
             drawMenuText(ren, xv, y, px, item);
         }
     }
+    if (gRow == 2) {
+        SDL_Rect hl{x0 + 3 * px, y - 2 * px, panelW - 6 * px, line - px};
+        SDL_SetRenderDrawColor(ren, 90, 70, 30, 255);
+        SDL_RenderFillRect(ren, &hl);
+    }
+    SDL_SetRenderDrawColor(ren, 235, 235, 225, 255);
+    drawMenuText(ren, x0 + 6 * px, y, px, "EXIT GAME");
+    y += line;
     if (restart) {
         SDL_SetRenderDrawColor(ren, 230, 150, 90, 255);
         drawMenuText(ren, x0 + 6 * px, y + line / 2, px, "RESOLUTION CHANGES AFTER A RESTART");
