@@ -600,6 +600,13 @@ vec3 cubeDir(vec3 c) {
             if (omod == 1) r = "(" + r + ") * 2.0";
             else if (omod == 2) r = "(" + r + ") * 4.0";
             else if (omod == 3) r = "(" + r + ") * 0.5";
+            if (p_.launch.stage != Stage::Pixel && p_.launch.stage != Stage::Compute) {
+                // GCN rounds after every multiply (v_mad/v_mac are not fused). Vertex shaders keep
+                // that, so a depth pre-pass and a later pass computing the same position agree
+                // bit for bit (an equal-or-less depth test against the pre-pass needs it).
+                out(guard() + "{ precise float r_ = " + r + "; " + vreg(dst) + " = sat(r_, " + (clampBit ? "true" : "false") + "); }\n");
+                return;
+            }
             writeV(dst, "sat(" + r + ", " + (clampBit ? "true" : "false") + ")");
         };
         auto ures = [&](const std::string& e) { writeV(dst, e); };
