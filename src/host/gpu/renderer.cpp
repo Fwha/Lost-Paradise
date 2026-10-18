@@ -479,6 +479,7 @@ public:
         if (const char* sn = getenv("LPN_GPU_SNAP")) {
             // "1": every draw; otherwise a list of draw numbers and ranges ("2752,2860-2870").
             snap_ = true;
+            if (const char* sc = getenv("LPN_GPU_SNAP_SCALE")) snapScale_ = std::max(1, std::atoi(sc));
             if (std::strcmp(sn, "1") != 0) {
                 for (const char* q = sn; *q;) {
                     char* end;
@@ -871,11 +872,14 @@ private:
         if (!readSurface(addr, w, h, px)) return;
         const std::string name = traceDir_ + "gpu-draw-" + std::to_string(drawIndex_) + ".ppm";
         if (FILE* f = std::fopen(name.c_str(), "wb")) {
-            std::fprintf(f, "P6\n%u %u\n255\n", w, h);
-            for (uint32_t p : px) {
-                const uint8_t rgb[3] = {uint8_t(p), uint8_t(p >> 8), uint8_t(p >> 16)};
-                std::fwrite(rgb, 1, 3, f);
-            }
+            const uint32_t s = snapScale_; // LPN_GPU_SNAP_SCALE: keep every s-th pixel and row
+            std::fprintf(f, "P6\n%u %u\n255\n", w / s, h / s);
+            for (uint32_t y = 0; y + s <= h; y += s)
+                for (uint32_t x = 0; x + s <= w; x += s) {
+                    const uint32_t p = px[size_t(y) * w + x];
+                    const uint8_t rgb[3] = {uint8_t(p), uint8_t(p >> 8), uint8_t(p >> 16)};
+                    std::fwrite(rgb, 1, 3, f);
+                }
             std::fclose(f);
         }
     }
@@ -903,9 +907,18 @@ private:
         }
         save("draw-" + std::to_string(drawIndex_) + "-" + stage + "-data.bin", p.data.data(), p.data.size() * 4);
         std::vector<uint8_t> bytes;
+        for (const auto& b : p.buffers)
+            std::fprintf(traceOut_, "[trace]   %s buffer 0x%" PRIx64 " stride %u records %u pc 0x%" PRIx64 "%s%s\n", stage, b.base(),
+                         b.stride(), b.numRecords(), b.pc, b.store ? " (written)" : "", b.known ? "" : " (unknown)");
         for (const auto& b : p.buffers) {
             const uint64_t size = b.stride() ? uint64_t(b.stride()) * b.numRecords() : b.numRecords();
-            if (!b.known || !size || size > (256u << 10)) continue;
+            if (!b.known || !size) continue;
+            if (size > (4u << 20)) { // a big buffer (a ring, say): the 256 KB the draw's base points at
+                bytes.resize(256u << 10);
+                if (readGuest(b.base(), bytes.data(), bytes.size()))
+                    save("bufwin-" + hex(b.base()) + "-stride" + std::to_string(b.stride()) + ".bin", bytes.data(), bytes.size());
+                continue;
+            }
             bytes.resize(size);
             if (readGuest(b.base(), bytes.data(), size))
                 save("buf-" + hex(b.base()) + "-stride" + std::to_string(b.stride()) + "-n" + std::to_string(b.numRecords()) + ".bin",
@@ -2763,6 +2776,14 @@ private:
         if (d.kind == DrawCall::kIndexed) {
             const uint32_t isz = r.indexType ? 4 : 2;
             if (!guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset)) return;
+            if (trace_ && !traceDir_.empty() && uint64_t(d.indexOffset + d.count) * isz <= (1u << 20)) { // captures: the indices
+                std::vector<uint8_t> idx(size_t(d.count) * isz);
+                if (readGuest(d.indexAddr + uint64_t(d.indexOffset) * isz, idx.data(), idx.size()))
+                    if (FILE* f = std::fopen((traceDir_ + "draw-" + std::to_string(drawIndex_) + "-indices-u" + std::to_string(isz * 8) + ".bin").c_str(), "wb")) {
+                        std::fwrite(idx.data(), 1, idx.size(), f);
+                        std::fclose(f);
+                    }
+            }
             if (raceCheck_) noteRead(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, 'i');
         }
 
@@ -2972,6 +2993,7 @@ private:
     std::string traceDir_;      // where trace dumps go ("" = working directory, else ends in /)
     std::string pendingCapture_; // folder of a requested capture (see captureNextFrame)
     bool trace_ = false, snap_ = false, dumpGlsl_ = false;
+    uint32_t snapScale_ = 1;
     std::vector<std::pair<uint64_t, uint64_t>> snapDraws_;
     bool snapWanted() const {
         if (snapDraws_.empty()) return true;
