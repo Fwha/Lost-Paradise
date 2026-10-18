@@ -7,10 +7,15 @@
 #include "host/window.h"
 
 #include <zlib.h>
+#ifdef LPN_HAVE_SDL2
+#include <SDL.h>
+#endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -383,40 +388,160 @@ int32_t sceRtcConvertLocalTimeToUtc(const uint64_t* local, uint64_t* utc) {
     return *utc = *local - utcOffsetMicros(), 0;
 }
 
-// --- AudioOut: no sound yet, but output blocks like the hardware so timing holds --------
+// --- AudioOut: each port plays through its own SDL audio device ------------------------
+// Output blocks like the hardware, one grain at a time on a steady clock, keeping about 40 ms
+// queued on the device. Without a device (headless, --no-audio, no SDL) the samples are dropped.
+
+bool gAudioEnabled = true;
 
 struct AudioPort {
-    uint32_t grain = 256, freq = 48000;
+    uint32_t grain = 256, freq = 48000, channels = 2, sampleBytes = 2;
     std::chrono::steady_clock::time_point next{};
+    uint64_t outputs = 0, underruns = 0;
+    bool primed = false;
+#ifdef LPN_HAVE_SDL2
+    SDL_AudioDeviceID dev = 0;
+#endif
 };
 std::mutex gAudioMutex;
 std::map<int32_t, AudioPort> gPorts;
 int32_t gNextPort = 1;
 
-int32_t sceAudioOutOpen(int32_t, int32_t, int32_t, uint32_t grain, uint32_t freq, uint32_t) {
+#ifdef LPN_HAVE_SDL2
+// The port's own format; SDL converts it (8 channels down to stereo too) for the device.
+SDL_AudioDeviceID openAudioDevice(const AudioPort& p) {
+    static const bool ok = [] {
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) return true;
+        std::fprintf(stderr, "[audio] SDL audio init failed: %s\n", SDL_GetError());
+        return false;
+    }();
+    if (!ok) return 0;
+    SDL_AudioSpec want{}, have{};
+    want.freq = int(p.freq);
+    want.format = p.sampleBytes == 4 ? AUDIO_F32SYS : AUDIO_S16SYS;
+    want.channels = uint8_t(p.channels);
+    want.samples = 512;
+    const SDL_AudioDeviceID dev = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+    if (!dev) {
+        std::fprintf(stderr, "[audio] cannot open device: %s\n", SDL_GetError());
+        return 0;
+    }
+    std::fprintf(stderr, "[audio] port %u ch %s %u Hz on %s\n", p.channels, p.sampleBytes == 4 ? "float" : "s16",
+                 p.freq, SDL_GetCurrentAudioDriver());
+    SDL_PauseAudioDevice(dev, 0);
+    return dev;
+}
+#endif
+
+int32_t sceAudioOutOpen(int32_t, int32_t, int32_t, uint32_t grain, uint32_t freq, uint32_t param) {
+    // param bits 0-7: S16 mono/stereo/8ch, float mono/stereo/8ch, S16 8ch std, float 8ch std.
+    static const uint8_t kChannels[8] = {1, 2, 8, 1, 2, 8, 8, 8};
+    const uint32_t format = param & 0xff;
+    if (format > 7) return int32_t(0x80260005); // INVALID_FORMAT
+    AudioPort p;
+    p.grain = grain;
+    p.freq = freq ? freq : 48000;
+    p.channels = kChannels[format];
+    p.sampleBytes = (format >= 3 && format <= 5) || format == 7 ? 4 : 2;
+    p.next = std::chrono::steady_clock::now();
+#ifdef LPN_HAVE_SDL2
+    if (gAudioEnabled) p.dev = openAudioDevice(p);
+#endif
     std::lock_guard lock(gAudioMutex);
     const int32_t h = gNextPort++;
-    gPorts[h] = {grain, freq ? freq : 48000, std::chrono::steady_clock::now()};
+    gPorts[h] = p;
     return h;
 }
 int32_t sceAudioOutClose(int32_t h) {
     std::lock_guard lock(gAudioMutex);
-    gPorts.erase(h);
+    auto it = gPorts.find(h);
+    if (it == gPorts.end()) return int32_t(0x80260004); // INVALID_PORT
+#ifdef LPN_HAVE_SDL2
+    if (it->second.dev) SDL_CloseAudioDevice(it->second.dev);
+#endif
+    gPorts.erase(it);
     return 0;
 }
-int32_t sceAudioOutOutput(int32_t h, const void*) {
-    std::chrono::steady_clock::time_point wake;
+int32_t sceAudioOutOutput(int32_t h, const void* samples) {
+    AudioPort p;
     {
         std::lock_guard lock(gAudioMutex);
         auto it = gPorts.find(h);
         if (it == gPorts.end()) return int32_t(0x80260004); // INVALID_PORT
-        auto& p = it->second;
-        const auto now = std::chrono::steady_clock::now();
-        if (p.next < now - std::chrono::milliseconds(100)) p.next = now; // resync after a stall
-        p.next += std::chrono::microseconds(uint64_t(p.grain) * 1000000 / p.freq);
-        wake = p.next;
+        p = it->second;
+        it->second.outputs++;
+#ifdef LPN_HAVE_SDL2
+        if (!p.dev) {
+#endif
+            const auto now = std::chrono::steady_clock::now();
+            if (it->second.next < now - std::chrono::milliseconds(100)) it->second.next = now; // resync after a stall
+            it->second.next += std::chrono::microseconds(uint64_t(p.grain) * 1000000 / p.freq);
+            p.next = it->second.next;
+#ifdef LPN_HAVE_SDL2
+        }
+#endif
     }
-    std::this_thread::sleep_until(wake);
+#ifdef LPN_HAVE_SDL2
+    if (p.dev) {
+        const uint32_t frameBytes = p.channels * p.sampleBytes, bytesPerMs = p.freq * frameBytes / 1000;
+        // LPN_AUDIO_MS: how much sound to keep queued (default 40 ms); more hides game hitches.
+        static const uint32_t latencyMs = [] {
+            const char* e = std::getenv("LPN_AUDIO_MS");
+            return e ? uint32_t(std::atoi(e)) : 40u;
+        }();
+        const uint32_t target = std::max(4 * p.grain * frameBytes, latencyMs * bytesPerMs);
+        if (p.outputs > 0 && SDL_GetQueuedAudioSize(p.dev) == 0) { // ran dry: an audible gap
+            uint64_t n;
+            {
+                std::lock_guard lock(gAudioMutex);
+                n = ++gPorts[h].underruns;
+            }
+            if ((n & (n - 1)) == 0 || n % 100 == 0)
+                std::fprintf(stderr, "[audio] port %d ran dry (%llu times, output %llu)\n", h, (unsigned long long)n,
+                             (unsigned long long)p.outputs);
+        }
+        // LPN_AUDIO_DUMP=dir: also write each port's raw samples to dir/port-N.raw.
+        static const char* dumpDir = std::getenv("LPN_AUDIO_DUMP");
+        if (dumpDir && samples) {
+            static std::map<int32_t, FILE*> files;
+            std::lock_guard lock(gAudioMutex);
+            FILE*& f = files[h];
+            if (!f) f = std::fopen((std::string(dumpDir) + "/port-" + std::to_string(h) + ".raw").c_str(), "wb");
+            if (f) std::fwrite(samples, frameBytes, p.grain, f);
+        }
+        if (samples) SDL_QueueAudio(p.dev, samples, p.grain * frameBytes);
+        // Block one grain at a time on a steady clock, like the hardware. Waiting for the queue
+        // to drain instead releases the game in bursts as the device takes 1024-frame chunks,
+        // and the game then reads its mix before its mixer thread has finished it (a 47 Hz
+        // flutter). The queue level only fills the queue up front and trims clock drift.
+        const auto grainTime = std::chrono::microseconds(uint64_t(p.grain) * 1000000 / p.freq);
+        const uint32_t queued = SDL_GetQueuedAudioSize(p.dev);
+        std::chrono::steady_clock::time_point wake;
+        {
+            std::lock_guard lock(gAudioMutex);
+            auto& next = gPorts[h].next;
+            const auto now = std::chrono::steady_clock::now();
+            auto& primed = gPorts[h].primed;
+            if (queued == 0 || next < now - std::chrono::milliseconds(100)) primed = false; // ran dry or stalled
+            if (!primed) {
+                next = now; // fill up without waiting
+                primed = queued >= target;
+            } else if (queued > target * 3 / 2) {
+                next += grainTime + grainTime / 16;
+            } else if (queued < target / 2) {
+                next += grainTime - grainTime / 16;
+            } else {
+                next += grainTime;
+            }
+            wake = next;
+        }
+        std::this_thread::sleep_until(wake);
+        return 0;
+    }
+#else
+    (void)samples;
+#endif
+    std::this_thread::sleep_until(p.next);
     return 0;
 }
 struct AudioOutOutputParam {
@@ -496,6 +621,8 @@ void regs(const char* lib, std::initializer_list<const char*> names, void* fn) {
 }
 
 } // namespace
+
+void setAudioEnabled(bool on) { gAudioEnabled = on; }
 
 void registerServicesHle() {
     void* zero = reinterpret_cast<void*>(&ok);

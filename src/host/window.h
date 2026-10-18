@@ -14,6 +14,8 @@ struct Frame {
 
 // Open the window (or do nothing when headless or built without SDL).
 void startPresenter(bool headless);
+// Sound through SDL (on by default); off, audio ports are only paced by the clock.
+void setAudioEnabled(bool on);
 // Copy a flipped buffer for display. Safe to call from any thread.
 void presentFrame(const Frame& f);
 

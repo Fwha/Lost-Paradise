@@ -30,7 +30,8 @@ namespace {
 int usage() {
     std::fprintf(stderr,
                  "usage: lpn-host <CUSA12776 dir> --nids <aerolib.csv> [options]\n"
-                 "  --headless     no window\n"
+                 "  --headless     no window (and no sound)\n"
+                 "  --no-audio     no sound\n"
                  "  --trace-files  log every file the game opens\n"
                  "  --dump-frame N write frame N's draws and shaders to ./gpu-dump\n"
                  "  --screenshot N save the Nth displayed frame as screenshot.ppm\n"
@@ -70,6 +71,7 @@ int main(int argc, char** argv) {
             host::hleOptions().traceFrom = std::strtoull(argv[++i], nullptr, 0);
         }
         else if (!std::strcmp(argv[i], "--headless")) headless = true;
+        else if (!std::strcmp(argv[i], "--no-audio")) host::setAudioEnabled(false);
         else if (!std::strcmp(argv[i], "--dump-frame") && i + 1 < argc)
             host::enableFrameDump(unsigned(std::strtoul(argv[++i], nullptr, 0)), "gpu-dump");
         else if (!std::strcmp(argv[i], "--press") && i + 1 < argc) {
@@ -155,6 +157,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     host::createGuestTls();
+    if (headless) host::setAudioEnabled(false);
     host::startPresenter(headless);
     if (gpu) host::render::startRenderer(computeOnly);
     std::atexit(host::printUnimplementedSummary);
