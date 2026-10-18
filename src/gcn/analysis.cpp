@@ -436,7 +436,7 @@ private:
         uint32_t off = 0;
         bool known = true;
         if ((w >> 8) & 1) off = (w & 0xFF) * 4;
-        else if ((w & 0xFF) == 255) off = in.literal;
+        else if ((w & 0xFF) == 255) off = in.literal * 4; // CI's 32-bit literal offset counts dwords, like the 8-bit one
         else known = src(st, w & 0xFF, in, off);
 
         uint32_t at;

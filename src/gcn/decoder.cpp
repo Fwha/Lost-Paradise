@@ -377,7 +377,7 @@ std::string disassemble(const Instruction& in, uint32_t pc) {
         const bool imm = (w >> 8) & 1;
         char off[24];
         if (imm) std::snprintf(off, sizeof off, "0x%x", (w & 0xFF) * 4);
-        else if ((w & 0xFF) == 255) std::snprintf(off, sizeof off, "0x%x", in.literal);
+        else if ((w & 0xFF) == 255) std::snprintf(off, sizeof off, "0x%x", in.literal * 4); // dwords, shown in bytes
         else std::snprintf(off, sizeof off, "%s", sreg(w & 0xFF).c_str());
         std::snprintf(b, sizeof b, "%s %s, s[%u:%u], %s", m.c_str(), sreg((w >> 15) & 0x7F).c_str(),
                       ((w >> 9) & 0x3F) * 2, ((w >> 9) & 0x3F) * 2 + (in.op >= 8 ? 3 : 1), off);
