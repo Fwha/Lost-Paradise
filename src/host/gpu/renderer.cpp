@@ -661,6 +661,7 @@ public:
         ++frame_;
         if (!pendingCapture_.empty()) { // F12: trace this frame into the capture folder
             traceDir_ = pendingCapture_ + "/";
+            captured_.clear();
             pendingCapture_.clear();
             traceFrame_ = frame_;
             timingFrame_ = frame_ + 1; // and times the one after it (see reportTiming)
@@ -874,6 +875,43 @@ private:
     }
 
     // Debugging: every 32-bit render target as gpu-rt-<address>.ppm (memory order BGRA assumed).
+    // F12 captures: each traced draw's shaders (GLSL), the data its shaders get (D[]) and the raw
+    // bytes of its small textures and buffers, so a draw can be worked through offline.
+    std::set<std::string> captured_;
+    void captureProgram(const gcn::Program& p, const ShaderModule* m, const char* stage) {
+        if (traceDir_.empty() || !m) return;
+        auto save = [&](const std::string& name, const void* data, size_t size) {
+            if (!captured_.insert(name).second) return;
+            if (FILE* f = std::fopen((traceDir_ + name).c_str(), "wb")) {
+                std::fwrite(data, 1, size, f);
+                std::fclose(f);
+            }
+        };
+        const std::string& g = m->translation.glsl;
+        save(std::string(stage) + "-" + hex(p.launch.entry) + "-" + std::to_string(m->id) + ".glsl", g.data(), g.size());
+        save("draw-" + std::to_string(drawIndex_) + "-" + stage + "-data.bin", p.data.data(), p.data.size() * 4);
+        std::vector<uint8_t> bytes;
+        for (const auto& b : p.buffers) {
+            const uint64_t size = b.stride() ? uint64_t(b.stride()) * b.numRecords() : b.numRecords();
+            if (!b.known || !size || size > (256u << 10)) continue;
+            bytes.resize(size);
+            if (readGuest(b.base(), bytes.data(), size))
+                save("buf-" + hex(b.base()) + "-stride" + std::to_string(b.stride()) + "-n" + std::to_string(b.numRecords()) + ".bin",
+                     bytes.data(), size);
+        }
+        for (const auto& im : p.images) {
+            const uint32_t bpe = bytesPerElement(im.dataFormat());
+            const size_t size = size_t((im.pitch() + 7) & ~7u) * ((im.height() + 7) & ~7u) * std::max(bpe, 1u);
+            if (!bpe || size > (1u << 20)) continue;
+            bytes.resize(size);
+            if (readGuest(im.base(), bytes.data(), size))
+                save("tex-" + hex(im.base()) + "-" + std::to_string(im.width()) + "x" + std::to_string(im.height()) + "-pitch" +
+                         std::to_string(im.pitch()) + "-fmt" + std::to_string(im.dataFormat()) + "." + std::to_string(im.numFormat()) +
+                         "-tile" + std::to_string(im.tileMode()) + "-sel" + std::to_string(im.dstSel()) + ".bin",
+                     bytes.data(), size);
+        }
+    }
+
     void dumpSurfaces() {
         for (const auto& [addr, s] : colors_) {
             if (s.elementBytes != 4) continue;
@@ -1970,6 +2008,15 @@ private:
         ProfScope pu(prof_, kProfTexUpload);
         scratch_.resize(tiled);
         if (!readGuest(t.base(), scratch_.data(), tiled)) return nullptr;
+        // Debugging: LPN_DUMP_TEX_BPE=<bytes per element> writes small textures of that element size
+        // as uploaded (still tiled) to tex-<address>-<w>x<h>-mode<m>.bin.
+        if (static const uint32_t dumpBpe = getenv("LPN_DUMP_TEX_BPE") ? std::atoi(getenv("LPN_DUMP_TEX_BPE")) : 0;
+            dumpBpe == bpe && ew * eh <= 1024)
+            if (FILE* f = std::fopen(("tex-" + hex(t.base()) + "-" + std::to_string(ew) + "x" + std::to_string(eh) + "-mode" +
+                                      std::to_string(mode) + ".bin").c_str(), "wb")) {
+                std::fwrite(scratch_.data(), 1, tiled, f);
+                std::fclose(f);
+            }
         ++prof_.texUploads;
         prof_.texBytes += bytes;
         if (!ringFits(bytes)) {
@@ -2374,6 +2421,7 @@ private:
         vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
         vk_.cmdPushDescriptorSet(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, lay.pipeline, 0, uint32_t(writes.size()),
                                  writes.data());
+        if (trace_) captureProgram(cs, m, "cs");
         if (trace_)
             for (const auto& b : cs.buffers) {
                 uint32_t first = 0;
@@ -2651,6 +2699,8 @@ private:
         imgs.reserve(64);
         sampledSurfaces_.clear();
         if (trace_) {
+            captureProgram(vs, vsm, "vs");
+            if (psm) captureProgram(ps, psm, "ps");
             for (const auto* prog : {&vs, &ps}) {
                 if (prog->data.size() <= gcn::data::kSmrd) continue;
                 std::fprintf(traceOut_, "[trace]   %s smrd:", prog == &vs ? "vs" : "ps");
