@@ -3,6 +3,7 @@
 // clocks, audio pacing and zlib. Each answers the way an offline console would.
 #include "host/hle.h"
 #include "host/kernel.h"
+#include "host/save_menu.h"
 #include "host/videoout.h"
 #include "host/window.h"
 
@@ -23,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace host {
 
@@ -247,8 +249,10 @@ const char* saveDataSystemMessage(int32_t type) {
 
 // SceSaveDataDialogParam after the 48-byte common base: size, mode, dispType, then pointers
 // (animation, items, user message, system message, ...).
-// The save a list dialog "chose": with no UI, the newest of the listed saves (see GetResult).
+// A list dialog shows our save menu over the game window; with no window it "chooses" itself:
+// the first slot offered when saving, the newest listed save otherwise (see GetResult).
 std::string gDialogChoice;
+bool gDialogMenu = false; // the current list dialog is our menu
 
 int32_t sceSaveDataDialogOpen(const uint8_t* p) {
     int32_t mode, disp;
@@ -257,25 +261,38 @@ int32_t sceSaveDataDialogOpen(const uint8_t* p) {
     const uint8_t* ptrs[6];
     std::memcpy(ptrs, p + 64, sizeof ptrs);
     const char* what = disp == 1 ? "save" : disp == 2 ? "load" : disp == 3 ? "delete" : "save data";
-    if (mode == 1 && ptrs[1]) { // list: items are userId, pad, titleId*, dirName*, dirNameNum
+    gDialogMenu = false;
+    if (mode == 1 && ptrs[1]) { // list: items are userId, pad, titleId*, dirName*, dirNameNum, pad, newItem*, focusPos
         const char* dirs = nullptr;
+        const void* newItem = nullptr;
         uint32_t count = 0;
+        int32_t focusPos = 0;
         std::memcpy(&dirs, ptrs[1] + 16, 8);
         std::memcpy(&count, ptrs[1] + 24, 4);
+        std::memcpy(&newItem, ptrs[1] + 32, 8);
+        std::memcpy(&focusPos, ptrs[1] + 40, 4);
         gDialogChoice.clear();
+        std::vector<SaveSlot> slots;
+        int newestIdx = -1, firstEmpty = -1;
         fs::file_time_type newest{};
         for (uint32_t i = 0; dirs && i < count; ++i) {
             const std::string name(dirs + i * 32, strnlen(dirs + i * 32, 32));
+            slots.push_back({name, saveRoot() + "/" + name});
             std::error_code ec;
             const auto t = fs::last_write_time(saveRoot() + "/" + name + "/data.saveps4", ec);
-            if (disp == 1 && gDialogChoice.empty()) gDialogChoice = name; // saving: the first slot offered
-            if (!ec && (disp != 1 && (gDialogChoice.empty() || t > newest))) {
-                gDialogChoice = name;
-                newest = t;
-            }
+            if (ec && firstEmpty < 0) firstEmpty = int(i);
+            if (!ec && (newestIdx < 0 || t > newest)) newestIdx = int(i), newest = t;
         }
-        std::fprintf(stderr, "[dialog] %s: %u saves listed, choosing %s\n", what, count,
-                     gDialogChoice.empty() ? "none" : gDialogChoice.c_str());
+        std::fprintf(stderr, "[dialog] %s: %u saves listed (new item %s, focus %d)\n", what, count,
+                     newItem ? "offered" : "none", focusPos);
+        const int focus = disp == 1 && firstEmpty >= 0 ? firstEmpty : std::max(newestIdx, 0);
+        const SaveMenuKind kind = disp == 1 ? SaveMenuKind::Save : disp == 3 ? SaveMenuKind::Delete : SaveMenuKind::Load;
+        gDialogMenu = openSaveMenu(kind, slots, focus);
+        if (!gDialogMenu) {
+            if (disp == 1 && !slots.empty()) gDialogChoice = slots[0].dir; // saving: the first slot offered
+            else if (newestIdx >= 0) gDialogChoice = slots[size_t(newestIdx)].dir;
+            std::fprintf(stderr, "[dialog] %s: choosing %s\n", what, gDialogChoice.empty() ? "none" : gDialogChoice.c_str());
+        }
     } else if (mode == 2 && ptrs[2]) { // user message: buttonType, msgType, msg
         const char* msg = nullptr;
         std::memcpy(&msg, ptrs[2] + 8, 8);
@@ -303,12 +320,19 @@ int32_t sceMsgDialogOpen(const uint8_t* p) {
     return 0;
 }
 
-constexpr int32_t kDialogFinished = 3;
+constexpr int32_t kDialogRunning = 2, kDialogFinished = 3;
 int32_t dialogFinished() { return kDialogFinished; }
+int32_t saveDataDialogStatus() { return saveMenuOpen() ? kDialogRunning : kDialogFinished; }
+int32_t saveDataDialogClose(const void*) {
+    closeSaveMenu();
+    return 0;
+}
 // SceSaveDataDialogResult: mode, result, buttonId, pad, dirName*, param*, userData.
 int32_t saveDataDialogResult(int32_t* r) {
+    if (gDialogMenu) gDialogChoice = saveMenuChoice();
     std::memset(r, 0, 12);
     r[2] = 1; // YES / OK
+    if (gDialogMenu && gDialogChoice.empty()) r[1] = 1; // USER_CANCELED
     char* dir = nullptr;
     std::memcpy(&dir, reinterpret_cast<uint8_t*>(r) + 16, 8);
     if (dir && !gDialogChoice.empty()) std::snprintf(dir, 32, "%s", gDialogChoice.c_str());
@@ -682,11 +706,11 @@ void registerServicesHle() {
     regs(ed, {"sceErrorDialogUpdateStatus"}, finished);
     const char* sdd = "libSceSaveDataDialog";
     regs(sdd,
-         {"sceSaveDataDialogInitialize", "sceSaveDataDialogClose",
-          "sceSaveDataDialogTerminate", "sceSaveDataDialogProgressBarSetValue"},
+         {"sceSaveDataDialogInitialize", "sceSaveDataDialogTerminate", "sceSaveDataDialogProgressBarSetValue"},
          zero);
     HLE(sdd, sceSaveDataDialogOpen);
-    regs(sdd, {"sceSaveDataDialogUpdateStatus"}, finished);
+    regs(sdd, {"sceSaveDataDialogUpdateStatus"}, reinterpret_cast<void*>(&saveDataDialogStatus));
+    regs(sdd, {"sceSaveDataDialogClose"}, reinterpret_cast<void*>(&saveDataDialogClose));
     regs(sdd, {"sceSaveDataDialogIsReadyToDisplay"}, positive);
     regs(sdd, {"sceSaveDataDialogGetResult"}, reinterpret_cast<void*>(&saveDataDialogResult));
     const char* ime = "libSceImeDialog";
