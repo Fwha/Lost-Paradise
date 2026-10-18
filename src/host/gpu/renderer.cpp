@@ -889,6 +889,12 @@ private:
         };
         const std::string& g = m->translation.glsl;
         save(std::string(stage) + "-" + hex(p.launch.entry) + "-" + std::to_string(m->id) + ".glsl", g.data(), g.size());
+        { // the machine code (lpn-gcn disassembles it; it stops at the OrbShdr block)
+            std::vector<uint8_t> code(64 << 10);
+            size_t n = code.size();
+            while (n >= 4096 && !readGuest(p.launch.entry, code.data(), n)) n /= 2;
+            if (n >= 4096) save(std::string(stage) + "-" + hex(p.launch.entry) + ".bin", code.data(), n);
+        }
         save("draw-" + std::to_string(drawIndex_) + "-" + stage + "-data.bin", p.data.data(), p.data.size() * 4);
         std::vector<uint8_t> bytes;
         for (const auto& b : p.buffers) {
