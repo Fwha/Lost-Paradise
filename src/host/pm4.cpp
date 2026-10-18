@@ -22,14 +22,32 @@ namespace {
 
 using namespace gpu;
 
-GpuRegs gRegs; // the graphics ring's state; only the command processor thread uses it
+// The graphics ring's state. The recorder thread (or, without the command processor thread,
+// the submitting thread) and the analysis thread each keep their own, from the same packets.
+GpuRegs gRecordRegs, gAnalysisRegs;
+thread_local GpuRegs* tRegs = &gRecordRegs;
+thread_local bool tDry = false; // the analysis thread: no side effects, analysis hooks only
+bool commandProcessorIsAsync();
+// Analysis hooks run inline, just before their counterparts: without the command processor
+// thread, or with LPN_NO_ANALYSIS_THREAD=1 (for comparison).
+bool inlineAnalysis() {
+    static const bool v = !commandProcessorIsAsync() || getenv("LPN_NO_ANALYSIS_THREAD") != nullptr;
+    return v;
+}
 std::atomic<uint64_t> gFrame{0};
 const uint64_t gTraceFrame = getenv("LPN_PM4_TRACE") ? std::strtoull(getenv("LPN_PM4_TRACE"), nullptr, 0) : ~0ull;
 std::vector<DrawListener*> gListeners;
 
 void draw(const DrawCall& d, Pm4Stats* st) {
+    if (tDry) {
+        for (DrawListener* l : gListeners) l->onAnalyzeDraw(d, *tRegs);
+        return;
+    }
     (d.kind >= DrawCall::kDispatch ? st->dispatches : st->draws)++;
-    for (DrawListener* l : gListeners) l->onDraw(d, gRegs);
+    for (DrawListener* l : gListeners) {
+        if (inlineAnalysis()) l->onAnalyzeDraw(d, *tRegs);
+        l->onDraw(d, *tRegs);
+    }
 }
 
 // CP DMA: copies or fills memory on the GPU timeline: by the renderer, in order with the draws,
@@ -39,9 +57,12 @@ void dmaData(const uint32_t* b) {
     const uint32_t srcSel = (control >> 29) & 3, dstSel = (control >> 20) & 3;
     const uint64_t src = uint64_t(b[1]) | (uint64_t(b[2]) << 32), dst = uint64_t(b[3]) | (uint64_t(b[4]) << 32);
     if (dstSel != 0 || !dst || !bytes) return; // only memory destinations matter to the CPU
-    if ((srcSel == 0 && src) || srcSel == 2)
-        for (DrawListener* l : gListeners)
-            if (l->onDmaCopy(dst, srcSel == 0 ? src : 0, bytes, srcSel == 2, b[1])) return;
+    if (!((srcSel == 0 && src) || srcSel == 2)) return;
+    if (tDry || inlineAnalysis())
+        for (DrawListener* l : gListeners) l->onAnalyzeDma(dst, srcSel == 0 ? src : 0, bytes, srcSel == 2, b[1]);
+    if (tDry) return;
+    for (DrawListener* l : gListeners)
+        if (l->onDmaCopy(dst, srcSel == 0 ? src : 0, bytes, srcSel == 2, b[1])) return;
     if (srcSel == 0 && src) std::memmove(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), bytes);
     else if (srcSel == 2) { // fill with the immediate in src_lo
         auto* d = reinterpret_cast<uint32_t*>(dst);
@@ -61,6 +82,7 @@ uint64_t gpuClock() {
 uint64_t address(uint32_t lo, uint32_t hi) { return uint64_t(lo) | (uint64_t(hi & 0xFFFF) << 32); }
 
 void queueRecorder(std::function<void()> fn);
+void queueChunk(std::vector<uint32_t> chunk, Pm4Stats* st);
 
 bool commandProcessorIsAsync() {
     static const bool async = getenv("LPN_SYNC_SUBMIT") == nullptr;
@@ -201,22 +223,26 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
             const uint32_t op = (h >> 8) & 0xFF;
             ++st->opcodes[op];
             const uint32_t* b = p + 1;
+            if (tDry && (op == kOpEventWriteEop || op == kOpReleaseMem || op == kOpEventWriteEos || op == kOpWaitRegMem)) {
+                p += len;
+                continue;
+            }
             switch (op) {
             case kOpSetContextReg:
             case kOpSetShReg:
             case kOpSetUconfigReg: {
                 // body: register offset (low 16 bits; the top holds an index field), then values
                 const uint32_t reg = b[0] & 0xFFFF;
-                uint32_t* file = op == kOpSetContextReg ? gRegs.ctx : op == kOpSetShReg ? gRegs.sh : gRegs.uconfig;
+                uint32_t* file = op == kOpSetContextReg ? tRegs->ctx : op == kOpSetShReg ? tRegs->sh : tRegs->uconfig;
                 const uint32_t size = op == kOpSetContextReg ? kContextRegs : op == kOpSetShReg ? kShRegs : kUconfigRegs;
                 if (reg + count <= size) std::memcpy(&file[reg], b + 1, count * 4);
                 break;
             }
-            case kOpIndexBase: gRegs.indexBase = address(b[0], b[1]); break;
-            case kOpIndexBufferSize: gRegs.indexBufferSize = b[0]; break;
-            case kOpIndexType: gRegs.indexType = b[0] & 3; break;
-            case kOpNumInstances: gRegs.numInstances = b[0] ? b[0] : 1; break;
-            case kOpSetBase: gRegs.indirectBase = address(b[1], b[2]); break;
+            case kOpIndexBase: tRegs->indexBase = address(b[0], b[1]); break;
+            case kOpIndexBufferSize: tRegs->indexBufferSize = b[0]; break;
+            case kOpIndexType: tRegs->indexType = b[0] & 3; break;
+            case kOpNumInstances: tRegs->numInstances = b[0] ? b[0] : 1; break;
+            case kOpSetBase: tRegs->indirectBase = address(b[1], b[2]); break;
             case kOpDrawIndex2: {
                 DrawCall d{DrawCall::kIndexed};
                 d.indexAddr = address(b[1], b[2]);
@@ -226,7 +252,7 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
             }
             case kOpDrawIndexOffset2: {
                 DrawCall d{DrawCall::kIndexed};
-                d.indexAddr = gRegs.indexBase;
+                d.indexAddr = tRegs->indexBase;
                 d.indexOffset = b[1];
                 d.count = b[2];
                 draw(d, st);
@@ -242,7 +268,7 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
             case kOpDrawIndirect: {
                 DrawCall d{op == kOpDrawIndirect ? DrawCall::kIndirect : DrawCall::kIndexedIndirect};
                 d.indirectOffset = b[0];
-                d.indexAddr = gRegs.indexBase;
+                d.indexAddr = tRegs->indexBase;
                 draw(d, st);
                 break;
             }
@@ -282,9 +308,13 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
                     std::fprintf(stderr, "[pm4] write data control 0x%x addr 0x%" PRIx64 " dwords %u first 0x%x (draws so far %" PRIu64 ")\n",
                                  b[0], address(b[1], b[2]), count - 2, count >= 3 ? b[3] : 0, st->draws);
                 if (dstSel == 2 || dstSel == 5) {
+                    if (tDry || inlineAnalysis())
+                        for (DrawListener* l : gListeners) l->onAnalyzeWrite(address(b[1], b[2]), b + 3, count - 2);
+                    if (tDry) break;
                     auto* dst = reinterpret_cast<volatile uint32_t*>(address(b[1], b[2]));
                     for (uint32_t i = 3; i < count + 1; ++i) dst[i - 3] = b[i];
                     for (DrawListener* l : gListeners) l->onMemoryWrite(address(b[1], b[2]), uint64_t(count - 2) * 4);
+                    for (DrawListener* l : gListeners) l->onCpWrite(address(b[1], b[2]), uint64_t(count - 2) * 4);
                     ++st->fences;
                 }
                 break;
@@ -348,7 +378,7 @@ void scan(const uint32_t* p, const uint32_t* end, std::vector<uint32_t>& out, Pm
                              address(b[1], b[2]), b[3], b[4],
                              (b[0] & 0x10) ? *reinterpret_cast<volatile uint32_t*>(address(b[1] & ~3u, b[2])) : 0);
             if (!out.empty()) // what comes before is recorded meanwhile
-                queueRecorder([chunk = std::move(out), st] { execute(chunk.data(), chunk.data() + chunk.size(), st, 0); });
+                queueChunk(std::move(out), st);
             out.clear();
             waitRegMem(b, st);
             drain = b;
@@ -363,7 +393,7 @@ void scan(const uint32_t* p, const uint32_t* end, std::vector<uint32_t>& out, Pm
                 const uint64_t addr = address(b[1], b[2]);
                 noteGpuWrite(addr, values.empty() ? 0 : values[0]);
                 if (!out.empty())
-                    queueRecorder([chunk = std::move(out), st] { execute(chunk.data(), chunk.data() + chunk.size(), st, 0); });
+                    queueChunk(std::move(out), st);
                 out.clear();
                 queueRecorder([addr, values = std::move(values)] {
                     afterGpuWork([addr, values] {
@@ -427,11 +457,7 @@ void recorderThread() {
     }
 }
 
-void queueRecorder(std::function<void()> fn) {
-    if (!commandProcessorIsAsync()) {
-        fn();
-        return;
-    }
+void queueRecord(std::function<void()> fn) {
     std::unique_lock lock(gRec.m);
     if (!gRec.started) {
         gRec.started = true;
@@ -440,6 +466,83 @@ void queueRecorder(std::function<void()> fn) {
     gRec.cv.wait(lock, [] { return gRec.work.size() < kRecQueueLimit; });
     gRec.work.push_back(std::move(fn));
     gRec.cv.notify_all();
+}
+
+// The analysis thread sits between the command processor and the recorder: it executes each
+// chunk of packets dry (analysis hooks only, its own registers) and then hands it on, so the
+// recorder finds every draw's shaders analysed.
+struct Stage {
+    std::vector<uint32_t> chunk;
+    Pm4Stats* st = nullptr;
+    std::function<void()> analyze, record;
+};
+struct {
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<Stage> work;
+    bool started = false;
+} gAna;
+
+void analysisThread() {
+    tDry = true;
+    tRegs = &gAnalysisRegs;
+    Pm4Stats dry;
+    for (;;) {
+        Stage w;
+        {
+            std::unique_lock lock(gAna.m);
+            gAna.cv.wait(lock, [] { return !gAna.work.empty(); });
+            w = std::move(gAna.work.front());
+            gAna.work.pop_front();
+        }
+        gAna.cv.notify_all();
+        if (!w.chunk.empty()) {
+            execute(w.chunk.data(), w.chunk.data() + w.chunk.size(), &dry, 0);
+            queueRecord([chunk = std::move(w.chunk), st = w.st] { execute(chunk.data(), chunk.data() + chunk.size(), st, 0); });
+        }
+        if (w.analyze) w.analyze();
+        if (w.record) queueRecord(std::move(w.record));
+    }
+}
+
+void queueStage(Stage w) {
+    if (!commandProcessorIsAsync()) { // on the caller's thread, analysis inline
+        if (!w.chunk.empty()) execute(w.chunk.data(), w.chunk.data() + w.chunk.size(), w.st, 0);
+        if (w.analyze) w.analyze();
+        if (w.record) w.record();
+        return;
+    }
+    if (inlineAnalysis()) {
+        if (!w.chunk.empty())
+            queueRecord([chunk = std::move(w.chunk), st = w.st] { execute(chunk.data(), chunk.data() + chunk.size(), st, 0); });
+        if (w.analyze || w.record)
+            queueRecord([a = std::move(w.analyze), r = std::move(w.record)] {
+                if (a) a();
+                if (r) r();
+            });
+        return;
+    }
+    std::unique_lock lock(gAna.m);
+    if (!gAna.started) {
+        gAna.started = true;
+        std::thread(analysisThread).detach();
+    }
+    gAna.cv.wait(lock, [] { return gAna.work.size() < kRecQueueLimit; });
+    gAna.work.push_back(std::move(w));
+    gAna.cv.notify_all();
+}
+
+// Work for the recorder thread, in order with the commands queued before it.
+void queueRecorder(std::function<void()> fn) {
+    Stage w;
+    w.record = std::move(fn);
+    queueStage(std::move(w));
+}
+void queueChunk(std::vector<uint32_t> chunk, Pm4Stats* st) {
+    Stage w;
+    w.chunk = std::move(chunk);
+    w.st = st;
+    queueStage(std::move(w));
 }
 
 } // namespace
@@ -464,17 +567,27 @@ void timeline(const char* fmt, ...) {
 
 void addDrawListener(DrawListener* l) { gListeners.push_back(l); }
 void notifySubmitEnd() {
-    queueRecorder([] {
+    Stage w;
+    w.analyze = [] {
+        for (DrawListener* l : gListeners) l->onAnalyzeSubmitEnd();
+    };
+    w.record = [] {
         if (timelineOn()) timeline("rec: submission recorded");
         for (DrawListener* l : gListeners) l->onSubmitEnd();
-    });
+    };
+    queueStage(std::move(w));
 }
 void notifyFrameEnd() {
-    queueRecorder([] {
+    Stage w;
+    w.analyze = [] {
+        for (DrawListener* l : gListeners) l->onAnalyzeFrameEnd();
+    };
+    w.record = [] {
         if (timelineOn()) timeline("rec: frame %" PRIu64 " recorded", gFrame.load() + 1);
         ++gFrame;
         for (DrawListener* l : gListeners) l->onFrameEnd();
-    });
+    };
+    queueStage(std::move(w));
 }
 void afterCommandsRecorded(std::function<void()> fn) { queueRecorder(std::move(fn)); }
 
@@ -488,7 +601,7 @@ void executePm4(const uint32_t* cmds, uint32_t numDwords, Pm4Stats* stats) {
     std::vector<uint32_t> out;
     scan(cmds, cmds + numDwords, out, stats, 0);
     if (!out.empty())
-        queueRecorder([chunk = std::move(out), stats] { execute(chunk.data(), chunk.data() + chunk.size(), stats, 0); });
+        queueChunk(std::move(out), stats);
 }
 
 void writePm4Nop(uint32_t* cmds, uint32_t numDwords) {

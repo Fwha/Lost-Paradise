@@ -56,6 +56,17 @@ public:
     // The command processor is about to wait (WAIT_REG_MEM): hand the GPU what was recorded,
     // since the value waited for may come from its fences.
     virtual void onWait() {}
+    // The analysis thread's view: the same commands, in the same order, are executed there first
+    // with a register file of its own, so a listener can prepare a draw (analyse its shaders)
+    // ahead of onDraw. Nothing in these may touch the GPU. Without the command processor thread,
+    // each is called just before its counterpart.
+    virtual void onAnalyzeDraw(const DrawCall&, const GpuRegs&) {}
+    virtual void onAnalyzeDma(uint64_t /*dst*/, uint64_t /*src*/, uint64_t /*bytes*/, bool /*fill*/, uint32_t /*value*/) {}
+    virtual void onAnalyzeWrite(uint64_t /*addr*/, const uint32_t* /*values*/, uint32_t /*count*/) {}
+    virtual void onAnalyzeSubmitEnd() {}
+    virtual void onAnalyzeFrameEnd() {}
+    // WRITE_DATA wrote memory (after onMemoryWrite): the counterpart of onAnalyzeWrite.
+    virtual void onCpWrite(uint64_t /*addr*/, uint64_t /*size*/) {}
     // CP DMA from memory (or a fill) to memory: true when the listener runs it on the GPU timeline,
     // in order with the draws around it; otherwise the command processor copies it now.
     virtual bool onDmaCopy(uint64_t /*dst*/, uint64_t /*src*/, uint64_t /*bytes*/, bool /*fill*/, uint32_t /*value*/) {
