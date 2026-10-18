@@ -271,7 +271,7 @@ private:
     }
 
     std::string helpers() {
-        std::string h = R"(float F(uint x) { return uintBitsToFloat(x); }
+        return R"(float F(uint x) { return uintBitsToFloat(x); }
 uint U(float x) { return floatBitsToUint(x); }
 uint sat(float x, bool c) { return U(c ? clamp(x, 0.0, 1.0) : x); }
 uint med3u(uint a, uint b, uint c) { return max(min(a, b), min(max(a, b), c)); }
@@ -328,16 +328,6 @@ vec3 cubeDir(vec3 c) {
     }
 }
 )";
-        // LPN_DEBUG_NAN (see exp()): helpers for showing NaNs; "2" also notes every NaN result.
-        if (const char* d = std::getenv("LPN_DEBUG_NAN")) {
-            if (!std::strcmp(d, "2")) {
-                const std::string sat = "uint sat(float x, bool c) { return";
-                h.replace(h.find(sat), sat.size(), "bool nanSeen_ = false;\nuint sat(float x, bool c) { nanSeen_ = nanSeen_ || isnan(x); return");
-            }
-            h += "vec4 nanDbg(vec4 v) { return any(isnan(v)) ? vec4(1.0, 0.0, 1.0, 1.0) : any(isinf(v)) ? vec4(0.0, 1.0, 0.0, 1.0) : v; }\n";
-            h += "vec4 nanSeenDbg(vec4 v) { return nanSeen_ ? vec4(1.0, 0.0, 1.0, 1.0) : v; }\n";
-        }
-        return h;
     }
 
     // ---- instructions ------------------------------------------------------------------------
@@ -916,11 +906,6 @@ vec3 cubeDir(vec3 c) {
                                                        {"xyzw", "zyxw", "wzyx", "wxyz"}};
             const uint32_t comps = std::min<uint32_t>(p_.launch.colorComps[mrt], 4);
             const char* swz = kSwizzle[comps][p_.launch.colorSwap[mrt] & 3];
-            // LPN_DEBUG_NAN=1: colour outputs holding a NaN show magenta, an infinity green.
-            // LPN_DEBUG_NAN=2: magenta wherever any float result in the pixel shader was a NaN.
-            static const char* debugNan = std::getenv("LPN_DEBUG_NAN");
-            if (debugNan && !isU && !isS)
-                v = std::string(std::strcmp(debugNan, "2") ? "nanDbg(" : "nanSeenDbg(") + v + ")";
             if (probing() && mrt == 0) {
                 if (!probed_) init_ += "vec3 probe_ = vec3(1.0, 0.0, 1.0);\n";
                 probed_ = true;
@@ -1263,9 +1248,7 @@ vec3 cubeDir(vec3 c) {
         const std::string uv = "uv_";
         auto grad = [&](uint32_t first) { return oneD ? "vec2(" + fv(first) + ", 0.0)" : vecOf(first, dims, false); };
         std::string call;
-        // LPN_TEX_LOD0=<pixel shader entry> (hex): that shader samples without derivatives (level 0).
-        static const uint64_t lod0Shader = std::getenv("LPN_TEX_LOD0") ? std::strtoull(std::getenv("LPN_TEX_LOD0"), nullptr, 16) : 0;
-        const bool fragment = p_.launch.stage == Stage::Pixel && p_.launch.entry != lod0Shader;
+        const bool fragment = p_.launch.stage == Stage::Pixel;
         if (compare) {
             std::string uvz = glslCoords == 2 ? "vec3(uv_, " + fv(zReg) + ")" : "vec4(uv_, " + fv(zReg) + ")";
             if (gather) call = "textureGather(" + tn + ", " + uv + ", " + fv(zReg) + ")";
