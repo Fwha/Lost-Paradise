@@ -64,6 +64,8 @@ constexpr uint32_t kSpiPsInputCntl = 0x191, kSpiPsInputEna = 0x1B3, kSpiPsInCont
                    kSpiShaderColFormat = 0x1C5;
 constexpr uint32_t kCbBlendControl = 0x1E0, kDbDepthControl = 0x200, kCbColorControl = 0x202,
                    kDbShaderControl = 0x203, kPaClClipCntl = 0x204, kPaSuScModeCntl = 0x205, kPaClVteCntl = 0x206;
+// PA_SU_POLY_OFFSET_CLAMP / FRONT_SCALE / FRONT_OFFSET (depth bias; BACK_* follow).
+constexpr uint32_t kPaSuPolyOffsetClamp = 0x2df, kPaSuPolyOffsetFrontScale = 0x2e0, kPaSuPolyOffsetFrontOffset = 0x2e1;
 constexpr uint32_t kCbColorBase = 0x318, kCbColorStride = 0xF;
 constexpr uint32_t kCbColorCmask = 7, kCbColorClearWord0 = 11, kCbColorClearWord1 = 12; // within a target's block
 // sh window
@@ -1691,6 +1693,7 @@ private:
         uint32_t writeMasks = 0;
         uint32_t blend[8] = {};
         uint32_t vsOutputs = 0;
+        uint32_t polyOffset[3] = {}; // clamp, scale, offset (float bits) while polygon offset is on
     };
 
     static VkBlendFactor blendFactor(uint32_t f) {
@@ -1785,6 +1788,13 @@ private:
         if (!rect && (s.modeCntl & 2)) rs.cullMode |= VK_CULL_MODE_BACK_BIT;
         rs.frontFace = (s.modeCntl & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
         rs.lineWidth = 1.0f;
+        if (s.modeCntl & (3u << 11)) { // POLY_OFFSET_FRONT/BACK_ENABLE
+            // Scale is in 1/16ths of the slope; the offset is in the depth format's units, as Vulkan's.
+            rs.depthBiasEnable = VK_TRUE;
+            rs.depthBiasClamp = std::bit_cast<float>(s.polyOffset[0]);
+            rs.depthBiasSlopeFactor = std::bit_cast<float>(s.polyOffset[1]) / 16.0f;
+            rs.depthBiasConstantFactor = std::bit_cast<float>(s.polyOffset[2]);
+        }
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -2619,6 +2629,11 @@ private:
                          r.ctx[reg::kDbStencilControl], r.ctx[reg::kDbStencilRefMask],
                          uint64_t(r.ctx[reg::kDbZReadBase]) << 8, uint64_t(r.ctx[reg::kDbHtileDataBase]) << 8,
                          std::bit_cast<float>(r.ctx[reg::kDbDepthClear]), r.uconfig[reg::kPrimitiveType], d.count);
+        if (trace_ && (r.ctx[reg::kPaSuScModeCntl] & (3u << 11)))
+            std::fprintf(traceOut_, "[trace]   polygon offset scale %g offset %g clamp %g (mode 0x%x)\n",
+                         std::bit_cast<float>(r.ctx[reg::kPaSuPolyOffsetFrontScale]),
+                         std::bit_cast<float>(r.ctx[reg::kPaSuPolyOffsetFrontOffset]),
+                         std::bit_cast<float>(r.ctx[reg::kPaSuPolyOffsetClamp]), r.ctx[reg::kPaSuScModeCntl]);
         if (trace_ && cbMode > 1) {
             const uint32_t* cb = &r.ctx[reg::kCbColorBase];
             std::fprintf(traceOut_, "[trace]   eliminate 0x%" PRIx64 " info 0x%x cmask 0x%" PRIx64 " clear 0x%x 0x%x\n",
@@ -2726,6 +2741,8 @@ private:
         gs.ps = psm ? psm->id : 0;
         gs.topology = prim;
         gs.modeCntl = r.ctx[reg::kPaSuScModeCntl];
+        if (gs.modeCntl & (3u << 11))
+            for (int i = 0; i < 3; ++i) gs.polyOffset[i] = r.ctx[reg::kPaSuPolyOffsetClamp + i];
         gs.vsOutputs = vsm->translation.outputs;
 
         std::vector<VkDescriptorSetLayoutBinding> lb;

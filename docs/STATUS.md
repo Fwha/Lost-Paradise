@@ -112,6 +112,9 @@ Last updated 2026-10-16.
   `LPN_DBG_PS=<entry>[,<entry>...] LPN_DBG_OUT="<vec4 args>"` replaces those pixel shaders' color
   output (e.g. `"iA4.xyz * 4.0, 1.0"`); `dbgT<n>` holds image n's last sample and
   `LPN_DBG_CAP="<GLSL line text>|<expr>"` captures `vec4(expr)` into `dbgC` after that line.
+  `LPN_PROBE=<ps entry hex>:<pc hex>:<v>,<v>,<v>` shows three VGPRs of that pixel shader, as they
+  are just before the instruction at pc, on its colour target 0 (magenta where pc is never reached);
+  `LPN_NO_KILL=<ps entry hex>` stops that pixel shader discarding.
   `LPN_PM4_TRACE=<frame>` logs that frame's DMA_DATA and EVENT_WRITE packets;
   `LPN_GPU_STATS=<n>` prints PM4 opcode counts for the 300 submissions ending at submission n.
 - Captures while playing: F12 saves the displayed frame and a GPU trace of the next one (every

@@ -3,8 +3,10 @@
 // branches run as a loop over a switch on the program counter.
 #include "gcn/shader.h"
 
+#include <cinttypes>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <cstring>
 
@@ -55,6 +57,7 @@ public:
             if (p_.controlFlow && p_.labels.count(pc)) out("case " + label(pc) + ":\n");
             pc_ = pc;
             next_ = pc + in.size;
+            probe(pc);
             instruction(in);
             expect = next_;
         }
@@ -329,6 +332,37 @@ vec3 cubeDir(vec3 c) {
 
     // ---- instructions ------------------------------------------------------------------------
 
+    // LPN_PROBE=<pixel shader entry>:<pc>:<vgpr>,<vgpr>,<vgpr> (hex, hex, decimal): that shader's
+    // colour target 0 shows the three registers as they are just before the instruction at pc
+    // (magenta where it is never reached), for working out where a shader goes wrong.
+    struct Probe {
+        uint64_t entry = 0, pc = 0;
+        uint32_t regs[3] = {};
+    };
+    static const Probe* probeSetting() {
+        static const Probe* p = [] () -> const Probe* {
+            const char* e = std::getenv("LPN_PROBE");
+            static Probe pr;
+            if (!e || std::sscanf(e, "%" SCNx64 ":%" SCNx64 ":%u,%u,%u", &pr.entry, &pr.pc, &pr.regs[0], &pr.regs[1], &pr.regs[2]) != 5)
+                return nullptr;
+            return &pr;
+        }();
+        return p;
+    }
+    bool probing() const {
+        const Probe* p = probeSetting();
+        return p && p_.launch.stage == Stage::Pixel && p_.launch.entry == p->entry;
+    }
+    void probe(uint64_t pc) {
+        if (!probing()) return;
+        const Probe* p = probeSetting();
+        if (pc - p_.launch.entry != p->pc) return;
+        if (!probed_) init_ += "vec3 probe_ = vec3(1.0, 0.0, 1.0);\n";
+        probed_ = true;
+        out(fmt("probe_ = vec3(F(%s), F(%s), F(%s));\n", vreg(p->regs[0]).c_str(), vreg(p->regs[1]).c_str(), vreg(p->regs[2]).c_str()));
+    }
+    bool probed_ = false;
+
     void instruction(const Instruction& in) {
         literal_ = in.literal;
         switch (in.format) {
@@ -556,6 +590,13 @@ vec3 cubeDir(vec3 c) {
             if (omod == 1) r = "(" + r + ") * 2.0";
             else if (omod == 2) r = "(" + r + ") * 4.0";
             else if (omod == 3) r = "(" + r + ") * 0.5";
+            if (p_.launch.stage != Stage::Pixel && p_.launch.stage != Stage::Compute) {
+                // GCN rounds after every multiply (v_mad/v_mac are not fused). Vertex shaders keep
+                // that, so a depth pre-pass and a later pass computing the same position agree
+                // bit for bit (an equal-or-less depth test against the pre-pass needs it).
+                out(guard() + "{ precise float r_ = " + r + "; " + vreg(dst) + " = sat(r_, " + (clampBit ? "true" : "false") + "); }\n");
+                return;
+            }
             writeV(dst, "sat(" + r + ", " + (clampBit ? "true" : "false") + ")");
         };
         auto ures = [&](const std::string& e) { writeV(dst, e); };
@@ -795,7 +836,9 @@ vec3 cubeDir(vec3 c) {
         const uint32_t vs[4] = {w1 & 0xFF, (w1 >> 8) & 0xFF, (w1 >> 16) & 0xFF, w1 >> 24};
         auto comp = [&](int i) { return (en >> i) & 1 ? "F(" + vreg(vs[i]) + ")" : std::string("0.0"); };
         auto vec = [&] { return "vec4(" + comp(0) + ", " + comp(1) + ", " + comp(2) + ", " + comp(3) + ")"; };
-        if (p_.launch.stage == Stage::Pixel && vm && exec_) out("if ((exec_lo & 1u) == 0u) discard;\n");
+        // LPN_NO_KILL=<pixel shader entry> (hex): that shader never discards (debugging).
+        static const uint64_t noKill = std::getenv("LPN_NO_KILL") ? std::strtoull(std::getenv("LPN_NO_KILL"), nullptr, 16) : 0;
+        if (p_.launch.stage == Stage::Pixel && vm && exec_ && p_.launch.entry != noKill) out("if ((exec_lo & 1u) == 0u) discard;\n");
 
         if (target == 12) { // pos0
             out("gl_Position = " + vec() + ";\n");
@@ -863,6 +906,11 @@ vec3 cubeDir(vec3 c) {
                                                        {"xyzw", "zyxw", "wzyx", "wxyz"}};
             const uint32_t comps = std::min<uint32_t>(p_.launch.colorComps[mrt], 4);
             const char* swz = kSwizzle[comps][p_.launch.colorSwap[mrt] & 3];
+            if (probing() && mrt == 0) {
+                if (!probed_) init_ += "vec3 probe_ = vec3(1.0, 0.0, 1.0);\n";
+                probed_ = true;
+                v = "vec4(probe_, 1.0)";
+            }
             if (std::strcmp(swz, "xyzw")) out(fmt("oC%u = %s(%s).%s;\n", mrt, type, v.c_str(), swz));
             else out(fmt("oC%u = %s(%s);\n", mrt, type, v.c_str()));
             return;
