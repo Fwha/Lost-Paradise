@@ -41,6 +41,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <unordered_set>
 #include <vector>
 
@@ -483,13 +484,72 @@ public:
                 }
             }
         }
-        prof_.on = getenv("LPN_PROFILE") != nullptr;
+        prof_.on = aprof_.on = getenv("LPN_PROFILE") != nullptr;
         openPipelineCache();
         dumpGlsl_ = getenv("LPN_GPU_GLSL") != nullptr;
         return true;
     }
 
+    // ---- the analysis thread (see pm4.h): shader analysis for each draw, ahead of recording ----
+    // It owns programs_, codePages_, submit_ and the shader modules' creation; the recorder takes
+    // each draw's DrawAnalysis from analyses_ in order.
+
+    void onAnalyzeDraw(const DrawCall& d, const GpuRegs& r) override {
+        DrawAnalysis a;
+        if (d.kind == DrawCall::kDispatch) analyzeDispatch(r, a);
+        else if (!computeOnly_ && (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed)) analyzeDraw(r, a);
+        std::lock_guard lock(analysesMutex_);
+        analyses_.push_back(std::move(a));
+    }
+
+    // Memory the command processor writes reaches guest memory only when the recorder (or the
+    // GPU) gets there: until then analysis reads it through an overlay on its page cache.
+    void onAnalyzeDma(uint64_t dst, uint64_t src, uint64_t bytes, bool fill, uint32_t value) override {
+        std::vector<uint8_t> data(bytes);
+        bool ok = true;
+        if (fill) for (uint64_t i = 0; i + 4 <= bytes; i += 4) std::memcpy(&data[i], &value, 4);
+        else ok = codePages_.read(src, data.data(), bytes);
+        codePages_.invalidate(dst, bytes);
+        ++submit_; // and re-verify shader code before reuse
+        uint64_t id = 0;
+        if (ok) codePages_.overlay(dst, std::move(data), id = ++overlayIds_);
+        std::lock_guard lock(analysesMutex_);
+        dmaOverlays_.push_back(id);
+    }
+    void onAnalyzeWrite(uint64_t addr, const uint32_t* values, uint32_t count) override {
+        std::vector<uint8_t> data(size_t(count) * 4);
+        std::memcpy(data.data(), values, data.size());
+        codePages_.invalidate(addr, data.size());
+        ++submit_;
+        const uint64_t id = ++overlayIds_;
+        codePages_.overlay(addr, std::move(data), id);
+        std::lock_guard lock(analysesMutex_);
+        writeOverlays_.push_back(id);
+    }
+    void onAnalyzeSubmitEnd() override {
+        codePages_.clear();
+        ++submit_;
+    }
+    void onAnalyzeFrameEnd() override {
+        codePages_.clear();
+        ++submit_;
+        if (programCount_ > 20000) {
+            programs_.clear();
+            programCount_ = 0;
+        }
+    }
+
     void onDraw(const DrawCall& d, const GpuRegs& r) override {
+        DrawAnalysis a;
+        {
+            std::lock_guard lock(analysesMutex_);
+            if (analyses_.empty()) {
+                warnOnce("a draw arrived without its analysis");
+                return;
+            }
+            a = std::move(analyses_.front());
+            analyses_.pop_front();
+        }
         std::lock_guard lock(m_);
         ProfScope ps(prof_, kProfRenderer);
         ++prof_.calls;
@@ -501,9 +561,9 @@ public:
                          shaderAddress(r, reg::kPgmLoPs), shaderAddress(r, reg::kPgmLoCs));
         if (raceCheck_) raceShader_ = shaderAddress(r, d.kind == DrawCall::kDispatch ? reg::kPgmLoCs : reg::kPgmLoPs);
         const uint64_t passesBefore = prof_.passes;
-        if (d.kind == DrawCall::kDispatch) dispatch(d, r);
+        if (d.kind == DrawCall::kDispatch) dispatch(d, r, a);
         else if (computeOnly_) return;
-        else if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r);
+        else if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r, a);
         else warnOnce("indirect draws and dispatches are not rendered yet");
         if (frame_ == timingFrame_ && timing_ && recording_ && timingMeta_.size() + 1 < kTimingQueries) {
             vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timing_, uint32_t(timingMeta_.size() + 1));
@@ -519,24 +579,43 @@ public:
     void onMemoryWrite(uint64_t addr, uint64_t size) override {
         std::lock_guard lock(m_);
         if (raceCheck_) noteWrite(addr, size);
-        codePages_.invalidate(addr, size);
-        ++submit_; // and re-verify shader code before reuse
+    }
+    void onCpWrite(uint64_t, uint64_t) override { // written now: the analysis overlay is done
+        uint64_t id;
+        {
+            std::lock_guard lock(analysesMutex_);
+            if (writeOverlays_.empty()) return;
+            id = writeOverlays_.front();
+            writeOverlays_.pop_front();
+        }
+        codePages_.dropOverlay(id);
     }
 
     bool onDmaCopy(uint64_t dst, uint64_t src, uint64_t bytes, bool fill, uint32_t value) override {
+        uint64_t id = 0; // the analysis thread's overlay for this copy
+        {
+            std::lock_guard lock(analysesMutex_);
+            if (!dmaOverlays_.empty()) {
+                id = dmaOverlays_.front();
+                dmaOverlays_.pop_front();
+            }
+        }
+        // Copied by the CPU right after a false return: the overlay can go at once.
+        auto cpu = [&] {
+            if (id) codePages_.dropOverlay(id);
+            return false;
+        };
         static const bool cpuDma = getenv("LPN_CPU_DMA") != nullptr; // the old way, for comparison
-        if (cpuDma) return false;
+        if (cpuDma) return cpu();
         std::lock_guard lock(m_);
         VkBuffer db, sb = VK_NULL_HANDLE;
         VkDeviceSize doff, soff = 0;
-        if (!guestBuffer(dst, bytes, db, doff)) return false;
-        std::vector<uint8_t> data(bytes);
+        if (!guestBuffer(dst, bytes, db, doff)) return cpu();
         if (fill) {
-            if (dst % 4 || bytes % 4) return false;
-            for (uint64_t i = 0; i < bytes; i += 4) std::memcpy(&data[i], &value, 4);
+            if (dst % 4 || bytes % 4) return cpu();
         } else {
-            if (src < dst + bytes && dst < src + bytes) return false; // overlapping: copied by the CPU
-            if (!guestBuffer(src, bytes, sb, soff) || !codePages_.read(src, data.data(), bytes)) return false;
+            if (src < dst + bytes && dst < src + bytes) return cpu(); // overlapping: copied by the CPU
+            if (!guestBuffer(src, bytes, sb, soff)) return cpu();
         }
         begin();
         fullBarrier();
@@ -547,12 +626,8 @@ public:
             vkCmdCopyBuffer(cmd_, sb, db, 1, &c);
         }
         if (raceCheck_) noteWrite(dst, bytes);
-        codePages_.invalidate(dst, bytes);
-        ++submit_; // and re-verify shader code before reuse
         ++prof_.dmas, prof_.dmaBytes += bytes;
-        const uint64_t id = ++overlayIds_;
-        codePages_.overlay(dst, std::move(data), id);
-        pendingDone_.push_back([this, id] { codePages_.dropOverlay(id); });
+        if (id) pendingDone_.push_back([this, id] { codePages_.dropOverlay(id); }); // once the GPU has copied
         return true;
     }
 
@@ -565,8 +640,6 @@ public:
         std::lock_guard lock(m_);
         ProfScope ps(prof_, kProfRenderer);
         flush();
-        codePages_.clear();
-        ++submit_;
     }
 
     void onFrameEnd() override {
@@ -574,8 +647,6 @@ public:
         {
             ProfScope ps(prof_, kProfRenderer);
             flush();
-            codePages_.clear();
-            ++submit_;
         }
         if (frame_ == traceFrame_) {
             dumpSurfaces();
@@ -584,10 +655,6 @@ public:
                 traceOut_ = stderr;
                 std::fprintf(stderr, "[capture] saved %s\n", traceDir_.c_str());
             }
-        }
-        if (programCount_ > 20000) {
-            programs_.clear();
-            programCount_ = 0;
         }
         if (prof_.on) reportSlowFrame();
         savePipelineCache();
@@ -694,7 +761,15 @@ public:
         pendingCapture_ = dir;
     }
 
+    // The analysis thread's slots and counts join the recorder's (a little racy, for a report).
+    void mergeAnalysisProfile() {
+        for (int i : {kProfAnalyze, kProfShaderLookup, kProfLaunch}) prof_.ns[i] += std::exchange(aprof_.ns[i], 0);
+        prof_.analysisHits += std::exchange(aprof_.analysisHits, 0);
+        prof_.analyses += std::exchange(aprof_.analyses, 0);
+    }
+
     void reportProfile() {
+        mergeAnalysisProfile();
         const auto now = std::chrono::steady_clock::now();
         const double wall = std::chrono::duration<double>(now - prof_.windowStart).count();
         std::fprintf(stderr, "[prof] frames %" PRIu64 "-%" PRIu64 ": %.1f fps, %.1f ms/frame;", frame_ - 300, frame_,
@@ -1025,8 +1100,10 @@ private:
     bool ringFits(VkDeviceSize size) const { return ringUsed_ + size + 4096 <= kRingSize; }
 
     void warnOnce(const std::string& w) {
+        std::lock_guard lock(warnMutex_); // the analysis and recorder threads both warn
         if (warned_.insert(w).second) std::fprintf(stderr, "[gpu] %s\n", w.c_str());
     }
+    std::mutex warnMutex_;
 
     // ---- memory --------------------------------------------------------------------------------
 
@@ -2103,7 +2180,7 @@ private:
     // ---- draws ---------------------------------------------------------------------------------
 
     gcn::LaunchState launch(const GpuRegs& r, gcn::Stage stage) {
-        ProfScope pl(prof_, kProfLaunch);
+        ProfScope pl(aprof_, kProfLaunch);
         gcn::LaunchState l;
         l.stage = stage;
         switch (stage) {
@@ -2140,7 +2217,7 @@ private:
     // program's data is fresh for this draw. Null when there is no shader.
     CachedProgram* analyzed(const gcn::LaunchState& l, uint32_t bindingBase) {
         if (!l.entry) return nullptr;
-        ProfScope ps(prof_, kProfAnalyze);
+        ProfScope ps(aprof_, kProfAnalyze);
         auto& walks = programs_[launchKey(l, bindingBase)].walks;
         gcn::Program r;
         for (size_t i = 0; i < walks.size(); ++i) {
@@ -2154,7 +2231,7 @@ private:
             auto& shapes = walks.front().shapes;
             for (size_t j = 0; j < shapes.size(); ++j)
                 if (gcn::adopt(shapes[j]->prog, r)) {
-                    ++prof_.analysisHits;
+                    ++aprof_.analysisHits;
                     if (j) std::rotate(shapes.begin(), shapes.begin() + ptrdiff_t(j), shapes.begin() + ptrdiff_t(j) + 1);
                     return shapes.front().get();
                 }
@@ -2198,7 +2275,7 @@ private:
     }
 
     CachedProgram* analyze(CachedProgram& c, const gcn::LaunchState& l, uint32_t bindingBase) {
-        ++prof_.analyses;
+        ++aprof_.analyses;
         c.prog = gcn::analyze(l, readCached_);
         c.code.clear();
         for (const auto& [pc, in] : c.prog.code) {
@@ -2208,20 +2285,79 @@ private:
         c.codeHash = hashCode(c.code);
         c.checkedSubmit = submit_;
         c.valid = c.codeHash != 0;
-        ProfScope pl(prof_, kProfShaderLookup);
+        ProfScope pl(aprof_, kProfShaderLookup);
         c.module = c.prog.launch.entry ? shader(c.prog, bindingBase) : nullptr;
         return c.prog.launch.entry ? &c : nullptr;
     }
 
-    void dispatch(const DrawCall& d, const GpuRegs& r) {
+    // A draw's analysed programs, handed from the analysis thread to the recorder: copies of the
+    // per-draw parts (the cached programs are re-targeted by the next draws meanwhile).
+    struct DrawAnalysis {
+        bool ok = false;
+        ShaderModule *vsm = nullptr, *psm = nullptr; // a dispatch's module is vsm
+        gcn::Program vs, ps;
+    };
+    static void takeDrawPart(gcn::Program& to, const gcn::Program& from) {
+        to.launch = from.launch;
+        to.data = from.data;
+        to.buffers = from.buffers;
+        to.images = from.images;
+        to.warnings = from.warnings;
+    }
+
+    void analyzeDispatch(const GpuRegs& r, DrawAnalysis& a) {
         static const uint64_t skipCs = getenv("LPN_SKIP_CS") ? std::strtoull(getenv("LPN_SKIP_CS"), nullptr, 0) : 0;
         if (skipCs && shaderAddress(r, reg::kPgmLoCs) == skipCs) return; // debugging: what a shader costs
         CachedProgram* csc = analyzed(launch(r, gcn::Stage::Compute), 0);
         if (!csc) return;
-        gcn::Program& cs = csc->prog;
+        a.ok = true;
+        a.vsm = csc->module;
+        takeDrawPart(a.vs, csc->prog);
+    }
+
+    // The register-only part of draw(): which draws render, and the pixel shader's launch as the
+    // render targets' formats shape it.
+    void analyzeDraw(const GpuRegs& r, DrawAnalysis& a) {
+        const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
+        const uint32_t dbRender = r.ctx[reg::kDbRenderControl];
+        if (cbMode > 1 || (dbRender & 0x1C)) return;
+        const uint32_t prim = r.uconfig[reg::kPrimitiveType];
+        if (prim == 0 || prim == 8 || prim == 13) return;
+        CachedProgram* vsc = analyzed(launch(r, gcn::Stage::Vertex), 0);
+        if (!vsc) return;
+        a.ok = true;
+        a.vsm = vsc->module;
+        takeDrawPart(a.vs, vsc->prog);
+        if (!shaderAddress(r, reg::kPgmLoPs)) return;
+        gcn::LaunchState psLaunch = launch(r, gcn::Stage::Pixel);
+        const uint32_t targetMask = r.ctx[reg::kCbTargetMask] & r.ctx[reg::kCbShaderMask];
+        for (uint32_t i = 0; i < 8 && cbMode == 1; ++i) {
+            const uint32_t* cb = &r.ctx[reg::kCbColorBase + i * reg::kCbColorStride];
+            const uint32_t info = cb[::gpu::ctx::kCbColorInfo];
+            const uint32_t fmt = (info >> 2) & 0x1F, num = (info >> 8) & 7;
+            if (!fmt || !((targetMask >> (i * 4)) & 0xF) || colorFormat(fmt, num) == VK_FORMAT_UNDEFINED) continue;
+            psTargetLaunch(psLaunch, i, fmt, num, info);
+        }
+        if (CachedProgram* psc = analyzed(psLaunch, kPsBindingBase)) {
+            a.psm = psc->module;
+            takeDrawPart(a.ps, psc->prog);
+        }
+    }
+    static void psTargetLaunch(gcn::LaunchState& l, uint32_t i, uint32_t fmt, uint32_t num, uint32_t info) {
+        if (num == 4) l.colorUint |= 1u << i;
+        if (num == 5) l.colorSint |= 1u << i;
+        l.colorSwap[i] = (info >> 11) & 3;
+        static const uint8_t kComps[32] = {0, 1, 1, 2, 1, 2, 3, 3, 4, 4, 4, 2, 4, 3, 4, 0,
+                                           3, 4, 4, 4, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        l.colorComps[i] = kComps[fmt];
+    }
+
+    void dispatch(const DrawCall& d, const GpuRegs&, DrawAnalysis& a) {
+        if (!a.ok) return;
+        gcn::Program& cs = a.vs;
         if (!ringFits(1 << 20)) flush();
         begin();
-        ShaderModule* m = csc->module;
+        ShaderModule* m = a.vsm;
         std::vector<VkDescriptorSetLayoutBinding> lb;
         addBindings(lb, cs, 0, VK_SHADER_STAGE_COMPUTE_BIT);
         Layout& lay = layout(lb);
@@ -2377,7 +2513,7 @@ private:
             std::fprintf(traceOut_, "[trace]   copied %ux%u back to 0x%" PRIx64 "\n", w, h, t.base());
     }
 
-    void draw(const DrawCall& d, const GpuRegs& r) {
+    void draw(const DrawCall& d, const GpuRegs& r, DrawAnalysis& a) {
         const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
         const uint32_t dbRender = r.ctx[reg::kDbRenderControl];
         if (trace_)
@@ -2401,10 +2537,8 @@ private:
             return;
         }
 
-        CachedProgram* vsc = analyzed(launch(r, gcn::Stage::Vertex), 0);
-        if (!vsc) return;
-        gcn::Program& vs = vsc->prog;
-        const bool hasPs = shaderAddress(r, reg::kPgmLoPs) != 0;
+        if (!a.ok) return;
+        gcn::Program& vs = a.vs;
 
         // Render targets.
         Pass pass;
@@ -2412,7 +2546,6 @@ private:
         VkRenderingAttachmentInfo colors[8]{};
         uint32_t colorCount = 0;
         uint32_t width = 16384, height = 16384;
-        gcn::LaunchState psLaunch = launch(r, gcn::Stage::Pixel);
         const uint32_t targetMask = r.ctx[reg::kCbTargetMask] & r.ctx[reg::kCbShaderMask];
         for (uint32_t i = 0; i < 8 && cbMode == 1; ++i) {
             const uint32_t* cb = &r.ctx[reg::kCbColorBase + i * reg::kCbColorStride];
@@ -2445,15 +2578,9 @@ private:
             gs.colorFormats[i] = vf;
             gs.writeMasks |= ((targetMask >> (i * 4)) & 0xF) << (i * 4);
             gs.blend[i] = r.ctx[reg::kCbBlendControl + i];
-            if (num == 4) psLaunch.colorUint |= 1u << i;
-            if (num == 5) psLaunch.colorSint |= 1u << i;
-            psLaunch.colorSwap[i] = (info >> 11) & 3;
             if ((info >> 13) & 1) // FAST_CLEAR: a CMASK fill clears it (see dispatch)
                 noteMetadata(uint64_t(cb[reg::kCbColorCmask]) << 8, uint64_t(cb[0]) << 8, false,
                              cb[reg::kCbColorClearWord0], cb[reg::kCbColorClearWord1]);
-            static const uint8_t kComps[32] = {0, 1, 1, 2, 1, 2, 3, 3, 4, 4, 4, 2, 4, 3, 4, 0,
-                                               3, 4, 4, 4, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-            psLaunch.colorComps[i] = kComps[fmt];
         }
         for (uint32_t i = colorCount; i < 8; ++i) colors[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
 
@@ -2495,11 +2622,9 @@ private:
 
         if (!ringFits(1 << 20)) flush();
         begin();
-        ShaderModule* vsm = vsc->module;
-        CachedProgram* psc = hasPs ? analyzed(psLaunch, kPsBindingBase) : nullptr;
-        gcn::Program noPs;
-        gcn::Program& ps = psc ? psc->prog : noPs;
-        ShaderModule* psm = psc ? psc->module : nullptr;
+        ShaderModule* vsm = a.vsm;
+        gcn::Program& ps = a.ps;
+        ShaderModule* psm = a.psm;
         gs.vs = vsm->id;
         gs.ps = psm ? psm->id : 0;
         gs.topology = prim;
@@ -2777,8 +2902,12 @@ private:
         uint64_t draws = 0, dispatches = 0;
     } stats_;
     Profiler prof_;
-    PageCache codePages_;
+    PageCache codePages_; // the analysis thread's
     uint64_t overlayIds_ = 0;
+    Profiler aprof_; // the analysis thread's slots and counts, merged into prof_'s reports
+    std::mutex analysesMutex_;
+    std::deque<DrawAnalysis> analyses_; // one per draw or dispatch, for the recorder
+    std::deque<uint64_t> dmaOverlays_, writeOverlays_; // the analysis thread's overlay of each DMA / WRITE_DATA
     std::unordered_map<std::string, ProgramVariants> programs_;
     size_t programCount_ = 0;
     const gcn::ReadMemory readCached_ = [this](uint64_t a, void* d, size_t n) { return codePages_.read(a, d, n); };
