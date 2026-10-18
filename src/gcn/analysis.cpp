@@ -25,17 +25,25 @@ struct Work {
 };
 
 // Work items in order. A deque allocates per item here (they are large), and a replay runs for
-// every draw: a vector with a read position allocates once.
+// every draw: a vector with a read position, kept per thread (one queue runs at a time), does not
+// allocate at all once it has grown.
 class WorkQueue {
 public:
-    WorkQueue(std::initializer_list<Work> init) : items_(init) { items_.reserve(16); }
+    explicit WorkQueue(Work first) : items_(storage()) {
+        items_.clear();
+        items_.push_back(std::move(first));
+    }
     bool empty() const { return head_ == items_.size(); }
     Work& front() { return items_[head_]; }
     void pop_front() { ++head_; }
     void push_back(Work w) { items_.push_back(std::move(w)); }
 
 private:
-    std::vector<Work> items_;
+    static std::vector<Work>& storage() {
+        thread_local std::vector<Work> v;
+        return v;
+    }
+    std::vector<Work>& items_;
     size_t head_ = 0;
 };
 
@@ -48,7 +56,7 @@ public:
 
     Program run() {
         p_.data.assign(data::kSmrd, 0);
-        WorkQueue work{{p_.launch.entry, start()}};
+        WorkQueue work{Work{p_.launch.entry, start()}};
         p_.labels.insert(p_.launch.entry);
         unsigned steps = 0;
         while (!work.empty() && steps < 100000) {
@@ -94,7 +102,7 @@ public:
         p_.images = prior.images;
         seenBuffers_.assign(p_.buffers.size(), false);
         seenImages_.assign(p_.images.size(), false);
-        WorkQueue work{{p_.launch.entry, start()}};
+        WorkQueue work{Work{p_.launch.entry, start()}};
         State st;
         for (const Program::TraceStep& t : prior.trace) {
             if (t.start) {

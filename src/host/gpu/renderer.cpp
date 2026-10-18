@@ -530,7 +530,17 @@ public:
     // each draw's DrawAnalysis from analyses_ in order.
 
     void onAnalyzeDraw(const DrawCall& d, const GpuRegs& r) override {
+        // A spare one keeps its vectors' storage: no allocations per draw here, or frees on the recorder.
         DrawAnalysis a;
+        {
+            std::lock_guard lock(analysesMutex_);
+            if (!spareAnalyses_.empty()) {
+                a = std::move(spareAnalyses_.back());
+                spareAnalyses_.pop_back();
+            }
+        }
+        a.ok = false;
+        a.vsm = a.psm = nullptr;
         if (d.kind == DrawCall::kDispatch) analyzeDispatch(r, a);
         else if (!computeOnly_ && (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed)) analyzeDraw(r, a);
         std::lock_guard lock(analysesMutex_);
@@ -585,6 +595,14 @@ public:
             a = std::move(analyses_.front());
             analyses_.pop_front();
         }
+        struct Recycle { // hands `a` back to the analysis thread however the draw ends
+            Renderer& r;
+            DrawAnalysis& a;
+            ~Recycle() {
+                std::lock_guard lock(r.analysesMutex_);
+                if (r.spareAnalyses_.size() < 64) r.spareAnalyses_.push_back(std::move(a));
+            }
+        } recycle{*this, a};
         std::lock_guard lock(m_);
         ProfScope ps(prof_, kProfRenderer);
         ++prof_.calls;
@@ -2676,8 +2694,12 @@ private:
         if (!a.ok) return;
         gcn::Program& vs = a.vs;
 
-        // Render targets.
-        Pass pass;
+        // Render targets. The pass and vectors below are reused from draw to draw (no allocations).
+        Pass& pass = drawPass_;
+        pass.open = false;
+        pass.images.clear();
+        pass.written.clear();
+        pass.depthImage = VK_NULL_HANDLE;
         GraphicsState gs{};
         VkRenderingAttachmentInfo colors[8]{};
         uint32_t colorCount = 0;
@@ -2770,7 +2792,8 @@ private:
             for (int i = 0; i < 3; ++i) gs.polyOffset[i] = r.ctx[reg::kPaSuPolyOffsetClamp + i];
         gs.vsOutputs = vsm->translation.outputs;
 
-        std::vector<VkDescriptorSetLayoutBinding> lb;
+        std::vector<VkDescriptorSetLayoutBinding>& lb = drawBindings_;
+        lb.clear();
         addBindings(lb, vs, 0, VK_SHADER_STAGE_VERTEX_BIT);
         if (psm) addBindings(lb, ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT);
         Layout* layp;
@@ -2783,11 +2806,12 @@ private:
         if (!pipe) return;
         Layout& lay = *layp;
 
-        std::vector<VkWriteDescriptorSet> writes;
-        std::vector<VkDescriptorBufferInfo> bufs;
-        std::vector<VkDescriptorImageInfo> imgs;
-        bufs.reserve(64);
-        imgs.reserve(64);
+        std::vector<VkWriteDescriptorSet>& writes = drawWrites_;
+        std::vector<VkDescriptorBufferInfo>& bufs = drawBufs_;
+        std::vector<VkDescriptorImageInfo>& imgs = drawImgs_;
+        writes.clear();
+        bufs.clear();
+        imgs.clear();
         sampledSurfaces_.clear();
         if (trace_) {
             captureProgram(vs, vsm, "vs");
@@ -2861,7 +2885,7 @@ private:
                 if (gs.stencil) ri.pStencilAttachment = &depth;
             }
             vkCmdBeginRendering(cmd_, &ri);
-            pass_ = std::move(pass);
+            std::swap(pass_, pass); // the old pass's storage is reused by the next draw
             pass_.open = true;
             ++prof_.passes;
         }
@@ -3057,6 +3081,7 @@ private:
     Profiler aprof_; // the analysis thread's slots and counts, merged into prof_'s reports
     std::mutex analysesMutex_;
     std::deque<DrawAnalysis> analyses_; // one per draw or dispatch, for the recorder
+    std::vector<DrawAnalysis> spareAnalyses_; // used ones, back from the recorder
     std::deque<uint64_t> dmaOverlays_, writeOverlays_; // the analysis thread's overlay of each DMA / WRITE_DATA
     std::unordered_map<std::string, ProgramVariants> programs_;
     size_t programCount_ = 0;
@@ -3076,7 +3101,11 @@ private:
             return colorCount == o.colorCount && depth == o.depth && stencil == o.stencil && width == o.width &&
                    height == o.height && std::equal(views, views + colorCount, o.views);
         }
-    } pass_;
+    } pass_, drawPass_; // the open pass; the draw being recorded's
+    std::vector<VkDescriptorSetLayoutBinding> drawBindings_;
+    std::vector<VkWriteDescriptorSet> drawWrites_;
+    std::vector<VkDescriptorBufferInfo> drawBufs_;
+    std::vector<VkDescriptorImageInfo> drawImgs_;
     std::vector<VkImage> sampledSurfaces_;
     std::string spirvDir_; // "-": no SPIR-V cache
     VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
