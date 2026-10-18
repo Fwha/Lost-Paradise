@@ -708,7 +708,10 @@ vec3 cubeDir(vec3 c) {
         }
         // VOP1
         case 384: break;
-        case 385: ures(a); break;
+        case 385: // v_mov_b32; in VOP3 form its abs/neg/omod/clamp apply as for a float move (games negate with it)
+            if (clampBit || omod) fres(fa);
+            else ures("(" + a + (abs & 1 ? " & 0x7fffffffu" : "") + ")" + (neg & 1 ? " ^ 0x80000000u" : ""));
+            break;
         case 386: writeS(dst, a); break; // v_readfirstlane_b32 (lane-local)
         case 389: fres("float(int(" + a + "))"); break;
         case 398: fres("float(bitfieldExtract(int(" + a + "), 0, 4)) * 0.0625"); break; // v_cvt_off_f32_i4
