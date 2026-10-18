@@ -3,6 +3,7 @@
 // branches run as a loop over a switch on the program counter.
 #include "gcn/shader.h"
 
+#include <cinttypes>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -56,6 +57,7 @@ public:
             if (p_.controlFlow && p_.labels.count(pc)) out("case " + label(pc) + ":\n");
             pc_ = pc;
             next_ = pc + in.size;
+            probe(pc);
             instruction(in);
             expect = next_;
         }
@@ -332,6 +334,37 @@ vec3 cubeDir(vec3 c) {
     }
 
     // ---- instructions ------------------------------------------------------------------------
+
+    // LPN_PROBE=<pixel shader entry>:<pc>:<vgpr>,<vgpr>,<vgpr> (hex, hex, decimal): that shader's
+    // colour target 0 shows the three registers as they are just before the instruction at pc
+    // (magenta where it is never reached), for working out where a shader goes wrong.
+    struct Probe {
+        uint64_t entry = 0, pc = 0;
+        uint32_t regs[3] = {};
+    };
+    static const Probe* probeSetting() {
+        static const Probe* p = [] () -> const Probe* {
+            const char* e = std::getenv("LPN_PROBE");
+            static Probe pr;
+            if (!e || std::sscanf(e, "%" SCNx64 ":%" SCNx64 ":%u,%u,%u", &pr.entry, &pr.pc, &pr.regs[0], &pr.regs[1], &pr.regs[2]) != 5)
+                return nullptr;
+            return &pr;
+        }();
+        return p;
+    }
+    bool probing() const {
+        const Probe* p = probeSetting();
+        return p && p_.launch.stage == Stage::Pixel && p_.launch.entry == p->entry;
+    }
+    void probe(uint64_t pc) {
+        if (!probing()) return;
+        const Probe* p = probeSetting();
+        if (pc - p_.launch.entry != p->pc) return;
+        if (!probed_) init_ += "vec3 probe_ = vec3(1.0, 0.0, 1.0);\n";
+        probed_ = true;
+        out(fmt("probe_ = vec3(F(%s), F(%s), F(%s));\n", vreg(p->regs[0]).c_str(), vreg(p->regs[1]).c_str(), vreg(p->regs[2]).c_str()));
+    }
+    bool probed_ = false;
 
     void instruction(const Instruction& in) {
         literal_ = in.literal;
@@ -872,6 +905,11 @@ vec3 cubeDir(vec3 c) {
             static const char* debugNan = std::getenv("LPN_DEBUG_NAN");
             if (debugNan && !isU && !isS)
                 v = std::string(std::strcmp(debugNan, "2") ? "nanDbg(" : "nanSeenDbg(") + v + ")";
+            if (probing() && mrt == 0) {
+                if (!probed_) init_ += "vec3 probe_ = vec3(1.0, 0.0, 1.0);\n";
+                probed_ = true;
+                v = "vec4(probe_, 1.0)";
+            }
             if (std::strcmp(swz, "xyzw")) out(fmt("oC%u = %s(%s).%s;\n", mrt, type, v.c_str(), swz));
             else out(fmt("oC%u = %s(%s);\n", mrt, type, v.c_str()));
             return;
