@@ -434,7 +434,7 @@ struct Profiler {
     uint64_t ns[kProfCount] = {};
     uint64_t passWhy[4] = {}; // why a new render pass started, by PassWhy
     uint64_t feedbackOn[2] = {}; // a draw sampled the open pass's depth / color attachment
-    uint64_t calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0;
+    uint64_t barriers = 0, calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -835,8 +835,9 @@ public:
         std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / 300, prof_.dmas / 300.0,
                      prof_.dmaBytes / 300.0 / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
-        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes per frame\n",
-                     prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.analyses / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0, prof_.passes / 300.0);
+        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame\n",
+                     prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.analyses / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0, prof_.passes / 300.0,
+                     prof_.barriers / 300.0);
         const bool on = prof_.on;
         std::fill(std::begin(frameNs_), std::end(frameNs_), 0);
         frameAnalyses_ = 0;
@@ -1069,6 +1070,7 @@ private:
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK(vkBeginCommandBuffer(cmd_, &bi));
         recording_ = true;
+        needBarrier_ = true; // earlier batches' writes
         if (frame_ == timingFrame_ && timing_ && timingMeta_.size() + 1 < kTimingQueries) {
             vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timing_, uint32_t(timingMeta_.size() + 1));
             timingMeta_.push_back({0, 0, false, false, 0, true});
@@ -1186,13 +1188,31 @@ public:
 
 private:
 
+    // Before a copy, clear, dispatch or upload: everything before it is done and visible. What it
+    // writes is then made visible by the barrier the next draw's pass starts with (needBarrier_).
     void fullBarrier() {
         endPass();
+        barrier();
+        needBarrier_ = true;
+    }
+    void barrier() {
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                              nullptr, 0, nullptr);
+        ++prof_.barriers;
+        needBarrier_ = false;
+        drawWritten_.clear();
+        drawSampled_.clear();
+    }
+    static bool overlaps(const std::vector<VkImage>& a, const std::vector<VkImage>& b) {
+        for (VkImage x : a)
+            if (std::find(b.begin(), b.end(), x) != b.end()) return true;
+        return false;
+    }
+    static void addOnce(std::vector<VkImage>& v, VkImage x) {
+        if (std::find(v.begin(), v.end(), x) == v.end()) v.push_back(x);
     }
 
     // Space in the upload ring; flushes first if the ring is full.
@@ -2877,13 +2897,20 @@ private:
         // writing it then share one pass.
         bool feedback = false;
         for (VkImage im : sampledSurfaces_)
-            if (std::find(pass_.written.begin(), pass_.written.end(), im) != pass_.written.end()) {
+            if (std::find(drawWritten_.begin(), drawWritten_.end(), im) != drawWritten_.end()) {
                 feedback = true;
                 if (prof_.on && pass_.open && pass_.sameTargets(pass)) ++prof_.feedbackOn[im == pass_.depthImage ? 0 : 1];
             }
         if (!pass_.open || feedback || !pass_.sameTargets(pass)) {
             if (prof_.on) ++prof_.passWhy[!pass_.open ? passClosedBy_ : feedback ? kPassFeedback : kPassTargets];
-            fullBarrier();
+            if (pass_.open) { // to other targets: no barrier unless something since the last one needs it
+                vkCmdEndRendering(cmd_);
+                pass_.open = false;
+            }
+            // Draws since the last barrier wrote and sampled only images; another pass needs the
+            // barrier when it samples what they wrote, or renders into what they wrote or sampled.
+            if (needBarrier_ || feedback || overlaps(pass.images, drawWritten_) || overlaps(pass.images, drawSampled_))
+                barrier();
             VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
             ri.renderArea = {{0, 0}, {width, height}};
             ri.layerCount = 1;
@@ -2930,8 +2957,11 @@ private:
             if ((im != pass_.depthImage || clearDepth || (((depthControl >> 2) & 1) && ((depthControl >> 1) & 1)) ||
                  (gs.stencil && (depthControl & 1) && ((r.ctx[reg::kDbStencilRefMask] >> 16) & 0xFF) &&
                   (r.ctx[reg::kDbStencilControl] & 0xFFFFFF))) &&
-                std::find(pass_.written.begin(), pass_.written.end(), im) == pass_.written.end())
+                std::find(pass_.written.begin(), pass_.written.end(), im) == pass_.written.end()) {
                 pass_.written.push_back(im);
+                addOnce(drawWritten_, im);
+            }
+        for (VkImage im : sampledSurfaces_) addOnce(drawSampled_, im);
         if (stores(vs) || (psm && stores(ps))) {
             endPass();
             passClosedBy_ = kPassStore;
@@ -2941,6 +2971,7 @@ private:
     }
 
     void endPass() {
+        needBarrier_ = true; // something other than a draw comes next
         if (!pass_.open) return;
         vkCmdEndRendering(cmd_);
         pass_.open = false;
@@ -3116,6 +3147,10 @@ private:
     std::vector<VkDescriptorBufferInfo> drawBufs_;
     std::vector<VkDescriptorImageInfo> drawImgs_;
     std::vector<VkImage> sampledSurfaces_;
+    // Since the last barrier: images draws wrote and sampled, and whether anything else (a copy,
+    // dispatch, upload, clear, shader store or new batch) needs one before the next pass.
+    std::vector<VkImage> drawWritten_, drawSampled_;
+    bool needBarrier_ = true;
     std::string spirvDir_; // "-": no SPIR-V cache
     VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
     std::string pipelineCachePath_;
