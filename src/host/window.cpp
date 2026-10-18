@@ -1,5 +1,6 @@
 #include "host/window.h"
 
+#include "host/display_menu.h"
 #include "host/hle.h"
 #include "host/save_menu.h"
 #include "host/videoout.h"
@@ -107,9 +108,9 @@ void pollPad(SDL_GameController* gc) {
         if (lt > 1000) p.l2 = uint8_t(lt >> 7), p.buttons |= kL2;
         if (rt > 1000) p.r2 = uint8_t(rt >> 7), p.buttons |= kR2;
     }
-    // The game sees nothing while our save menu is open, nor the keys still held as it closes.
+    // The game sees nothing while one of our menus is open, nor the keys still held as it closes.
     static bool suppress = false;
-    if (saveMenuOpen()) suppress = true;
+    if (saveMenuOpen() || displayMenuOpen()) suppress = true;
     else if (suppress && !p.buttons && p.lx == 0x80 && p.ly == 0x80 && p.rx == 0x80 && p.ry == 0x80) suppress = false;
     if (suppress) p = PadState{};
     std::lock_guard lock(gPadMutex);
@@ -130,6 +131,7 @@ void presenterThread() {
         gEnabled = false;
         return;
     }
+    applyWindowMode(win);
     SDL_GameController* gc = nullptr;
     SDL_Texture* tex = nullptr;
     uint32_t texW = 0, texH = 0, texFormat = 0;
@@ -137,6 +139,7 @@ void presenterThread() {
     for (;;) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            if (displayMenuEvent(e, win)) continue;
             if (saveMenuEvent(e)) continue;
             if (e.type == SDL_QUIT) {
                 std::fprintf(stderr, "[window] closed\n");
@@ -170,6 +173,7 @@ void presenterThread() {
         SDL_RenderClear(ren);
         if (tex) SDL_RenderCopy(ren, tex, nullptr, nullptr);
         drawSaveMenu(ren);
+        drawDisplayMenu(ren);
         SDL_RenderPresent(ren);
     }
 }

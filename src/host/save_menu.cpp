@@ -232,6 +232,11 @@ int textWidth(const std::string& s, int px) { return int(s.size()) * 6 * px; }
 
 } // namespace
 
+#ifdef LPN_HAVE_SDL2
+void drawMenuText(SDL_Renderer* ren, int x, int y, int px, const std::string& s) { drawText(ren, x, y, px, s); }
+int menuTextWidth(const std::string& s, int px) { return textWidth(s, px); }
+#endif
+
 bool openSaveMenu(SaveMenuKind kind, std::vector<SaveSlot> slots, int focus, bool newItem) {
     const char* env = std::getenv("LPN_SAVE_MENU");
     newItem = newItem && kind == SaveMenuKind::Save;

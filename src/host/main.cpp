@@ -4,6 +4,7 @@
 // linked against each other; everything they import from the PS4 system libraries is
 // bound to our C++ implementations, or to a logging stub until one exists.
 #include "host/crash.h"
+#include "host/display_settings.h"
 #include "host/gpu/frame_dump.h"
 #include "host/hle.h"
 #include "host/kernel.h"
@@ -129,6 +130,11 @@ int main(int argc, char** argv) {
     host::installCrashHandler();
     host::registerBuiltinHle();
     host::layoutStaticTls(modules);
+
+    // F11 menu settings (lpn-display.ini): the render resolution has to be in place before the
+    // game starts, the window mode before the window opens.
+    host::loadDisplaySettings();
+    host::patchRenderResolution(*modules[0], host::displaySettings().width, host::displaySettings().height);
 
     const int32_t fsOffset = host::guestThreadPointerFsOffset();
     for (auto* m : modules) {
