@@ -339,6 +339,12 @@ struct Surface {
     Image img;
     uint32_t elementBytes = 4;
     bool depth = false;
+    // Memory a render target lived in can later hold a texture the CPU writes (a pool reused
+    // for a video frame): such a surface is sampled from memory instead (see resolveImage).
+    uint64_t writtenFrame = 0; // last frame the GPU rendered into it
+    uint64_t memSample = 0;    // sampleHash of its memory, while the GPU leaves it alone
+    bool cpuOwned = false;     // its memory changed meanwhile: the CPU's contents win
+    uint64_t checkedFrame = ~0ull;
 };
 
 struct GuestTexture {
@@ -2056,6 +2062,27 @@ private:
         float scale[2] = {1, 1};
     };
 
+    void gpuWrote(Surface& s) {
+        s.writtenFrame = frame_;
+        s.memSample = 0;
+        s.cpuOwned = false;
+    }
+    // Whether a render target's memory has been rewritten (by the CPU) since the GPU last
+    // rendered into it two or more frames ago; it is then sampled from memory like a texture.
+    bool cpuWritten(Surface& s, const gcn::ImageResource& t) {
+        if (t.storage) { // a shader writes it
+            gpuWrote(s);
+            return false;
+        }
+        if (s.cpuOwned) return true;
+        if (frame_ < s.writtenFrame + 2 || s.checkedFrame == frame_) return false; // once a frame
+        s.checkedFrame = frame_;
+        const uint64_t sample = sampleHash(t.base(), size_t(t.pitch()) * t.height() * s.elementBytes);
+        if (!s.memSample) s.memSample = sample;
+        else if (sample && sample != s.memSample) s.cpuOwned = true;
+        return s.cpuOwned;
+    }
+
     ImageBinding resolveImage(const gcn::ImageResource& t) {
         ImageBinding b;
         const VkImageViewType vt = viewType(t.type());
@@ -2080,13 +2107,13 @@ private:
             warnOnce("depth-compare texture without a depth buffer at 0x" + hex(addr));
             return b;
         }
-        if (auto it = colors_.find(addr); it != colors_.end()) {
+        // A texture of another element size (a compressed one, say) at a render target's address
+        // is not that render target: the memory was reused, so it is read from memory.
+        if (auto it = colors_.find(addr); it != colors_.end() && format != VK_FORMAT_UNDEFINED &&
+                                          bytesPerElement(t.dataFormat()) == it->second.elementBytes &&
+                                          !cpuWritten(it->second, t)) {
             Surface& s = it->second;
             sampledSurfaces_.push_back(s.img.image);
-            if (format == VK_FORMAT_UNDEFINED || bytesPerElement(t.dataFormat()) != s.elementBytes) {
-                warnOnce("texture format " + std::to_string(t.dataFormat()) + " over a render target of different size");
-                format = s.img.format;
-            }
             b.view = view(s.img, format, vt == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
                           swz);
             b.scale[0] = float(t.width()) / float(s.img.width);
@@ -2097,6 +2124,7 @@ private:
             // A compute shader writing an image no draw has rendered yet: make it a surface.
             if (format != VK_FORMAT_UNDEFINED) {
                 Surface* s = colorSurface(addr, t.width(), t.height(), format, bytesPerElement(t.dataFormat()));
+                if (s) gpuWrote(*s);
                 if (s) b.view = view(s->img, format, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
             }
             if (!b.view) b.view = dummyView(vt, kind, true);
@@ -2546,6 +2574,7 @@ private:
         if (it == colors_.end()) return;
         if (raceCheck_) noteWrite(t.base(), uint64_t(std::max(t.pitch(), t.width())) * t.height() * it->second.elementBytes);
         Surface& s = it->second;
+        gpuWrote(s); // its memory changes now, from the GPU
         const uint32_t w = std::min(t.width(), s.img.width), h = std::min(t.height(), s.img.height);
         const uint32_t pitch = std::max(t.pitch(), w);
         const uint64_t bytes = (uint64_t(pitch) * (h - 1) + w) * s.elementBytes;
@@ -2615,6 +2644,7 @@ private:
             const uint32_t slice = ((cb[::gpu::ctx::kCbColorSlice] & 0x3FFFFF) + 1) * 64;
             Surface* s = colorSurface(uint64_t(cb[0]) << 8, pitch, slice / pitch, vf, bytesPerElement(fmt));
             if (!s) continue;
+            gpuWrote(*s);
             colors[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
             colors[i].imageView = view(s->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
             pass.images.push_back(s->img.image);
