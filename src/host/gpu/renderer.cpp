@@ -903,6 +903,9 @@ private:
         }
         save("draw-" + std::to_string(drawIndex_) + "-" + stage + "-data.bin", p.data.data(), p.data.size() * 4);
         std::vector<uint8_t> bytes;
+        for (const auto& b : p.buffers)
+            std::fprintf(traceOut_, "[trace]   %s buffer 0x%" PRIx64 " stride %u records %u pc 0x%" PRIx64 "%s%s\n", stage, b.base(),
+                         b.stride(), b.numRecords(), b.pc, b.store ? " (written)" : "", b.known ? "" : " (unknown)");
         for (const auto& b : p.buffers) {
             const uint64_t size = b.stride() ? uint64_t(b.stride()) * b.numRecords() : b.numRecords();
             if (!b.known || !size || size > (256u << 10)) continue;
