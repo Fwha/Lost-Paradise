@@ -908,7 +908,13 @@ private:
                          b.stride(), b.numRecords(), b.pc, b.store ? " (written)" : "", b.known ? "" : " (unknown)");
         for (const auto& b : p.buffers) {
             const uint64_t size = b.stride() ? uint64_t(b.stride()) * b.numRecords() : b.numRecords();
-            if (!b.known || !size || size > (256u << 10)) continue;
+            if (!b.known || !size) continue;
+            if (size > (256u << 10)) { // a big buffer (a ring, say): the 64 KB the draw's base points at
+                bytes.resize(64u << 10);
+                if (readGuest(b.base(), bytes.data(), bytes.size()))
+                    save("bufwin-" + hex(b.base()) + "-stride" + std::to_string(b.stride()) + ".bin", bytes.data(), bytes.size());
+                continue;
+            }
             bytes.resize(size);
             if (readGuest(b.base(), bytes.data(), size))
                 save("buf-" + hex(b.base()) + "-stride" + std::to_string(b.stride()) + "-n" + std::to_string(b.numRecords()) + ".bin",
