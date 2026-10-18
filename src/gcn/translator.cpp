@@ -271,8 +271,10 @@ private:
     std::string helpers() {
         return R"(float F(uint x) { return uintBitsToFloat(x); }
 uint U(float x) { return floatBitsToUint(x); }
-uint sat(float x, bool c) { return U(c ? clamp(x, 0.0, 1.0) : x); }
+bool nanSeen_ = false;
+uint sat(float x, bool c) { nanSeen_ = nanSeen_ || isnan(x); return U(c ? clamp(x, 0.0, 1.0) : x); }
 vec4 nanDbg(vec4 v) { return any(isnan(v)) ? vec4(1.0, 0.0, 1.0, 1.0) : any(isinf(v)) ? vec4(0.0, 1.0, 0.0, 1.0) : v; }
+vec4 nanSeenDbg(vec4 v) { return nanSeen_ ? vec4(1.0, 0.0, 1.0, 1.0) : v; }
 uint med3u(uint a, uint b, uint c) { return max(min(a, b), min(max(a, b), c)); }
 int med3i(int a, int b, int c) { return max(min(a, b), min(max(a, b), c)); }
 float med3f(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
@@ -866,9 +868,10 @@ vec3 cubeDir(vec3 c) {
             const uint32_t comps = std::min<uint32_t>(p_.launch.colorComps[mrt], 4);
             const char* swz = kSwizzle[comps][p_.launch.colorSwap[mrt] & 3];
             // LPN_DEBUG_NAN=1: colour outputs holding a NaN show magenta, an infinity green.
-            static const bool debugNan = std::getenv("LPN_DEBUG_NAN") != nullptr;
+            // LPN_DEBUG_NAN=2: magenta wherever any float result in the pixel shader was a NaN.
+            static const char* debugNan = std::getenv("LPN_DEBUG_NAN");
             if (debugNan && !isU && !isS)
-                v = "nanDbg(" + v + ")";
+                v = std::string(std::strcmp(debugNan, "2") ? "nanDbg(" : "nanSeenDbg(") + v + ")";
             if (std::strcmp(swz, "xyzw")) out(fmt("oC%u = %s(%s).%s;\n", mrt, type, v.c_str(), swz));
             else out(fmt("oC%u = %s(%s);\n", mrt, type, v.c_str()));
             return;
