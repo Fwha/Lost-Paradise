@@ -1594,23 +1594,32 @@ private:
             VK_CHECK(vkCreatePipelineCache(vk_.device, &ci, nullptr, &pipelineCache_));
         }
     }
-    // Called at frame end: writes the cache once some new pipelines have been made.
+    // Called at frame end: writes the cache once some new pipelines have been made. Writing it
+    // (tens of MB) stalled the frame ~190 ms every 5 s in crowds, where pipelines keep coming, so
+    // it is written on its own thread (pipeline caches are internally synchronized).
     void savePipelineCache() {
-        if (pipelineCachePath_.empty() || newPipelines_ < 16) return;
+        if (pipelineCachePath_.empty() || newPipelines_ < 16 || pipelineSaving_.load()) return;
         const auto now = std::chrono::steady_clock::now();
-        if (now - lastPipelineSave_ < std::chrono::seconds(5)) return;
-        size_t n = 0;
-        if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, nullptr) != VK_SUCCESS || !n) return;
-        std::vector<char> data(n);
-        if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, data.data()) != VK_SUCCESS) return;
-        const std::string tmp = pipelineCachePath_ + ".tmp" + std::to_string(getpid());
-        if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
-            const bool ok = std::fwrite(data.data(), 1, n, f) == n;
-            if (std::fclose(f) == 0 && ok) std::rename(tmp.c_str(), pipelineCachePath_.c_str());
-            else std::remove(tmp.c_str());
-        }
+        if (now - lastPipelineSave_ < std::chrono::seconds(30)) return;
         newPipelines_ = 0;
         lastPipelineSave_ = now;
+        pipelineSaving_ = true;
+        std::thread([this] {
+            size_t n = 0;
+            std::vector<char> data;
+            if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, nullptr) == VK_SUCCESS && n) {
+                data.resize(n);
+                if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, data.data()) != VK_SUCCESS) n = 0;
+            }
+            const std::string tmp = pipelineCachePath_ + ".tmp" + std::to_string(getpid());
+            if (n)
+                if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+                    const bool ok = std::fwrite(data.data(), 1, n, f) == n;
+                    if (std::fclose(f) == 0 && ok) std::rename(tmp.c_str(), pipelineCachePath_.c_str());
+                    else std::remove(tmp.c_str());
+                }
+            pipelineSaving_ = false;
+        }).detach();
     }
 
     static std::vector<uint32_t> loadSpirv(const std::string& path) {
@@ -3112,6 +3121,7 @@ private:
     std::string pipelineCachePath_;
     uint32_t newPipelines_ = 0;
     std::chrono::steady_clock::time_point lastPipelineSave_{};
+    std::atomic<bool> pipelineSaving_{false};
 };
 
 Renderer* gRenderer = nullptr;
