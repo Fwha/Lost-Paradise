@@ -34,6 +34,9 @@ void closeSaveMenu();
 // and drawing over the frame.
 bool saveMenuEvent(const SDL_Event& e);
 void drawSaveMenu(SDL_Renderer* ren);
+// The menus' blocky font (5x7 glyphs scaled by px; letters are drawn as capitals).
+void drawMenuText(SDL_Renderer* ren, int x, int y, int px, const std::string& s);
+int menuTextWidth(const std::string& s, int px);
 #endif
 
 } // namespace host
