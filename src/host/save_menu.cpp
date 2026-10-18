@@ -23,10 +23,12 @@ std::mutex gM;
 std::atomic<bool> gOpen{false};
 SaveMenuKind gKind = SaveMenuKind::Save;
 std::string gChoice;
+bool gChoseNew = false; // the "EMPTY" new-save row was picked
 
 struct Row {
     SaveSlot slot;
     bool used = false;
+    bool isNew = false; // the game's "new save" item, below the listed saves
     std::string when; // newest file's time, "" when empty
 };
 std::vector<Row> gRows;
@@ -42,6 +44,7 @@ std::string gMessage; // shown under the list after a delete
 
 void refreshRow(Row& r) {
     r.used = false;
+    if (r.isNew) return;
     r.when.clear();
     time_t newest = 0;
     std::error_code ec;
@@ -74,6 +77,7 @@ const char* actionName(Action a) {
 std::vector<Action> actionsFor(const Row& r) {
     switch (gKind) {
     case SaveMenuKind::Save:
+        if (r.isNew) return {Action::Save, Action::Cancel};
         if (!r.used) return {Action::Save, Action::Cancel};
         return {Action::Overwrite, Action::Delete, Action::Cancel};
     case SaveMenuKind::Load:
@@ -86,10 +90,11 @@ std::vector<Action> actionsFor(const Row& r) {
     return {};
 }
 
-void finish(const std::string& choice) {
+void finish(const std::string& choice, bool chooseNew = false) {
     gChoice = choice;
+    gChoseNew = chooseNew;
     gOpen = false;
-    std::fprintf(stderr, "[save menu] %s\n", choice.empty() ? "cancelled" : ("chose " + choice).c_str());
+    std::fprintf(stderr, "[save menu] %s\n", chooseNew ? "chose a new save" : choice.empty() ? "cancelled" : ("chose " + choice).c_str());
 }
 
 // Run the confirmed (or confirmation-free) action on the highlighted slot.
@@ -102,6 +107,11 @@ void perform(Action a) {
         std::fprintf(stderr, "[save menu] deleted %s%s\n", r.slot.dir.c_str(), ec ? " (failed)" : "");
         gMessage = ec ? "COULD NOT DELETE " + r.slot.dir : "DELETED " + r.slot.dir;
         refreshRow(r);
+        // A deleted save leaves the list, as on a PS4; a new save can take its number again.
+        if (!r.used) {
+            gRows.erase(gRows.begin() + gCursor);
+            gCursor = std::clamp(gCursor, 0, std::max(0, int(gRows.size()) - 1));
+        }
         gScreen = Screen::List;
         return;
     }
@@ -109,7 +119,8 @@ void perform(Action a) {
         gScreen = Screen::List;
         return;
     }
-    finish(r.slot.dir);
+    if (r.isNew) finish("", true);
+    else finish(r.slot.dir);
 }
 
 void select() {
@@ -221,9 +232,10 @@ int textWidth(const std::string& s, int px) { return int(s.size()) * 6 * px; }
 
 } // namespace
 
-bool openSaveMenu(SaveMenuKind kind, std::vector<SaveSlot> slots, int focus) {
+bool openSaveMenu(SaveMenuKind kind, std::vector<SaveSlot> slots, int focus, bool newItem) {
     const char* env = std::getenv("LPN_SAVE_MENU");
-    if ((env && !std::strcmp(env, "0")) || slots.empty() || !windowShowsMenus()) return false;
+    newItem = newItem && kind == SaveMenuKind::Save;
+    if ((env && !std::strcmp(env, "0")) || (slots.empty() && !newItem) || !windowShowsMenus()) return false;
     std::lock_guard lock(gM);
     gKind = kind;
     gRows.clear();
@@ -233,10 +245,16 @@ bool openSaveMenu(SaveMenuKind kind, std::vector<SaveSlot> slots, int focus) {
         refreshRow(r);
         gRows.push_back(std::move(r));
     }
+    if (newItem) {
+        Row r;
+        r.isNew = true;
+        gRows.push_back(std::move(r));
+    }
     gCursor = std::clamp(focus, 0, int(gRows.size()) - 1);
     gScreen = Screen::List;
     gMessage.clear();
     gChoice.clear();
+    gChoseNew = false;
     gOpen = true;
     return true;
 }
@@ -246,6 +264,11 @@ bool saveMenuOpen() { return gOpen; }
 std::string saveMenuChoice() {
     std::lock_guard lock(gM);
     return gChoice;
+}
+
+bool saveMenuChoseNew() {
+    std::lock_guard lock(gM);
+    return gChoseNew;
 }
 
 void closeSaveMenu() {
@@ -326,6 +349,10 @@ void drawSaveMenu(SDL_Renderer* ren) {
             SDL_RenderFillRect(ren, &hl);
         }
         SDL_SetRenderDrawColor(ren, r.used ? 235 : 140, r.used ? 235 : 140, r.used ? 225 : 140, 255);
+        if (r.isNew) {
+            drawText(ren, x0 + 6 * px, y, px, "EMPTY");
+            continue;
+        }
         drawText(ren, x0 + 6 * px, y, px, "SLOT " + r.slot.dir);
         drawText(ren, x0 + 6 * px + textWidth("SLOT " + r.slot.dir + "  ", px), y, px, r.used ? r.when : "EMPTY");
     }

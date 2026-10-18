@@ -283,28 +283,13 @@ int32_t sceSaveDataDialogOpen(const uint8_t* p) {
             if (ec && firstEmpty < 0) firstEmpty = int(i);
             if (!ec && (newestIdx < 0 || t > newest)) newestIdx = int(i), newest = t;
         }
-        // Saving: an empty slot under the listed saves, as on a PS4, named after the highest
-        // numbered one ("02" -> "03") and skipping any folder already on disk (e.g. system "99").
-        if (disp == 1) {
-            int n = 0;
-            size_t width = 2;
-            for (const auto& s : slots)
-                if (!s.dir.empty() && s.dir.find_first_not_of("0123456789") == std::string::npos)
-                    n = std::max(n, std::atoi(s.dir.c_str())), width = s.dir.size();
-            std::string name;
-            do {
-                char buf[16];
-                std::snprintf(buf, sizeof buf, "%0*d", int(width), ++n);
-                name = buf;
-            } while (fs::exists(saveRoot() + "/" + name));
-            slots.push_back({name, saveRoot() + "/" + name});
-            if (firstEmpty < 0) firstEmpty = int(slots.size()) - 1;
-        }
         std::fprintf(stderr, "[dialog] %s: %u saves listed (new item %s, focus %d)\n", what, count,
                      newItem ? "offered" : "none", focusPos);
+        // Saving starts on an empty slot: a listed one, else the new-save row under the saves.
+        if (disp == 1 && firstEmpty < 0 && newItem) firstEmpty = int(slots.size());
         const int focus = disp == 1 && firstEmpty >= 0 ? firstEmpty : std::max(newestIdx, 0);
         const SaveMenuKind kind = disp == 1 ? SaveMenuKind::Save : disp == 3 ? SaveMenuKind::Delete : SaveMenuKind::Load;
-        gDialogMenu = openSaveMenu(kind, slots, focus);
+        gDialogMenu = openSaveMenu(kind, slots, focus, newItem != nullptr);
         if (!gDialogMenu) {
             if (disp == 1 && !slots.empty()) gDialogChoice = slots[0].dir; // saving: the first slot offered
             else if (newestIdx >= 0) gDialogChoice = slots[size_t(newestIdx)].dir;
@@ -346,13 +331,16 @@ int32_t saveDataDialogClose(const void*) {
 }
 // SceSaveDataDialogResult: mode, result, buttonId, pad, dirName*, param*, userData.
 int32_t saveDataDialogResult(int32_t* r) {
+    // An OK result with an empty dirName is the new-save item: the game then saves to the lowest
+    // free slot number itself.
+    const bool choseNew = gDialogMenu && saveMenuChoseNew();
     if (gDialogMenu) gDialogChoice = saveMenuChoice();
     std::memset(r, 0, 12);
     r[2] = 1; // YES / OK
-    if (gDialogMenu && gDialogChoice.empty()) r[1] = 1; // USER_CANCELED
+    if (gDialogMenu && gDialogChoice.empty() && !choseNew) r[1] = 1; // USER_CANCELED
     char* dir = nullptr;
     std::memcpy(&dir, reinterpret_cast<uint8_t*>(r) + 16, 8);
-    if (dir && !gDialogChoice.empty()) std::snprintf(dir, 32, "%s", gDialogChoice.c_str());
+    if (dir && (choseNew || !gDialogChoice.empty())) std::snprintf(dir, 32, "%s", gDialogChoice.c_str());
     return 0;
 }
 
