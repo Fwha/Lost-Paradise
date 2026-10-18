@@ -285,6 +285,10 @@ int32_t sceSaveDataDialogOpen(const uint8_t* p) {
         }
         std::fprintf(stderr, "[dialog] %s: %u saves listed (new item %s, focus %d)\n", what, count,
                      newItem ? "offered" : "none", focusPos);
+        // The game's own new save picks the lowest free number from 01 to 30 (eboot 0x9a5d60), so
+        // there is no new-save row once 30 saves exist.
+        constexpr uint32_t kMaxSaves = 30;
+        if (count >= kMaxSaves) newItem = nullptr;
         // Saving starts on an empty slot: a listed one, else the new-save row under the saves.
         if (disp == 1 && firstEmpty < 0 && newItem) firstEmpty = int(slots.size());
         const int focus = disp == 1 && firstEmpty >= 0 ? firstEmpty : std::max(newestIdx, 0);
