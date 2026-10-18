@@ -271,12 +271,9 @@ private:
     }
 
     std::string helpers() {
-        return R"(float F(uint x) { return uintBitsToFloat(x); }
+        std::string h = R"(float F(uint x) { return uintBitsToFloat(x); }
 uint U(float x) { return floatBitsToUint(x); }
-bool nanSeen_ = false;
-uint sat(float x, bool c) { nanSeen_ = nanSeen_ || isnan(x); return U(c ? clamp(x, 0.0, 1.0) : x); }
-vec4 nanDbg(vec4 v) { return any(isnan(v)) ? vec4(1.0, 0.0, 1.0, 1.0) : any(isinf(v)) ? vec4(0.0, 1.0, 0.0, 1.0) : v; }
-vec4 nanSeenDbg(vec4 v) { return nanSeen_ ? vec4(1.0, 0.0, 1.0, 1.0) : v; }
+uint sat(float x, bool c) { return U(c ? clamp(x, 0.0, 1.0) : x); }
 uint med3u(uint a, uint b, uint c) { return max(min(a, b), min(max(a, b), c)); }
 int med3i(int a, int b, int c) { return max(min(a, b), min(max(a, b), c)); }
 float med3f(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
@@ -331,6 +328,16 @@ vec3 cubeDir(vec3 c) {
     }
 }
 )";
+        // LPN_DEBUG_NAN (see exp()): helpers for showing NaNs; "2" also notes every NaN result.
+        if (const char* d = std::getenv("LPN_DEBUG_NAN")) {
+            if (!std::strcmp(d, "2")) {
+                const std::string sat = "uint sat(float x, bool c) { return";
+                h.replace(h.find(sat), sat.size(), "bool nanSeen_ = false;\nuint sat(float x, bool c) { nanSeen_ = nanSeen_ || isnan(x); return");
+            }
+            h += "vec4 nanDbg(vec4 v) { return any(isnan(v)) ? vec4(1.0, 0.0, 1.0, 1.0) : any(isinf(v)) ? vec4(0.0, 1.0, 0.0, 1.0) : v; }\n";
+            h += "vec4 nanSeenDbg(vec4 v) { return nanSeen_ ? vec4(1.0, 0.0, 1.0, 1.0) : v; }\n";
+        }
+        return h;
     }
 
     // ---- instructions ------------------------------------------------------------------------
