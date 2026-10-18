@@ -909,8 +909,8 @@ private:
         for (const auto& b : p.buffers) {
             const uint64_t size = b.stride() ? uint64_t(b.stride()) * b.numRecords() : b.numRecords();
             if (!b.known || !size) continue;
-            if (size > (256u << 10)) { // a big buffer (a ring, say): the 64 KB the draw's base points at
-                bytes.resize(64u << 10);
+            if (size > (4u << 20)) { // a big buffer (a ring, say): the 256 KB the draw's base points at
+                bytes.resize(256u << 10);
                 if (readGuest(b.base(), bytes.data(), bytes.size()))
                     save("bufwin-" + hex(b.base()) + "-stride" + std::to_string(b.stride()) + ".bin", bytes.data(), bytes.size());
                 continue;
@@ -2772,6 +2772,14 @@ private:
         if (d.kind == DrawCall::kIndexed) {
             const uint32_t isz = r.indexType ? 4 : 2;
             if (!guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset)) return;
+            if (trace_ && !traceDir_.empty() && uint64_t(d.indexOffset + d.count) * isz <= (1u << 20)) { // captures: the indices
+                std::vector<uint8_t> idx(size_t(d.count) * isz);
+                if (readGuest(d.indexAddr + uint64_t(d.indexOffset) * isz, idx.data(), idx.size()))
+                    if (FILE* f = std::fopen((traceDir_ + "draw-" + std::to_string(drawIndex_) + "-indices-u" + std::to_string(isz * 8) + ".bin").c_str(), "wb")) {
+                        std::fwrite(idx.data(), 1, idx.size(), f);
+                        std::fclose(f);
+                    }
+            }
             if (raceCheck_) noteRead(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, 'i');
         }
 
