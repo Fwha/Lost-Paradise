@@ -389,9 +389,8 @@ int32_t sceRtcConvertLocalTimeToUtc(const uint64_t* local, uint64_t* utc) {
 }
 
 // --- AudioOut: each port plays through its own SDL audio device ------------------------
-// Output blocks like the hardware: once a port has about 40 ms queued it waits for the device
-// to drain, so the device clock paces the game's mixer. Without a device (headless,
-// --no-audio, no SDL) the port is paced by the system clock and the samples are dropped.
+// Output blocks like the hardware, one grain at a time on a steady clock, keeping about 40 ms
+// queued on the device. Without a device (headless, --no-audio, no SDL) the samples are dropped.
 
 bool gAudioEnabled = true;
 
@@ -399,6 +398,7 @@ struct AudioPort {
     uint32_t grain = 256, freq = 48000, channels = 2, sampleBytes = 2;
     std::chrono::steady_clock::time_point next{};
     uint64_t outputs = 0, underruns = 0;
+    bool primed = false;
 #ifdef LPN_HAVE_SDL2
     SDL_AudioDeviceID dev = 0;
 #endif
@@ -420,7 +420,7 @@ SDL_AudioDeviceID openAudioDevice(const AudioPort& p) {
     want.freq = int(p.freq);
     want.format = p.sampleBytes == 4 ? AUDIO_F32SYS : AUDIO_S16SYS;
     want.channels = uint8_t(p.channels);
-    want.samples = 1024;
+    want.samples = 512;
     const SDL_AudioDeviceID dev = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
     if (!dev) {
         std::fprintf(stderr, "[audio] cannot open device: %s\n", SDL_GetError());
@@ -510,8 +510,32 @@ int32_t sceAudioOutOutput(int32_t h, const void* samples) {
             if (f) std::fwrite(samples, frameBytes, p.grain, f);
         }
         if (samples) SDL_QueueAudio(p.dev, samples, p.grain * frameBytes);
-        for (uint32_t queued; (queued = SDL_GetQueuedAudioSize(p.dev)) > target;)
-            std::this_thread::sleep_for(std::chrono::microseconds(uint64_t(queued - target) * 1000 / bytesPerMs + 500));
+        // Block one grain at a time on a steady clock, like the hardware. Waiting for the queue
+        // to drain instead releases the game in bursts as the device takes 1024-frame chunks,
+        // and the game then reads its mix before its mixer thread has finished it (a 47 Hz
+        // flutter). The queue level only fills the queue up front and trims clock drift.
+        const auto grainTime = std::chrono::microseconds(uint64_t(p.grain) * 1000000 / p.freq);
+        const uint32_t queued = SDL_GetQueuedAudioSize(p.dev);
+        std::chrono::steady_clock::time_point wake;
+        {
+            std::lock_guard lock(gAudioMutex);
+            auto& next = gPorts[h].next;
+            const auto now = std::chrono::steady_clock::now();
+            auto& primed = gPorts[h].primed;
+            if (queued == 0 || next < now - std::chrono::milliseconds(100)) primed = false; // ran dry or stalled
+            if (!primed) {
+                next = now; // fill up without waiting
+                primed = queued >= target;
+            } else if (queued > target * 3 / 2) {
+                next += grainTime + grainTime / 16;
+            } else if (queued < target / 2) {
+                next += grainTime - grainTime / 16;
+            } else {
+                next += grainTime;
+            }
+            wake = next;
+        }
+        std::this_thread::sleep_until(wake);
         return 0;
     }
 #else
