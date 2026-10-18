@@ -839,7 +839,9 @@ vec3 cubeDir(vec3 c) {
         const uint32_t vs[4] = {w1 & 0xFF, (w1 >> 8) & 0xFF, (w1 >> 16) & 0xFF, w1 >> 24};
         auto comp = [&](int i) { return (en >> i) & 1 ? "F(" + vreg(vs[i]) + ")" : std::string("0.0"); };
         auto vec = [&] { return "vec4(" + comp(0) + ", " + comp(1) + ", " + comp(2) + ", " + comp(3) + ")"; };
-        if (p_.launch.stage == Stage::Pixel && vm && exec_) out("if ((exec_lo & 1u) == 0u) discard;\n");
+        // LPN_NO_KILL=<pixel shader entry> (hex): that shader never discards (debugging).
+        static const uint64_t noKill = std::getenv("LPN_NO_KILL") ? std::strtoull(std::getenv("LPN_NO_KILL"), nullptr, 16) : 0;
+        if (p_.launch.stage == Stage::Pixel && vm && exec_ && p_.launch.entry != noKill) out("if ((exec_lo & 1u) == 0u) discard;\n");
 
         if (target == 12) { // pos0
             out("gl_Position = " + vec() + ";\n");
