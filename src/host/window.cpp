@@ -1,6 +1,7 @@
 #include "host/window.h"
 
 #include "host/hle.h"
+#include "host/save_menu.h"
 #include "host/videoout.h"
 
 #include <algorithm>
@@ -106,6 +107,11 @@ void pollPad(SDL_GameController* gc) {
         if (lt > 1000) p.l2 = uint8_t(lt >> 7), p.buttons |= kL2;
         if (rt > 1000) p.r2 = uint8_t(rt >> 7), p.buttons |= kR2;
     }
+    // The game sees nothing while our save menu is open, nor the keys still held as it closes.
+    static bool suppress = false;
+    if (saveMenuOpen()) suppress = true;
+    else if (suppress && !p.buttons && p.lx == 0x80 && p.ly == 0x80 && p.rx == 0x80 && p.ry == 0x80) suppress = false;
+    if (suppress) p = PadState{};
     std::lock_guard lock(gPadMutex);
     gPad = p;
 }
@@ -131,6 +137,7 @@ void presenterThread() {
     for (;;) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            if (saveMenuEvent(e)) continue;
             if (e.type == SDL_QUIT) {
                 std::fprintf(stderr, "[window] closed\n");
                 printUnimplementedSummary();
@@ -162,6 +169,7 @@ void presenterThread() {
         lock.unlock();
         SDL_RenderClear(ren);
         if (tex) SDL_RenderCopy(ren, tex, nullptr, nullptr);
+        drawSaveMenu(ren);
         SDL_RenderPresent(ren);
     }
 }
@@ -177,6 +185,11 @@ void startPresenter(bool headless) {
 #else
     if (!headless) std::fprintf(stderr, "[window] built without SDL2; running headless\n");
 #endif
+}
+
+bool windowShowsMenus() {
+    std::lock_guard lock(gPadMutex);
+    return gEnabled && gScript.empty();
 }
 
 PadState padState() {

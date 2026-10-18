@@ -22,6 +22,7 @@ add_executable(lpn-host
     gpu/tiling.cpp
     gpu/vk.cpp
     window.cpp
+    save_menu.cpp
     tls.cpp
     crash.cpp
     trampoline.S
