@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -397,6 +398,7 @@ bool gAudioEnabled = true;
 struct AudioPort {
     uint32_t grain = 256, freq = 48000, channels = 2, sampleBytes = 2;
     std::chrono::steady_clock::time_point next{};
+    uint64_t outputs = 0, underruns = 0;
 #ifdef LPN_HAVE_SDL2
     SDL_AudioDeviceID dev = 0;
 #endif
@@ -467,6 +469,7 @@ int32_t sceAudioOutOutput(int32_t h, const void* samples) {
         auto it = gPorts.find(h);
         if (it == gPorts.end()) return int32_t(0x80260004); // INVALID_PORT
         p = it->second;
+        it->second.outputs++;
 #ifdef LPN_HAVE_SDL2
         if (!p.dev) {
 #endif
@@ -481,7 +484,31 @@ int32_t sceAudioOutOutput(int32_t h, const void* samples) {
 #ifdef LPN_HAVE_SDL2
     if (p.dev) {
         const uint32_t frameBytes = p.channels * p.sampleBytes, bytesPerMs = p.freq * frameBytes / 1000;
-        const uint32_t target = std::max(4 * p.grain * frameBytes, 40 * bytesPerMs);
+        // LPN_AUDIO_MS: how much sound to keep queued (default 40 ms); more hides game hitches.
+        static const uint32_t latencyMs = [] {
+            const char* e = std::getenv("LPN_AUDIO_MS");
+            return e ? uint32_t(std::atoi(e)) : 40u;
+        }();
+        const uint32_t target = std::max(4 * p.grain * frameBytes, latencyMs * bytesPerMs);
+        if (p.outputs > 0 && SDL_GetQueuedAudioSize(p.dev) == 0) { // ran dry: an audible gap
+            uint64_t n;
+            {
+                std::lock_guard lock(gAudioMutex);
+                n = ++gPorts[h].underruns;
+            }
+            if ((n & (n - 1)) == 0 || n % 100 == 0)
+                std::fprintf(stderr, "[audio] port %d ran dry (%llu times, output %llu)\n", h, (unsigned long long)n,
+                             (unsigned long long)p.outputs);
+        }
+        // LPN_AUDIO_DUMP=dir: also write each port's raw samples to dir/port-N.raw.
+        static const char* dumpDir = std::getenv("LPN_AUDIO_DUMP");
+        if (dumpDir && samples) {
+            static std::map<int32_t, FILE*> files;
+            std::lock_guard lock(gAudioMutex);
+            FILE*& f = files[h];
+            if (!f) f = std::fopen((std::string(dumpDir) + "/port-" + std::to_string(h) + ".raw").c_str(), "wb");
+            if (f) std::fwrite(samples, frameBytes, p.grain, f);
+        }
         if (samples) SDL_QueueAudio(p.dev, samples, p.grain * frameBytes);
         for (uint32_t queued; (queued = SDL_GetQueuedAudioSize(p.dev)) > target;)
             std::this_thread::sleep_for(std::chrono::microseconds(uint64_t(queued - target) * 1000 / bytesPerMs + 500));
