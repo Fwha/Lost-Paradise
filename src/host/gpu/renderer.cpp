@@ -216,38 +216,47 @@ class PageCache {
 public:
     bool read(uint64_t addr, void* dst, size_t size) {
         if (!readPages(addr, dst, size)) return false;
-        if (addr < hi_.load(std::memory_order_relaxed) && lo_.load(std::memory_order_relaxed) < addr + size) {
+        // Overlays are few but live across many draws: their ranges are checked without the
+        // lock, from a copy taken when they change.
+        if (const uint64_t v = version_.load(std::memory_order_acquire); v != seenVersion_) {
             std::lock_guard lock(overlayMutex_);
-            for (const Overlay& o : overlays_) { // oldest first
-                const uint64_t a = std::max(addr, o.addr), b = std::min(addr + size, o.addr + o.bytes.size());
-                if (a < b) std::memcpy(static_cast<uint8_t*>(dst) + (a - addr), o.bytes.data() + (a - o.addr), b - a);
-            }
+            ranges_.clear();
+            for (const Overlay& o : overlays_) ranges_.emplace_back(o.addr, o.addr + o.bytes.size());
+            seenVersion_ = version_.load(std::memory_order_relaxed);
         }
+        for (const auto& [lo, hi] : ranges_)
+            if (addr < hi && lo < addr + size) {
+                std::lock_guard lock(overlayMutex_);
+                for (const Overlay& o : overlays_) { // oldest first
+                    const uint64_t a = std::max(addr, o.addr), b = std::min(addr + size, o.addr + o.bytes.size());
+                    if (a < b) std::memcpy(static_cast<uint8_t*>(dst) + (a - addr), o.bytes.data() + (a - o.addr), b - a);
+                }
+                break;
+            }
         return true;
     }
     void clear() {
         pages_.clear();
-        lastPage_ = ~0ull;
+        for (Slot& s : slots_) s = Slot{};
     }
     // Bytes a GPU copy recorded but not yet run will write: reads see them already, as they
     // would on the console where the copy runs before the draws recorded after it.
     void overlay(uint64_t addr, std::vector<uint8_t> bytes, uint64_t id) {
         std::lock_guard lock(overlayMutex_);
-        lo_ = std::min(lo_.load(), addr);
-        hi_ = std::max(hi_.load(), addr + bytes.size());
         overlays_.push_back({addr, std::move(bytes), id});
+        version_.fetch_add(1, std::memory_order_release);
     }
     void dropOverlay(uint64_t id) {
         std::lock_guard lock(overlayMutex_);
         std::erase_if(overlays_, [&](const Overlay& o) { return o.id == id; });
-        uint64_t lo = ~0ull, hi = 0;
-        for (const Overlay& o : overlays_) lo = std::min(lo, o.addr), hi = std::max(hi, o.addr + o.bytes.size());
-        lo_ = lo, hi_ = hi;
+        version_.fetch_add(1, std::memory_order_release);
     }
     // Forgets the pages of [addr, addr + size), which changed.
     void invalidate(uint64_t addr, uint64_t size) {
-        for (uint64_t page = addr & ~uint64_t(kPage - 1); page < addr + size; page += kPage) pages_.erase(page);
-        lastPage_ = ~0ull;
+        for (uint64_t page = addr & ~uint64_t(kPage - 1); page < addr + size; page += kPage) {
+            pages_.erase(page);
+            if (Slot& s = slot(page); s.page == page) s = Slot{};
+        }
     }
 
 private:
@@ -272,23 +281,33 @@ private:
     };
     std::mutex overlayMutex_;
     std::vector<Overlay> overlays_;
-    std::atomic<uint64_t> lo_{~0ull}, hi_{0};
+    std::atomic<uint64_t> version_{0}; // bumped when overlays_ changes
+    uint64_t seenVersion_ = ~0ull;      // the reader's copy of the ranges is from this version
+    std::vector<std::pair<uint64_t, uint64_t>> ranges_;
 
     static constexpr size_t kPage = 4096;
+    // Recently used pages, direct-mapped in front of the map: a draw's loads hop between a few
+    // pages (descriptors, constants), and a map lookup each cost more than the copy.
+    struct Slot {
+        uint64_t page = ~0ull;
+        const uint8_t* data = nullptr;
+    };
+    static constexpr size_t kSlots = 256;
+    Slot& slot(uint64_t page) { return slots_[(page / kPage) & (kSlots - 1)]; }
     const uint8_t* lookup(uint64_t page) {
-        if (page == lastPage_) return lastData_;
-        lastPage_ = page;
+        Slot& s = slot(page);
+        if (s.page == page) return s.data;
         auto it = pages_.find(page);
         if (it == pages_.end()) {
             auto data = std::make_unique<std::array<uint8_t, kPage>>();
             if (!readGuest(page, data->data(), kPage)) data.reset();
             it = pages_.emplace(page, std::move(data)).first;
         }
-        return lastData_ = it->second ? it->second->data() : nullptr;
+        s.page = page;
+        return s.data = it->second ? it->second->data() : nullptr;
     }
     std::unordered_map<uint64_t, std::unique_ptr<std::array<uint8_t, kPage>>> pages_; // null: unreadable
-    uint64_t lastPage_ = ~0ull; // the last page looked up, and its data
-    const uint8_t* lastData_ = nullptr;
+    std::array<Slot, kSlots> slots_{};
 };
 
 // Identifies a shader launch: the launch state analysis or translation reads, except user data
@@ -319,7 +338,21 @@ const std::string& launchKey(const gcn::LaunchState& l, uint32_t bindingBase) {
     return k;
 }
 
-std::string bytesKey(const void* p, size_t n) { return std::string(static_cast<const char*>(p), n); }
+constexpr VkWriteDescriptorSet descriptorWrite(VkDescriptorType type) {
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.descriptorCount = 1;
+    w.descriptorType = type;
+    return w;
+}
+
+// Hash map keys of a few words, looked up per draw without building a string.
+struct WordsHash {
+    template <size_t N> size_t operator()(const std::array<uint32_t, N>& a) const {
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (uint32_t w : a) h = (h ^ w) * 0x100000001b3ull;
+        return size_t(h ^ (h >> 32));
+    }
+};
 
 #define VK_CHECK(x)                                                                                     \
     do {                                                                                                \
@@ -333,7 +366,7 @@ struct Image {
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0, layers = 1, levels = 1;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    std::map<std::string, VkImageView> views;
+    std::map<std::array<uint32_t, 7>, VkImageView> views;
 };
 
 // A render target or depth buffer at a guest address.
@@ -408,7 +441,7 @@ struct Profiler {
     uint64_t ns[kProfCount] = {};
     uint64_t passWhy[4] = {}; // why a new render pass started, by PassWhy
     uint64_t feedbackOn[2] = {}; // a draw sampled the open pass's depth / color attachment
-    uint64_t calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0;
+    uint64_t barriers = 0, calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -504,7 +537,17 @@ public:
     // each draw's DrawAnalysis from analyses_ in order.
 
     void onAnalyzeDraw(const DrawCall& d, const GpuRegs& r) override {
+        // A spare one keeps its vectors' storage: no allocations per draw here, or frees on the recorder.
         DrawAnalysis a;
+        {
+            std::lock_guard lock(analysesMutex_);
+            if (!spareAnalyses_.empty()) {
+                a = std::move(spareAnalyses_.back());
+                spareAnalyses_.pop_back();
+            }
+        }
+        a.ok = false;
+        a.vsm = a.psm = nullptr;
         if (d.kind == DrawCall::kDispatch) analyzeDispatch(r, a);
         else if (!computeOnly_ && (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed)) analyzeDraw(r, a);
         std::lock_guard lock(analysesMutex_);
@@ -559,6 +602,14 @@ public:
             a = std::move(analyses_.front());
             analyses_.pop_front();
         }
+        struct Recycle { // hands `a` back to the analysis thread however the draw ends
+            Renderer& r;
+            DrawAnalysis& a;
+            ~Recycle() {
+                std::lock_guard lock(r.analysesMutex_);
+                if (r.spareAnalyses_.size() < 64) r.spareAnalyses_.push_back(std::move(a));
+            }
+        } recycle{*this, a};
         std::lock_guard lock(m_);
         ProfScope ps(prof_, kProfRenderer);
         ++prof_.calls;
@@ -791,8 +842,9 @@ public:
         std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / 300, prof_.dmas / 300.0,
                      prof_.dmaBytes / 300.0 / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
-        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes per frame\n",
-                     prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.analyses / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0, prof_.passes / 300.0);
+        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame\n",
+                     prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.analyses / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0, prof_.passes / 300.0,
+                     prof_.barriers / 300.0);
         const bool on = prof_.on;
         std::fill(std::begin(frameNs_), std::end(frameNs_), 0);
         frameAnalyses_ = 0;
@@ -1025,6 +1077,7 @@ private:
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK(vkBeginCommandBuffer(cmd_, &bi));
         recording_ = true;
+        needBarrier_ = true; // earlier batches' writes
         if (frame_ == timingFrame_ && timing_ && timingMeta_.size() + 1 < kTimingQueries) {
             vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timing_, uint32_t(timingMeta_.size() + 1));
             timingMeta_.push_back({0, 0, false, false, 0, true});
@@ -1142,13 +1195,31 @@ public:
 
 private:
 
+    // Before a copy, clear, dispatch or upload: everything before it is done and visible. What it
+    // writes is then made visible by the barrier the next draw's pass starts with (needBarrier_).
     void fullBarrier() {
         endPass();
+        barrier();
+        needBarrier_ = true;
+    }
+    void barrier() {
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                              nullptr, 0, nullptr);
+        ++prof_.barriers;
+        needBarrier_ = false;
+        drawWritten_.clear();
+        drawSampled_.clear();
+    }
+    static bool overlaps(const std::vector<VkImage>& a, const std::vector<VkImage>& b) {
+        for (VkImage x : a)
+            if (std::find(b.begin(), b.end(), x) != b.end()) return true;
+        return false;
+    }
+    static void addOnce(std::vector<VkImage>& v, VkImage x) {
+        if (std::find(v.begin(), v.end(), x) == v.end()) v.push_back(x);
     }
 
     // Space in the upload ring; flushes first if the ring is full.
@@ -1289,6 +1360,7 @@ private:
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
         ici.usage = usage;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ++imageGen_; // remembered image bindings may name an image this replaces
         if (vkCreateImage(vk_.device, &ici, nullptr, &img.image) != VK_SUCCESS) return false;
         VkMemoryRequirements req;
         vkGetImageMemoryRequirements(vk_.device, img.image, &req);
@@ -1346,9 +1418,8 @@ private:
                      VkImageAspectFlags aspect = 0) {
         if (!aspect) aspect = img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT;
         if (!aspect) aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-        const uint32_t key[] = {uint32_t(format), uint32_t(type), uint32_t(swz.r), uint32_t(swz.g), uint32_t(swz.b),
-                                uint32_t(swz.a), aspect};
-        const std::string k = bytesKey(key, sizeof(key));
+        const std::array<uint32_t, 7> k{uint32_t(format), uint32_t(type), uint32_t(swz.r), uint32_t(swz.g),
+                                        uint32_t(swz.b), uint32_t(swz.a), aspect};
         auto it = img.views.find(k);
         if (it != img.views.end()) return it->second;
         VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1551,23 +1622,32 @@ private:
             VK_CHECK(vkCreatePipelineCache(vk_.device, &ci, nullptr, &pipelineCache_));
         }
     }
-    // Called at frame end: writes the cache once some new pipelines have been made.
+    // Called at frame end: writes the cache once some new pipelines have been made. Writing it
+    // (tens of MB) stalled the frame ~190 ms every 5 s in crowds, where pipelines keep coming, so
+    // it is written on its own thread (pipeline caches are internally synchronized).
     void savePipelineCache() {
-        if (pipelineCachePath_.empty() || newPipelines_ < 16) return;
+        if (pipelineCachePath_.empty() || newPipelines_ < 16 || pipelineSaving_.load()) return;
         const auto now = std::chrono::steady_clock::now();
-        if (now - lastPipelineSave_ < std::chrono::seconds(5)) return;
-        size_t n = 0;
-        if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, nullptr) != VK_SUCCESS || !n) return;
-        std::vector<char> data(n);
-        if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, data.data()) != VK_SUCCESS) return;
-        const std::string tmp = pipelineCachePath_ + ".tmp" + std::to_string(getpid());
-        if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
-            const bool ok = std::fwrite(data.data(), 1, n, f) == n;
-            if (std::fclose(f) == 0 && ok) std::rename(tmp.c_str(), pipelineCachePath_.c_str());
-            else std::remove(tmp.c_str());
-        }
+        if (now - lastPipelineSave_ < std::chrono::seconds(30)) return;
         newPipelines_ = 0;
         lastPipelineSave_ = now;
+        pipelineSaving_ = true;
+        std::thread([this] {
+            size_t n = 0;
+            std::vector<char> data;
+            if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, nullptr) == VK_SUCCESS && n) {
+                data.resize(n);
+                if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, data.data()) != VK_SUCCESS) n = 0;
+            }
+            const std::string tmp = pipelineCachePath_ + ".tmp" + std::to_string(getpid());
+            if (n)
+                if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+                    const bool ok = std::fwrite(data.data(), 1, n, f) == n;
+                    if (std::fclose(f) == 0 && ok) std::rename(tmp.c_str(), pipelineCachePath_.c_str());
+                    else std::remove(tmp.c_str());
+                }
+            pipelineSaving_ = false;
+        }).detach();
     }
 
     static std::vector<uint32_t> loadSpirv(const std::string& path) {
@@ -1663,10 +1743,11 @@ private:
     }
 
     Layout& layout(const std::vector<VkDescriptorSetLayoutBinding>& bindings) {
-        std::string key;
+        thread_local std::string key; // per draw: built in a reused buffer
+        key.clear();
         for (const auto& b : bindings) {
             const uint32_t k[] = {b.binding, uint32_t(b.descriptorType), b.stageFlags};
-            key += bytesKey(k, sizeof(k));
+            key.append(reinterpret_cast<const char*>(k), sizeof(k));
         }
         auto it = layouts_.find(key);
         if (it != layouts_.end()) return it->second;
@@ -1744,7 +1825,8 @@ private:
     }
 
     VkPipeline graphicsPipeline(const GraphicsState& s, ShaderModule* vs, ShaderModule* ps, VkPipelineLayout layout) {
-        const std::string key = bytesKey(&s, sizeof(s));
+        thread_local std::string key; // per draw: built in a reused buffer
+        key.assign(reinterpret_cast<const char*>(&s), sizeof(s));
         auto it = pipelines_.find(key);
         if (it != pipelines_.end()) return it->second;
 
@@ -2001,9 +2083,7 @@ private:
         const uint32_t ep = bc ? (pitchPx + 3) / 4 : pitchPx;
         const uint32_t layers = t.type() == 11 ? 6 : (t.type() == 13 || t.type() == 10) ? t.lastArray() + 1 : 1;
         const uint32_t slices = t.type() == 10 ? t.depth() : layers;
-        const uint32_t key[] = {t.t[0], t.t[1], t.t[2], t.t[3] & ~0xFFFu, t.t[4], t.t[5]};
-        const std::string k = bytesKey(key, sizeof(key));
-        GuestTexture& tex = textures_[k];
+        GuestTexture& tex = textures_[{t.t[0], t.t[1], t.t[2], t.t[3] & ~0xFFFu, t.t[4], t.t[5]}];
         if (tex.img.image && tex.checkedFrame == frame_) return &tex;
         // Re-reading every sampled texture each frame cost ~8 ms in fights and ~15 ms in crowded
         // areas, though most never change. One unchanged for 60 frames is fully hashed on every
@@ -2088,6 +2168,7 @@ private:
     void gpuWrote(Surface& s) {
         s.writtenFrame = frame_;
         s.memSample = 0;
+        if (s.cpuOwned) ++imageGen_; // sampled as a render target again, not from memory
         s.cpuOwned = false;
     }
     // Whether a render target's memory has been rewritten (by the CPU) since the GPU last
@@ -2102,11 +2183,44 @@ private:
         s.checkedFrame = frame_;
         const uint64_t sample = sampleHash(t.base(), size_t(t.pitch()) * t.height() * s.elementBytes);
         if (!s.memSample) s.memSample = sample;
-        else if (sample && sample != s.memSample) s.cpuOwned = true;
+        else if (sample && sample != s.memSample) s.cpuOwned = true, ++imageGen_;
         return s.cpuOwned;
     }
 
+    // Draws in a frame resolve the same few hundred T#/S# pairs over and over (a crowd repeats its
+    // materials): the first resolution in a frame does the checks, later ones reuse its result
+    // until an image is created or a render target goes back to the GPU (imageGen_).
+    struct ImageMemo {
+        uint32_t t[8], s[4];
+        bool compare;
+        uint64_t frame = ~0ull, gen = 0;
+        ImageBinding b;
+        VkImage sampled; // the render target it samples, if any (for feedback checks)
+    };
+    static constexpr size_t kImageMemos = 1024;
     ImageBinding resolveImage(const gcn::ImageResource& t) {
+        if (t.storage || trace_) return resolveImageUncached(t); // storage: marks the target written
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (uint32_t w : t.t) h = (h ^ w) * 0x100000001b3ull;
+        for (uint32_t w : t.s) h = (h ^ w) * 0x100000001b3ull;
+        ImageMemo& m = imageMemos_[(h ^ (h >> 29) ^ t.compare) & (kImageMemos - 1)];
+        if (m.frame == frame_ && m.gen == imageGen_ && m.compare == t.compare && std::equal(t.t, t.t + 8, m.t) &&
+            std::equal(t.s, t.s + 4, m.s)) {
+            if (m.sampled) sampledSurfaces_.push_back(m.sampled);
+            return m.b;
+        }
+        const size_t before = sampledSurfaces_.size();
+        const ImageBinding b = resolveImageUncached(t);
+        std::copy(t.t, t.t + 8, m.t);
+        std::copy(t.s, t.s + 4, m.s);
+        m.compare = t.compare;
+        m.frame = frame_;
+        m.gen = imageGen_;
+        m.b = b;
+        m.sampled = sampledSurfaces_.size() > before ? sampledSurfaces_.back() : VK_NULL_HANDLE;
+        return b;
+    }
+    ImageBinding resolveImageUncached(const gcn::ImageResource& t) {
         ImageBinding b;
         const VkImageViewType vt = viewType(t.type());
         const uint32_t nf = t.numFormat();
@@ -2237,11 +2351,8 @@ private:
                 p.data[b.data] = p.data[b.data + 1] = p.data[b.data + 2] = p.data[b.data + 3] = 0;
             }
             bufInfos.push_back({r.buffer, r.offset, r.range});
-            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            w.dstBinding = n++;
-            w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes.push_back(w);
+            writes.push_back(kBufferWrite); // copied from a constant: built on the stack it stalled on store forwarding
+            writes.back().dstBinding = n++;
         }
         for (auto& im : p.images) {
             const ImageBinding ib = resolveImage(im);
@@ -2253,23 +2364,20 @@ private:
             float scale[2] = {ib.scale[0], ib.scale[1]};
             std::memcpy(&p.data[im.data], scale, 8);
             imgInfos.push_back({ib.sampler, ib.view, VK_IMAGE_LAYOUT_GENERAL});
-            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            w.dstBinding = n++;
-            w.descriptorCount = 1;
-            w.descriptorType = im.storage ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes.push_back(w);
+            writes.push_back(im.storage ? kStorageImageWrite : kSampledImageWrite);
+            writes.back().dstBinding = n++;
         }
         // Draw data last: resource resolution above fills parts of it.
         const VkDeviceSize bytes = p.data.size() * 4;
         const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
         std::memcpy(static_cast<uint8_t*>(ringPtr_) + at, p.data.data(), bytes);
         bufInfos.push_back({ring_, at, bytes});
-        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        w.dstBinding = base;
-        w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes.push_back(w);
+        writes.push_back(kBufferWrite);
+        writes.back().dstBinding = base;
     }
+    static constexpr VkWriteDescriptorSet kBufferWrite = descriptorWrite(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    static constexpr VkWriteDescriptorSet kStorageImageWrite = descriptorWrite(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+    static constexpr VkWriteDescriptorSet kSampledImageWrite = descriptorWrite(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
 
     // Points each write at its info entry (the vectors are complete by now).
     static void linkWrites(std::vector<VkWriteDescriptorSet>& writes, std::vector<VkDescriptorBufferInfo>& bufs,
@@ -2651,8 +2759,12 @@ private:
         if (!a.ok) return;
         gcn::Program& vs = a.vs;
 
-        // Render targets.
-        Pass pass;
+        // Render targets. The pass and vectors below are reused from draw to draw (no allocations).
+        Pass& pass = drawPass_;
+        pass.open = false;
+        pass.images.clear();
+        pass.written.clear();
+        pass.depthImage = VK_NULL_HANDLE;
         GraphicsState gs{};
         VkRenderingAttachmentInfo colors[8]{};
         uint32_t colorCount = 0;
@@ -2745,7 +2857,8 @@ private:
             for (int i = 0; i < 3; ++i) gs.polyOffset[i] = r.ctx[reg::kPaSuPolyOffsetClamp + i];
         gs.vsOutputs = vsm->translation.outputs;
 
-        std::vector<VkDescriptorSetLayoutBinding> lb;
+        std::vector<VkDescriptorSetLayoutBinding>& lb = drawBindings_;
+        lb.clear();
         addBindings(lb, vs, 0, VK_SHADER_STAGE_VERTEX_BIT);
         if (psm) addBindings(lb, ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT);
         Layout* layp;
@@ -2758,11 +2871,12 @@ private:
         if (!pipe) return;
         Layout& lay = *layp;
 
-        std::vector<VkWriteDescriptorSet> writes;
-        std::vector<VkDescriptorBufferInfo> bufs;
-        std::vector<VkDescriptorImageInfo> imgs;
-        bufs.reserve(64);
-        imgs.reserve(64);
+        std::vector<VkWriteDescriptorSet>& writes = drawWrites_;
+        std::vector<VkDescriptorBufferInfo>& bufs = drawBufs_;
+        std::vector<VkDescriptorImageInfo>& imgs = drawImgs_;
+        writes.clear();
+        bufs.clear();
+        imgs.clear();
         sampledSurfaces_.clear();
         if (trace_) {
             captureProgram(vs, vsm, "vs");
@@ -2819,13 +2933,20 @@ private:
         // writing it then share one pass.
         bool feedback = false;
         for (VkImage im : sampledSurfaces_)
-            if (std::find(pass_.written.begin(), pass_.written.end(), im) != pass_.written.end()) {
+            if (std::find(drawWritten_.begin(), drawWritten_.end(), im) != drawWritten_.end()) {
                 feedback = true;
                 if (prof_.on && pass_.open && pass_.sameTargets(pass)) ++prof_.feedbackOn[im == pass_.depthImage ? 0 : 1];
             }
         if (!pass_.open || feedback || !pass_.sameTargets(pass)) {
             if (prof_.on) ++prof_.passWhy[!pass_.open ? passClosedBy_ : feedback ? kPassFeedback : kPassTargets];
-            fullBarrier();
+            if (pass_.open) { // to other targets: no barrier unless something since the last one needs it
+                vkCmdEndRendering(cmd_);
+                pass_.open = false;
+            }
+            // Draws since the last barrier wrote and sampled only images; another pass needs the
+            // barrier when it samples what they wrote, or renders into what they wrote or sampled.
+            if (needBarrier_ || feedback || overlaps(pass.images, drawWritten_) || overlaps(pass.images, drawSampled_))
+                barrier();
             VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
             ri.renderArea = {{0, 0}, {width, height}};
             ri.layerCount = 1;
@@ -2836,7 +2957,7 @@ private:
                 if (gs.stencil) ri.pStencilAttachment = &depth;
             }
             vkCmdBeginRendering(cmd_, &ri);
-            pass_ = std::move(pass);
+            std::swap(pass_, pass); // the old pass's storage is reused by the next draw
             pass_.open = true;
             ++prof_.passes;
         }
@@ -2872,8 +2993,11 @@ private:
             if ((im != pass_.depthImage || clearDepth || (((depthControl >> 2) & 1) && ((depthControl >> 1) & 1)) ||
                  (gs.stencil && (depthControl & 1) && ((r.ctx[reg::kDbStencilRefMask] >> 16) & 0xFF) &&
                   (r.ctx[reg::kDbStencilControl] & 0xFFFFFF))) &&
-                std::find(pass_.written.begin(), pass_.written.end(), im) == pass_.written.end())
+                std::find(pass_.written.begin(), pass_.written.end(), im) == pass_.written.end()) {
                 pass_.written.push_back(im);
+                addOnce(drawWritten_, im);
+            }
+        for (VkImage im : sampledSurfaces_) addOnce(drawSampled_, im);
         if (stores(vs) || (psm && stores(ps))) {
             endPass();
             passClosedBy_ = kPassStore;
@@ -2883,6 +3007,7 @@ private:
     }
 
     void endPass() {
+        needBarrier_ = true; // something other than a draw comes next
         if (!pass_.open) return;
         vkCmdEndRendering(cmd_);
         pass_.open = false;
@@ -2994,7 +3119,7 @@ private:
     std::map<uint64_t, Import> imports_;
     std::unordered_map<uint64_t, Surface> colors_, depths_;
     std::unordered_map<uint64_t, Metadata> metadata_; // by HTILE/CMASK address
-    std::unordered_map<std::string, GuestTexture> textures_;
+    std::unordered_map<std::array<uint32_t, 6>, GuestTexture, WordsHash> textures_;
     std::map<std::array<uint32_t, 5>, VkSampler> samplers_;
     std::unordered_map<std::string, std::unique_ptr<ShaderModule>> shaders_;
     std::unordered_map<uint64_t, VkShaderModule> expanders_;
@@ -3032,6 +3157,7 @@ private:
     Profiler aprof_; // the analysis thread's slots and counts, merged into prof_'s reports
     std::mutex analysesMutex_;
     std::deque<DrawAnalysis> analyses_; // one per draw or dispatch, for the recorder
+    std::vector<DrawAnalysis> spareAnalyses_; // used ones, back from the recorder
     std::deque<uint64_t> dmaOverlays_, writeOverlays_; // the analysis thread's overlay of each DMA / WRITE_DATA
     std::unordered_map<std::string, ProgramVariants> programs_;
     size_t programCount_ = 0;
@@ -3051,13 +3177,24 @@ private:
             return colorCount == o.colorCount && depth == o.depth && stencil == o.stencil && width == o.width &&
                    height == o.height && std::equal(views, views + colorCount, o.views);
         }
-    } pass_;
+    } pass_, drawPass_; // the open pass; the draw being recorded's
+    std::vector<VkDescriptorSetLayoutBinding> drawBindings_;
+    std::vector<VkWriteDescriptorSet> drawWrites_;
+    std::vector<VkDescriptorBufferInfo> drawBufs_;
+    std::vector<VkDescriptorImageInfo> drawImgs_;
     std::vector<VkImage> sampledSurfaces_;
+    std::array<ImageMemo, kImageMemos> imageMemos_{};
+    uint64_t imageGen_ = 1;
+    // Since the last barrier: images draws wrote and sampled, and whether anything else (a copy,
+    // dispatch, upload, clear, shader store or new batch) needs one before the next pass.
+    std::vector<VkImage> drawWritten_, drawSampled_;
+    bool needBarrier_ = true;
     std::string spirvDir_; // "-": no SPIR-V cache
     VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
     std::string pipelineCachePath_;
     uint32_t newPipelines_ = 0;
     std::chrono::steady_clock::time_point lastPipelineSave_{};
+    std::atomic<bool> pipelineSaving_{false};
 };
 
 Renderer* gRenderer = nullptr;
