@@ -111,6 +111,7 @@ struct Program {
         Instruction in;
         bool start = false;  // a work item starts at `pc` (no instruction)
         bool result = false; // whether the path went on after the instruction
+        uint32_t slot = ~0u;  // SMRD: its result's offset in `data`; MUBUF/MTBUF/MIMG: its resource's index
     };
     std::vector<TraceStep> trace;
 

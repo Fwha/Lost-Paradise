@@ -72,8 +72,9 @@ public:
                 in = decode(words, in.size / 4);
                 p_.code[w.pc] = in;
                 const uint64_t next = w.pc + in.size;
+                slot_ = ~0u;
                 const bool more = step(in, w.pc, w.st, next, work);
-                if (!more || !inert(in)) p_.trace.push_back({w.pc, in, false, more});
+                if (!more || !inert(in)) p_.trace.push_back({w.pc, in, false, more, slot_});
                 if (!more) break;
                 w.pc = next;
             }
@@ -100,7 +101,7 @@ public:
                 if (work.empty() || work.front().pc != t.pc) return false;
                 st = std::move(work.front().st);
                 work.pop_front();
-            } else if (step(t.in, t.pc, st, t.pc + t.in.size, work) != t.result || diverged_) {
+            } else if ((slot_ = t.slot, step(t.in, t.pc, st, t.pc + t.in.size, work) != t.result) || diverged_) {
                 return false;
             }
         }
@@ -184,9 +185,19 @@ private:
         if (!prior_) p_.labels.insert(pc); // a replay keeps the prior labels
     }
 
-    // Instructions step() does nothing for: a replay can skip them.
+    // VOP3 instructions that write an SGPR pair: compares, and VOP3b's carry or flags.
+    static bool writesSgprPair(const Instruction& in) {
+        return in.op < 256 || (in.op >= 293 && in.op <= 298) || in.op == 365 || in.op == 366 || in.op == 374 ||
+               in.op == 375;
+    }
+
+    // Instructions step() does nothing for: a replay can skip them. Most of a shader is vector
+    // ALU work, so this keeps traces short.
     static bool inert(const Instruction& in) {
         switch (in.format) {
+        case Format::SOPP: return in.op != 1 && in.op != 2 && !(in.op >= 4 && in.op <= 9);
+        case Format::SMRD: return in.op >= 29 || (in.op & 7) > 4;
+        case Format::VOP3: return !writesSgprPair(in);
         case Format::VOP1: return in.op != 2;
         case Format::VOP2: return in.op != 1 && !(in.op >= 37 && in.op <= 42);
         case Format::EXP:
@@ -255,8 +266,7 @@ private:
         case Format::SMRD: smrd(in, pc, st); return true;
         case Format::VOP3:
             if (in.op < 256) unknown(st, w & 0xFF, 2); // compare into an SGPR pair
-            else if ((in.op >= 293 && in.op <= 298) || in.op == 365 || in.op == 366 || in.op == 374 || in.op == 375)
-                unknown(st, (w >> 8) & 0x7F, 2); // VOP3b: carry or flags into an SGPR pair
+            else if (writesSgprPair(in)) unknown(st, (w >> 8) & 0x7F, 2); // VOP3b: carry or flags into an SGPR pair
             return true;
         case Format::VOPC:
             if (in.op & 16) p_.writesExec = true; // v_cmpx
@@ -440,13 +450,12 @@ private:
         else known = src(st, w & 0xFF, in, off);
 
         uint32_t at;
-        if (prior_) {
-            auto pit = prior_->smrd.find(pc);
-            if (pit == prior_->smrd.end()) {
+        if (prior_) { // the trace step holds where its result goes
+            if (slot_ == ~0u) {
                 diverged_ = true;
                 return;
             }
-            at = pit->second;
+            at = slot_;
         } else if (auto it = p_.smrd.find(pc); it == p_.smrd.end()) {
             at = uint32_t(p_.data.size());
             p_.smrd[pc] = at;
@@ -454,6 +463,7 @@ private:
         } else {
             at = it->second;
         }
+        slot_ = at;
         if (at + n > p_.data.size()) {
             diverged_ = true;
             return;
@@ -507,8 +517,13 @@ private:
     void buffer(const Instruction& in, uint64_t pc, State& st) {
         const uint32_t w = in.words[0], w1 = in.words[1];
         int found = -1;
-        for (size_t i = 0; i < p_.buffers.size(); ++i)
-            if (p_.buffers[i].pc == pc) found = int(i);
+        if (prior_) { // the trace step holds the resource's index
+            if (slot_ < p_.buffers.size() && p_.buffers[slot_].pc == pc) found = int(slot_);
+        } else {
+            for (size_t i = 0; i < p_.buffers.size(); ++i)
+                if (p_.buffers[i].pc == pc) found = int(i);
+            slot_ = found >= 0 ? uint32_t(found) : uint32_t(p_.buffers.size());
+        }
         if (prior_) { // the first visit in a replay re-resolves the prior resource
             if (found < 0) diverged_ = true;
             if (found < 0 || seenBuffers_[found]) return;
@@ -541,8 +556,13 @@ private:
     void image(const Instruction& in, uint64_t pc, State& st) {
         const uint32_t w1 = in.words[1];
         int found = -1;
-        for (size_t i = 0; i < p_.images.size(); ++i)
-            if (p_.images[i].pc == pc) found = int(i);
+        if (prior_) {
+            if (slot_ < p_.images.size() && p_.images[slot_].pc == pc) found = int(slot_);
+        } else {
+            for (size_t i = 0; i < p_.images.size(); ++i)
+                if (p_.images[i].pc == pc) found = int(i);
+            slot_ = found >= 0 ? uint32_t(found) : uint32_t(p_.images.size());
+        }
         if (prior_) {
             if (found < 0) diverged_ = true;
             if (found < 0 || seenImages_[found]) return;
@@ -572,6 +592,7 @@ private:
     const ReadMemory& readData_;
     const Program* prior_; // replaying this program's trace
     bool diverged_ = false;
+    uint32_t slot_ = ~0u; // the stepped instruction's TraceStep::slot
     std::vector<bool> seenBuffers_, seenImages_;
     Program p_;
 };

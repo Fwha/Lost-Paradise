@@ -216,38 +216,47 @@ class PageCache {
 public:
     bool read(uint64_t addr, void* dst, size_t size) {
         if (!readPages(addr, dst, size)) return false;
-        if (addr < hi_.load(std::memory_order_relaxed) && lo_.load(std::memory_order_relaxed) < addr + size) {
+        // Overlays are few but live across many draws: their ranges are checked without the
+        // lock, from a copy taken when they change.
+        if (const uint64_t v = version_.load(std::memory_order_acquire); v != seenVersion_) {
             std::lock_guard lock(overlayMutex_);
-            for (const Overlay& o : overlays_) { // oldest first
-                const uint64_t a = std::max(addr, o.addr), b = std::min(addr + size, o.addr + o.bytes.size());
-                if (a < b) std::memcpy(static_cast<uint8_t*>(dst) + (a - addr), o.bytes.data() + (a - o.addr), b - a);
-            }
+            ranges_.clear();
+            for (const Overlay& o : overlays_) ranges_.emplace_back(o.addr, o.addr + o.bytes.size());
+            seenVersion_ = version_.load(std::memory_order_relaxed);
         }
+        for (const auto& [lo, hi] : ranges_)
+            if (addr < hi && lo < addr + size) {
+                std::lock_guard lock(overlayMutex_);
+                for (const Overlay& o : overlays_) { // oldest first
+                    const uint64_t a = std::max(addr, o.addr), b = std::min(addr + size, o.addr + o.bytes.size());
+                    if (a < b) std::memcpy(static_cast<uint8_t*>(dst) + (a - addr), o.bytes.data() + (a - o.addr), b - a);
+                }
+                break;
+            }
         return true;
     }
     void clear() {
         pages_.clear();
-        lastPage_ = ~0ull;
+        for (Slot& s : slots_) s = Slot{};
     }
     // Bytes a GPU copy recorded but not yet run will write: reads see them already, as they
     // would on the console where the copy runs before the draws recorded after it.
     void overlay(uint64_t addr, std::vector<uint8_t> bytes, uint64_t id) {
         std::lock_guard lock(overlayMutex_);
-        lo_ = std::min(lo_.load(), addr);
-        hi_ = std::max(hi_.load(), addr + bytes.size());
         overlays_.push_back({addr, std::move(bytes), id});
+        version_.fetch_add(1, std::memory_order_release);
     }
     void dropOverlay(uint64_t id) {
         std::lock_guard lock(overlayMutex_);
         std::erase_if(overlays_, [&](const Overlay& o) { return o.id == id; });
-        uint64_t lo = ~0ull, hi = 0;
-        for (const Overlay& o : overlays_) lo = std::min(lo, o.addr), hi = std::max(hi, o.addr + o.bytes.size());
-        lo_ = lo, hi_ = hi;
+        version_.fetch_add(1, std::memory_order_release);
     }
     // Forgets the pages of [addr, addr + size), which changed.
     void invalidate(uint64_t addr, uint64_t size) {
-        for (uint64_t page = addr & ~uint64_t(kPage - 1); page < addr + size; page += kPage) pages_.erase(page);
-        lastPage_ = ~0ull;
+        for (uint64_t page = addr & ~uint64_t(kPage - 1); page < addr + size; page += kPage) {
+            pages_.erase(page);
+            if (Slot& s = slot(page); s.page == page) s = Slot{};
+        }
     }
 
 private:
@@ -272,23 +281,33 @@ private:
     };
     std::mutex overlayMutex_;
     std::vector<Overlay> overlays_;
-    std::atomic<uint64_t> lo_{~0ull}, hi_{0};
+    std::atomic<uint64_t> version_{0}; // bumped when overlays_ changes
+    uint64_t seenVersion_ = ~0ull;      // the reader's copy of the ranges is from this version
+    std::vector<std::pair<uint64_t, uint64_t>> ranges_;
 
     static constexpr size_t kPage = 4096;
+    // Recently used pages, direct-mapped in front of the map: a draw's loads hop between a few
+    // pages (descriptors, constants), and a map lookup each cost more than the copy.
+    struct Slot {
+        uint64_t page = ~0ull;
+        const uint8_t* data = nullptr;
+    };
+    static constexpr size_t kSlots = 256;
+    Slot& slot(uint64_t page) { return slots_[(page / kPage) & (kSlots - 1)]; }
     const uint8_t* lookup(uint64_t page) {
-        if (page == lastPage_) return lastData_;
-        lastPage_ = page;
+        Slot& s = slot(page);
+        if (s.page == page) return s.data;
         auto it = pages_.find(page);
         if (it == pages_.end()) {
             auto data = std::make_unique<std::array<uint8_t, kPage>>();
             if (!readGuest(page, data->data(), kPage)) data.reset();
             it = pages_.emplace(page, std::move(data)).first;
         }
-        return lastData_ = it->second ? it->second->data() : nullptr;
+        s.page = page;
+        return s.data = it->second ? it->second->data() : nullptr;
     }
     std::unordered_map<uint64_t, std::unique_ptr<std::array<uint8_t, kPage>>> pages_; // null: unreadable
-    uint64_t lastPage_ = ~0ull; // the last page looked up, and its data
-    const uint8_t* lastData_ = nullptr;
+    std::array<Slot, kSlots> slots_{};
 };
 
 // Identifies a shader launch: the launch state analysis or translation reads, except user data
@@ -319,7 +338,14 @@ const std::string& launchKey(const gcn::LaunchState& l, uint32_t bindingBase) {
     return k;
 }
 
-std::string bytesKey(const void* p, size_t n) { return std::string(static_cast<const char*>(p), n); }
+// Hash map keys of a few words, looked up per draw without building a string.
+struct WordsHash {
+    template <size_t N> size_t operator()(const std::array<uint32_t, N>& a) const {
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (uint32_t w : a) h = (h ^ w) * 0x100000001b3ull;
+        return size_t(h ^ (h >> 32));
+    }
+};
 
 #define VK_CHECK(x)                                                                                     \
     do {                                                                                                \
@@ -333,7 +359,7 @@ struct Image {
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0, layers = 1, levels = 1;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    std::map<std::string, VkImageView> views;
+    std::map<std::array<uint32_t, 7>, VkImageView> views;
 };
 
 // A render target or depth buffer at a guest address.
@@ -1346,9 +1372,8 @@ private:
                      VkImageAspectFlags aspect = 0) {
         if (!aspect) aspect = img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT;
         if (!aspect) aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-        const uint32_t key[] = {uint32_t(format), uint32_t(type), uint32_t(swz.r), uint32_t(swz.g), uint32_t(swz.b),
-                                uint32_t(swz.a), aspect};
-        const std::string k = bytesKey(key, sizeof(key));
+        const std::array<uint32_t, 7> k{uint32_t(format), uint32_t(type), uint32_t(swz.r), uint32_t(swz.g),
+                                        uint32_t(swz.b), uint32_t(swz.a), aspect};
         auto it = img.views.find(k);
         if (it != img.views.end()) return it->second;
         VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1663,10 +1688,11 @@ private:
     }
 
     Layout& layout(const std::vector<VkDescriptorSetLayoutBinding>& bindings) {
-        std::string key;
+        thread_local std::string key; // per draw: built in a reused buffer
+        key.clear();
         for (const auto& b : bindings) {
             const uint32_t k[] = {b.binding, uint32_t(b.descriptorType), b.stageFlags};
-            key += bytesKey(k, sizeof(k));
+            key.append(reinterpret_cast<const char*>(k), sizeof(k));
         }
         auto it = layouts_.find(key);
         if (it != layouts_.end()) return it->second;
@@ -1744,7 +1770,8 @@ private:
     }
 
     VkPipeline graphicsPipeline(const GraphicsState& s, ShaderModule* vs, ShaderModule* ps, VkPipelineLayout layout) {
-        const std::string key = bytesKey(&s, sizeof(s));
+        thread_local std::string key; // per draw: built in a reused buffer
+        key.assign(reinterpret_cast<const char*>(&s), sizeof(s));
         auto it = pipelines_.find(key);
         if (it != pipelines_.end()) return it->second;
 
@@ -2001,9 +2028,7 @@ private:
         const uint32_t ep = bc ? (pitchPx + 3) / 4 : pitchPx;
         const uint32_t layers = t.type() == 11 ? 6 : (t.type() == 13 || t.type() == 10) ? t.lastArray() + 1 : 1;
         const uint32_t slices = t.type() == 10 ? t.depth() : layers;
-        const uint32_t key[] = {t.t[0], t.t[1], t.t[2], t.t[3] & ~0xFFFu, t.t[4], t.t[5]};
-        const std::string k = bytesKey(key, sizeof(key));
-        GuestTexture& tex = textures_[k];
+        GuestTexture& tex = textures_[{t.t[0], t.t[1], t.t[2], t.t[3] & ~0xFFFu, t.t[4], t.t[5]}];
         if (tex.img.image && tex.checkedFrame == frame_) return &tex;
         // Re-reading every sampled texture each frame cost ~8 ms in fights and ~15 ms in crowded
         // areas, though most never change. One unchanged for 60 frames is fully hashed on every
@@ -2994,7 +3019,7 @@ private:
     std::map<uint64_t, Import> imports_;
     std::unordered_map<uint64_t, Surface> colors_, depths_;
     std::unordered_map<uint64_t, Metadata> metadata_; // by HTILE/CMASK address
-    std::unordered_map<std::string, GuestTexture> textures_;
+    std::unordered_map<std::array<uint32_t, 6>, GuestTexture, WordsHash> textures_;
     std::map<std::array<uint32_t, 5>, VkSampler> samplers_;
     std::unordered_map<std::string, std::unique_ptr<ShaderModule>> shaders_;
     std::unordered_map<uint64_t, VkShaderModule> expanders_;
