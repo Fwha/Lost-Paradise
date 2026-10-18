@@ -283,6 +283,23 @@ int32_t sceSaveDataDialogOpen(const uint8_t* p) {
             if (ec && firstEmpty < 0) firstEmpty = int(i);
             if (!ec && (newestIdx < 0 || t > newest)) newestIdx = int(i), newest = t;
         }
+        // Saving: an empty slot under the listed saves, as on a PS4, named after the highest
+        // numbered one ("02" -> "03") and skipping any folder already on disk (e.g. system "99").
+        if (disp == 1) {
+            int n = 0;
+            size_t width = 2;
+            for (const auto& s : slots)
+                if (!s.dir.empty() && s.dir.find_first_not_of("0123456789") == std::string::npos)
+                    n = std::max(n, std::atoi(s.dir.c_str())), width = s.dir.size();
+            std::string name;
+            do {
+                char buf[16];
+                std::snprintf(buf, sizeof buf, "%0*d", int(width), ++n);
+                name = buf;
+            } while (fs::exists(saveRoot() + "/" + name));
+            slots.push_back({name, saveRoot() + "/" + name});
+            if (firstEmpty < 0) firstEmpty = int(slots.size()) - 1;
+        }
         std::fprintf(stderr, "[dialog] %s: %u saves listed (new item %s, focus %d)\n", what, count,
                      newItem ? "offered" : "none", focusPos);
         const int focus = disp == 1 && firstEmpty >= 0 ? firstEmpty : std::max(newestIdx, 0);

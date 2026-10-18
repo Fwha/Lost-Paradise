@@ -261,6 +261,8 @@ bool saveMenuEvent(const SDL_Event& e) {
         switch (e.key.keysym.scancode) {
         case SDL_SCANCODE_UP: case SDL_SCANCODE_W: move(-1); break;
         case SDL_SCANCODE_DOWN: case SDL_SCANCODE_S: move(1); break;
+        case SDL_SCANCODE_LEFT: case SDL_SCANCODE_A: if (gScreen != Screen::List) move(-1); break;
+        case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_D: if (gScreen != Screen::List) move(1); break;
         case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: case SDL_SCANCODE_SPACE:
             if (!e.key.repeat) select();
             break;
@@ -278,6 +280,8 @@ bool saveMenuEvent(const SDL_Event& e) {
         switch (e.cbutton.button) {
         case SDL_CONTROLLER_BUTTON_DPAD_UP: move(-1); break;
         case SDL_CONTROLLER_BUTTON_DPAD_DOWN: move(1); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_LEFT: if (gScreen != Screen::List) move(-1); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: if (gScreen != Screen::List) move(1); break;
         case SDL_CONTROLLER_BUTTON_A: select(); break;
         case SDL_CONTROLLER_BUTTON_B: back(); break;
         case SDL_CONTROLLER_BUTTON_X: quickDelete(); break;
