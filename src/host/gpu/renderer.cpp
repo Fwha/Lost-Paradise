@@ -2107,13 +2107,13 @@ private:
             warnOnce("depth-compare texture without a depth buffer at 0x" + hex(addr));
             return b;
         }
-        if (auto it = colors_.find(addr); it != colors_.end() && !cpuWritten(it->second, t)) {
+        // A texture of another element size (a compressed one, say) at a render target's address
+        // is not that render target: the memory was reused, so it is read from memory.
+        if (auto it = colors_.find(addr); it != colors_.end() && format != VK_FORMAT_UNDEFINED &&
+                                          bytesPerElement(t.dataFormat()) == it->second.elementBytes &&
+                                          !cpuWritten(it->second, t)) {
             Surface& s = it->second;
             sampledSurfaces_.push_back(s.img.image);
-            if (format == VK_FORMAT_UNDEFINED || bytesPerElement(t.dataFormat()) != s.elementBytes) {
-                warnOnce("texture format " + std::to_string(t.dataFormat()) + " over a render target of different size");
-                format = s.img.format;
-            }
             b.view = view(s.img, format, vt == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
                           swz);
             b.scale[0] = float(t.width()) / float(s.img.width);
