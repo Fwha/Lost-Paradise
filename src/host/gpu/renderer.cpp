@@ -479,6 +479,7 @@ public:
         if (const char* sn = getenv("LPN_GPU_SNAP")) {
             // "1": every draw; otherwise a list of draw numbers and ranges ("2752,2860-2870").
             snap_ = true;
+            if (const char* sc = getenv("LPN_GPU_SNAP_SCALE")) snapScale_ = std::max(1, std::atoi(sc));
             if (std::strcmp(sn, "1") != 0) {
                 for (const char* q = sn; *q;) {
                     char* end;
@@ -871,11 +872,14 @@ private:
         if (!readSurface(addr, w, h, px)) return;
         const std::string name = traceDir_ + "gpu-draw-" + std::to_string(drawIndex_) + ".ppm";
         if (FILE* f = std::fopen(name.c_str(), "wb")) {
-            std::fprintf(f, "P6\n%u %u\n255\n", w, h);
-            for (uint32_t p : px) {
-                const uint8_t rgb[3] = {uint8_t(p), uint8_t(p >> 8), uint8_t(p >> 16)};
-                std::fwrite(rgb, 1, 3, f);
-            }
+            const uint32_t s = snapScale_; // LPN_GPU_SNAP_SCALE: keep every s-th pixel and row
+            std::fprintf(f, "P6\n%u %u\n255\n", w / s, h / s);
+            for (uint32_t y = 0; y + s <= h; y += s)
+                for (uint32_t x = 0; x + s <= w; x += s) {
+                    const uint32_t p = px[size_t(y) * w + x];
+                    const uint8_t rgb[3] = {uint8_t(p), uint8_t(p >> 8), uint8_t(p >> 16)};
+                    std::fwrite(rgb, 1, 3, f);
+                }
             std::fclose(f);
         }
     }
@@ -2989,6 +2993,7 @@ private:
     std::string traceDir_;      // where trace dumps go ("" = working directory, else ends in /)
     std::string pendingCapture_; // folder of a requested capture (see captureNextFrame)
     bool trace_ = false, snap_ = false, dumpGlsl_ = false;
+    uint32_t snapScale_ = 1;
     std::vector<std::pair<uint64_t, uint64_t>> snapDraws_;
     bool snapWanted() const {
         if (snapDraws_.empty()) return true;
