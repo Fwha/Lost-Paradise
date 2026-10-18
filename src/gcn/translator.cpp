@@ -1254,7 +1254,9 @@ vec3 cubeDir(vec3 c) {
         const std::string uv = "uv_";
         auto grad = [&](uint32_t first) { return oneD ? "vec2(" + fv(first) + ", 0.0)" : vecOf(first, dims, false); };
         std::string call;
-        const bool fragment = p_.launch.stage == Stage::Pixel;
+        // LPN_TEX_LOD0=<pixel shader entry> (hex): that shader samples without derivatives (level 0).
+        static const uint64_t lod0Shader = std::getenv("LPN_TEX_LOD0") ? std::strtoull(std::getenv("LPN_TEX_LOD0"), nullptr, 16) : 0;
+        const bool fragment = p_.launch.stage == Stage::Pixel && p_.launch.entry != lod0Shader;
         if (compare) {
             std::string uvz = glslCoords == 2 ? "vec3(uv_, " + fv(zReg) + ")" : "vec4(uv_, " + fv(zReg) + ")";
             if (gather) call = "textureGather(" + tn + ", " + uv + ", " + fv(zReg) + ")";
