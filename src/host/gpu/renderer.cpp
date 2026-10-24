@@ -532,6 +532,7 @@ struct Profiler {
     uint64_t fastKind[3] = {}; // of kFastKind: other draw kind, other shaders, other prim/instances/index type
     uint64_t fastRes[3] = {}; // of kFastResources: resource counts, a buffer, an image
     uint64_t fastMoved = 0; // fast draws that bound a buffer again
+    uint64_t fastImages = 0; // fast draws that bound other textures
     uint64_t fastSwitches = 0; // fast draws that switched shaders (switchDraw)
     uint64_t switchMiss[6] = {}; // other shaders not switched to: no slot, slot stale, state, sampled, resources, index
     uint64_t depthJoins = 0, depthOnly = 0; // depth-only draws that joined the open pass, of all depth-only ones
@@ -1129,9 +1130,9 @@ public:
             if (prof_.missUser[i]) std::fprintf(stderr, " s%d %.0f", i, prof_.missUser[i] / n);
         std::fprintf(stderr, "\n[prof] t=%.1f draws recorded in full:", profile::seconds());
         for (int i = 0; i < kFastMissCount; ++i) std::fprintf(stderr, " %s %.0f", kFastMissNames[i], prof_.fastMiss[i] / n);
-        std::fprintf(stderr, " (kind %.0f, shaders %.0f, prim %.0f; resource counts %.0f, buffer %.0f, image %.0f); fast draws binding a buffer again %.0f, switching shaders %.0f",
+        std::fprintf(stderr, " (kind %.0f, shaders %.0f, prim %.0f; resource counts %.0f, buffer %.0f, image %.0f); fast draws binding a buffer again %.0f, other textures %.0f, switching shaders %.0f",
                      prof_.fastKind[0] / n, prof_.fastKind[1] / n, prof_.fastKind[2] / n, prof_.fastRes[0] / n,
-                     prof_.fastRes[1] / n, prof_.fastRes[2] / n, prof_.fastMoved / n, prof_.fastSwitches / n);
+                     prof_.fastRes[1] / n, prof_.fastRes[2] / n, prof_.fastMoved / n, prof_.fastImages / n, prof_.fastSwitches / n);
         std::fprintf(stderr, " (not switched: no slot %.0f, slot stale %.0f, state %.0f, sampled %.0f, resources %.0f, index %.0f)",
                      prof_.switchMiss[0] / n, prof_.switchMiss[1] / n, prof_.switchMiss[2] / n, prof_.switchMiss[3] / n,
                      prof_.switchMiss[4] / n, prof_.switchMiss[5] / n);
@@ -3023,14 +3024,29 @@ private:
         VkImage sampled; // the render target it samples, if any (for feedback checks)
     };
     static constexpr size_t kImageMemos = 1024;
-    ImageBinding resolveImage(const gcn::ImageResource& t) {
-        if (t.storage || trace_) return resolveImageUncached(t); // storage: marks the target written
+    ImageMemo& imageMemo(const gcn::ImageResource& t) {
         uint64_t h = 0xcbf29ce484222325ull;
         for (uint32_t w : t.t) h = (h ^ w) * 0x100000001b3ull;
         for (uint32_t w : t.s) h = (h ^ w) * 0x100000001b3ull;
-        ImageMemo& m = imageMemos_[(h ^ (h >> 29) ^ t.compare) & (kImageMemos - 1)];
-        if (m.frame == frame_ && m.gen == imageGen_ && m.compare == t.compare && std::equal(t.t, t.t + 8, m.t) &&
-            std::equal(t.s, t.s + 4, m.s)) {
+        return imageMemos_[(h ^ (h >> 29) ^ t.compare) & (kImageMemos - 1)];
+    }
+    bool memoHit(const ImageMemo& m, const gcn::ImageResource& t) const {
+        return m.frame == frame_ && m.gen == imageGen_ && m.compare == t.compare && std::equal(t.t, t.t + 8, m.t) &&
+               std::equal(t.s, t.s + 4, m.s);
+    }
+    // An image already resolved this frame that samples no render target: what fastDraw may bind
+    // without recording anything (an upload) or affecting the pass.
+    bool peekImage(const gcn::ImageResource& t, ImageBinding& b) {
+        if (t.storage || trace_) return false;
+        const ImageMemo& m = imageMemo(t);
+        if (!memoHit(m, t) || m.sampled) return false;
+        b = m.b;
+        return true;
+    }
+    ImageBinding resolveImage(const gcn::ImageResource& t) {
+        if (t.storage || trace_) return resolveImageUncached(t); // storage: marks the target written
+        ImageMemo& m = imageMemo(t);
+        if (memoHit(m, t)) {
             if (m.sampled) sampledSurfaces_.push_back(m.sampled);
             return m.b;
         }
@@ -4391,6 +4407,8 @@ private:
     };
     // 16: the city gate switches between more shaders in a pass than the steps (4 were enough there).
     static constexpr size_t kFastSlots = 16;
+    // LPN_NO_FAST_TEXTURES=1: a draw sampling other textures than the last is recorded in full.
+    const bool noFastTextures_ = getenv("LPN_NO_FAST_TEXTURES") != nullptr;
     std::array<FastSlot, kFastSlots> fastSlots_;
     uint64_t passSerial_ = 0, fastEpoch_ = 0, fastUse_ = 0;
 
@@ -4433,8 +4451,11 @@ private:
             return miss(2);
         for (VkImage im : f.sampled) // sampling what a draw since has rendered to needs a new pass
             if (std::find(drawWritten_.begin(), drawWritten_.end(), im) != drawWritten_.end()) return miss(3);
-        uint32_t moved;
-        if (sameButUserData(a.vs, slot->prev.vs, moved) >= 0 || (a.psm && sameButUserData(a.ps, slot->prev.ps, moved) >= 0))
+        uint32_t moved, vsImages = 0, psImages = 0;
+        ImageBinding vsImg[32], psImg[32];
+        if (sameButUserData(a.vs, slot->prev.vs, moved, noFastTextures_ ? nullptr : &vsImages) >= 0 ||
+            (a.psm && sameButUserData(a.ps, slot->prev.ps, moved, noFastTextures_ ? nullptr : &psImages) >= 0) ||
+            !peekImages(a.vs, vsImages, vsImg) || !peekImages(a.ps, psImages, psImg))
             return miss(4);
         VkBuffer indexBuffer = VK_NULL_HANDLE;
         VkDeviceSize indexOffset = 0;
@@ -4448,6 +4469,11 @@ private:
         std::vector<VkWriteDescriptorSet>& writes = drawWrites_;
         std::vector<VkDescriptorBufferInfo>& bufs = drawBufs_;
         std::vector<VkDescriptorImageInfo>& imgs = drawImgs_;
+        // Other textures go into the slot's descriptors first (rebindImages also queues writes of its
+        // own for fastDraw, dropped here: all of the slot's are pushed).
+        writes.clear(), imgs.clear();
+        rebindImages(a.vs, slot->prev.vs, vsImages, vsImg, 0, f);
+        if (a.psm) rebindImages(a.ps, slot->prev.ps, psImages, psImg, kPsBindingBase, f);
         writes = f.writes;
         bufs = f.bufs;
         imgs = f.imgs;
@@ -4531,9 +4557,14 @@ private:
                     if (r.ctx[i] != f.ctx[i]) ++prof_.fastCtx[i];
             return miss(kFastCtx);
         }
-        uint32_t vsMoved = 0, psMoved = 0;
-        int why = sameButUserData(a.vs, prevDraw_.vs, vsMoved);
-        if (why < 0 && a.psm) why = sameButUserData(a.ps, prevDraw_.ps, psMoved);
+        uint32_t vsMoved = 0, psMoved = 0, vsImages = 0, psImages = 0;
+        uint32_t* const vi = noFastTextures_ ? nullptr : &vsImages;
+        uint32_t* const pi = noFastTextures_ ? nullptr : &psImages;
+        int why = sameButUserData(a.vs, prevDraw_.vs, vsMoved, vi);
+        if (why < 0 && a.psm) why = sameButUserData(a.ps, prevDraw_.ps, psMoved, pi);
+        // Other textures (another material on the same shaders): only ones already resolved this frame.
+        ImageBinding vsImg[32], psImg[32];
+        if (why < 0 && !(peekImages(a.vs, vsImages, vsImg) && peekImages(a.ps, psImages, psImg))) why = 2;
         if (why >= 0) {
             if (prof_.on) ++prof_.fastRes[why];
             return miss(kFastResources);
@@ -4564,8 +4595,11 @@ private:
                 }
         };
         if (vsMoved || psMoved) ++prof_.fastMoved;
+        if (vsImages || psImages) ++prof_.fastImages;
         rebind(a.vs, prevDraw_.vs, vsMoved, 0);
         if (a.psm) rebind(a.ps, prevDraw_.ps, psMoved, kPsBindingBase);
+        rebindImages(a.vs, prevDraw_.vs, vsImages, vsImg, 0, fast_);
+        if (a.psm) rebindImages(a.ps, prevDraw_.ps, psImages, psImg, kPsBindingBase, fast_);
         auto data = [&](const gcn::Program& p, gcn::Program& bound, uint32_t base) {
             const VkDeviceSize bytes = p.data.size() * 4;
             if (!std::memcmp(p.data.data(), bound.data.data(), bytes)) return;
@@ -4596,13 +4630,47 @@ private:
         ++prof_.fastDraws;
         return true;
     }
+    bool peekImages(const gcn::Program& p, uint32_t mask, ImageBinding* out) {
+        for (uint32_t i = 0; mask; ++i, mask >>= 1)
+            if ((mask & 1) && !peekImage(p.images[i], out[i])) return false;
+        return true;
+    }
+    // Binds the images in `mask` (resolved by peekImages) as fastDraw's next descriptor writes, and
+    // keeps them in `f` and `bound` for a later switchDraw back to these shaders.
+    void rebindImages(gcn::Program& p, gcn::Program& bound, uint32_t mask, const ImageBinding* ib, uint32_t base,
+                      FastDraw& f) {
+        for (uint32_t i = 0; mask; ++i, mask >>= 1) {
+            if (!(mask & 1)) continue;
+            gcn::ImageResource& im = p.images[i];
+            std::memcpy(&p.data[im.data], ib[i].scale, 8);
+            const VkDescriptorImageInfo info{ib[i].sampler, ib[i].view, VK_IMAGE_LAYOUT_GENERAL};
+            const uint32_t binding = base + 1 + uint32_t(p.buffers.size()) + i;
+            drawImgs_.push_back(info);
+            drawWrites_.push_back(kSampledImageWrite);
+            drawWrites_.back().dstBinding = binding;
+            size_t n = 0;
+            for (const auto& w : f.writes)
+                if (w.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                    if (w.dstBinding == binding) {
+                        f.imgs[n] = info;
+                        break;
+                    }
+                    ++n;
+                }
+            std::memcpy(bound.images[i].t, im.t, sizeof im.t);
+            std::memcpy(bound.images[i].s, im.s, sizeof im.s);
+        }
+    }
     // Whether `cur` is `prev` (as bindResources and draw() left it) but for its user data words, the
     // scalar loads made from them (constants, uploaded with the draw data) and where read-only
     // buffers sit (per-draw vertex data): -1 if so, else why not (FastRes). Fills in the words the
     // resources fill from prev's (the same resources resolve alike); `moved` gets the buffers to
-    // bind again.
-    static int sameButUserData(gcn::Program& cur, const gcn::Program& prev, uint32_t& moved) {
+    // bind again. With `images`, sampled images may differ too, if the shader reads them alike
+    // (same type, number kind, coordinates, compare): it gets those to bind again, their scale
+    // words left for the caller.
+    static int sameButUserData(gcn::Program& cur, const gcn::Program& prev, uint32_t& moved, uint32_t* images = nullptr) {
         moved = 0;
+        if (images) *images = 0;
         if (cur.data.size() != prev.data.size() || cur.buffers.size() != prev.buffers.size() ||
             cur.images.size() != prev.images.size() || cur.data.size() < gcn::data::kSmrd || cur.buffers.size() > 32)
             return 0;
@@ -4616,14 +4684,19 @@ private:
         }
         for (size_t i = 0; i < cur.images.size(); ++i) {
             const gcn::ImageResource &x = cur.images[i], &y = prev.images[i];
-            if (std::memcmp(x.t, y.t, sizeof x.t) || std::memcmp(x.s, y.s, sizeof x.s) || x.storage != y.storage ||
-                x.compare != y.compare || x.data != y.data)
-                return 2;
+            if (x.storage != y.storage || x.compare != y.compare || x.data != y.data) return 2;
+            if (std::memcmp(x.t, y.t, sizeof x.t) || std::memcmp(x.s, y.s, sizeof x.s)) {
+                if (!images || x.storage || i >= 32 || x.type() != y.type() || x.numFormat() != y.numFormat() ||
+                    ((x.s[0] ^ y.s[0]) >> 15 & 1))
+                    return 2;
+                *images |= 1u << i;
+            }
         }
         std::memcpy(&cur.data[gcn::data::kPosTransform], &prev.data[gcn::data::kPosTransform], 16);
         for (size_t i = 0; i < prev.buffers.size(); ++i)
             if (!(moved >> i & 1)) std::memcpy(&cur.data[prev.buffers[i].data], &prev.data[prev.buffers[i].data], 16);
-        for (const auto& im : prev.images) std::memcpy(&cur.data[im.data], &prev.data[im.data], 8);
+        for (size_t i = 0; i < prev.images.size(); ++i)
+            if (!(images && (*images >> i & 1))) std::memcpy(&cur.data[prev.images[i].data], &prev.data[prev.images[i].data], 8);
         return -1;
     }
 
