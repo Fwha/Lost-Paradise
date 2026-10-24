@@ -485,6 +485,8 @@ struct Profiler {
     uint64_t feedbackOn[2] = {}; // a draw sampled the open pass's depth / color attachment
     uint64_t missWhy[4] = {}; // a launch not repeating the stage's last: shader, submission, user data, other
     uint64_t missUser[16] = {}; // the user data words that differed
+    uint64_t fastMiss[8] = {}; // a draw not taking fastDraw, by FastMiss
+    std::unordered_map<uint32_t, uint64_t> fastCtx; // the context registers that differed
     uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
@@ -493,6 +495,14 @@ struct Profiler {
 // attachments, the draw before wrote memory from a shader, or the pass was ended by something
 // else (a dispatch, copy, flush or clear).
 enum PassWhy { kPassTargets, kPassFeedback, kPassStore, kPassOther };
+
+// Why a draw was recorded in full rather than by fastDraw: the draw before could not be repeated
+// (no open pass, a depth clear, it sampled what it renders to), something was recorded in
+// between, a new frame or images, another draw kind, shader or primitive, other context
+// registers, other resources, or no index buffer.
+enum FastMiss { kFastNotKept, kFastBetween, kFastFrame, kFastKind, kFastCtx, kFastResources, kFastIndex, kFastMissCount };
+constexpr const char* kFastMissNames[kFastMissCount] = {"not repeatable", "recorded between", "new frame/images/pass",
+                                                        "kind/shader/prim", "context regs", "resources", "index buffer"};
 
 class ProfScope {
 public:
@@ -1053,7 +1063,17 @@ public:
                      profile::seconds(), prof_.missWhy[0] / n, prof_.missWhy[1] / n, prof_.missWhy[2] / n, prof_.missWhy[3] / n);
         for (int i = 0; i < 16; ++i)
             if (prof_.missUser[i]) std::fprintf(stderr, " s%d %.0f", i, prof_.missUser[i] / n);
-        std::fprintf(stderr, "\n");
+        std::fprintf(stderr, "\n[prof] t=%.1f draws recorded in full:", profile::seconds());
+        for (int i = 0; i < kFastMissCount; ++i) std::fprintf(stderr, " %s %.0f", kFastMissNames[i], prof_.fastMiss[i] / n);
+        if (!prof_.fastCtx.empty()) {
+            std::vector<std::pair<uint64_t, uint32_t>> regs;
+            for (auto [reg, count] : prof_.fastCtx) regs.push_back({count, reg});
+            std::sort(regs.rbegin(), regs.rend());
+            std::fprintf(stderr, "; context regs differing:");
+            for (size_t i = 0; i < regs.size() && i < 8; ++i)
+                std::fprintf(stderr, " 0x%x %.0f", 0xA000 + regs[i].second, regs[i].first / n);
+        }
+        std::fprintf(stderr, " per frame\n");
         windowFrames_ = slowFrames_ = 0;
         worstFrameMs_ = 0;
         const bool on = prof_.on;
@@ -4180,19 +4200,31 @@ private:
     };
     bool fastDraw(const DrawCall& d, const GpuRegs& r, DrawAnalysis& a) {
         const FastDraw& f = fast_;
-        if (!f.valid || f.rec != recCount_ || f.frame != frame_ || f.imageGen != imageGen_ || !recording_ || !pass_.open)
+        auto miss = [&](FastMiss why) {
+            if (prof_.on) ++prof_.fastMiss[why];
             return false;
+        };
+        if (!f.valid) return miss(kFastNotKept);
+        if (f.rec != recCount_) return miss(kFastBetween);
+        if (f.frame != frame_ || f.imageGen != imageGen_ || !recording_ || !pass_.open) return miss(kFastFrame);
         if (d.kind != f.kind || a.vsm != f.vsm || a.psm != f.psm || r.indexType != f.indexType ||
-            r.numInstances != f.numInstances || r.uconfig[reg::kPrimitiveType] != f.prim || !ringFits(1 << 16) ||
-            std::memcmp(r.ctx, f.ctx, sizeof f.ctx) != 0)
-            return false;
-        if (!sameButUserData(a.vs, prevDraw_.vs) || (a.psm && !sameButUserData(a.ps, prevDraw_.ps))) return false;
+            r.numInstances != f.numInstances || r.uconfig[reg::kPrimitiveType] != f.prim || !ringFits(1 << 16))
+            return miss(kFastKind);
+        if (std::memcmp(r.ctx, f.ctx, sizeof f.ctx) != 0) {
+            if (prof_.on)
+                for (uint32_t i = 0; i < ::gpu::kContextRegs; ++i)
+                    if (r.ctx[i] != f.ctx[i]) ++prof_.fastCtx[i];
+            return miss(kFastCtx);
+        }
+        if (!sameButUserData(a.vs, prevDraw_.vs) || (a.psm && !sameButUserData(a.ps, prevDraw_.ps)))
+            return miss(kFastResources);
         VkBuffer indexBuffer = VK_NULL_HANDLE;
         VkDeviceSize indexOffset = 0;
         if (d.kind == DrawCall::kIndexed) {
             const uint32_t isz = r.indexType ? 4 : 2;
             if (!vramBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset) &&
-                !guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset)) return false;
+                !guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset))
+                return miss(kFastIndex);
         }
         ProfScope pb(prof_, kProfBind);
         std::vector<VkWriteDescriptorSet>& writes = drawWrites_;
