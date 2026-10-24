@@ -3,6 +3,7 @@
 // on; a second thread reads the buffer back and shows it, so the vblank clock never waits.
 #include "host/videoout.h"
 
+#include "host/display_settings.h"
 #include "host/equeue.h"
 #include "host/gpu/renderer.h"
 #include "host/hle.h"
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdio>
@@ -80,9 +82,11 @@ struct Display {
     int32_t flipRate = 0; // 0: every vblank, 1: every 2nd, 2: every 3rd
 } gDisplay;
 
-double gVblankHz = 59.94;
-double gFpsCap = 30;   // even 30 fps; uncapped, crowded areas swing between 20 and 30
-int32_t gMinFlipRate = 1; // from the cap
+// The PS4's refresh rate: the game's flip rates (sceVideoOutSetFlipRate) count its vblanks.
+constexpr double kPs4Hz = 59.94;
+std::atomic<double> gVblankHz{kPs4Hz}; // the vblank clock; Uncapped runs it at the monitor's rate
+std::atomic<bool> gVblankPinned{false}; // --vblank given
+std::atomic<double> gFpsCap{30};       // even 30 fps; uncapped, crowded areas swing between 20 and 30
 uint64_t gScreenshotFlip = 0;
 uint64_t gScreenshotEvery = 0;
 std::string gScreenshotPath;
@@ -200,12 +204,14 @@ void queueShow(const Frame& frame, uint64_t flip) {
 }
 
 void vblankThread() {
-    const auto period = std::chrono::nanoseconds(int64_t(1e9 / gVblankHz));
     auto next = Clock::now();
+    auto flipDue = next; // the earliest time the next flip may show, from the flip rate and the cap
     uint64_t lastFlipVblank = 0, statFrom = 0;
     uint64_t intervals[5] = {}; // flips 1, 2, 3, 4, 5+ vblanks apart
     double lateMax = 0;
     for (;;) {
+        const double hz = gVblankHz;
+        const auto period = std::chrono::nanoseconds(int64_t(1e9 / hz));
         next += period;
         std::this_thread::sleep_until(next);
         const auto now = Clock::now();
@@ -218,8 +224,15 @@ void vblankThread() {
         {
             std::lock_guard lock(gDisplay.m);
             vblank = ++gDisplay.vblankCount;
-            if (!gDisplay.pending.empty() && gDisplay.vblankCount % (std::max(gDisplay.flipRate, gMinFlipRate) + 1) == 0 &&
-                render::gpuDone(gDisplay.pending.front().gpuMark)) {
+            // Flips are paced in time rather than by counting vblanks, so the game's 30 and 20 fps
+            // scenes (it steps them by 1/30 and 1/20 s) keep their speed when the clock runs faster
+            // than the PS4's. Half a vblank of slack keeps an on-time flip from slipping to the next.
+            const double cap = gFpsCap;
+            const double interval = std::max(gDisplay.flipRate > 0 ? (gDisplay.flipRate + 1) / kPs4Hz : 0.0,
+                                             cap > 0 ? std::max(1.0, std::round(hz / cap)) / hz : 0.0);
+            if (!gDisplay.pending.empty() && now >= flipDue - period / 2 && render::gpuDone(gDisplay.pending.front().gpuMark)) {
+                const auto step = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(interval));
+                flipDue = std::max(flipDue, now - step) + step;
                 const Flip f = gDisplay.pending.front();
                 gDisplay.pending.pop_front();
                 auto& s = gDisplay.status;
@@ -376,6 +389,7 @@ int32_t ok() { return 0; }
 
 int32_t videoOutSubmitFlip(int32_t handle, int32_t index, int32_t, int64_t arg) {
     if (handle != kHandle) return kErrInvalidHandle;
+    syncFrameClock(); // the game's thread, between two runs of its frame clock
     if (index < -1 || index >= 16) return kErrInvalidIndex;
     static uint64_t nextId = 0;
     uint64_t id;
@@ -399,14 +413,19 @@ int32_t videoOutSubmitFlip(int32_t handle, int32_t index, int32_t, int64_t arg) 
 }
 
 void setVblankRate(double hz) {
+    if (hz < 20 || hz > 1000) return;
     gVblankHz = hz;
-    setFpsCap(gFpsCap);
+    gVblankPinned = true;
 }
 
-void setFpsCap(double fps) {
-    gFpsCap = fps;
-    gMinFlipRate = fps > 0 ? std::max(0, int32_t(gVblankHz / fps + 0.5) - 1) : 0;
+void setDisplayRefresh(double hz) {
+    if (gVblankPinned) return;
+    const double rate = hz >= 20 && hz <= 1000 ? hz : kPs4Hz;
+    if (rate != gVblankHz) std::fprintf(stderr, "[videoout] vblank clock at %.2f Hz\n", rate);
+    gVblankHz = rate;
 }
+
+void setFpsCap(double fps) { gFpsCap = fps; }
 
 void registerVideoOutHle() {
     const char* v = "libSceVideoOut";
