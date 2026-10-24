@@ -152,9 +152,10 @@ int32_t scePadReadState(int32_t, PadData* d) {
     d->acceleration[1] = 1.0f; // gravity, pad lying flat
     d->connected = true;
     d->connectedCount = 1;
-    d->timestamp = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch())
-                                .count());
+    d->timestamp = gameTimeScale() != 1.0 ? gameClockNs() / 1000
+                                          : uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                         std::chrono::steady_clock::now().time_since_epoch())
+                                                         .count());
     return 0;
 }
 struct PadControllerInformation {

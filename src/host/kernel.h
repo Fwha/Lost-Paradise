@@ -28,6 +28,12 @@ inline int32_t sceErrorFromHost(int linuxErrno) { return sceError(toPs4Errno(lin
 // The guest's errno, as returned by libkernel's __error().
 int* guestErrno();
 
+// Nanoseconds since start on the game's process clock (sceKernelGetProcessTime*, pad
+// timestamps). LPN_TIME_SCALE=<f> runs it f times as fast as real time: a test knob that sets
+// the game's frame time apart from the frame rate (0.5 at 60 fps steps 1/120 s a frame).
+uint64_t gameClockNs();
+double gameTimeScale();
+
 namespace ps4errno {
 constexpr int kEPERM = 1, kENOENT = 2, kESRCH = 3, kEINTR = 4, kEIO = 5, kEBADF = 9, kEDEADLK = 11, kENOMEM = 12,
               kEACCES = 13, kEFAULT = 14, kEBUSY = 16, kEEXIST = 17, kEINVAL = 22, kEAGAIN = 35, kETIMEDOUT = 60,

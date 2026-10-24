@@ -1,8 +1,13 @@
 #include "host/display_settings.h"
 
+#include "host/kernel.h"
 #include "host/module.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -183,9 +188,60 @@ bool prepareFrameClock(Module& eboot) {
     return true;
 }
 
-void setFrameClock(int fps) { gClockWanted = fps <= 0 || fps > 61 ? 2 : fps < 59 ? 1 : 0; }
+// A scaled game clock (LPN_TIME_SCALE) needs the measured time unfloored, at any cap.
+void setFrameClock(int fps) {
+    gClockWanted = fps <= 0 || fps > 61 || gameTimeScale() != 1.0 ? 2 : fps < 59 ? 1 : 0;
+}
+
+namespace {
+
+// LPN_PROFILE=1: a [clock] line a second with what the game's frame clock (0x2486080) stepped:
+// frame times, game seconds per real second for its float time and its 1/3000 s ticks, and how
+// many frames were too short to count as one 60 Hz or 30 Hz frame when rounded.
+void clockStats() {
+    static const bool enabled = std::getenv("LPN_PROFILE") != nullptr;
+    if (!enabled) return;
+    struct Clock {
+        float dt;           // +0x60
+        int32_t ticks;      // +0x64
+        uint8_t pad0[0x10];
+        float time;         // +0x78
+        float rawTime;      // +0x7c
+        uint32_t totalTicks; // +0x80
+        uint8_t pad1[0xc];
+        uint32_t fixedOn;   // +0x90
+        float fixedDt;      // +0x94
+        uint32_t flags;     // +0x98
+    };
+    static_assert(offsetof(Clock, time) == 0x18 && offsetof(Clock, fixedOn) == 0x30);
+    const Clock& c = *reinterpret_cast<const Clock*>(gEbootText + 0x2486080 + 0x60);
+    using Wall = std::chrono::steady_clock;
+    static Wall::time_point start = Wall::now();
+    static float time0 = c.time;
+    static uint32_t ticks0 = c.totalTicks;
+    static int frames = 0, under60 = 0, under30 = 0;
+    static float dtMin = 1e9f, dtMax = 0, dtSum = 0;
+    ++frames;
+    dtSum += c.dt, dtMin = std::min(dtMin, c.dt), dtMax = std::max(dtMax, c.dt);
+    under60 += std::lrint(c.dt * 60.0f) == 0; // as cvtss2si rounds: half to even
+    under30 += std::lrint(c.dt * 30.0f) == 0;
+    const double wall = std::chrono::duration<double>(Wall::now() - start).count();
+    if (wall < 1.0) return;
+    static int second = 0;
+    std::fprintf(stderr,
+                 "[clock] t=%d fps=%.0f dt=%.2f/%.2f/%.2f ms speed=%.3f ticks=%.3f round0@60=%d round0@30=%d "
+                 "fixed=%u/%.4f flags=0x%x\n",
+                 ++second, frames / wall, dtMin * 1e3f, dtSum / frames * 1e3f, dtMax * 1e3f, (c.time - time0) / wall,
+                 (c.totalTicks - ticks0) / 3000.0 / wall, under60, under30, c.fixedOn, c.fixedDt, c.flags);
+    start = Wall::now(), time0 = c.time, ticks0 = c.totalTicks;
+    frames = under60 = under30 = 0;
+    dtMin = 1e9f, dtMax = dtSum = 0;
+}
+
+} // namespace
 
 void syncFrameClock() {
+    if (gEbootText) clockStats();
     const int want = gClockWanted;
     if (!gEbootText || want == gClockActive) return;
     for (const CodePatch& p : kMeasured) write(p, want >= 1);
