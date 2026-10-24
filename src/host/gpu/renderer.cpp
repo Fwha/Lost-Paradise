@@ -490,6 +490,7 @@ struct Profiler {
     uint64_t fastRes[3] = {}; // of kFastResources: resource counts, a buffer, an image
     uint64_t fastMoved = 0; // fast draws that bound a buffer again
     uint64_t fastSwitches = 0; // fast draws that switched shaders (switchDraw)
+    uint64_t depthJoins = 0, depthOnly = 0; // depth-only draws that joined the open pass, of all depth-only ones
     std::unordered_map<uint32_t, uint64_t> fastCtx; // the context registers that differed
     uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
@@ -1067,9 +1068,10 @@ public:
         std::fprintf(stderr, "[prof] t=%.1f frames %" PRIu64 "-%" PRIu64 ": %.1f fps, %.1f ms/frame, worst %.1f ms, %" PRIu64 " over 17 ms;",
                      profile::seconds(), frame_ - windowFrames_, frame_, n / wall, wall * 1000 / n, worstFrameMs_, slowFrames_);
         for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.2f", kProfNames[i], prof_.ns[i] / 1e6 / n);
-        std::fprintf(stderr, " passes for targets %.0f feedback %.0f (depth %.0f color %.0f) store %.0f other %.0f;",
+        std::fprintf(stderr, " passes for targets %.0f feedback %.0f (depth %.0f color %.0f) store %.0f other %.0f; depth-only draws %.0f (%.0f joined a pass);",
                      prof_.passWhy[0] / n, prof_.passWhy[1] / n, prof_.feedbackOn[0] / n,
-                     prof_.feedbackOn[1] / n, prof_.passWhy[2] / n, prof_.passWhy[3] / n);
+                     prof_.feedbackOn[1] / n, prof_.passWhy[2] / n, prof_.passWhy[3] / n, prof_.depthOnly / n,
+                     prof_.depthJoins / n);
         std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / n, prof_.dmas / n,
                      prof_.dmaBytes / n / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
@@ -4075,10 +4077,16 @@ private:
         // targets attached but not written. Outside the city gate the game interleaves depth-only
         // draws with color ones on the same depth buffer: each switch was a new pass and barrier,
         // ~430 a frame (60 fps).
+        if (!colorCount && hasDepth) ++prof_.depthOnly;
         if (!colorCount && hasDepth && pass_.open && pass_.colorCount && pass_.depth == depth.imageView &&
-            pass_.stencil == gs.stencil && pass_.width == width && pass_.height == height && !noDepthJoin_) {
+            pass_.stencil == gs.stencil && pass_.width <= width && pass_.height <= height && !noDepthJoin_) {
+            // The pass's area is the smaller of its targets' (the depth buffer is often taller).
+            ++prof_.depthJoins;
             colorCount = pass_.colorCount;
+            width = pass_.width;
+            height = pass_.height;
             for (uint32_t i = 0; i < colorCount; ++i) {
+                colors[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
                 colors[i].imageView = pass_.views[i];
                 colors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
                 colors[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
