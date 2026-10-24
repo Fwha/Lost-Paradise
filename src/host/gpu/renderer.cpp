@@ -774,8 +774,11 @@ public:
         batchIdleCv_.wait(lock, [&] { return analysisBatches_.empty() && batchesBusy_ == 0; });
     }
     void onDraw(const DrawCall& d, const GpuRegs& r) override {
-        DrawAnalysis a;
-        {
+        // Analyses are taken, and handed back, a run at a time: a lock per draw was 4% of the
+        // recorder at 6,000 draws a frame.
+        if (takenNext_ == taken_.size()) {
+            taken_.clear();
+            takenNext_ = 0;
             std::unique_lock lock(analysesMutex_);
             if (analyses_.empty()) {
                 warnOnce("a draw arrived without its analysis");
@@ -785,18 +788,25 @@ public:
                 ProfScope pw(prof_, kProfAnalysisWait);
                 analysesCv_.wait(lock, [&] { return analyses_.front().ready; });
             }
-            a = std::move(analyses_.front());
-            analyses_.pop_front();
+            do {
+                taken_.push_back(std::move(analyses_.front()));
+                analyses_.pop_front();
+            } while (taken_.size() < kTakeRun && !analyses_.empty() && analyses_.front().ready);
         }
+        DrawAnalysis& a = taken_[takenNext_++];
         struct Recycle { // hands `a` back to the analysis thread however the draw ends
             Renderer& r;
             DrawAnalysis& a;
             ~Recycle() {
+                r.returned_.push_back(std::move(a));
+                if (r.returned_.size() < kTakeRun) return;
                 std::lock_guard lock(r.analysesMutex_);
                 // As many as can be in flight: analysis runs up to a frame ahead, and at ~6,000
                 // draws a frame a smaller pool left most draws allocating a fresh one (12% of the
                 // analysis thread in malloc) and the recorder freeing it (6% in ~Program).
-                if (r.spareAnalyses_.size() < 16384) r.spareAnalyses_.push_back(std::move(a));
+                for (DrawAnalysis& x : r.returned_)
+                    if (r.spareAnalyses_.size() < 16384) r.spareAnalyses_.push_back(std::move(x));
+                r.returned_.clear();
             }
         } recycle{*this, a};
         std::lock_guard lock(m_);
@@ -4501,6 +4511,9 @@ private:
     std::condition_variable analysesCv_; // a DrawAnalysis is ready
     std::deque<DrawAnalysis> analyses_; // one per draw or dispatch, for the recorder
     std::vector<DrawAnalysis> spareAnalyses_; // used ones, back from the recorder
+    static constexpr size_t kTakeRun = 64;
+    std::vector<DrawAnalysis> taken_, returned_; // the recorder's: ready ones taken, used ones to hand back
+    size_t takenNext_ = 0;
     std::deque<uint64_t> dmaOverlays_, writeOverlays_; // the analysis thread's overlay of each DMA / WRITE_DATA
     std::vector<std::unique_ptr<AnalysisCtx>> actx_; // one per worker (one without workers)
     unsigned analysisWorkers_ = 0;
