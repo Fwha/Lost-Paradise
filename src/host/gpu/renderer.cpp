@@ -480,6 +480,65 @@ private:
     std::chrono::steady_clock::time_point t0_;
 };
 
+// Vulkan commands recorded on a thread of their own. The recorder thread decides every draw's
+// state, resources and pipeline, and queues the Vulkan calls themselves (about a quarter of its
+// time went into the driver) as closures in chunks; the command thread runs them in order into
+// the batch's command buffer, ends it and submits it. Arrays a call points to are copied into
+// the chunk. LPN_SYNC_RECORD=1 runs each call on the recorder as it is made.
+class CmdChunk {
+public:
+    template <typename F> void push(F&& f) {
+        using T = std::decay_t<F>;
+        void* p = alloc(sizeof(T), alignof(T));
+        new (p) T(std::forward<F>(f));
+        ops_.push_back({[](void* o) {
+                            T& t = *static_cast<T*>(o);
+                            t();
+                            t.~T();
+                        },
+                        p});
+    }
+    template <typename T> T* keep(const T* src, size_t n) {
+        if (!n) return nullptr;
+        T* d = static_cast<T*>(alloc(sizeof(T) * n, alignof(T)));
+        std::memcpy(static_cast<void*>(d), src, sizeof(T) * n);
+        return d;
+    }
+    bool empty() const { return ops_.empty(); }
+    void run() {
+        for (const Op& o : ops_) o.call(o.obj);
+        ops_.clear();
+        block_ = 0;
+        used_ = 0;
+    }
+
+private:
+    static constexpr size_t kBlock = 256 << 10;
+    void* alloc(size_t size, size_t align) {
+        for (;;) {
+            if (block_ < blocks_.size()) {
+                const size_t at = (used_ + align - 1) & ~(align - 1);
+                if (at + size <= blocks_[block_].second) {
+                    used_ = at + size;
+                    return blocks_[block_].first.get() + at;
+                }
+                ++block_;
+                used_ = 0;
+                continue;
+            }
+            const size_t n = std::max(kBlock, size + align);
+            blocks_.emplace_back(std::make_unique<std::byte[]>(n), n);
+        }
+    }
+    struct Op {
+        void (*call)(void*);
+        void* obj;
+    };
+    std::vector<Op> ops_;
+    std::vector<std::pair<std::unique_ptr<std::byte[]>, size_t>> blocks_;
+    size_t block_ = 0, used_ = 0;
+};
+
 class Renderer final : public DrawListener {
 public:
     bool init() {
@@ -523,6 +582,7 @@ public:
         if (!dummyBuffer_) return false;
         sync_ = getenv("LPN_GPU_SYNC") != nullptr;
         std::thread([this] { completeBatches(); }).detach();
+        if (!syncRecord_) std::thread([this] { commandThread(); }).detach();
         storageAlign_ = std::max<VkDeviceSize>(vk_.props.limits.minStorageBufferOffsetAlignment, 16);
         if (const char* t = getenv("LPN_GPU_TRACE")) traceFrame_ = std::strtoull(t, nullptr, 0);
         if (const char* sn = getenv("LPN_GPU_SNAP")) {
@@ -641,10 +701,13 @@ public:
         else if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r, a);
         else warnOnce("indirect draws and dispatches are not rendered yet");
         if (frame_ == timingFrame_ && timing_ && recording_ && timingMeta_.size() + 1 < kTimingQueries) {
-            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timing_, uint32_t(timingMeta_.size() + 1));
+            rec([c = cmd_, q = timing_, i = uint32_t(timingMeta_.size() + 1)] {
+                vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q, i);
+            });
             timingMeta_.push_back({drawIndex_, shaderAddress(r, d.kind == DrawCall::kDispatch ? reg::kPgmLoCs : reg::kPgmLoPs),
                                    d.kind == DrawCall::kDispatch, prof_.passes != passesBefore, d.count});
         }
+        if (++drawsSinceHandOff_ >= 32) handOff(); // the command thread trails by a few draws
         static const uint32_t flushDraws = getenv("LPN_FLUSH_DRAWS") ? std::atoi(getenv("LPN_FLUSH_DRAWS")) : 400;
         if (flushDraws && recording_ && ++drawsSinceFlush_ >= flushDraws) flush();
     }
@@ -695,10 +758,10 @@ public:
         begin();
         fullBarrier();
         if (fill) {
-            vkCmdFillBuffer(cmd_, db, doff, bytes, value);
+            rec([c = cmd_, db, doff, bytes, value] { vkCmdFillBuffer(c, db, doff, bytes, value); });
         } else {
-            const VkBufferCopy c{soff, doff, bytes};
-            vkCmdCopyBuffer(cmd_, sb, db, 1, &c);
+            const VkBufferCopy bc{soff, doff, bytes};
+            rec([c = cmd_, sb, db, bc] { vkCmdCopyBuffer(c, sb, db, 1, &bc); });
         }
         if (raceCheck_) noteWrite(dst, bytes);
         ++prof_.dmas, prof_.dmaBytes += bytes;
@@ -787,8 +850,10 @@ public:
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(vk_.phys, &props);
         gpuTickNs_ = props.limits.timestampPeriod;
-        vkCmdResetQueryPool(cmd_, timing_, 0, kTimingQueries);
-        vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timing_, 0);
+        rec([c = cmd_, q = timing_] {
+            vkCmdResetQueryPool(c, q, 0, kTimingQueries);
+            vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q, 0);
+        });
         timingMeta_.clear();
     }
     void reportTiming() {
@@ -904,7 +969,7 @@ public:
         VkBufferImageCopy r{};
         r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         r.imageExtent = {c.w, c.h, 1};
-        vkCmdCopyImageToBuffer(cmd_, s.img.image, VK_IMAGE_LAYOUT_GENERAL, d.buf, 1, &r);
+        rec([c = cmd_, im = s.img.image, buf = d.buf, r] { vkCmdCopyImageToBuffer(c, im, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r); });
         if (!riding) flush();
         std::lock_guard dl(doneMutex_);
         c.seq = riding ? submitted_ + 1 : submitted_;
@@ -1057,7 +1122,7 @@ private:
         c.imageExtent = {w, h, 1};
         const VkDeviceSize at = ringAlloc(bytes, 16);
         c.bufferOffset = at;
-        vkCmdCopyImageToBuffer(cmd_, s.img.image, VK_IMAGE_LAYOUT_GENERAL, ring_, 1, &c);
+        rec([cb = cmd_, im = s.img.image, buf = ring_, c] { vkCmdCopyImageToBuffer(cb, im, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &c); });
         const auto* src = static_cast<const uint8_t*>(ringPtr_) + at;
         waitIdle();
         pixels.assign(size_t(width) * height, 0);
@@ -1072,6 +1137,62 @@ private:
     // finish its previous submission; a completion thread waits on the fences and then runs
     // what was deferred until the GPU is done (fences the game polls, interrupts, deletions).
     // LPN_GPU_SYNC=1 waits after every submission instead.
+    // Queues a Vulkan call (a closure over values, given the batch's command buffer) for the
+    // command thread.
+    template <typename F> void rec(F&& f) {
+        if (syncRecord_) f();
+        else chunk_->push(std::forward<F>(f));
+    }
+    // Storage for an array a queued call points to, valid until the call has run.
+    template <typename T> const T* keep(const T* p, size_t n) { return syncRecord_ ? p : chunk_->keep(p, n); }
+    void handOff() {
+        drawsSinceHandOff_ = 0;
+        if (syncRecord_ || chunk_->empty()) return;
+        std::unique_ptr<CmdChunk> next;
+        {
+            std::lock_guard lock(chunkMutex_);
+            chunks_.push_back(std::move(chunk_));
+            if (!spareChunks_.empty()) {
+                next = std::move(spareChunks_.front());
+                spareChunks_.pop_front();
+            }
+        }
+        chunkCv_.notify_one();
+        chunk_ = next ? std::move(next) : std::make_unique<CmdChunk>();
+    }
+    void commandThread() {
+        for (;;) {
+            std::unique_ptr<CmdChunk> c;
+            {
+                std::unique_lock lock(chunkMutex_);
+                chunkCv_.wait(lock, [&] { return !chunks_.empty(); });
+                c = std::move(chunks_.front());
+                chunks_.pop_front();
+            }
+            c->run();
+            std::lock_guard lock(chunkMutex_);
+            spareChunks_.push_back(std::move(c));
+        }
+    }
+    void pushDescriptors(VkPipelineBindPoint point, VkPipelineLayout layout, std::vector<VkWriteDescriptorSet>& writes,
+                         std::vector<VkDescriptorBufferInfo>& bufs, std::vector<VkDescriptorImageInfo>& imgs) {
+        if (syncRecord_) {
+            linkWrites(writes, bufs, imgs);
+            vk_.cmdPushDescriptorSet(cmd_, point, layout, 0, uint32_t(writes.size()), writes.data());
+            return;
+        }
+        auto* w = const_cast<VkWriteDescriptorSet*>(keep(writes.data(), writes.size()));
+        const VkDescriptorBufferInfo* b = keep(bufs.data(), bufs.size());
+        const VkDescriptorImageInfo* im = keep(imgs.data(), imgs.size());
+        size_t nb = 0, ni = 0;
+        for (size_t k = 0; k < writes.size(); ++k) {
+            if (w[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) w[k].pBufferInfo = &b[nb++];
+            else w[k].pImageInfo = &im[ni++];
+        }
+        const uint32_t n = uint32_t(writes.size());
+        rec([this, c = cmd_, point, layout, n, w] { vk_.cmdPushDescriptorSet(c, point, layout, 0, n, w); });
+    }
+
     void useBatch(uint32_t i) {
         cur_ = i;
         cmd_ = batches_[i].cmd;
@@ -1088,40 +1209,47 @@ private:
             std::unique_lock lock(doneMutex_);
             doneCv_.wait(lock, [&] { return !b.busy; });
         }
-        VK_CHECK(vkResetFences(vk_.device, 1, &b.fence));
-        VK_CHECK(vkResetCommandBuffer(cmd_, 0));
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        VK_CHECK(vkBeginCommandBuffer(cmd_, &bi));
+        rec([this, c = cmd_, fence = b.fence] {
+            VK_CHECK(vkResetFences(vk_.device, 1, &fence));
+            VK_CHECK(vkResetCommandBuffer(c, 0));
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            VK_CHECK(vkBeginCommandBuffer(c, &bi));
+        });
         recording_ = true;
         bound_ = Bound{};
         needBarrier_ = true; // earlier batches' writes
         if (frame_ == timingFrame_ && timing_ && timingMeta_.size() + 1 < kTimingQueries) {
-            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timing_, uint32_t(timingMeta_.size() + 1));
+            rec([c = cmd_, q = timing_, i = uint32_t(timingMeta_.size() + 1)] {
+                vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, q, i);
+            });
             timingMeta_.push_back({0, 0, false, false, 0, true});
         }
-        if (timestamps_) {
-            vkCmdResetQueryPool(cmd_, timestamps_, 2 * cur_, 2);
-            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamps_, 2 * cur_);
-        }
+        if (timestamps_)
+            rec([c = cmd_, q = timestamps_, i = 2 * cur_] {
+                vkCmdResetQueryPool(c, q, i, 2);
+                vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, q, i);
+            });
     }
 
     void flush() {
         if (!recording_) {
             if (!pendingDone_.empty()) {
-                // Nothing new to submit: due when the last submission finishes.
-                std::vector<std::function<void()>> now;
-                {
-                    std::lock_guard lock(doneMutex_);
-                    if (!inFlight_.empty()) {
-                        auto& done = batches_[inFlight_.back()].done;
-                        for (auto& f : pendingDone_) done.push_back(std::move(f));
-                    } else {
-                        now.swap(pendingDone_);
+                // Nothing new to submit: due when the last submission finishes. Decided on the
+                // command thread, which has submitted everything queued before.
+                rec([this, fns = std::move(pendingDone_)]() mutable {
+                    {
+                        std::lock_guard lock(doneMutex_);
+                        if (!inFlight_.empty()) {
+                            auto& done = batches_[inFlight_.back()].done;
+                            for (auto& f : fns) done.push_back(std::move(f));
+                            return;
+                        }
                     }
-                    pendingDone_.clear();
-                }
-                for (auto& f : now) f();
+                    for (auto& f : fns) f();
+                });
+                pendingDone_.clear();
+                handOff();
             }
             if (sync_) waitSubmitted();
             return;
@@ -1134,24 +1262,34 @@ private:
             afterFlush_.insert(afterFlush_.begin(), [this, reads] { checkReads(*reads); });
         }
         Batch& b = batches_[cur_];
-        if (timestamps_) vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamps_, 2 * cur_ + 1);
-        VK_CHECK(vkEndCommandBuffer(cmd_));
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &cmd_;
-        VK_CHECK(vkQueueSubmit(vk_.queue, 1, &si, b.fence));
-        if (timelineOn()) timeline("rec: batch %" PRIu64 " submitted", submitted_ + 1);
-        {
-            std::lock_guard lock(doneMutex_);
-            b.busy = true;
-            ++submitted_;
-            for (auto& f : afterFlush_) b.done.push_back(std::move(f));
-            for (auto& f : pendingDone_) b.done.push_back(std::move(f));
-            inFlight_.push_back(cur_);
-        }
+        if (timestamps_)
+            rec([c = cmd_, q = timestamps_, i = 2 * cur_ + 1] { vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q, i); });
+        std::vector<std::function<void()>> fns = std::move(afterFlush_);
+        for (auto& f : pendingDone_) fns.push_back(std::move(f));
         afterFlush_.clear();
         pendingDone_.clear();
-        doneCv_.notify_all();
+        {
+            std::lock_guard lock(doneMutex_);
+            b.busy = true; // its ring and command buffer are not reused until the GPU is done
+            ++submitted_;
+        }
+        // The completion thread learns of the batch once it is submitted (inFlight_).
+        rec([this, i = cur_, c = cmd_, fns = std::move(fns)]() mutable {
+            Batch& b = batches_[i];
+            VK_CHECK(vkEndCommandBuffer(c));
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &c;
+            VK_CHECK(vkQueueSubmit(vk_.queue, 1, &si, b.fence));
+            if (timelineOn()) timeline("rec: batch submitted");
+            {
+                std::lock_guard lock(doneMutex_);
+                for (auto& f : fns) b.done.push_back(std::move(f));
+                inFlight_.push_back(i);
+            }
+            doneCv_.notify_all();
+        });
+        handOff();
         recording_ = false;
         useBatch((cur_ + 1) % kBatches);
         drawsSinceFlush_ = 0;
@@ -1166,7 +1304,7 @@ private:
     void waitSubmitted() {
         ProfScope ps(prof_, kProfGpuWait);
         std::unique_lock lock(doneMutex_);
-        doneCv_.wait(lock, [&] { return inFlight_.empty() && !completing_; });
+        doneCv_.wait(lock, [&] { return completed_ >= submitted_ && !completing_; });
     }
 
     void completeBatches() {
@@ -1224,8 +1362,10 @@ private:
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
-                             nullptr, 0, nullptr);
+        rec([c = cmd_, mb] {
+            vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0,
+                                 nullptr);
+        });
         ++prof_.barriers;
         needBarrier_ = false;
         drawWritten_.clear();
@@ -1405,17 +1545,23 @@ private:
         ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         ib.image = img.image;
         ib.subresourceRange = {img.aspect, 0, 1, 0, ici.arrayLayers};
-        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
-                             0, nullptr, 1, &ib);
+        rec([c = cmd_, ib] {
+            vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &ib);
+        });
         // Clear so never-written surfaces read as black rather than garbage.
         const VkImageSubresourceRange range{img.aspect, 0, 1, 0, ici.arrayLayers};
         if (depth) {
-            VkClearDepthStencilValue v{1.0f, 0};
             if (usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
-                vkCmdClearDepthStencilImage(cmd_, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+                rec([c = cmd_, im = img.image, range] {
+                    const VkClearDepthStencilValue v{1.0f, 0};
+                    vkCmdClearDepthStencilImage(c, im, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+                });
         } else if ((usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
-            VkClearColorValue v{};
-            vkCmdClearColorImage(cmd_, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+            rec([c = cmd_, im = img.image, range] {
+                const VkClearColorValue v{};
+                vkCmdClearColorImage(c, im, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+            });
         }
         return true;
     }
@@ -2264,17 +2410,19 @@ private:
         // Scale is in 1/16ths of the slope; the offset is in the depth format's units, as Vulkan's.
         if (!bound_.state || std::memcmp(bound_.polyOffset, d.polyOffset, sizeof d.polyOffset) != 0) {
             std::memcpy(bound_.polyOffset, d.polyOffset, sizeof d.polyOffset);
-            vkCmdSetDepthBias(cmd_, std::bit_cast<float>(d.polyOffset[2]), std::bit_cast<float>(d.polyOffset[0]),
-                              std::bit_cast<float>(d.polyOffset[1]) / 16.0f);
+            rec([c = cmd_, k = std::bit_cast<float>(d.polyOffset[2]), cl = std::bit_cast<float>(d.polyOffset[0]),
+                 sl = std::bit_cast<float>(d.polyOffset[1]) / 16.0f] { vkCmdSetDepthBias(c, k, cl, sl); });
         }
         const uint32_t back = (depthControl >> 7) & 1 ? d.stencilMasksBf : d.stencilMasks;
         if (bound_.state && bound_.stencil[0] == d.stencilMasks && bound_.stencil[1] == back) return;
         bound_.stencil[0] = d.stencilMasks, bound_.stencil[1] = back;
-        for (auto [face, m] : {std::pair{VK_STENCIL_FACE_FRONT_BIT, d.stencilMasks}, std::pair{VK_STENCIL_FACE_BACK_BIT, back}}) {
-            vkCmdSetStencilCompareMask(cmd_, face, (m >> 8) & 0xFF);
-            vkCmdSetStencilWriteMask(cmd_, face, (m >> 16) & 0xFF);
-            vkCmdSetStencilReference(cmd_, face, m & 0xFF);
-        }
+        rec([c = cmd_, front = d.stencilMasks, back] {
+            for (auto [face, m] : {std::pair{VK_STENCIL_FACE_FRONT_BIT, front}, std::pair{VK_STENCIL_FACE_BACK_BIT, back}}) {
+                vkCmdSetStencilCompareMask(c, face, (m >> 8) & 0xFF);
+                vkCmdSetStencilWriteMask(c, face, (m >> 16) & 0xFF);
+                vkCmdSetStencilReference(c, face, m & 0xFF);
+            }
+        });
     }
     // What the command buffer being recorded has bound and set, so unchanged state is not set
     // again for every draw (most of a crowd's draws share it). Reset by begin().
@@ -2487,7 +2635,7 @@ private:
         c.bufferRowLength = bc ? ew * 4 : ew;
         c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, t.type() == 10 ? 1 : layers};
         c.imageExtent = {w, h, t.type() == 10 ? t.depth() : 1};
-        vkCmdCopyBufferToImage(cmd_, ring_, tex.img.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        rec([cb = cmd_, buf = ring_, im = tex.img.image, c] { vkCmdCopyBufferToImage(cb, buf, im, VK_IMAGE_LAYOUT_GENERAL, 1, &c); });
         return &tex;
     }
 
@@ -2916,9 +3064,8 @@ private:
         bindResources(cs, 0, VK_SHADER_STAGE_COMPUTE_BIT, writes, bufs, imgs);
         linkWrites(writes, bufs, imgs);
         fullBarrier();
-        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-        vk_.cmdPushDescriptorSet(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, lay.pipeline, 0, uint32_t(writes.size()),
-                                 writes.data());
+        rec([c = cmd_, pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pipe); });
+        pushDescriptors(VK_PIPELINE_BIND_POINT_COMPUTE, lay.pipeline, writes, bufs, imgs);
         if (trace_) captureProgram(cs, m, "cs");
         if (trace_)
             for (const auto& b : cs.buffers) {
@@ -2927,7 +3074,7 @@ private:
                 std::fprintf(traceOut_, "[trace]   buffer 0x%" PRIx64 " stride %u records %u first 0x%x%s\n", b.base(),
                              b.stride(), b.numRecords(), first, b.store ? " (written)" : "");
             }
-        vkCmdDispatch(cmd_, d.groups[0], d.groups[1], d.groups[2]);
+        rec([c = cmd_, x = d.groups[0], y = d.groups[1], z = d.groups[2]] { vkCmdDispatch(c, x, y, z); });
         ++stats_.dispatches;
         for (const auto& im : cs.images)
             if (im.storage && im.tileMode() == kTileLinearAligned) writeBack(im);
@@ -2967,7 +3114,7 @@ private:
         VkDeviceSize offset;
         if (b.base() % 4 || !guestBuffer(b.base(), records * 16, buffer, offset)) return false;
         fullBarrier();
-        vkCmdFillBuffer(cmd_, buffer, offset, records * 16, value[0]);
+        rec([c = cmd_, buffer, offset, bytes = records * 16, v = value[0]] { vkCmdFillBuffer(c, buffer, offset, bytes, v); });
         if (raceCheck_) noteWrite(b.base(), records * 16);
         ++stats_.dispatches;
         fastClear(b.base());
@@ -3009,15 +3156,15 @@ private:
         fullBarrier();
         VkImageSubresourceRange range{img.aspect, 0, 1, 0, img.layers};
         if (m.depth) {
-            VkClearDepthStencilValue v{std::bit_cast<float>(m.clear[0]), m.clear[1] & 0xFF};
-            vkCmdClearDepthStencilImage(cmd_, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+            const VkClearDepthStencilValue v{std::bit_cast<float>(m.clear[0]), m.clear[1] & 0xFF};
+            rec([c = cmd_, im = img.image, v, range] { vkCmdClearDepthStencilImage(c, im, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range); });
         } else {
             VkClearColorValue v;
             if (!clearColor(img.format, m.clear, v)) {
                 warnOnce("fast clear of a render target in format " + std::to_string(img.format));
                 return;
             }
-            vkCmdClearColorImage(cmd_, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+            rec([c = cmd_, im = img.image, v, range] { vkCmdClearColorImage(c, im, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range); });
         }
         if (trace_)
             std::fprintf(traceOut_, "[trace]   fast clear of %s 0x%" PRIx64 " to 0x%x 0x%x\n", m.depth ? "depth" : "target",
@@ -3094,7 +3241,7 @@ private:
         c.bufferRowLength = pitch;
         c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         c.imageExtent = {w, h, 1};
-        vkCmdCopyImageToBuffer(cmd_, s.img.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &c);
+        rec([cb = cmd_, im = s.img.image, buffer, c] { vkCmdCopyImageToBuffer(cb, im, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &c); });
         if (trace_)
             std::fprintf(traceOut_, "[trace]   copied %ux%u back to 0x%" PRIx64 "\n", w, h, t.base());
     }
@@ -3313,7 +3460,7 @@ private:
         if (!pass_.open || feedback || !pass_.sameTargets(pass)) {
             if (prof_.on) ++prof_.passWhy[!pass_.open ? passClosedBy_ : feedback ? kPassFeedback : kPassTargets];
             if (pass_.open) { // to other targets: no barrier unless something since the last one needs it
-                vkCmdEndRendering(cmd_);
+                rec([c = cmd_] { vkCmdEndRendering(c); });
                 pass_.open = false;
             }
             // Draws since the last barrier wrote and sampled only images; another pass needs the
@@ -3324,23 +3471,25 @@ private:
             ri.renderArea = {{0, 0}, {width, height}};
             ri.layerCount = 1;
             ri.colorAttachmentCount = colorCount;
-            ri.pColorAttachments = colors;
+            ri.pColorAttachments = keep(colors, colorCount);
             if (hasDepth) {
-                ri.pDepthAttachment = &depth;
-                if (gs.stencil) ri.pStencilAttachment = &depth;
+                ri.pDepthAttachment = keep(&depth, 1);
+                if (gs.stencil) ri.pStencilAttachment = ri.pDepthAttachment;
             }
-            vkCmdBeginRendering(cmd_, &ri);
+            rec([c = cmd_, ri] { vkCmdBeginRendering(c, &ri); });
             std::swap(pass_, pass); // the old pass's storage is reused by the next draw
             pass_.open = true;
             ++prof_.passes;
         }
-        if (bound_.pipeline != pipe) vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe), bound_.pipeline = pipe;
-        vk_.cmdPushDescriptorSet(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, lay.pipeline, 0, uint32_t(writes.size()),
-                                 writes.data());
+        if (bound_.pipeline != pipe) {
+            rec([c = cmd_, pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); });
+            bound_.pipeline = pipe;
+        }
+        pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, lay.pipeline, writes, bufs, imgs);
         setViewportScissor(r, width, height);
         if (!bound_.state || std::memcmp(bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
             std::memcpy(bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
-            vkCmdSetBlendConstants(cmd_, reinterpret_cast<const float*>(bound_.blend));
+            rec([c = cmd_, b = std::bit_cast<std::array<float, 4>>(bound_.blend)] { vkCmdSetBlendConstants(c, b.data()); });
         }
         setDynamicState(dyn, gs.depthControl);
         bound_.state = true;
@@ -3352,17 +3501,19 @@ private:
             ca.clearValue.depthStencil = {z, r.ctx[reg::kDbStencilClear] & 0xFF};
             if (gs.stencil && (dbRender & 2)) ca.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
             VkClearRect cr{{{0, 0}, {width, height}}, 0, 1};
-            vkCmdClearAttachments(cmd_, 1, &ca, 1, &cr);
+            rec([c = cmd_, ca, cr] { vkCmdClearAttachments(c, 1, &ca, 1, &cr); });
         }
         if (d.kind == DrawCall::kIndexed) {
             const VkIndexType it = r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
             if (bound_.index != indexBuffer || bound_.indexOffset != indexOffset || bound_.indexType != it) {
-                vkCmdBindIndexBuffer(cmd_, indexBuffer, indexOffset, it);
+                rec([c = cmd_, indexBuffer, indexOffset, it] { vkCmdBindIndexBuffer(c, indexBuffer, indexOffset, it); });
                 bound_.index = indexBuffer, bound_.indexOffset = indexOffset, bound_.indexType = it;
             }
-            vkCmdDrawIndexed(cmd_, d.count, std::max(r.numInstances, 1u), d.indexOffset, 0, 0);
+            rec([c = cmd_, n = d.count, inst = std::max(r.numInstances, 1u), first = d.indexOffset] {
+                vkCmdDrawIndexed(c, n, inst, first, 0, 0);
+            });
         } else {
-            vkCmdDraw(cmd_, d.count, std::max(r.numInstances, 1u), 0, 0);
+            rec([c = cmd_, n = d.count, inst = std::max(r.numInstances, 1u)] { vkCmdDraw(c, n, inst, 0, 0); });
         }
         auto stores = [](const gcn::Program& p) {
             for (const auto& b : p.buffers)
@@ -3391,7 +3542,7 @@ private:
     void endPass() {
         needBarrier_ = true; // something other than a draw comes next
         if (!pass_.open) return;
-        vkCmdEndRendering(cmd_);
+        rec([c = cmd_] { vkCmdEndRendering(c); });
         pass_.open = false;
         passClosedBy_ = kPassOther;
     }
@@ -3426,7 +3577,7 @@ private:
             vp.x += vp.width;
             vp.width = -vp.width;
         }
-        if (!bound_.state || std::memcmp(&bound_.viewport, &vp, sizeof vp) != 0) vkCmdSetViewport(cmd_, 0, 1, &vp), bound_.viewport = vp;
+        if (!bound_.state || std::memcmp(&bound_.viewport, &vp, sizeof vp) != 0) rec([c = cmd_, vp] { vkCmdSetViewport(c, 0, 1, &vp); }), bound_.viewport = vp;
 
         int32_t x0 = 0, y0 = 0, x1 = int32_t(width), y1 = int32_t(height);
         auto clip = [&](uint32_t tl, uint32_t br) {
@@ -3450,7 +3601,7 @@ private:
             std::fprintf(traceOut_, "[trace]   viewport %.1f,%.1f %.1fx%.1f z %.2f..%.2f scissor %d,%d %ux%u vte 0x%x colfmt 0x%x\n",
                          vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth, sc.offset.x, sc.offset.y,
                          sc.extent.width, sc.extent.height, vte, r.ctx[reg::kSpiShaderColFormat]);
-        if (!bound_.state || std::memcmp(&bound_.scissor, &sc, sizeof sc) != 0) vkCmdSetScissor(cmd_, 0, 1, &sc), bound_.scissor = sc;
+        if (!bound_.state || std::memcmp(&bound_.scissor, &sc, sizeof sc) != 0) rec([c = cmd_, sc] { vkCmdSetScissor(c, 0, 1, &sc); }), bound_.scissor = sc;
     }
 
     Vk vk_;
@@ -3489,6 +3640,13 @@ private:
     std::vector<std::function<void()>> pendingDone_; // due after the batch being recorded
     bool sync_ = false;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE; // the current batch's
+    // The command thread's queue (see CmdChunk): chunks handed over in order, and spare ones.
+    bool syncRecord_ = getenv("LPN_SYNC_RECORD") != nullptr;
+    std::unique_ptr<CmdChunk> chunk_ = std::make_unique<CmdChunk>(); // being filled
+    std::mutex chunkMutex_;
+    std::condition_variable chunkCv_;
+    std::deque<std::unique_ptr<CmdChunk>> chunks_, spareChunks_;
+    uint32_t drawsSinceHandOff_ = 0;
     bool recording_ = false;
     VkBuffer ring_ = VK_NULL_HANDLE, dummyBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory dummyMemory_ = VK_NULL_HANDLE;
