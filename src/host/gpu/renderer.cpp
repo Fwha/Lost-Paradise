@@ -235,7 +235,9 @@ public:
             }
         return true;
     }
-    void clear() {
+    void clear() { // after every submission: the page buffers are kept for the next one
+        for (auto& [page, data] : pages_)
+            if (data) spare_.push_back(std::move(data));
         pages_.clear();
         for (Slot& s : slots_) s = Slot{};
     }
@@ -254,7 +256,10 @@ public:
     // Forgets the pages of [addr, addr + size), which changed.
     void invalidate(uint64_t addr, uint64_t size) {
         for (uint64_t page = addr & ~uint64_t(kPage - 1); page < addr + size; page += kPage) {
-            pages_.erase(page);
+            if (auto it = pages_.find(page); it != pages_.end()) {
+                if (it->second) spare_.push_back(std::move(it->second));
+                pages_.erase(it);
+            }
             if (Slot& s = slot(page); s.page == page) s = Slot{};
         }
     }
@@ -299,14 +304,21 @@ private:
         if (s.page == page) return s.data;
         auto it = pages_.find(page);
         if (it == pages_.end()) {
-            auto data = std::make_unique<std::array<uint8_t, kPage>>();
-            if (!readGuest(page, data->data(), kPage)) data.reset();
+            std::unique_ptr<std::array<uint8_t, kPage>> data;
+            if (!spare_.empty()) {
+                data = std::move(spare_.back());
+                spare_.pop_back();
+            } else {
+                data = std::make_unique<std::array<uint8_t, kPage>>();
+            }
+            if (!readGuest(page, data->data(), kPage)) spare_.push_back(std::move(data));
             it = pages_.emplace(page, std::move(data)).first;
         }
         s.page = page;
         return s.data = it->second ? it->second->data() : nullptr;
     }
     std::unordered_map<uint64_t, std::unique_ptr<std::array<uint8_t, kPage>>> pages_; // null: unreadable
+    std::vector<std::unique_ptr<std::array<uint8_t, kPage>>> spare_; // page buffers to reuse (a few thousand a frame)
     std::array<Slot, kSlots> slots_{};
 };
 
@@ -1082,6 +1094,7 @@ private:
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK(vkBeginCommandBuffer(cmd_, &bi));
         recording_ = true;
+        bound_ = Bound{};
         needBarrier_ = true; // earlier batches' writes
         if (frame_ == timingFrame_ && timing_ && timingMeta_.size() + 1 < kTimingQueries) {
             vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timing_, uint32_t(timingMeta_.size() + 1));
@@ -2249,15 +2262,32 @@ private:
 
     void setDynamicState(const DynamicState& d, uint32_t depthControl) {
         // Scale is in 1/16ths of the slope; the offset is in the depth format's units, as Vulkan's.
-        vkCmdSetDepthBias(cmd_, std::bit_cast<float>(d.polyOffset[2]), std::bit_cast<float>(d.polyOffset[0]),
-                          std::bit_cast<float>(d.polyOffset[1]) / 16.0f);
+        if (!bound_.state || std::memcmp(bound_.polyOffset, d.polyOffset, sizeof d.polyOffset) != 0) {
+            std::memcpy(bound_.polyOffset, d.polyOffset, sizeof d.polyOffset);
+            vkCmdSetDepthBias(cmd_, std::bit_cast<float>(d.polyOffset[2]), std::bit_cast<float>(d.polyOffset[0]),
+                              std::bit_cast<float>(d.polyOffset[1]) / 16.0f);
+        }
         const uint32_t back = (depthControl >> 7) & 1 ? d.stencilMasksBf : d.stencilMasks;
+        if (bound_.state && bound_.stencil[0] == d.stencilMasks && bound_.stencil[1] == back) return;
+        bound_.stencil[0] = d.stencilMasks, bound_.stencil[1] = back;
         for (auto [face, m] : {std::pair{VK_STENCIL_FACE_FRONT_BIT, d.stencilMasks}, std::pair{VK_STENCIL_FACE_BACK_BIT, back}}) {
             vkCmdSetStencilCompareMask(cmd_, face, (m >> 8) & 0xFF);
             vkCmdSetStencilWriteMask(cmd_, face, (m >> 16) & 0xFF);
             vkCmdSetStencilReference(cmd_, face, m & 0xFF);
         }
     }
+    // What the command buffer being recorded has bound and set, so unchanged state is not set
+    // again for every draw (most of a crowd's draws share it). Reset by begin().
+    struct Bound {
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        bool state = false; // the dynamic state below has been set
+        uint32_t blend[4] = {}, polyOffset[3] = {}, stencil[2] = {};
+        VkViewport viewport{};
+        VkRect2D scissor{};
+        VkBuffer index = VK_NULL_HANDLE;
+        VkDeviceSize indexOffset = 0;
+        VkIndexType indexType = VK_INDEX_TYPE_UINT16;
+    } bound_;
 
     static bool isIntegerFormat(VkFormat f) {
         switch (f) {
@@ -2733,7 +2763,7 @@ private:
         if (!l.entry) return nullptr;
         ProfScope ps(aprof_, kProfAnalyze);
         auto& walks = programs_[launchKey(l, bindingBase)].walks;
-        gcn::Program r;
+        gcn::Program& r = replayScratch_; // its storage cycles through adopt() (no allocations per launch)
         for (size_t i = 0; i < walks.size(); ++i) {
             if (!codeUnchanged(*walks[i].shapes.front())) {
                 programCount_ -= walks[i].shapes.size();
@@ -3304,12 +3334,16 @@ private:
             pass_.open = true;
             ++prof_.passes;
         }
-        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        if (bound_.pipeline != pipe) vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe), bound_.pipeline = pipe;
         vk_.cmdPushDescriptorSet(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, lay.pipeline, 0, uint32_t(writes.size()),
                                  writes.data());
         setViewportScissor(r, width, height);
-        vkCmdSetBlendConstants(cmd_, reinterpret_cast<const float*>(&r.ctx[reg::kCbBlendRed]));
+        if (!bound_.state || std::memcmp(bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
+            std::memcpy(bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
+            vkCmdSetBlendConstants(cmd_, reinterpret_cast<const float*>(bound_.blend));
+        }
         setDynamicState(dyn, gs.depthControl);
+        bound_.state = true;
         if (clearDepth) {
             VkClearAttachment ca{};
             ca.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -3321,7 +3355,11 @@ private:
             vkCmdClearAttachments(cmd_, 1, &ca, 1, &cr);
         }
         if (d.kind == DrawCall::kIndexed) {
-            vkCmdBindIndexBuffer(cmd_, indexBuffer, indexOffset, r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+            const VkIndexType it = r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+            if (bound_.index != indexBuffer || bound_.indexOffset != indexOffset || bound_.indexType != it) {
+                vkCmdBindIndexBuffer(cmd_, indexBuffer, indexOffset, it);
+                bound_.index = indexBuffer, bound_.indexOffset = indexOffset, bound_.indexType = it;
+            }
             vkCmdDrawIndexed(cmd_, d.count, std::max(r.numInstances, 1u), d.indexOffset, 0, 0);
         } else {
             vkCmdDraw(cmd_, d.count, std::max(r.numInstances, 1u), 0, 0);
@@ -3388,7 +3426,7 @@ private:
             vp.x += vp.width;
             vp.width = -vp.width;
         }
-        vkCmdSetViewport(cmd_, 0, 1, &vp);
+        if (!bound_.state || std::memcmp(&bound_.viewport, &vp, sizeof vp) != 0) vkCmdSetViewport(cmd_, 0, 1, &vp), bound_.viewport = vp;
 
         int32_t x0 = 0, y0 = 0, x1 = int32_t(width), y1 = int32_t(height);
         auto clip = [&](uint32_t tl, uint32_t br) {
@@ -3412,7 +3450,7 @@ private:
             std::fprintf(traceOut_, "[trace]   viewport %.1f,%.1f %.1fx%.1f z %.2f..%.2f scissor %d,%d %ux%u vte 0x%x colfmt 0x%x\n",
                          vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth, sc.offset.x, sc.offset.y,
                          sc.extent.width, sc.extent.height, vte, r.ctx[reg::kSpiShaderColFormat]);
-        vkCmdSetScissor(cmd_, 0, 1, &sc);
+        if (!bound_.state || std::memcmp(&bound_.scissor, &sc, sizeof sc) != 0) vkCmdSetScissor(cmd_, 0, 1, &sc), bound_.scissor = sc;
     }
 
     Vk vk_;
@@ -3434,6 +3472,7 @@ private:
     VkQueryPool timestamps_ = VK_NULL_HANDLE; // LPN_PROFILE: two per batch
     double gpuTickNs_ = 1;
     std::atomic<uint64_t> gpuBusyNs_{0};
+    gcn::Program replayScratch_; // the analysis thread's
     uint32_t textureCount_ = 0; // textures created, for their check phases
     std::mutex doneMutex_; // guards Batch::busy and done, inFlight_, completing_, the counters
     std::condition_variable doneCv_;
