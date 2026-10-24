@@ -1,6 +1,7 @@
 #include "host/display_menu.h"
 
 #include "host/display_settings.h"
+#include "host/gpu/renderer.h"
 #include "host/hle.h"
 #include "host/save_menu.h"
 
@@ -73,6 +74,7 @@ void select(SDL_Window* win) {
     if (gRow == 2) { // as closing the window does
         std::fprintf(stderr, "[window] exit from the display menu\n");
         printUnimplementedSummary();
+        render::saveCaches();
         std::_Exit(0);
     }
     const DisplaySettings& s = displaySettings();

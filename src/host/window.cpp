@@ -1,6 +1,7 @@
 #include "host/window.h"
 
 #include "host/display_menu.h"
+#include "host/gpu/renderer.h"
 #include "host/hle.h"
 #include "host/save_menu.h"
 #include "host/videoout.h"
@@ -144,6 +145,7 @@ void presenterThread() {
             if (e.type == SDL_QUIT) {
                 std::fprintf(stderr, "[window] closed\n");
                 printUnimplementedSummary();
+                render::saveCaches();
                 std::_Exit(0);
             }
             if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F12 && !e.key.repeat) requestCapture();

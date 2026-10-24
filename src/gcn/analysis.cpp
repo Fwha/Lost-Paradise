@@ -601,7 +601,12 @@ private:
     const Program* prior_; // replaying this program's trace
     bool diverged_ = false;
     uint32_t slot_ = ~0u; // the stepped instruction's TraceStep::slot
-    std::vector<bool> seenBuffers_, seenImages_;
+    // Kept per thread: a replay runs for every launch, and these would allocate each time.
+    static std::vector<bool>& seenStorage(int i) {
+        thread_local std::vector<bool> v[2];
+        return v[i];
+    }
+    std::vector<bool>&seenBuffers_ = seenStorage(0), &seenImages_ = seenStorage(1);
     Program p_;
 };
 
@@ -614,9 +619,17 @@ Program analyze(const LaunchState& launch, const ReadMemory& readCode, const Rea
 bool replay(const Program& p, const LaunchState& launch, const ReadMemory& readData, Program& out) {
     if (p.trace.empty()) return false;
     Analyzer a(launch, readData, readData, &p);
-    if (!a.replay()) return false;
-    out = std::move(a.program());
-    return true;
+    // A replay runs for every launch: it fills out's vectors, keeping their storage.
+    Program& q = a.program();
+    q.data.swap(out.data);
+    q.buffers.swap(out.buffers);
+    q.images.swap(out.images);
+    const bool ok = a.replay();
+    out.launch = q.launch;
+    out.data.swap(q.data);
+    out.buffers.swap(q.buffers);
+    out.images.swap(q.images);
+    return ok;
 }
 
 bool adopt(Program& p, Program& r) {
@@ -634,10 +647,11 @@ bool adopt(Program& p, Program& r) {
             x.dstSel() != y.dstSel())
             return false;
     }
+    // Swapped rather than moved: r takes p's old storage, for the caller's next replay.
     p.launch = r.launch;
-    p.data = std::move(r.data);
-    p.buffers = std::move(r.buffers);
-    p.images = std::move(r.images);
+    p.data.swap(r.data);
+    p.buffers.swap(r.buffers);
+    p.images.swap(r.images);
     return true;
 }
 

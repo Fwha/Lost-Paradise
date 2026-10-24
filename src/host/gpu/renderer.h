@@ -36,4 +36,8 @@ bool gpuDone(uint64_t mark);
 // Traces the next frame (as LPN_GPU_TRACE does) into `dir`: trace.txt and every render target.
 void captureNextFrame(const std::string& dir);
 
+// Before exiting: writes the driver's pipeline cache, so pipelines made since the last periodic
+// save are not compiled again next run.
+void saveCaches();
+
 } // namespace host::render

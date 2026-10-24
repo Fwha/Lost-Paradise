@@ -207,6 +207,19 @@ private:
     std::atomic<bool> failed_{false};
 };
 
+// GuestHasher::hash on the calling thread alone: the same chunks, the same result.
+uint64_t hashGuestSerial(uint64_t addr, size_t size) {
+    constexpr size_t kChunk = 128 << 10;
+    thread_local std::vector<uint8_t> buf(kChunk);
+    uint64_t h = 0xcbf29ce484222325ull ^ size;
+    for (size_t off = 0; off < size; off += kChunk) {
+        const size_t n = std::min(kChunk, size - off);
+        if (!readGuest(addr + off, buf.data(), n)) return 0;
+        h = (h ^ hashBytes(buf.data(), n)) * 0x100000001b3ull;
+    }
+    return h | 1;
+}
+
 // Guest reads for shader analysis, a page at a time. Analysis reads instruction by
 // instruction, and a syscall each made it the renderer's main cost. Memory a submission
 // references cannot change until the GPU is done with it, except where the command processor
@@ -235,7 +248,9 @@ public:
             }
         return true;
     }
-    void clear() {
+    void clear() { // after every submission: the page buffers are kept for the next one
+        for (auto& [page, data] : pages_)
+            if (data) spare_.push_back(std::move(data));
         pages_.clear();
         for (Slot& s : slots_) s = Slot{};
     }
@@ -254,7 +269,10 @@ public:
     // Forgets the pages of [addr, addr + size), which changed.
     void invalidate(uint64_t addr, uint64_t size) {
         for (uint64_t page = addr & ~uint64_t(kPage - 1); page < addr + size; page += kPage) {
-            pages_.erase(page);
+            if (auto it = pages_.find(page); it != pages_.end()) {
+                if (it->second) spare_.push_back(std::move(it->second));
+                pages_.erase(it);
+            }
             if (Slot& s = slot(page); s.page == page) s = Slot{};
         }
     }
@@ -299,14 +317,21 @@ private:
         if (s.page == page) return s.data;
         auto it = pages_.find(page);
         if (it == pages_.end()) {
-            auto data = std::make_unique<std::array<uint8_t, kPage>>();
-            if (!readGuest(page, data->data(), kPage)) data.reset();
+            std::unique_ptr<std::array<uint8_t, kPage>> data;
+            if (!spare_.empty()) {
+                data = std::move(spare_.back());
+                spare_.pop_back();
+            } else {
+                data = std::make_unique<std::array<uint8_t, kPage>>();
+            }
+            if (!readGuest(page, data->data(), kPage)) spare_.push_back(std::move(data));
             it = pages_.emplace(page, std::move(data)).first;
         }
         s.page = page;
         return s.data = it->second ? it->second->data() : nullptr;
     }
     std::unordered_map<uint64_t, std::unique_ptr<std::array<uint8_t, kPage>>> pages_; // null: unreadable
+    std::vector<std::unique_ptr<std::array<uint8_t, kPage>>> spare_; // page buffers to reuse (a few thousand a frame)
     std::array<Slot, kSlots> slots_{};
 };
 
@@ -382,13 +407,21 @@ struct Surface {
     uint64_t checkedFrame = ~0ull;
 };
 
+// A texture's full hash, computed off the recorder (see Renderer::guestTexture).
+struct AsyncHash {
+    std::atomic<int> state{0}; // 0 idle, 1 queued or running, 2 result ready
+    uint64_t result = 0;       // 0: unreadable
+};
+
 struct GuestTexture {
     Image img;
+    std::shared_ptr<AsyncHash> check;
     uint64_t hash = 0;
     uint64_t checkedFrame = ~0ull;
     uint64_t changedFrame = 0; // the contents were last (re)uploaded in this frame
     uint64_t sample = 0;       // sampleHash at the last full check
     uint32_t uses = 0;         // frames it was used in while unchanged
+    uint32_t phase = 0;        // which of every 8 uses gets the full check (spread across textures)
 };
 
 struct Import {
@@ -401,6 +434,7 @@ struct ShaderModule {
     VkShaderModule module = VK_NULL_HANDLE;
     gcn::Translation translation;
     uint32_t id = 0;
+    std::string name; // its SPIR-V cache name: a hash of the GLSL, the same in every run
 };
 
 struct BufferRange {
@@ -441,7 +475,7 @@ struct Profiler {
     uint64_t ns[kProfCount] = {};
     uint64_t passWhy[4] = {}; // why a new render pass started, by PassWhy
     uint64_t feedbackOn[2] = {}; // a draw sampled the open pass's depth / color attachment
-    uint64_t barriers = 0, calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0;
+    uint64_t barriers = 0, calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -464,6 +498,65 @@ private:
     Profiler* p_;
     ProfSlot s_;
     std::chrono::steady_clock::time_point t0_;
+};
+
+// Vulkan commands recorded on a thread of their own. The recorder thread decides every draw's
+// state, resources and pipeline, and queues the Vulkan calls themselves (about a quarter of its
+// time went into the driver) as closures in chunks; the command thread runs them in order into
+// the batch's command buffer, ends it and submits it. Arrays a call points to are copied into
+// the chunk. LPN_SYNC_RECORD=1 runs each call on the recorder as it is made.
+class CmdChunk {
+public:
+    template <typename F> void push(F&& f) {
+        using T = std::decay_t<F>;
+        void* p = alloc(sizeof(T), alignof(T));
+        new (p) T(std::forward<F>(f));
+        ops_.push_back({[](void* o) {
+                            T& t = *static_cast<T*>(o);
+                            t();
+                            t.~T();
+                        },
+                        p});
+    }
+    template <typename T> T* keep(const T* src, size_t n) {
+        if (!n) return nullptr;
+        T* d = static_cast<T*>(alloc(sizeof(T) * n, alignof(T)));
+        std::memcpy(static_cast<void*>(d), src, sizeof(T) * n);
+        return d;
+    }
+    bool empty() const { return ops_.empty(); }
+    void run() {
+        for (const Op& o : ops_) o.call(o.obj);
+        ops_.clear();
+        block_ = 0;
+        used_ = 0;
+    }
+
+private:
+    static constexpr size_t kBlock = 256 << 10;
+    void* alloc(size_t size, size_t align) {
+        for (;;) {
+            if (block_ < blocks_.size()) {
+                const size_t at = (used_ + align - 1) & ~(align - 1);
+                if (at + size <= blocks_[block_].second) {
+                    used_ = at + size;
+                    return blocks_[block_].first.get() + at;
+                }
+                ++block_;
+                used_ = 0;
+                continue;
+            }
+            const size_t n = std::max(kBlock, size + align);
+            blocks_.emplace_back(std::make_unique<std::byte[]>(n), n);
+        }
+    }
+    struct Op {
+        void (*call)(void*);
+        void* obj;
+    };
+    std::vector<Op> ops_;
+    std::vector<std::pair<std::unique_ptr<std::byte[]>, size_t>> blocks_;
+    size_t block_ = 0, used_ = 0;
 };
 
 class Renderer final : public DrawListener {
@@ -509,6 +602,9 @@ public:
         if (!dummyBuffer_) return false;
         sync_ = getenv("LPN_GPU_SYNC") != nullptr;
         std::thread([this] { completeBatches(); }).detach();
+        if (!syncRecord_) std::thread([this] { commandThread(); }).detach();
+        if (asyncTexChecks_)
+            for (int i = 0; i < 3; ++i) std::thread([this] { texHashWorker(); }).detach();
         storageAlign_ = std::max<VkDeviceSize>(vk_.props.limits.minStorageBufferOffsetAlignment, 16);
         if (const char* t = getenv("LPN_GPU_TRACE")) traceFrame_ = std::strtoull(t, nullptr, 0);
         if (const char* sn = getenv("LPN_GPU_SNAP")) {
@@ -528,6 +624,7 @@ public:
         }
         prof_.on = aprof_.on = getenv("LPN_PROFILE") != nullptr;
         openPipelineCache();
+        startPipelineWorkers();
         dumpGlsl_ = getenv("LPN_GPU_GLSL") != nullptr;
         return true;
     }
@@ -549,7 +646,10 @@ public:
         a.ok = false;
         a.vsm = a.psm = nullptr;
         if (d.kind == DrawCall::kDispatch) analyzeDispatch(r, a);
-        else if (!computeOnly_ && (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed)) analyzeDraw(r, a);
+        else if (!computeOnly_ && (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed)) {
+            analyzeDraw(r, a);
+            if (a.ok) prefetchPipeline(r, a);
+        }
         std::lock_guard lock(analysesMutex_);
         analyses_.push_back(std::move(a));
     }
@@ -626,10 +726,13 @@ public:
         else if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r, a);
         else warnOnce("indirect draws and dispatches are not rendered yet");
         if (frame_ == timingFrame_ && timing_ && recording_ && timingMeta_.size() + 1 < kTimingQueries) {
-            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timing_, uint32_t(timingMeta_.size() + 1));
+            rec([c = cmd_, q = timing_, i = uint32_t(timingMeta_.size() + 1)] {
+                vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q, i);
+            });
             timingMeta_.push_back({drawIndex_, shaderAddress(r, d.kind == DrawCall::kDispatch ? reg::kPgmLoCs : reg::kPgmLoPs),
                                    d.kind == DrawCall::kDispatch, prof_.passes != passesBefore, d.count});
         }
+        if (++drawsSinceHandOff_ >= 32) handOff(); // the command thread trails by a few draws
         static const uint32_t flushDraws = getenv("LPN_FLUSH_DRAWS") ? std::atoi(getenv("LPN_FLUSH_DRAWS")) : 400;
         if (flushDraws && recording_ && ++drawsSinceFlush_ >= flushDraws) flush();
     }
@@ -639,6 +742,7 @@ public:
     void onMemoryWrite(uint64_t addr, uint64_t size) override {
         std::lock_guard lock(m_);
         if (raceCheck_) noteWrite(addr, size);
+        cpWrites(addr, size);
     }
     void onCpWrite(uint64_t, uint64_t) override { // written now: the analysis overlay is done
         uint64_t id;
@@ -680,12 +784,13 @@ public:
         begin();
         fullBarrier();
         if (fill) {
-            vkCmdFillBuffer(cmd_, db, doff, bytes, value);
+            rec([c = cmd_, db, doff, bytes, value] { vkCmdFillBuffer(c, db, doff, bytes, value); });
         } else {
-            const VkBufferCopy c{soff, doff, bytes};
-            vkCmdCopyBuffer(cmd_, sb, db, 1, &c);
+            const VkBufferCopy bc{soff, doff, bytes};
+            rec([c = cmd_, sb, db, bc] { vkCmdCopyBuffer(c, sb, db, 1, &bc); });
         }
         if (raceCheck_) noteWrite(dst, bytes);
+        gpuWrites(dst, bytes);
         ++prof_.dmas, prof_.dmaBytes += bytes;
         if (id) pendingDone_.push_back([this, id] { codePages_.dropOverlay(id); }); // once the GPU has copied
         return true;
@@ -729,6 +834,7 @@ public:
             if (!traceOut_) traceOut_ = stderr;
         }
         if (prof_.on && frame_ % 300 == 0) reportProfile();
+        if (frame_ % 300 == 0) std::erase_if(vramCandidates_, [&](const auto& c) { return c.second + 60 < frame_; });
         if (frame_ == timingFrame_ + 1) reportTiming();
         if (frame_ == timingFrame_) startTiming();
         drawIndex_ = 0;
@@ -741,11 +847,13 @@ public:
         if (ms > 50 && frame_ > 0) {
             std::fprintf(stderr, "[prof] slow frame %" PRIu64 ": %.1f ms;", frame_, ms);
             for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.1f", kProfNames[i], (prof_.ns[i] - frameNs_[i]) / 1e6);
-            std::fprintf(stderr, "; %" PRIu64 " analyses\n", prof_.analyses - frameAnalyses_);
+            std::fprintf(stderr, "; %" PRIu64 " analyses, %" PRIu64 " pipelines made\n", prof_.analyses - frameAnalyses_,
+                         prof_.pipelinesMade - framePipelines_);
         }
         lastFrameEnd_ = now;
         std::copy(std::begin(prof_.ns), std::end(prof_.ns), frameNs_);
         frameAnalyses_ = prof_.analyses;
+        framePipelines_ = prof_.pipelinesMade;
     }
 
     // LPN_GPU_TIMING=<frame>, or the frame after an F12 capture: GPU time of every draw and
@@ -770,8 +878,10 @@ public:
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(vk_.phys, &props);
         gpuTickNs_ = props.limits.timestampPeriod;
-        vkCmdResetQueryPool(cmd_, timing_, 0, kTimingQueries);
-        vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timing_, 0);
+        rec([c = cmd_, q = timing_] {
+            vkCmdResetQueryPool(c, q, 0, kTimingQueries);
+            vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q, 0);
+        });
         timingMeta_.clear();
     }
     void reportTiming() {
@@ -827,6 +937,7 @@ public:
         for (int i : {kProfAnalyze, kProfShaderLookup, kProfLaunch}) prof_.ns[i] += std::exchange(aprof_.ns[i], 0);
         prof_.analysisHits += std::exchange(aprof_.analysisHits, 0);
         prof_.analyses += std::exchange(aprof_.analyses, 0);
+        prof_.pipelinesMade += std::exchange(aprof_.pipelinesMade, 0);
     }
 
     void reportProfile() {
@@ -842,12 +953,13 @@ public:
         std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / 300, prof_.dmas / 300.0,
                      prof_.dmaBytes / 300.0 / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
-        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame\n",
+        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " blended draws skipped for one; VRAM buffers %.0f MB, %.1f copies (%.2f MB) per frame\n",
                      prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.analyses / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0, prof_.passes / 300.0,
-                     prof_.barriers / 300.0);
+                     prof_.barriers / 300.0, prof_.pipelinesMade, prof_.pipelineWaits, vramBytes_ / 1e6, prof_.vramCopies / 300.0,
+                     prof_.vramCopyBytes / 300.0 / 1e6);
         const bool on = prof_.on;
         std::fill(std::begin(frameNs_), std::end(frameNs_), 0);
-        frameAnalyses_ = 0;
+        frameAnalyses_ = framePipelines_ = 0;
         prof_ = Profiler{};
         prof_.on = on;
         prof_.windowStart = now;
@@ -887,7 +999,7 @@ public:
         VkBufferImageCopy r{};
         r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         r.imageExtent = {c.w, c.h, 1};
-        vkCmdCopyImageToBuffer(cmd_, s.img.image, VK_IMAGE_LAYOUT_GENERAL, d.buf, 1, &r);
+        rec([c = cmd_, im = s.img.image, buf = d.buf, r] { vkCmdCopyImageToBuffer(c, im, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r); });
         if (!riding) flush();
         std::lock_guard dl(doneMutex_);
         c.seq = riding ? submitted_ + 1 : submitted_;
@@ -1040,7 +1152,7 @@ private:
         c.imageExtent = {w, h, 1};
         const VkDeviceSize at = ringAlloc(bytes, 16);
         c.bufferOffset = at;
-        vkCmdCopyImageToBuffer(cmd_, s.img.image, VK_IMAGE_LAYOUT_GENERAL, ring_, 1, &c);
+        rec([cb = cmd_, im = s.img.image, buf = ring_, c] { vkCmdCopyImageToBuffer(cb, im, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &c); });
         const auto* src = static_cast<const uint8_t*>(ringPtr_) + at;
         waitIdle();
         pixels.assign(size_t(width) * height, 0);
@@ -1055,6 +1167,62 @@ private:
     // finish its previous submission; a completion thread waits on the fences and then runs
     // what was deferred until the GPU is done (fences the game polls, interrupts, deletions).
     // LPN_GPU_SYNC=1 waits after every submission instead.
+    // Queues a Vulkan call (a closure over values, given the batch's command buffer) for the
+    // command thread.
+    template <typename F> void rec(F&& f) {
+        if (syncRecord_) f();
+        else chunk_->push(std::forward<F>(f));
+    }
+    // Storage for an array a queued call points to, valid until the call has run.
+    template <typename T> const T* keep(const T* p, size_t n) { return syncRecord_ ? p : chunk_->keep(p, n); }
+    void handOff() {
+        drawsSinceHandOff_ = 0;
+        if (syncRecord_ || chunk_->empty()) return;
+        std::unique_ptr<CmdChunk> next;
+        {
+            std::lock_guard lock(chunkMutex_);
+            chunks_.push_back(std::move(chunk_));
+            if (!spareChunks_.empty()) {
+                next = std::move(spareChunks_.front());
+                spareChunks_.pop_front();
+            }
+        }
+        chunkCv_.notify_one();
+        chunk_ = next ? std::move(next) : std::make_unique<CmdChunk>();
+    }
+    void commandThread() {
+        for (;;) {
+            std::unique_ptr<CmdChunk> c;
+            {
+                std::unique_lock lock(chunkMutex_);
+                chunkCv_.wait(lock, [&] { return !chunks_.empty(); });
+                c = std::move(chunks_.front());
+                chunks_.pop_front();
+            }
+            c->run();
+            std::lock_guard lock(chunkMutex_);
+            spareChunks_.push_back(std::move(c));
+        }
+    }
+    void pushDescriptors(VkPipelineBindPoint point, VkPipelineLayout layout, std::vector<VkWriteDescriptorSet>& writes,
+                         std::vector<VkDescriptorBufferInfo>& bufs, std::vector<VkDescriptorImageInfo>& imgs) {
+        if (syncRecord_) {
+            linkWrites(writes, bufs, imgs);
+            vk_.cmdPushDescriptorSet(cmd_, point, layout, 0, uint32_t(writes.size()), writes.data());
+            return;
+        }
+        auto* w = const_cast<VkWriteDescriptorSet*>(keep(writes.data(), writes.size()));
+        const VkDescriptorBufferInfo* b = keep(bufs.data(), bufs.size());
+        const VkDescriptorImageInfo* im = keep(imgs.data(), imgs.size());
+        size_t nb = 0, ni = 0;
+        for (size_t k = 0; k < writes.size(); ++k) {
+            if (w[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) w[k].pBufferInfo = &b[nb++];
+            else w[k].pImageInfo = &im[ni++];
+        }
+        const uint32_t n = uint32_t(writes.size());
+        rec([this, c = cmd_, point, layout, n, w] { vk_.cmdPushDescriptorSet(c, point, layout, 0, n, w); });
+    }
+
     void useBatch(uint32_t i) {
         cur_ = i;
         cmd_ = batches_[i].cmd;
@@ -1071,39 +1239,47 @@ private:
             std::unique_lock lock(doneMutex_);
             doneCv_.wait(lock, [&] { return !b.busy; });
         }
-        VK_CHECK(vkResetFences(vk_.device, 1, &b.fence));
-        VK_CHECK(vkResetCommandBuffer(cmd_, 0));
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        VK_CHECK(vkBeginCommandBuffer(cmd_, &bi));
+        rec([this, c = cmd_, fence = b.fence] {
+            VK_CHECK(vkResetFences(vk_.device, 1, &fence));
+            VK_CHECK(vkResetCommandBuffer(c, 0));
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            VK_CHECK(vkBeginCommandBuffer(c, &bi));
+        });
         recording_ = true;
+        bound_ = Bound{};
         needBarrier_ = true; // earlier batches' writes
         if (frame_ == timingFrame_ && timing_ && timingMeta_.size() + 1 < kTimingQueries) {
-            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timing_, uint32_t(timingMeta_.size() + 1));
+            rec([c = cmd_, q = timing_, i = uint32_t(timingMeta_.size() + 1)] {
+                vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, q, i);
+            });
             timingMeta_.push_back({0, 0, false, false, 0, true});
         }
-        if (timestamps_) {
-            vkCmdResetQueryPool(cmd_, timestamps_, 2 * cur_, 2);
-            vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamps_, 2 * cur_);
-        }
+        if (timestamps_)
+            rec([c = cmd_, q = timestamps_, i = 2 * cur_] {
+                vkCmdResetQueryPool(c, q, i, 2);
+                vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, q, i);
+            });
     }
 
     void flush() {
         if (!recording_) {
             if (!pendingDone_.empty()) {
-                // Nothing new to submit: due when the last submission finishes.
-                std::vector<std::function<void()>> now;
-                {
-                    std::lock_guard lock(doneMutex_);
-                    if (!inFlight_.empty()) {
-                        auto& done = batches_[inFlight_.back()].done;
-                        for (auto& f : pendingDone_) done.push_back(std::move(f));
-                    } else {
-                        now.swap(pendingDone_);
+                // Nothing new to submit: due when the last submission finishes. Decided on the
+                // command thread, which has submitted everything queued before.
+                rec([this, fns = std::move(pendingDone_)]() mutable {
+                    {
+                        std::lock_guard lock(doneMutex_);
+                        if (!inFlight_.empty()) {
+                            auto& done = batches_[inFlight_.back()].done;
+                            for (auto& f : fns) done.push_back(std::move(f));
+                            return;
+                        }
                     }
-                    pendingDone_.clear();
-                }
-                for (auto& f : now) f();
+                    for (auto& f : fns) f();
+                });
+                pendingDone_.clear();
+                handOff();
             }
             if (sync_) waitSubmitted();
             return;
@@ -1116,24 +1292,34 @@ private:
             afterFlush_.insert(afterFlush_.begin(), [this, reads] { checkReads(*reads); });
         }
         Batch& b = batches_[cur_];
-        if (timestamps_) vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamps_, 2 * cur_ + 1);
-        VK_CHECK(vkEndCommandBuffer(cmd_));
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &cmd_;
-        VK_CHECK(vkQueueSubmit(vk_.queue, 1, &si, b.fence));
-        if (timelineOn()) timeline("rec: batch %" PRIu64 " submitted", submitted_ + 1);
-        {
-            std::lock_guard lock(doneMutex_);
-            b.busy = true;
-            ++submitted_;
-            for (auto& f : afterFlush_) b.done.push_back(std::move(f));
-            for (auto& f : pendingDone_) b.done.push_back(std::move(f));
-            inFlight_.push_back(cur_);
-        }
+        if (timestamps_)
+            rec([c = cmd_, q = timestamps_, i = 2 * cur_ + 1] { vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q, i); });
+        std::vector<std::function<void()>> fns = std::move(afterFlush_);
+        for (auto& f : pendingDone_) fns.push_back(std::move(f));
         afterFlush_.clear();
         pendingDone_.clear();
-        doneCv_.notify_all();
+        {
+            std::lock_guard lock(doneMutex_);
+            b.busy = true; // its ring and command buffer are not reused until the GPU is done
+            ++submitted_;
+        }
+        // The completion thread learns of the batch once it is submitted (inFlight_).
+        rec([this, i = cur_, c = cmd_, fns = std::move(fns)]() mutable {
+            Batch& b = batches_[i];
+            VK_CHECK(vkEndCommandBuffer(c));
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &c;
+            VK_CHECK(vkQueueSubmit(vk_.queue, 1, &si, b.fence));
+            if (timelineOn()) timeline("rec: batch submitted");
+            {
+                std::lock_guard lock(doneMutex_);
+                for (auto& f : fns) b.done.push_back(std::move(f));
+                inFlight_.push_back(i);
+            }
+            doneCv_.notify_all();
+        });
+        handOff();
         recording_ = false;
         useBatch((cur_ + 1) % kBatches);
         drawsSinceFlush_ = 0;
@@ -1148,7 +1334,7 @@ private:
     void waitSubmitted() {
         ProfScope ps(prof_, kProfGpuWait);
         std::unique_lock lock(doneMutex_);
-        doneCv_.wait(lock, [&] { return inFlight_.empty() && !completing_; });
+        doneCv_.wait(lock, [&] { return completed_ >= submitted_ && !completing_; });
     }
 
     void completeBatches() {
@@ -1206,8 +1392,10 @@ private:
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
-                             nullptr, 0, nullptr);
+        rec([c = cmd_, mb] {
+            vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0,
+                                 nullptr);
+        });
         ++prof_.barriers;
         needBarrier_ = false;
         drawWritten_.clear();
@@ -1387,17 +1575,23 @@ private:
         ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         ib.image = img.image;
         ib.subresourceRange = {img.aspect, 0, 1, 0, ici.arrayLayers};
-        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
-                             0, nullptr, 1, &ib);
+        rec([c = cmd_, ib] {
+            vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                                 &ib);
+        });
         // Clear so never-written surfaces read as black rather than garbage.
         const VkImageSubresourceRange range{img.aspect, 0, 1, 0, ici.arrayLayers};
         if (depth) {
-            VkClearDepthStencilValue v{1.0f, 0};
             if (usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
-                vkCmdClearDepthStencilImage(cmd_, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+                rec([c = cmd_, im = img.image, range] {
+                    const VkClearDepthStencilValue v{1.0f, 0};
+                    vkCmdClearDepthStencilImage(c, im, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+                });
         } else if ((usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
-            VkClearColorValue v{};
-            vkCmdClearColorImage(cmd_, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+            rec([c = cmd_, im = img.image, range] {
+                const VkClearColorValue v{};
+                vkCmdClearColorImage(c, im, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+            });
         }
         return true;
     }
@@ -1530,6 +1724,7 @@ private:
             }
         }
         m->module = module(m->translation.glsl, stage);
+        m->name = spirvName(m->translation.glsl, stage);
         m->id = uint32_t(shaders_.size() + 1);
         if (dumpGlsl_) { // debugging: every translation as gpu-glsl-<stage>-<entry>-<id>.glsl
             const char* st = stage == gcn::GlslStage::Fragment ? "ps" : stage == gcn::GlslStage::Compute ? "cs" : "vs";
@@ -1568,6 +1763,9 @@ private:
     std::string spirvCachePath(const std::string& glsl, gcn::GlslStage stage) {
         cacheDir();
         if (spirvDir_ == "-") return {};
+        return spirvDir_ + "/" + spirvName(glsl, stage) + ".spv";
+    }
+    static std::string spirvName(const std::string& glsl, gcn::GlslStage stage) {
         std::string text = glsl;
         text += char('0' + int(stage));
         text.resize((text.size() + 7) & ~size_t(7), '\0');
@@ -1575,8 +1773,8 @@ private:
         for (char& c : text) c = char(c ^ 0x5a); // a second, independent hash
         const uint64_t b = hashBytes(text.data(), text.size());
         char name[40];
-        std::snprintf(name, sizeof name, "%016" PRIx64 "%016" PRIx64 ".spv", a, b);
-        return spirvDir_ + "/" + name;
+        std::snprintf(name, sizeof name, "%016" PRIx64 "%016" PRIx64, a, b);
+        return name;
     }
     // The on-disk caches' folder: $LPN_SHADER_CACHE (default ~/.cache/lpn-host/spirv; "off": none).
     void cacheDir() {
@@ -1626,13 +1824,25 @@ private:
     // (tens of MB) stalled the frame ~190 ms every 5 s in crowds, where pipelines keep coming, so
     // it is written on its own thread (pipeline caches are internally synchronized).
     void savePipelineCache() {
-        if (pipelineCachePath_.empty() || newPipelines_ < 16 || pipelineSaving_.load()) return;
+        if (pipelineCachePath_.empty() || !newPipelines_ || pipelineSaving_.load()) return;
         const auto now = std::chrono::steady_clock::now();
-        if (now - lastPipelineSave_ < std::chrono::seconds(30)) return;
+        if (now - lastPipelineSave_ < std::chrono::seconds(20)) return;
         newPipelines_ = 0;
         lastPipelineSave_ = now;
         pipelineSaving_ = true;
-        std::thread([this] {
+        std::thread([this] { writePipelineCache(); }).detach();
+    }
+public:
+    // At exit: pipelines made since the last save would otherwise be compiled again next run.
+    void savePipelineCacheNow() {
+        if (pipelineCachePath_.empty()) return;
+        while (pipelineSaving_.exchange(true)) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (newPipelines_) writePipelineCache();
+        else pipelineSaving_ = false;
+    }
+private:
+    void writePipelineCache() {
+        {
             size_t n = 0;
             std::vector<char> data;
             if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, nullptr) == VK_SUCCESS && n) {
@@ -1647,7 +1857,7 @@ private:
                     else std::remove(tmp.c_str());
                 }
             pipelineSaving_ = false;
-        }).detach();
+        }
     }
 
     static std::vector<uint32_t> loadSpirv(const std::string& path) {
@@ -1683,6 +1893,7 @@ private:
 
     // Geometry shader turning each primitive of a RECTLIST (3 corners) or QUADLIST into a strip.
     VkShaderModule expandShader(bool quads, uint32_t outputs) {
+        std::lock_guard lock(layoutMutex_);
         const uint64_t key = (uint64_t(quads) << 32) | outputs;
         auto it = expanders_.find(key);
         if (it != expanders_.end()) return it->second;
@@ -1743,6 +1954,7 @@ private:
     }
 
     Layout& layout(const std::vector<VkDescriptorSetLayoutBinding>& bindings) {
+        std::lock_guard lock(layoutMutex_);
         thread_local std::string key; // per draw: built in a reused buffer
         key.clear();
         for (const auto& b : bindings) {
@@ -1774,6 +1986,12 @@ private:
         uint32_t writeMasks = 0;
         uint32_t blend[8] = {};
         uint32_t vsOutputs = 0;
+        // Stencil reference/masks and the depth bias are dynamic state: they vary per character
+        // and per shadow cascade, and as pipeline state each value made a new pipeline (a frame
+        // building a dozen of them hitched 0.2-0.4 s in crowds). Not part of the key; draw() sets them.
+    };
+    struct DynamicState {
+        uint32_t stencilMasks = 0, stencilMasksBf = 0; // DB_STENCILREFMASK(_BF)
         uint32_t polyOffset[3] = {}; // clamp, scale, offset (float bits) while polygon offset is on
     };
 
@@ -1824,12 +2042,280 @@ private:
         }
     }
 
-    VkPipeline graphicsPipeline(const GraphicsState& s, ShaderModule* vs, ShaderModule* ps, VkPipelineLayout layout) {
+    // ---- pipeline builds off the recorder ----
+    // The driver takes 10-100 ms to build a pipeline it has not cached, and a new area or effect
+    // needs dozens at once: built in line, they froze the game for up to seconds. Pipelines are
+    // built by worker threads instead. A blended draw that writes no depth (effects, particles,
+    // UI) whose pipeline is still being built is skipped: it can be missing for a frame or two.
+    // Other draws wait for theirs, as skipping one let the ground vanish for a moment and could
+    // leave depth that later draws test against. Every pipeline is also recorded in
+    // pipelines.list beside the SPIR-V (state, shader names, bindings), and each run builds the
+    // recorded ones at startup, so places seen before have them ready.
+    // LPN_SYNC_PIPELINES=1 builds in line as before (no skipped draws); LPN_PREBUILD=0 skips the startup builds.
+    struct BuiltPipeline {
+        std::atomic<bool> ready{false};
+        std::atomic<bool> started{false}; // a worker has it
+        VkPipeline pipeline = VK_NULL_HANDLE;
+    };
+    struct PipelineJob {
+        GraphicsState state; // vs and ps are 0: the modules below
+        VkShaderModule vs = VK_NULL_HANDLE, ps = VK_NULL_HANDLE, geom = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        std::shared_ptr<BuiltPipeline> out;
+        std::string record; // appended to pipelines.list once built, unless it came from there
+        bool prebuild = false; // from pipelines.list: vs and ps are its own, destroyed after
+    };
+    static constexpr uint32_t kRecordVersion = 1;
+
+    // What identifies a pipeline across runs (its key in built_ and its pipelines.list entry).
+    static std::string pipelineRecord(const GraphicsState& s, const std::string& vs, const std::string& ps,
+                                      const std::vector<VkDescriptorSetLayoutBinding>& bindings) {
+        std::string r;
+        auto put = [&](const void* p, size_t n) { r.append(static_cast<const char*>(p), n); };
+        const uint32_t head[] = {kRecordVersion, uint32_t(sizeof(GraphicsState)), uint32_t(vs.size()), uint32_t(ps.size()),
+                                 uint32_t(bindings.size())};
+        put(head, sizeof head);
+        put(&s, sizeof s);
+        r += vs;
+        r += ps;
+        for (const auto& b : bindings) {
+            const uint32_t k[] = {b.binding, uint32_t(b.descriptorType), b.stageFlags};
+            put(k, sizeof k);
+        }
+        return r;
+    }
+    static bool parseRecord(const std::string& r, GraphicsState& s, std::string& vs, std::string& ps,
+                            std::vector<VkDescriptorSetLayoutBinding>& bindings) {
+        uint32_t head[5];
+        if (r.size() < sizeof head) return false;
+        std::memcpy(head, r.data(), sizeof head);
+        if (head[0] != kRecordVersion || head[1] != sizeof(GraphicsState) ||
+            r.size() != sizeof head + sizeof s + head[2] + head[3] + size_t(head[4]) * 12)
+            return false;
+        size_t at = sizeof head;
+        std::memcpy(&s, r.data() + at, sizeof s);
+        at += sizeof s;
+        vs = r.substr(at, head[2]);
+        ps = r.substr(at + head[2], head[3]);
+        at += head[2] + head[3];
+        bindings.resize(head[4]);
+        for (auto& b : bindings) {
+            uint32_t k[3];
+            std::memcpy(k, r.data() + at, sizeof k);
+            at += sizeof k;
+            b = {k[0], VkDescriptorType(k[1]), 1, k[2], nullptr};
+        }
+        return true;
+    }
+
+    VkShaderModule geometryFor(const GraphicsState& s) {
+        if (s.topology == 17) return expandShader(false, s.vsOutputs);
+        if (s.topology == 19) return expandShader(true, s.vsOutputs);
+        return VK_NULL_HANDLE;
+    }
+
+    VkPipeline graphicsPipeline(const GraphicsState& s, ShaderModule* vs, ShaderModule* ps, VkPipelineLayout layout,
+                                const std::vector<VkDescriptorSetLayoutBinding>& bindings) {
         thread_local std::string key; // per draw: built in a reused buffer
         key.assign(reinterpret_cast<const char*>(&s), sizeof(s));
         auto it = pipelines_.find(key);
         if (it != pipelines_.end()) return it->second;
+        if (!vs->module || (ps && !ps->module)) return pipelines_[key] = VK_NULL_HANDLE;
+        GraphicsState c = s;
+        c.vs = c.ps = 0;
+        std::string record = pipelineRecord(c, vs->name, ps ? ps->name : std::string(), bindings);
+        std::shared_ptr<BuiltPipeline> b;
+        bool fresh = false;
+        {
+            std::lock_guard lock(buildMutex_);
+            auto& slot = built_[record];
+            if (!slot) slot = std::make_shared<BuiltPipeline>(), fresh = true;
+            b = slot;
+        }
+        if (fresh) {
+            ++prof_.pipelinesMade;
+            PipelineJob j{c, vs->module, ps ? ps->module : VK_NULL_HANDLE, geometryFor(s), layout, b, std::move(record), false};
+            if (syncPipelines_) runJob(j);
+            else {
+                queueJob(std::move(j), true);
+                hurry(b); // the recorder needs this one now
+            }
+        }
+        if (!b->ready.load(std::memory_order_acquire)) {
+            if (!b->started.load()) hurry(b);
+            if (skippable(c)) {
+                ++prof_.pipelineWaits;
+                return VK_NULL_HANDLE; // still being built: the draw is skipped
+            }
+            ProfScope pw(prof_, kProfGpuWait);
+            b->ready.wait(false, std::memory_order_acquire);
+        }
+        return pipelines_[key] = b->pipeline;
+    }
 
+    // Blended into the color targets and writing no depth: nothing later depends on it.
+    static bool skippable(const GraphicsState& s) {
+        if (s.depthFormat && ((s.depthControl >> 2) & 1) && !s.depthWriteOff) return false;
+        bool any = false;
+        for (uint32_t i = 0; i < 8; ++i)
+            if (s.colorFormats[i] && ((s.writeMasks >> (i * 4)) & 0xF)) {
+                if (!((s.blend[i] >> 30) & 1)) return false;
+                any = true;
+            }
+        return any;
+    }
+
+    // A startup build a draw is now waiting for goes to the front of the queue.
+    void hurry(const std::shared_ptr<BuiltPipeline>& b) {
+        std::lock_guard lock(buildMutex_);
+        for (auto* q : {&jobs_, &backgroundJobs_})
+            for (auto it = q->begin(); it != q->end(); ++it)
+                if (it->out == b) {
+                    PipelineJob j = std::move(*it);
+                    q->erase(it);
+                    jobs_.push_front(std::move(j));
+                    return;
+                }
+    }
+
+    void startPipelineWorkers() {
+        syncPipelines_ = getenv("LPN_SYNC_PIPELINES") != nullptr;
+        if (spirvDir_ != "-") {
+            pipelineListPath_ = spirvDir_ + "/pipelines.list";
+            pipelineList_ = std::fopen(pipelineListPath_.c_str(), "ab");
+        }
+        if (syncPipelines_) return;
+        const unsigned n = std::clamp(std::thread::hardware_concurrency() >= 8 ? std::thread::hardware_concurrency() - 4 : 2u, 2u, 16u);
+        for (unsigned i = 0; i < n; ++i)
+            std::thread([this] {
+                for (;;) {
+                    PipelineJob j;
+                    {
+                        std::unique_lock lock(buildMutex_);
+                        buildCv_.wait(lock, [&] { return !jobs_.empty() || !backgroundJobs_.empty(); });
+                        auto& q = jobs_.empty() ? backgroundJobs_ : jobs_;
+                        j = std::move(q.front());
+                        q.pop_front();
+                        j.out->started = true;
+                    }
+                    runJob(j);
+                }
+            }).detach();
+        const char* pb = getenv("LPN_PREBUILD");
+        if (!pipelineListPath_.empty() && !(pb && !std::strcmp(pb, "0"))) std::thread([this] { prebuildPipelines(); }).detach();
+    }
+
+    // Draws' pipelines go ahead of the startup builds.
+    void queueJob(PipelineJob&& j, bool urgent) {
+        {
+            std::lock_guard lock(buildMutex_);
+            // A draw's pipelines in the order they were asked for (a waiting draw's goes first, see
+            // hurry()); the startup builds after all of them.
+            (urgent ? jobs_ : backgroundJobs_).push_back(std::move(j));
+        }
+        buildCv_.notify_one();
+    }
+
+    void runJob(PipelineJob& j) {
+        j.out->pipeline = buildGraphics(j.state, j.vs, j.ps, j.geom, j.layout);
+        j.out->started = true;
+        j.out->ready.store(true, std::memory_order_release);
+        j.out->ready.notify_all();
+        ++newPipelines_;
+        if (j.prebuild) {
+            vkDestroyShaderModule(vk_.device, j.vs, nullptr);
+            if (j.ps) vkDestroyShaderModule(vk_.device, j.ps, nullptr);
+        } else if (j.out->pipeline && pipelineList_) {
+            std::lock_guard lock(listMutex_);
+            const uint32_t n = uint32_t(j.record.size());
+            std::fwrite(&n, 4, 1, pipelineList_);
+            std::fwrite(j.record.data(), 1, n, pipelineList_);
+            std::fflush(pipelineList_);
+        }
+    }
+
+    VkShaderModule loadModule(const std::string& name) {
+        if (name.empty()) return VK_NULL_HANDLE;
+        const std::vector<uint32_t> spirv = loadSpirv(spirvDir_ + "/" + name + ".spv");
+        if (spirv.empty()) return VK_NULL_HANDLE;
+        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        ci.codeSize = spirv.size() * 4;
+        ci.pCode = spirv.data();
+        VkShaderModule m = VK_NULL_HANDLE;
+        return vkCreateShaderModule(vk_.device, &ci, nullptr, &m) == VK_SUCCESS ? m : VK_NULL_HANDLE;
+    }
+
+    // Queues every pipeline in pipelines.list (newest first) for the workers.
+    void prebuildPipelines() {
+        std::vector<std::string> records;
+        if (FILE* f = std::fopen(pipelineListPath_.c_str(), "rb")) {
+            uint32_t n;
+            std::string r;
+            while (std::fread(&n, 4, 1, f) == 1 && n < (1u << 20)) {
+                r.resize(n);
+                if (std::fread(r.data(), 1, n, f) != n) break;
+                records.push_back(r);
+            }
+            std::fclose(f);
+        }
+        std::unordered_set<std::string> seen;
+        size_t queued = 0;
+        for (auto r = records.rbegin(); r != records.rend(); ++r) {
+            if (!seen.insert(*r).second) continue;
+            GraphicsState s;
+            std::string vsName, psName;
+            std::vector<VkDescriptorSetLayoutBinding> bindings;
+            if (!parseRecord(*r, s, vsName, psName, bindings)) continue;
+            PipelineJob j;
+            j.state = s;
+            j.prebuild = true;
+            j.vs = loadModule(vsName);
+            j.ps = loadModule(psName);
+            if (!j.vs || (!psName.empty() && !j.ps)) {
+                if (j.vs) vkDestroyShaderModule(vk_.device, j.vs, nullptr);
+                if (j.ps) vkDestroyShaderModule(vk_.device, j.ps, nullptr);
+                continue;
+            }
+            j.layout = layout(bindings).pipeline;
+            j.geom = geometryFor(s);
+            {
+                std::lock_guard lock(buildMutex_);
+                auto& slot = built_[*r];
+                if (slot) { // a draw got there first
+                    vkDestroyShaderModule(vk_.device, j.vs, nullptr);
+                    if (j.ps) vkDestroyShaderModule(vk_.device, j.ps, nullptr);
+                    continue;
+                }
+                slot = j.out = std::make_shared<BuiltPipeline>();
+            }
+            queueJob(std::move(j), false);
+            ++queued;
+        }
+        std::fprintf(stderr, "[gpu] building %zu pipelines from earlier runs\n", queued);
+        // Keep the list from growing without bound: rewrite it without duplicates.
+        if (records.size() > seen.size() + 1024) {
+            std::lock_guard lock(listMutex_);
+            const std::string tmp = pipelineListPath_ + ".tmp" + std::to_string(getpid());
+            if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+                std::unordered_set<std::string> written;
+                for (const auto& r : records)
+                    if (written.insert(r).second) {
+                        const uint32_t n = uint32_t(r.size());
+                        std::fwrite(&n, 4, 1, f);
+                        std::fwrite(r.data(), 1, n, f);
+                    }
+                if (std::fclose(f) == 0) {
+                    std::rename(tmp.c_str(), pipelineListPath_.c_str());
+                    if (pipelineList_) std::fclose(pipelineList_);
+                    pipelineList_ = std::fopen(pipelineListPath_.c_str(), "ab");
+                }
+            }
+        }
+    }
+
+    // Thread-safe: only the device and the pipeline cache (internally synchronized).
+    VkPipeline buildGraphics(const GraphicsState& s, VkShaderModule vsModule, VkShaderModule psModule, VkShaderModule geom,
+                             VkPipelineLayout layout) {
         std::vector<VkPipelineShaderStageCreateInfo> stages;
         auto stage = [&](VkShaderStageFlagBits st, VkShaderModule m) {
             VkPipelineShaderStageCreateInfo i{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -1838,8 +2324,7 @@ private:
             i.pName = "main";
             stages.push_back(i);
         };
-        if (!vs->module || (ps && !ps->module)) return pipelines_[key] = VK_NULL_HANDLE;
-        stage(VK_SHADER_STAGE_VERTEX_BIT, vs->module);
+        stage(VK_SHADER_STAGE_VERTEX_BIT, vsModule);
         VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         switch (s.topology) {
         case 1: topo = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
@@ -1847,14 +2332,14 @@ private:
         case 3: topo = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
         case 5: topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
         case 6: topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
-        case 17: stage(VK_SHADER_STAGE_GEOMETRY_BIT, expandShader(false, s.vsOutputs)); break;
+        case 17: stage(VK_SHADER_STAGE_GEOMETRY_BIT, geom); break;
         case 19:
             topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
-            stage(VK_SHADER_STAGE_GEOMETRY_BIT, expandShader(true, s.vsOutputs));
+            stage(VK_SHADER_STAGE_GEOMETRY_BIT, geom);
             break;
         default: break;
         }
-        if (ps) stage(VK_SHADER_STAGE_FRAGMENT_BIT, ps->module);
+        if (psModule) stage(VK_SHADER_STAGE_FRAGMENT_BIT, psModule);
 
         VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -1872,10 +2357,7 @@ private:
         rs.lineWidth = 1.0f;
         if (s.modeCntl & (3u << 11)) { // POLY_OFFSET_FRONT/BACK_ENABLE
             // Scale is in 1/16ths of the slope; the offset is in the depth format's units, as Vulkan's.
-            rs.depthBiasEnable = VK_TRUE;
-            rs.depthBiasClamp = std::bit_cast<float>(s.polyOffset[0]);
-            rs.depthBiasSlopeFactor = std::bit_cast<float>(s.polyOffset[1]) / 16.0f;
-            rs.depthBiasConstantFactor = std::bit_cast<float>(s.polyOffset[2]);
+            rs.depthBiasEnable = VK_TRUE; // the factors are dynamic (setDynamicState)
         }
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -1886,20 +2368,16 @@ private:
             ds.depthCompareOp = VkCompareOp((s.depthControl >> 4) & 7);
             if (s.stencil) {
                 ds.stencilTestEnable = s.depthControl & 1;
-                auto face = [&](uint32_t func, uint32_t ops, uint32_t masks) {
+                auto face = [&](uint32_t func, uint32_t ops) { // masks and reference are dynamic
                     VkStencilOpState f{};
                     f.compareOp = VkCompareOp(func);
                     f.failOp = stencilOp(ops & 0xF);
                     f.passOp = stencilOp((ops >> 4) & 0xF);
                     f.depthFailOp = stencilOp((ops >> 8) & 0xF);
-                    f.compareMask = (masks >> 8) & 0xFF;
-                    f.writeMask = (masks >> 16) & 0xFF;
-                    f.reference = masks & 0xFF;
                     return f;
                 };
-                ds.front = face((s.depthControl >> 8) & 7, s.stencilControl, s.stencilMasks);
-                ds.back = (s.depthControl >> 7) & 1 ? face((s.depthControl >> 20) & 7, s.stencilControl >> 12, s.stencilMasksBf)
-                                                    : ds.front;
+                ds.front = face((s.depthControl >> 8) & 7, s.stencilControl);
+                ds.back = (s.depthControl >> 7) & 1 ? face((s.depthControl >> 20) & 7, s.stencilControl >> 12) : ds.front;
             }
         }
         VkPipelineColorBlendAttachmentState att[8]{};
@@ -1929,10 +2407,12 @@ private:
         VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         cb.attachmentCount = colorCount;
         cb.pAttachments = att;
-        const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                      VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+        const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
+                                      VK_DYNAMIC_STATE_BLEND_CONSTANTS,   VK_DYNAMIC_STATE_DEPTH_BIAS,
+                                      VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                                      VK_DYNAMIC_STATE_STENCIL_REFERENCE};
         VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dy.dynamicStateCount = 3;
+        dy.dynamicStateCount = uint32_t(std::size(dyn));
         dy.pDynamicStates = dyn;
         VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
         ri.colorAttachmentCount = colorCount;
@@ -1955,10 +2435,40 @@ private:
         gci.layout = layout;
         VkPipeline p = VK_NULL_HANDLE;
         const VkResult r = vkCreateGraphicsPipelines(vk_.device, pipelineCache_, 1, &gci, nullptr, &p);
-        ++newPipelines_;
         if (r != VK_SUCCESS) std::fprintf(stderr, "[gpu] graphics pipeline creation failed: %s\n", vkResultName(r));
-        return pipelines_[key] = p;
+        return p;
     }
+
+    void setDynamicState(const DynamicState& d, uint32_t depthControl) {
+        // Scale is in 1/16ths of the slope; the offset is in the depth format's units, as Vulkan's.
+        if (!bound_.state || std::memcmp(bound_.polyOffset, d.polyOffset, sizeof d.polyOffset) != 0) {
+            std::memcpy(bound_.polyOffset, d.polyOffset, sizeof d.polyOffset);
+            rec([c = cmd_, k = std::bit_cast<float>(d.polyOffset[2]), cl = std::bit_cast<float>(d.polyOffset[0]),
+                 sl = std::bit_cast<float>(d.polyOffset[1]) / 16.0f] { vkCmdSetDepthBias(c, k, cl, sl); });
+        }
+        const uint32_t back = (depthControl >> 7) & 1 ? d.stencilMasksBf : d.stencilMasks;
+        if (bound_.state && bound_.stencil[0] == d.stencilMasks && bound_.stencil[1] == back) return;
+        bound_.stencil[0] = d.stencilMasks, bound_.stencil[1] = back;
+        rec([c = cmd_, front = d.stencilMasks, back] {
+            for (auto [face, m] : {std::pair{VK_STENCIL_FACE_FRONT_BIT, front}, std::pair{VK_STENCIL_FACE_BACK_BIT, back}}) {
+                vkCmdSetStencilCompareMask(c, face, (m >> 8) & 0xFF);
+                vkCmdSetStencilWriteMask(c, face, (m >> 16) & 0xFF);
+                vkCmdSetStencilReference(c, face, m & 0xFF);
+            }
+        });
+    }
+    // What the command buffer being recorded has bound and set, so unchanged state is not set
+    // again for every draw (most of a crowd's draws share it). Reset by begin().
+    struct Bound {
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        bool state = false; // the dynamic state below has been set
+        uint32_t blend[4] = {}, polyOffset[3] = {}, stencil[2] = {};
+        VkViewport viewport{};
+        VkRect2D scissor{};
+        VkBuffer index = VK_NULL_HANDLE;
+        VkDeviceSize indexOffset = 0;
+        VkIndexType indexType = VK_INDEX_TYPE_UINT16;
+    } bound_;
 
     static bool isIntegerFormat(VkFormat f) {
         switch (f) {
@@ -2091,8 +2601,17 @@ private:
         // once; a small partial rewrite is seen up to 8 uses late. Counting uses rather than
         // frames matters: the title video alternates two textures frame by frame, and a schedule
         // by frame number never checked one of them. Another T# at the same address is another entry.
+        // Each texture has its own phase: textures loaded together otherwise all came due on the
+        // same frame, a ~20 ms spike every 8th frame in gameplay.
         const size_t span = size_t(ew) * eh * bpe * slices;
-        if (tex.img.image && frame_ - tex.changedFrame >= 60 && ++tex.uses % 8 != 0) {
+        // A full hash finished on a hasher thread is taken at the very next use, due or not: a
+        // partial rewrite (new glyphs in a font atlas) then shows one use late, not eight.
+        bool asyncChanged = false;
+        if (tex.check && tex.check->state.load(std::memory_order_acquire) == 2) {
+            tex.check->state.store(0, std::memory_order_relaxed);
+            asyncChanged = tex.check->result != tex.hash;
+        }
+        if (!asyncChanged && tex.img.image && frame_ - tex.changedFrame >= 60 && (++tex.uses + tex.phase) % 8 != 0) {
             tex.checkedFrame = frame_;
             if (sampleHash(t.base(), span) == tex.sample) return &tex;
         }
@@ -2106,6 +2625,26 @@ private:
         const size_t tiled = slice * slices;
         const VkDeviceSize bytes = VkDeviceSize(ew) * eh * bpe * slices;
         if (!bytes || bytes > kRingSize / 2 || tiled > (256u << 20)) return nullptr;
+        // The full check of a texture already uploaded runs on a hasher thread, its result taken
+        // at the next use (~2.7 ms a frame off the recorder in crowds). The fingerprint is still
+        // taken now, so a texture rewritten as a whole (a video frame) is uploaded at once; a
+        // partial rewrite shows one use later than before. LPN_SYNC_TEX_CHECKS=1: all in line.
+        if (tex.img.image && asyncTexChecks_ && !asyncChanged) {
+            tex.checkedFrame = frame_;
+            if (sampleHash(t.base(), span) == tex.sample) {
+                if (!tex.check) tex.check = std::make_shared<AsyncHash>();
+                AsyncHash& c = *tex.check;
+                const int st = c.state.load(std::memory_order_acquire);
+                if (st == 2) {
+                    c.state.store(0, std::memory_order_relaxed);
+                    if (c.result == tex.hash) return &tex;
+                    // changed (or unreadable): checked again in line below
+                } else {
+                    if (st == 0) queueTexHash(tex.check, t.base(), tiled);
+                    return &tex;
+                }
+            }
+        }
         uint64_t h64;
         {
             ProfScope ps(prof_, kProfTexRead);
@@ -2143,6 +2682,7 @@ private:
         for (uint32_t s = 0; s < slices; ++s)
             detile(mode, scratch_.data() + s * slice, dst + size_t(s) * ew * eh * bpe, ew, eh, ep, bpe);
         if (!tex.img.image) {
+            tex.phase = textureCount_++ % 8;
             const VkImageViewType vt = viewType(t.type());
             if (!createImage(tex.img, format, w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, false,
                              vt, slices))
@@ -2155,9 +2695,40 @@ private:
         c.bufferRowLength = bc ? ew * 4 : ew;
         c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, t.type() == 10 ? 1 : layers};
         c.imageExtent = {w, h, t.type() == 10 ? t.depth() : 1};
-        vkCmdCopyBufferToImage(cmd_, ring_, tex.img.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        rec([cb = cmd_, buf = ring_, im = tex.img.image, c] { vkCmdCopyBufferToImage(cb, buf, im, VK_IMAGE_LAYOUT_GENERAL, 1, &c); });
         return &tex;
     }
+
+    void queueTexHash(const std::shared_ptr<AsyncHash>& c, uint64_t addr, size_t size) {
+        c->state.store(1, std::memory_order_relaxed);
+        {
+            std::lock_guard lock(texHashMutex_);
+            texHashJobs_.push_back({c, addr, size});
+        }
+        texHashCv_.notify_one();
+    }
+    void texHashWorker() {
+        for (;;) {
+            TexHashJob j;
+            {
+                std::unique_lock lock(texHashMutex_);
+                texHashCv_.wait(lock, [&] { return !texHashJobs_.empty(); });
+                j = std::move(texHashJobs_.front());
+                texHashJobs_.pop_front();
+            }
+            j.check->result = hashGuestSerial(j.addr, j.size);
+            j.check->state.store(2, std::memory_order_release);
+        }
+    }
+    struct TexHashJob {
+        std::shared_ptr<AsyncHash> check;
+        uint64_t addr = 0;
+        size_t size = 0;
+    };
+    const bool asyncTexChecks_ = getenv("LPN_SYNC_TEX_CHECKS") == nullptr;
+    std::mutex texHashMutex_;
+    std::condition_variable texHashCv_;
+    std::deque<TexHashJob> texHashJobs_;
 
     struct ImageBinding {
         VkImageView view = VK_NULL_HANDLE;
@@ -2326,6 +2897,192 @@ private:
         }
     }
 
+    // ---- read-only buffers in VRAM ----------------------------------------------------------------
+    // Guest memory is imported host memory, so every vertex, index and constant fetch crossed
+    // PCIe (a third of the GPU's time in a crowd). A buffer of 64 KiB or more that shaders only
+    // read gets a copy in VRAM, made by the GPU in order with the draws. It is checked like a
+    // texture: fingerprinted on its first use in each frame and fully hashed (on a hasher thread)
+    // on every 8th; a change copies it again. Memory the command processor writes is copied again
+    // at its next use; memory a shader, a GPU copy or a fill writes is never shadowed, as the copy
+    // would go stale. A buffer that keeps changing is left in host memory for a while.
+    // LPN_NO_VRAM_BUFFERS=1 reads every buffer from host memory as before.
+    struct VramBuffer {
+        uint64_t base = 0, size = 0;
+        VkBuffer buf = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        uint64_t sample = 0, hash = 0;
+        uint64_t checkedFrame = ~0ull, changedFrame = 0, lastUse = 0, hostUntil = 0;
+        uint32_t uses = 0, phase = 0, changes = 0;
+        bool gpuWritten = false, dirty = false;
+        std::shared_ptr<AsyncHash> check;
+    };
+    struct PairHash {
+        size_t operator()(const std::pair<uint64_t, uint64_t>& k) const { return std::hash<uint64_t>()(k.first * 0x9E3779B97F4A7C15ull ^ k.second); }
+    };
+    static constexpr uint64_t kVramMin = 64 << 10, kVramMax = 64ull << 20, kVramBudget = 1536ull << 20;
+    static constexpr size_t kVramEntries = 1500; // each is a memory allocation of its own
+    const bool vramOn_ = getenv("LPN_NO_VRAM_BUFFERS") == nullptr;
+    std::unordered_map<std::pair<uint64_t, uint64_t>, std::unique_ptr<VramBuffer>, PairHash> vram_;
+    std::multimap<uint64_t, VramBuffer*> vramByBase_; // for overlap queries
+    std::map<uint64_t, uint64_t> gpuWrittenRanges_;  // [start, end), merged
+    uint64_t vramBytes_ = 0, vramCount_ = 0;
+    std::unordered_map<std::pair<uint64_t, uint64_t>, uint64_t, PairHash> vramCandidates_; // first seen in frame
+
+    // Each VRAM buffer overlapping [lo, hi), via fn.
+    template <typename F> void forVramOverlapping(uint64_t lo, uint64_t hi, F&& fn) {
+        for (auto it = vramByBase_.lower_bound(lo >= kVramMax ? lo - kVramMax : 0); it != vramByBase_.end() && it->first < hi; ++it)
+            if (it->second->base + it->second->size > lo) fn(*it->second);
+    }
+    // The GPU writes [addr, addr + size): copies of it would go stale.
+    void gpuWrites(uint64_t addr, uint64_t size) {
+        if (!vramOn_ || !size) return;
+        const uint64_t end = addr + size;
+        auto it = gpuWrittenRanges_.upper_bound(addr);
+        if (it != gpuWrittenRanges_.begin() && std::prev(it)->second >= end) return; // known
+        uint64_t lo = addr, hi = end;
+        if (it != gpuWrittenRanges_.begin() && std::prev(it)->second >= lo) --it;
+        while (it != gpuWrittenRanges_.end() && it->first <= hi) {
+            lo = std::min(lo, it->first);
+            hi = std::max(hi, it->second);
+            it = gpuWrittenRanges_.erase(it);
+        }
+        gpuWrittenRanges_[lo] = hi;
+        forVramOverlapping(addr, end, [](VramBuffer& v) { v.gpuWritten = true; });
+    }
+    bool gpuWritten(uint64_t addr, uint64_t size) const {
+        auto it = gpuWrittenRanges_.upper_bound(addr + size - 1);
+        return it != gpuWrittenRanges_.begin() && std::prev(it)->second > addr;
+    }
+    void cpWrites(uint64_t addr, uint64_t size) {
+        if (vramOn_) forVramOverlapping(addr, addr + size, [](VramBuffer& v) { v.dirty = true; });
+    }
+
+    // A fingerprint of imported guest memory, read directly: 64 samples of 16 bytes. Memory the
+    // GPU reads through an import has to stay mapped anyway, so no syscall guards the reads.
+    static uint64_t importedSample(uint64_t base, uint64_t size) {
+        uint64_t h = 0xcbf29ce484222325ull;
+        const uint64_t stride = std::max<uint64_t>(16, (size / 64) & ~15ull);
+        for (uint64_t off = 0; off + 16 <= size; off += stride) {
+            uint64_t w[2];
+            std::memcpy(w, reinterpret_cast<const void*>(base + off), 16);
+            h = ((h ^ w[0]) * 0x100000001b3ull ^ w[1]) * 0x100000001b3ull;
+        }
+        return h | 1;
+    }
+
+    // A VRAM copy of [base, base + size) for reading, or false to read host memory.
+    bool vramBuffer(uint64_t base, uint64_t size, VkBuffer& out, VkDeviceSize& off) {
+        if (!vramOn_ || size < kVramMin || size > kVramMax || base % 4 || size % 4) return false;
+        auto found = vram_.find({base, size});
+        if (found == vram_.end()) {
+            // Only a buffer used again in a later frame gets a copy: per-frame data in rings sits at
+            // a new address each frame, and copying it would cost more than it saves.
+            if (gpuWritten(base, size)) return false;
+            auto [cand, fresh] = vramCandidates_.try_emplace({base, size}, frame_);
+            if (fresh || cand->second == frame_) return false;
+            vramCandidates_.erase(cand);
+            VkBuffer imported;
+            VkDeviceSize at;
+            if (!guestBuffer(base, size, imported, at)) return false; // mapped (importedSample reads it directly)
+            if (vram_.size() >= kVramEntries) evictVram();
+            found = vram_.emplace(std::make_pair(base, size), std::make_unique<VramBuffer>()).first;
+        }
+        auto& slot = found->second;
+        if (!slot->size) {
+            slot->base = base, slot->size = size, slot->phase = uint32_t(vramCount_++ % 8);
+            slot->gpuWritten = gpuWritten(base, size);
+            vramByBase_.emplace(base, slot.get());
+        }
+        VramBuffer& v = *slot;
+        if (v.gpuWritten || frame_ < v.hostUntil) return false;
+        v.lastUse = frame_;
+        if (v.checkedFrame != frame_ || v.dirty) {
+            v.checkedFrame = frame_;
+            const uint64_t smp = importedSample(base, size);
+            bool changed = v.dirty || (v.buf && smp != v.sample);
+            v.dirty = false;
+            if (v.buf && !changed) {
+                if (!v.check) v.check = std::make_shared<AsyncHash>();
+                const int st = v.check->state.load(std::memory_order_acquire);
+                if (st == 2) {
+                    v.check->state.store(0, std::memory_order_relaxed);
+                    changed = v.check->result != v.hash;
+                } else if (st == 0 && (++v.uses + v.phase) % 8 == 0) {
+                    queueTexHash(v.check, base, size);
+                }
+            }
+            if (changed) {
+                if (frame_ - v.changedFrame < 30 && ++v.changes >= 2) { // keeps changing: host memory for a while
+                    v.hostUntil = frame_ + 600;
+                    v.changes = 0;
+                    return false;
+                }
+                v.changedFrame = frame_;
+            }
+            v.sample = smp;
+            if (!v.buf || changed) {
+                VkBuffer src;
+                VkDeviceSize soff;
+                if (!guestBuffer(base, size, src, soff)) return false;
+                if (!v.buf && !allocVram(v)) return false;
+                v.hash = hasher_.hash(base, size); // what the copy holds (the game does not write memory the GPU is about to read)
+                if (v.check) v.check->state.store(0, std::memory_order_relaxed); // a result in flight is about the old contents
+                fullBarrier();
+                const VkBufferCopy bc{soff, 0, size};
+                rec([c = cmd_, src, dst = v.buf, bc] { vkCmdCopyBuffer(c, src, dst, 1, &bc); });
+                ++prof_.vramCopies, prof_.vramCopyBytes += size;
+            }
+        }
+        out = v.buf;
+        off = 0;
+        return true;
+    }
+    bool allocVram(VramBuffer& v) {
+        if (vramBytes_ + v.size > kVramBudget) evictVram();
+        if (vramBytes_ + v.size > kVramBudget) return false;
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = v.size;
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (vkCreateBuffer(vk_.device, &bci, nullptr, &v.buf) != VK_SUCCESS) return v.buf = VK_NULL_HANDLE, false;
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(vk_.device, v.buf, &req);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = vk_.memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(vk_.device, &mai, nullptr, &v.mem) != VK_SUCCESS) {
+            vkDestroyBuffer(vk_.device, v.buf, nullptr);
+            v.buf = VK_NULL_HANDLE;
+            return false;
+        }
+        VK_CHECK(vkBindBufferMemory(vk_.device, v.buf, v.mem, 0));
+        vramBytes_ += v.size;
+        return true;
+    }
+    // Frees the copies used longest ago (a quarter of them), once the GPU is done with them.
+    void evictVram() {
+        std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> byUse;
+        for (auto& [k, v] : vram_)
+            if (v->lastUse + 2 < frame_) byUse.push_back({v->lastUse, k});
+        std::sort(byUse.begin(), byUse.end());
+        for (size_t i = 0; i < std::max<size_t>(byUse.size() / 4, std::min<size_t>(byUse.size(), 16)); ++i) {
+            auto it = vram_.find(byUse[i].second);
+            VramBuffer* v = it->second.get();
+            for (auto b = vramByBase_.lower_bound(v->base); b != vramByBase_.end() && b->first == v->base; ++b)
+                if (b->second == v) {
+                    vramByBase_.erase(b);
+                    break;
+                }
+            if (v->buf) {
+                vramBytes_ -= v->size;
+                afterFlush_.push_back([this, buf = v->buf, mem = v->mem] {
+                    vkDestroyBuffer(vk_.device, buf, nullptr);
+                    vkFreeMemory(vk_.device, mem, nullptr);
+                });
+            }
+            vram_.erase(it);
+        }
+    }
+
     void bindResources(gcn::Program& p, uint32_t base, VkShaderStageFlags, std::vector<VkWriteDescriptorSet>& writes,
                        std::vector<VkDescriptorBufferInfo>& bufInfos, std::vector<VkDescriptorImageInfo>& imgInfos) {
         ProfScope pb(prof_, kProfBind);
@@ -2335,7 +3092,8 @@ private:
             size = std::min<uint64_t>(size ? size : 16, std::min<uint64_t>(vk_.props.limits.maxStorageBufferRange, 64ull << 20));
             BufferRange r;
             VkDeviceSize off = 0;
-            if (b.known && guestBuffer(b.base(), size, r.buffer, off)) {
+            if (b.store && b.known) gpuWrites(b.base(), size);
+            if (b.known && ((!b.store && vramBuffer(b.base(), size, r.buffer, off)) || guestBuffer(b.base(), size, r.buffer, off))) {
                 if (raceCheck_) b.store ? noteWrite(b.base(), size) : noteRead(b.base(), size, 'b');
                 r.offset = off & ~(storageAlign_ - 1);
                 r.byteOffset = uint32_t(off - r.offset);
@@ -2431,7 +3189,7 @@ private:
         if (!l.entry) return nullptr;
         ProfScope ps(aprof_, kProfAnalyze);
         auto& walks = programs_[launchKey(l, bindingBase)].walks;
-        gcn::Program r;
+        gcn::Program& r = replayScratch_; // its storage cycles through adopt() (no allocations per launch)
         for (size_t i = 0; i < walks.size(); ++i) {
             if (!codeUnchanged(*walks[i].shapes.front())) {
                 programCount_ -= walks[i].shapes.size();
@@ -2529,6 +3287,61 @@ private:
 
     // The register-only part of draw(): which draws render, and the pixel shader's launch as the
     // render targets' formats shape it.
+    // The analysis thread runs ahead of the recorder (by up to a frame): it works out each draw's
+    // pipeline from the registers as draw() will, and queues any not built yet. A frame that
+    // brings dozens of new pipelines then has them built in parallel by all the workers, rather
+    // than one after another as the recorder reaches each draw. A wrong guess only costs a build.
+    void prefetchPipeline(const GpuRegs& r, const DrawAnalysis& a) {
+        static const bool off = getenv("LPN_NO_PIPELINE_PREFETCH") != nullptr;
+        if (off || syncPipelines_ || !a.vsm || !a.vsm->module || (a.psm && !a.psm->module)) return;
+        const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
+        GraphicsState gs{};
+        bool any = false;
+        const uint32_t targetMask = r.ctx[reg::kCbTargetMask] & r.ctx[reg::kCbShaderMask];
+        for (uint32_t i = 0; i < 8 && cbMode == 1; ++i) {
+            const uint32_t* cb = &r.ctx[reg::kCbColorBase + i * reg::kCbColorStride];
+            const uint32_t info = cb[::gpu::ctx::kCbColorInfo];
+            const uint32_t fmt = (info >> 2) & 0x1F, num = (info >> 8) & 7;
+            if (!fmt || !((targetMask >> (i * 4)) & 0xF)) continue;
+            const VkFormat vf = colorFormat(fmt, num);
+            if (vf == VK_FORMAT_UNDEFINED) continue;
+            gs.colorFormats[i] = vf;
+            gs.writeMasks |= ((targetMask >> (i * 4)) & 0xF) << (i * 4);
+            gs.blend[i] = r.ctx[reg::kCbBlendControl + i];
+            any = true;
+        }
+        const uint32_t zInfo = r.ctx[reg::kDbZInfo];
+        if (zInfo & 3) {
+            const bool stencil = r.ctx[reg::kDbStencilInfo] & 1;
+            gs.depthFormat = stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : (zInfo & 3) == 1 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
+            gs.stencil = stencil;
+            gs.depthControl = r.ctx[reg::kDbDepthControl];
+            gs.stencilControl = r.ctx[reg::kDbStencilControl];
+            gs.depthWriteOff = r.ctx[reg::kDbRenderControl] & 1;
+            any = true;
+        }
+        if (!any) return;
+        gs.topology = r.uconfig[reg::kPrimitiveType];
+        gs.modeCntl = r.ctx[reg::kPaSuScModeCntl];
+        gs.vsOutputs = a.vsm->translation.outputs;
+        thread_local std::vector<VkDescriptorSetLayoutBinding> lb;
+        lb.clear();
+        addBindings(lb, a.vs, 0, VK_SHADER_STAGE_VERTEX_BIT);
+        if (a.psm) addBindings(lb, a.ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT);
+        std::string record = pipelineRecord(gs, a.vsm->name, a.psm ? a.psm->name : std::string(), lb);
+        std::shared_ptr<BuiltPipeline> b;
+        {
+            std::lock_guard lock(buildMutex_);
+            auto& slot = built_[record];
+            if (slot) return;
+            slot = b = std::make_shared<BuiltPipeline>();
+        }
+        ++aprof_.pipelinesMade;
+        queueJob(PipelineJob{gs, a.vsm->module, a.psm ? a.psm->module : VK_NULL_HANDLE, geometryFor(gs), layout(lb).pipeline,
+                             std::move(b), std::move(record), false},
+                 true);
+    }
+
     void analyzeDraw(const GpuRegs& r, DrawAnalysis& a) {
         const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
         const uint32_t dbRender = r.ctx[reg::kDbRenderControl];
@@ -2569,6 +3382,7 @@ private:
         gcn::Program& cs = a.vs;
         if (!ringFits(1 << 20)) flush();
         begin();
+        if (fillDispatch(d, cs)) return;
         ShaderModule* m = a.vsm;
         std::vector<VkDescriptorSetLayoutBinding> lb;
         addBindings(lb, cs, 0, VK_SHADER_STAGE_COMPUTE_BIT);
@@ -2583,9 +3397,8 @@ private:
         bindResources(cs, 0, VK_SHADER_STAGE_COMPUTE_BIT, writes, bufs, imgs);
         linkWrites(writes, bufs, imgs);
         fullBarrier();
-        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-        vk_.cmdPushDescriptorSet(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, lay.pipeline, 0, uint32_t(writes.size()),
-                                 writes.data());
+        rec([c = cmd_, pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pipe); });
+        pushDescriptors(VK_PIPELINE_BIND_POINT_COMPUTE, lay.pipeline, writes, bufs, imgs);
         if (trace_) captureProgram(cs, m, "cs");
         if (trace_)
             for (const auto& b : cs.buffers) {
@@ -2594,12 +3407,52 @@ private:
                 std::fprintf(traceOut_, "[trace]   buffer 0x%" PRIx64 " stride %u records %u first 0x%x%s\n", b.base(),
                              b.stride(), b.numRecords(), first, b.store ? " (written)" : "");
             }
-        vkCmdDispatch(cmd_, d.groups[0], d.groups[1], d.groups[2]);
+        rec([c = cmd_, x = d.groups[0], y = d.groups[1], z = d.groups[2]] { vkCmdDispatch(c, x, y, z); });
         ++stats_.dispatches;
         for (const auto& im : cs.images)
             if (im.storage && im.tileMode() == kTileLinearAligned) writeBack(im);
         for (const auto& b : cs.buffers)
             if (b.store) fastClear(b.base());
+    }
+
+    // The game clears buffers with a small compute shader that stores one 16-byte value from its
+    // constants into records [0, groups x 64): two stores per work item, 32 per group. Guest buffers
+    // live in host memory, where the GPU's scattered dword writes crawl over PCIe (~4 ms for the 4 MB
+    // buffer it clears every gameplay frame at 1440p); a transfer fill writes whole lines instead.
+    // Only that exact code, filling with one repeated dword, takes this path.
+    bool fillDispatch(const DrawCall& d, const gcn::Program& cs) {
+        static constexpr uint32_t kFillCode[] = {0xbeeb03ff, 0x0000000c, 0x936ac008, 0xc2820500, 0xd2840004, 0x01a90500,
+                                                 0xbf8c007f, 0x7e000204, 0x7e020205, 0x7e040206, 0x7e060207, 0xe01c2000,
+                                                 0x80000004, 0xd2ba0004, 0x04110081, 0xe01c2000, 0x80000004, 0xbf810000};
+        static const bool off = getenv("LPN_NO_FILL_DISPATCH") != nullptr;
+        if (off || trace_ || cs.buffers.empty() || !cs.images.empty() || cs.launch.localSize[0] != 32 ||
+            cs.launch.localSize[1] != 1 || cs.launch.localSize[2] != 1)
+            return false;
+        uint32_t code[std::size(kFillCode)];
+        if (!readGuest(cs.launch.entry, code, sizeof code) || std::memcmp(code, kFillCode, sizeof code) != 0) return false;
+        // s_buffer_load_dwordx4 s[4:7], s[4:7], 0: the value is the first record of the V# in
+        // user data s[4:7].
+        const uint64_t constants = cs.launch.userData[4] | (uint64_t(cs.launch.userData[5] & 0xFFF) << 32);
+        uint32_t value[4];
+        if (cs.launch.userSgprs() < 8 || !readGuest(constants, value, sizeof value)) return false;
+        if (value[1] != value[0] || value[2] != value[0] || value[3] != value[0]) return false;
+        const gcn::BufferResource& b = cs.buffers[0];
+        for (const auto& o : cs.buffers) // both stores go through s[0:3]
+            if (!o.known || !o.store || o.base() != b.base() || o.stride() != b.stride() || o.numRecords() != b.numRecords())
+                return false;
+        if (b.stride() != 16) return false;
+        const uint64_t records = std::min<uint64_t>(b.numRecords(), uint64_t(d.groups[0]) * 64);
+        if (!records) return true;
+        VkBuffer buffer;
+        VkDeviceSize offset;
+        if (b.base() % 4 || !guestBuffer(b.base(), records * 16, buffer, offset)) return false;
+        fullBarrier();
+        rec([c = cmd_, buffer, offset, bytes = records * 16, v = value[0]] { vkCmdFillBuffer(c, buffer, offset, bytes, v); });
+        if (raceCheck_) noteWrite(b.base(), records * 16);
+        gpuWrites(b.base(), records * 16);
+        ++stats_.dispatches;
+        fastClear(b.base());
+        return true;
     }
 
     // ---- fast clears -----------------------------------------------------------------------------
@@ -2637,15 +3490,15 @@ private:
         fullBarrier();
         VkImageSubresourceRange range{img.aspect, 0, 1, 0, img.layers};
         if (m.depth) {
-            VkClearDepthStencilValue v{std::bit_cast<float>(m.clear[0]), m.clear[1] & 0xFF};
-            vkCmdClearDepthStencilImage(cmd_, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+            const VkClearDepthStencilValue v{std::bit_cast<float>(m.clear[0]), m.clear[1] & 0xFF};
+            rec([c = cmd_, im = img.image, v, range] { vkCmdClearDepthStencilImage(c, im, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range); });
         } else {
             VkClearColorValue v;
             if (!clearColor(img.format, m.clear, v)) {
                 warnOnce("fast clear of a render target in format " + std::to_string(img.format));
                 return;
             }
-            vkCmdClearColorImage(cmd_, img.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+            rec([c = cmd_, im = img.image, v, range] { vkCmdClearColorImage(c, im, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range); });
         }
         if (trace_)
             std::fprintf(traceOut_, "[trace]   fast clear of %s 0x%" PRIx64 " to 0x%x 0x%x\n", m.depth ? "depth" : "target",
@@ -2712,6 +3565,7 @@ private:
         VkBuffer buffer;
         VkDeviceSize offset = 0;
         if (!guestBuffer(t.base(), bytes, buffer, offset)) return;
+        gpuWrites(t.base(), bytes);
         if (offset % std::max<uint32_t>(s.elementBytes, 4)) {
             warnOnce("linear image at 0x" + hex(t.base()) + " is not aligned for a copy back");
             return;
@@ -2722,7 +3576,7 @@ private:
         c.bufferRowLength = pitch;
         c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         c.imageExtent = {w, h, 1};
-        vkCmdCopyImageToBuffer(cmd_, s.img.image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &c);
+        rec([cb = cmd_, im = s.img.image, buffer, c] { vkCmdCopyImageToBuffer(cb, im, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &c); });
         if (trace_)
             std::fprintf(traceOut_, "[trace]   copied %ux%u back to 0x%" PRIx64 "\n", w, h, t.base());
     }
@@ -2766,6 +3620,7 @@ private:
         pass.written.clear();
         pass.depthImage = VK_NULL_HANDLE;
         GraphicsState gs{};
+        DynamicState dyn{};
         VkRenderingAttachmentInfo colors[8]{};
         uint32_t colorCount = 0;
         uint32_t width = 16384, height = 16384;
@@ -2831,8 +3686,8 @@ private:
                 gs.stencil = stencil;
                 gs.depthControl = depthControl;
                 gs.stencilControl = r.ctx[reg::kDbStencilControl];
-                gs.stencilMasks = r.ctx[reg::kDbStencilRefMask];
-                gs.stencilMasksBf = r.ctx[reg::kDbStencilRefMaskBf];
+                dyn.stencilMasks = r.ctx[reg::kDbStencilRefMask];
+                dyn.stencilMasksBf = r.ctx[reg::kDbStencilRefMaskBf];
                 width = std::min(width, dw);
                 height = std::min(height, dh);
                 clearDepth = dbRender & 1;
@@ -2854,7 +3709,7 @@ private:
         gs.topology = prim;
         gs.modeCntl = r.ctx[reg::kPaSuScModeCntl];
         if (gs.modeCntl & (3u << 11))
-            for (int i = 0; i < 3; ++i) gs.polyOffset[i] = r.ctx[reg::kPaSuPolyOffsetClamp + i];
+            for (int i = 0; i < 3; ++i) dyn.polyOffset[i] = r.ctx[reg::kPaSuPolyOffsetClamp + i];
         gs.vsOutputs = vsm->translation.outputs;
 
         std::vector<VkDescriptorSetLayoutBinding>& lb = drawBindings_;
@@ -2866,7 +3721,7 @@ private:
         {
             ProfScope pp(prof_, kProfPipeline);
             layp = &layout(lb);
-            pipe = graphicsPipeline(gs, vsm, psm, layp->pipeline);
+            pipe = graphicsPipeline(gs, vsm, psm, layp->pipeline, lb);
         }
         if (!pipe) return;
         Layout& lay = *layp;
@@ -2906,7 +3761,8 @@ private:
         VkDeviceSize indexOffset = 0;
         if (d.kind == DrawCall::kIndexed) {
             const uint32_t isz = r.indexType ? 4 : 2;
-            if (!guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset)) return;
+            if (!vramBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset) &&
+                !guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset)) return;
             if (trace_ && !traceDir_.empty() && uint64_t(d.indexOffset + d.count) * isz <= (1u << 20)) { // captures: the indices
                 std::vector<uint8_t> idx(size_t(d.count) * isz);
                 if (readGuest(d.indexAddr + uint64_t(d.indexOffset) * isz, idx.data(), idx.size()))
@@ -2940,7 +3796,7 @@ private:
         if (!pass_.open || feedback || !pass_.sameTargets(pass)) {
             if (prof_.on) ++prof_.passWhy[!pass_.open ? passClosedBy_ : feedback ? kPassFeedback : kPassTargets];
             if (pass_.open) { // to other targets: no barrier unless something since the last one needs it
-                vkCmdEndRendering(cmd_);
+                rec([c = cmd_] { vkCmdEndRendering(c); });
                 pass_.open = false;
             }
             // Draws since the last barrier wrote and sampled only images; another pass needs the
@@ -2951,21 +3807,28 @@ private:
             ri.renderArea = {{0, 0}, {width, height}};
             ri.layerCount = 1;
             ri.colorAttachmentCount = colorCount;
-            ri.pColorAttachments = colors;
+            ri.pColorAttachments = keep(colors, colorCount);
             if (hasDepth) {
-                ri.pDepthAttachment = &depth;
-                if (gs.stencil) ri.pStencilAttachment = &depth;
+                ri.pDepthAttachment = keep(&depth, 1);
+                if (gs.stencil) ri.pStencilAttachment = ri.pDepthAttachment;
             }
-            vkCmdBeginRendering(cmd_, &ri);
+            rec([c = cmd_, ri] { vkCmdBeginRendering(c, &ri); });
             std::swap(pass_, pass); // the old pass's storage is reused by the next draw
             pass_.open = true;
             ++prof_.passes;
         }
-        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-        vk_.cmdPushDescriptorSet(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, lay.pipeline, 0, uint32_t(writes.size()),
-                                 writes.data());
+        if (bound_.pipeline != pipe) {
+            rec([c = cmd_, pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); });
+            bound_.pipeline = pipe;
+        }
+        pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, lay.pipeline, writes, bufs, imgs);
         setViewportScissor(r, width, height);
-        vkCmdSetBlendConstants(cmd_, reinterpret_cast<const float*>(&r.ctx[reg::kCbBlendRed]));
+        if (!bound_.state || std::memcmp(bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
+            std::memcpy(bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
+            rec([c = cmd_, b = std::bit_cast<std::array<float, 4>>(bound_.blend)] { vkCmdSetBlendConstants(c, b.data()); });
+        }
+        setDynamicState(dyn, gs.depthControl);
+        bound_.state = true;
         if (clearDepth) {
             VkClearAttachment ca{};
             ca.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -2974,13 +3837,19 @@ private:
             ca.clearValue.depthStencil = {z, r.ctx[reg::kDbStencilClear] & 0xFF};
             if (gs.stencil && (dbRender & 2)) ca.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
             VkClearRect cr{{{0, 0}, {width, height}}, 0, 1};
-            vkCmdClearAttachments(cmd_, 1, &ca, 1, &cr);
+            rec([c = cmd_, ca, cr] { vkCmdClearAttachments(c, 1, &ca, 1, &cr); });
         }
         if (d.kind == DrawCall::kIndexed) {
-            vkCmdBindIndexBuffer(cmd_, indexBuffer, indexOffset, r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
-            vkCmdDrawIndexed(cmd_, d.count, std::max(r.numInstances, 1u), d.indexOffset, 0, 0);
+            const VkIndexType it = r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+            if (bound_.index != indexBuffer || bound_.indexOffset != indexOffset || bound_.indexType != it) {
+                rec([c = cmd_, indexBuffer, indexOffset, it] { vkCmdBindIndexBuffer(c, indexBuffer, indexOffset, it); });
+                bound_.index = indexBuffer, bound_.indexOffset = indexOffset, bound_.indexType = it;
+            }
+            rec([c = cmd_, n = d.count, inst = std::max(r.numInstances, 1u), first = d.indexOffset] {
+                vkCmdDrawIndexed(c, n, inst, first, 0, 0);
+            });
         } else {
-            vkCmdDraw(cmd_, d.count, std::max(r.numInstances, 1u), 0, 0);
+            rec([c = cmd_, n = d.count, inst = std::max(r.numInstances, 1u)] { vkCmdDraw(c, n, inst, 0, 0); });
         }
         auto stores = [](const gcn::Program& p) {
             for (const auto& b : p.buffers)
@@ -3009,7 +3878,7 @@ private:
     void endPass() {
         needBarrier_ = true; // something other than a draw comes next
         if (!pass_.open) return;
-        vkCmdEndRendering(cmd_);
+        rec([c = cmd_] { vkCmdEndRendering(c); });
         pass_.open = false;
         passClosedBy_ = kPassOther;
     }
@@ -3044,7 +3913,7 @@ private:
             vp.x += vp.width;
             vp.width = -vp.width;
         }
-        vkCmdSetViewport(cmd_, 0, 1, &vp);
+        if (!bound_.state || std::memcmp(&bound_.viewport, &vp, sizeof vp) != 0) rec([c = cmd_, vp] { vkCmdSetViewport(c, 0, 1, &vp); }), bound_.viewport = vp;
 
         int32_t x0 = 0, y0 = 0, x1 = int32_t(width), y1 = int32_t(height);
         auto clip = [&](uint32_t tl, uint32_t br) {
@@ -3068,7 +3937,7 @@ private:
             std::fprintf(traceOut_, "[trace]   viewport %.1f,%.1f %.1fx%.1f z %.2f..%.2f scissor %d,%d %ux%u vte 0x%x colfmt 0x%x\n",
                          vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth, sc.offset.x, sc.offset.y,
                          sc.extent.width, sc.extent.height, vte, r.ctx[reg::kSpiShaderColFormat]);
-        vkCmdSetScissor(cmd_, 0, 1, &sc);
+        if (!bound_.state || std::memcmp(&bound_.scissor, &sc, sizeof sc) != 0) rec([c = cmd_, sc] { vkCmdSetScissor(c, 0, 1, &sc); }), bound_.scissor = sc;
     }
 
     Vk vk_;
@@ -3090,6 +3959,8 @@ private:
     VkQueryPool timestamps_ = VK_NULL_HANDLE; // LPN_PROFILE: two per batch
     double gpuTickNs_ = 1;
     std::atomic<uint64_t> gpuBusyNs_{0};
+    gcn::Program replayScratch_; // the analysis thread's
+    uint32_t textureCount_ = 0; // textures created, for their check phases
     std::mutex doneMutex_; // guards Batch::busy and done, inFlight_, completing_, the counters
     std::condition_variable doneCv_;
     std::deque<uint32_t> inFlight_;
@@ -3105,6 +3976,13 @@ private:
     std::vector<std::function<void()>> pendingDone_; // due after the batch being recorded
     bool sync_ = false;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE; // the current batch's
+    // The command thread's queue (see CmdChunk): chunks handed over in order, and spare ones.
+    bool syncRecord_ = getenv("LPN_SYNC_RECORD") != nullptr;
+    std::unique_ptr<CmdChunk> chunk_ = std::make_unique<CmdChunk>(); // being filled
+    std::mutex chunkMutex_;
+    std::condition_variable chunkCv_;
+    std::deque<std::unique_ptr<CmdChunk>> chunks_, spareChunks_;
+    uint32_t drawsSinceHandOff_ = 0;
     bool recording_ = false;
     VkBuffer ring_ = VK_NULL_HANDLE, dummyBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory dummyMemory_ = VK_NULL_HANDLE;
@@ -3114,7 +3992,7 @@ private:
     std::vector<uint8_t> scratch_;
     GuestHasher hasher_;
     std::chrono::steady_clock::time_point lastFrameEnd_ = std::chrono::steady_clock::now();
-    uint64_t frameNs_[kProfCount] = {}, frameAnalyses_ = 0;
+    uint64_t frameNs_[kProfCount] = {}, frameAnalyses_ = 0, framePipelines_ = 0;
 
     std::map<uint64_t, Import> imports_;
     std::unordered_map<uint64_t, Surface> colors_, depths_;
@@ -3192,7 +4070,15 @@ private:
     std::string spirvDir_; // "-": no SPIR-V cache
     VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
     std::string pipelineCachePath_;
-    uint32_t newPipelines_ = 0;
+    std::atomic<uint32_t> newPipelines_{0};
+    bool syncPipelines_ = false;
+    std::mutex buildMutex_, listMutex_; // built_ and jobs_; pipelines.list
+    std::condition_variable buildCv_;
+    std::unordered_map<std::string, std::shared_ptr<BuiltPipeline>> built_; // by pipelineRecord
+    std::deque<PipelineJob> jobs_, backgroundJobs_;
+    std::mutex layoutMutex_; // layouts_ and expanders_: the recorder, the analysis thread (prefetch) and startup builds
+    std::string pipelineListPath_;
+    FILE* pipelineList_ = nullptr;
     std::chrono::steady_clock::time_point lastPipelineSave_{};
     std::atomic<bool> pipelineSaving_{false};
 };
@@ -3227,6 +4113,10 @@ void fetchDisplayCopy(const DisplayCopy& c, uint32_t width, uint32_t height, std
 
 void captureNextFrame(const std::string& dir) {
     if (gRenderer) gRenderer->captureNextFrame(dir);
+}
+
+void saveCaches() {
+    if (gRenderer) gRenderer->savePipelineCacheNow();
 }
 
 } // namespace host::render
