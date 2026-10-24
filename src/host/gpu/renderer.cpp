@@ -487,7 +487,8 @@ struct Profiler {
     uint64_t missUser[16] = {}; // the user data words that differed
     uint64_t fastMiss[8] = {}; // a draw not taking fastDraw, by FastMiss
     uint64_t fastKind[3] = {}; // of kFastKind: other draw kind, other shaders, other prim/instances/index type
-    uint64_t fastRes[4] = {}; // of kFastResources: resource counts, a buffer, an image, the buffer's base
+    uint64_t fastRes[3] = {}; // of kFastResources: resource counts, a buffer, an image
+    uint64_t fastMoved = 0; // fast draws that bound a buffer again
     std::unordered_map<uint32_t, uint64_t> fastCtx; // the context registers that differed
     uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
@@ -812,11 +813,11 @@ public:
         if (d.kind == DrawCall::kDispatch) dispatch(d, r, a);
         else if (computeOnly_) return;
         else if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r, a);
+        else warnOnce("indirect draws and dispatches are not rendered yet");
         if (keepDraw_) { // the next draw may repeat this one (see fastDraw)
             keepDraw_ = false;
             std::swap(a, prevDraw_);
         }
-        else warnOnce("indirect draws and dispatches are not rendered yet");
         if (frame_ == timingFrame_ && timing_ && recording_ && timingMeta_.size() + 1 < kTimingQueries) {
             rec([c = cmd_, q = timing_, i = uint32_t(timingMeta_.size() + 1)] {
                 vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q, i);
@@ -1067,9 +1068,9 @@ public:
             if (prof_.missUser[i]) std::fprintf(stderr, " s%d %.0f", i, prof_.missUser[i] / n);
         std::fprintf(stderr, "\n[prof] t=%.1f draws recorded in full:", profile::seconds());
         for (int i = 0; i < kFastMissCount; ++i) std::fprintf(stderr, " %s %.0f", kFastMissNames[i], prof_.fastMiss[i] / n);
-        std::fprintf(stderr, " (kind %.0f, shaders %.0f, prim %.0f; resource counts %.0f, buffer %.0f, image %.0f, buffer base %.0f)",
+        std::fprintf(stderr, " (kind %.0f, shaders %.0f, prim %.0f; resource counts %.0f, buffer %.0f, image %.0f); fast draws binding a buffer again %.0f",
                      prof_.fastKind[0] / n, prof_.fastKind[1] / n, prof_.fastKind[2] / n, prof_.fastRes[0] / n,
-                     prof_.fastRes[1] / n, prof_.fastRes[2] / n, prof_.fastRes[3] / n);
+                     prof_.fastRes[1] / n, prof_.fastRes[2] / n, prof_.fastMoved / n);
         if (!prof_.fastCtx.empty()) {
             std::vector<std::pair<uint64_t, uint32_t>> regs;
             for (auto [reg, count] : prof_.fastCtx) regs.push_back({count, reg});
@@ -3104,9 +3105,18 @@ private:
     }
 
     // A VRAM copy of [base, base + size) for reading, or false to read host memory.
-    bool vramBuffer(uint64_t base, uint64_t size, VkBuffer& out, VkDeviceSize& off) {
+    // inPass: only a copy already checked this frame, as nothing can be recorded (fastDraw).
+    bool vramBuffer(uint64_t base, uint64_t size, VkBuffer& out, VkDeviceSize& off, bool inPass = false) {
         if (!vramOn_ || size < kVramMin || size > kVramMax || base % 4 || size % 4) return false;
         auto found = vram_.find({base, size});
+        if (inPass) {
+            if (found == vram_.end()) return false;
+            const VramBuffer& v = *found->second;
+            if (!v.size || !v.buf || v.gpuWritten || frame_ < v.hostUntil || v.checkedFrame != frame_ || v.dirty) return false;
+            out = v.buf;
+            off = 0;
+            return true;
+        }
         if (found == vram_.end()) {
             // Only a buffer used again in a later frame gets a copy: per-frame data in rings sits at
             // a new address each frame, and copying it would cost more than it saves.
@@ -3221,27 +3231,7 @@ private:
         ProfScope pb(prof_, kProfBind);
         uint32_t n = base + 1;
         for (auto& b : p.buffers) {
-            uint64_t size = b.stride() ? uint64_t(b.stride()) * b.numRecords() : b.numRecords();
-            size = std::min<uint64_t>(size ? size : 16, std::min<uint64_t>(vk_.props.limits.maxStorageBufferRange, 64ull << 20));
-            BufferRange r;
-            VkDeviceSize off = 0;
-            if (b.store && b.known) gpuWrites(b.base(), size);
-            if (b.known && ((!b.store && vramBuffer(b.base(), size, r.buffer, off)) || guestBuffer(b.base(), size, r.buffer, off))) {
-                if (raceCheck_) b.store ? noteWrite(b.base(), size) : noteRead(b.base(), size, 'b');
-                r.offset = off & ~(storageAlign_ - 1);
-                r.byteOffset = uint32_t(off - r.offset);
-                r.range = std::min<VkDeviceSize>(size + r.byteOffset, vk_.props.limits.maxStorageBufferRange);
-                p.data[b.data] = r.byteOffset;
-                p.data[b.data + 1] = b.stride();
-                p.data[b.data + 2] = b.numRecords();
-                p.data[b.data + 3] = uint32_t(r.range);
-            } else {
-                r.buffer = dummyBuffer_;
-                r.offset = 0;
-                r.range = 4096;
-                p.data[b.data] = p.data[b.data + 1] = p.data[b.data + 2] = p.data[b.data + 3] = 0;
-            }
-            bufInfos.push_back({r.buffer, r.offset, r.range});
+            bufInfos.push_back(bindBuffer(p, b));
             writes.push_back(kBufferWrite); // copied from a constant: built on the stack it stalled on store forwarding
             writes.back().dstBinding = n++;
         }
@@ -3265,6 +3255,30 @@ private:
         bufInfos.push_back({ring_, at, bytes});
         writes.push_back(kBufferWrite);
         writes.back().dstBinding = base;
+    }
+    // Resolves buffer `b` of `p` and fills its words in the draw data. inPass: nothing may be recorded.
+    VkDescriptorBufferInfo bindBuffer(gcn::Program& p, const gcn::BufferResource& b, bool inPass = false) {
+        uint64_t size = b.stride() ? uint64_t(b.stride()) * b.numRecords() : b.numRecords();
+        size = std::min<uint64_t>(size ? size : 16, std::min<uint64_t>(vk_.props.limits.maxStorageBufferRange, 64ull << 20));
+        BufferRange r;
+        VkDeviceSize off = 0;
+        if (b.store && b.known) gpuWrites(b.base(), size);
+        if (b.known && ((!b.store && vramBuffer(b.base(), size, r.buffer, off, inPass)) || guestBuffer(b.base(), size, r.buffer, off))) {
+            if (raceCheck_) b.store ? noteWrite(b.base(), size) : noteRead(b.base(), size, 'b');
+            r.offset = off & ~(storageAlign_ - 1);
+            r.byteOffset = uint32_t(off - r.offset);
+            r.range = std::min<VkDeviceSize>(size + r.byteOffset, vk_.props.limits.maxStorageBufferRange);
+            p.data[b.data] = r.byteOffset;
+            p.data[b.data + 1] = b.stride();
+            p.data[b.data + 2] = b.numRecords();
+            p.data[b.data + 3] = uint32_t(r.range);
+        } else {
+            r.buffer = dummyBuffer_;
+            r.offset = 0;
+            r.range = 4096;
+            p.data[b.data] = p.data[b.data + 1] = p.data[b.data + 2] = p.data[b.data + 3] = 0;
+        }
+        return {r.buffer, r.offset, r.range};
     }
     static constexpr VkWriteDescriptorSet kBufferWrite = descriptorWrite(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     static constexpr VkWriteDescriptorSet kStorageImageWrite = descriptorWrite(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
@@ -4223,26 +4237,18 @@ private:
                     if (r.ctx[i] != f.ctx[i]) ++prof_.fastCtx[i];
             return miss(kFastCtx);
         }
-        if (!sameButUserData(a.vs, prevDraw_.vs) || (a.psm && !sameButUserData(a.ps, prevDraw_.ps))) {
-            if (prof_.on) {
-                auto why = [](const gcn::Program& x, const gcn::Program& y) {
-                    if (x.data.size() != y.data.size() || x.buffers.size() != y.buffers.size() || x.images.size() != y.images.size())
-                        return 0;
-                    for (size_t i = 0; i < x.buffers.size(); ++i)
-                        if (x.buffers[i].base() != y.buffers[i].base()) return 3;
-                    for (size_t i = 0; i < x.images.size(); ++i)
-                        if (std::memcmp(x.images[i].t, y.images[i].t, sizeof x.images[i].t)) return 2;
-                    return 1;
-                };
-                ++prof_.fastRes[!sameButUserData(a.vs, prevDraw_.vs) ? why(a.vs, prevDraw_.vs) : why(a.ps, prevDraw_.ps)];
-            }
+        uint32_t vsMoved = 0, psMoved = 0;
+        int why = sameButUserData(a.vs, prevDraw_.vs, vsMoved);
+        if (why < 0 && a.psm) why = sameButUserData(a.ps, prevDraw_.ps, psMoved);
+        if (why >= 0) {
+            if (prof_.on) ++prof_.fastRes[why];
             return miss(kFastResources);
         }
         VkBuffer indexBuffer = VK_NULL_HANDLE;
         VkDeviceSize indexOffset = 0;
         if (d.kind == DrawCall::kIndexed) {
             const uint32_t isz = r.indexType ? 4 : 2;
-            if (!vramBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset) &&
+            if (!vramBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset, true) &&
                 !guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset))
                 return miss(kFastIndex);
         }
@@ -4253,7 +4259,19 @@ private:
         writes.clear();
         bufs.clear();
         imgs.clear();
-        // prevDraw_ holds the user data bound now.
+        // Buffers that moved, then the draw data; prevDraw_ holds what is bound now.
+        auto rebind = [&](gcn::Program& p, gcn::Program& bound, uint32_t moved, uint32_t base) {
+            for (uint32_t i = 0; moved; ++i, moved >>= 1)
+                if (moved & 1) {
+                    bufs.push_back(bindBuffer(p, p.buffers[i], true));
+                    writes.push_back(kBufferWrite);
+                    writes.back().dstBinding = base + 1 + i;
+                    std::memcpy(bound.buffers[i].sharp, p.buffers[i].sharp, sizeof p.buffers[i].sharp);
+                }
+        };
+        if (vsMoved || psMoved) ++prof_.fastMoved;
+        rebind(a.vs, prevDraw_.vs, vsMoved, 0);
+        if (a.psm) rebind(a.ps, prevDraw_.ps, psMoved, kPsBindingBase);
         auto data = [&](const gcn::Program& p, gcn::Program& bound, uint32_t base) {
             const VkDeviceSize bytes = p.data.size() * 4;
             if (!std::memcmp(p.data.data(), bound.data.data(), bytes)) return;
@@ -4284,29 +4302,35 @@ private:
         ++prof_.fastDraws;
         return true;
     }
-    // Whether `cur` is `prev` (as bindResources and draw() left it) but for its user data words and
-    // the scalar loads made from them (constants, uploaded with the draw data). Fills in the words
-    // the resources fill from prev's (the same resources resolve alike).
-    static bool sameButUserData(gcn::Program& cur, const gcn::Program& prev) {
+    // Whether `cur` is `prev` (as bindResources and draw() left it) but for its user data words, the
+    // scalar loads made from them (constants, uploaded with the draw data) and where read-only
+    // buffers sit (per-draw vertex data): -1 if so, else why not (FastRes). Fills in the words the
+    // resources fill from prev's (the same resources resolve alike); `moved` gets the buffers to
+    // bind again.
+    static int sameButUserData(gcn::Program& cur, const gcn::Program& prev, uint32_t& moved) {
+        moved = 0;
         if (cur.data.size() != prev.data.size() || cur.buffers.size() != prev.buffers.size() ||
-            cur.images.size() != prev.images.size() || cur.data.size() < gcn::data::kSmrd)
-            return false;
+            cur.images.size() != prev.images.size() || cur.data.size() < gcn::data::kSmrd || cur.buffers.size() > 32)
+            return 0;
         for (size_t i = 0; i < cur.buffers.size(); ++i) {
             const gcn::BufferResource &x = cur.buffers[i], &y = prev.buffers[i];
-            if (std::memcmp(x.sharp, y.sharp, sizeof x.sharp) || x.known != y.known || x.store != y.store || x.data != y.data ||
-                x.dfmt != y.dfmt || x.nfmt != y.nfmt)
-                return false;
+            if (x.known != y.known || x.store != y.store || x.data != y.data || x.dfmt != y.dfmt || x.nfmt != y.nfmt) return 1;
+            if (std::memcmp(x.sharp, y.sharp, sizeof x.sharp)) {
+                if (x.store || !x.known || x.sharp[3] != y.sharp[3] || x.stride() != y.stride()) return 1;
+                moved |= 1u << i;
+            }
         }
         for (size_t i = 0; i < cur.images.size(); ++i) {
             const gcn::ImageResource &x = cur.images[i], &y = prev.images[i];
             if (std::memcmp(x.t, y.t, sizeof x.t) || std::memcmp(x.s, y.s, sizeof x.s) || x.storage != y.storage ||
                 x.compare != y.compare || x.data != y.data)
-                return false;
+                return 2;
         }
         std::memcpy(&cur.data[gcn::data::kPosTransform], &prev.data[gcn::data::kPosTransform], 16);
-        for (const auto& b : prev.buffers) std::memcpy(&cur.data[b.data], &prev.data[b.data], 16);
+        for (size_t i = 0; i < prev.buffers.size(); ++i)
+            if (!(moved >> i & 1)) std::memcpy(&cur.data[prev.buffers[i].data], &prev.data[prev.buffers[i].data], 16);
         for (const auto& im : prev.images) std::memcpy(&cur.data[im.data], &prev.data[im.data], 8);
-        return true;
+        return -1;
     }
 
     void endPass() {
