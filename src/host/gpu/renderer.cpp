@@ -477,6 +477,8 @@ struct Profiler {
     uint64_t ns[kProfCount] = {};
     uint64_t passWhy[4] = {}; // why a new render pass started, by PassWhy
     uint64_t feedbackOn[2] = {}; // a draw sampled the open pass's depth / color attachment
+    uint64_t missWhy[4] = {}; // a launch not repeating the stage's last: shader, submission, user data, other
+    uint64_t missUser[16] = {}; // the user data words that differed
     uint64_t barriers = 0, calls = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
@@ -945,6 +947,8 @@ public:
         for (int i : {kProfAnalyze, kProfShaderLookup, kProfLaunch}) prof_.ns[i] += std::exchange(aprof_.ns[i], 0);
         prof_.analysisHits += std::exchange(aprof_.analysisHits, 0);
         prof_.repeats += std::exchange(aprof_.repeats, 0);
+        for (int i = 0; i < 4; ++i) prof_.missWhy[i] += std::exchange(aprof_.missWhy[i], 0);
+        for (int i = 0; i < 16; ++i) prof_.missUser[i] += std::exchange(aprof_.missUser[i], 0);
         prof_.analyses += std::exchange(aprof_.analyses, 0);
         prof_.pipelinesMade += std::exchange(aprof_.pipelinesMade, 0);
     }
@@ -967,6 +971,11 @@ public:
                      prof_.calls / n, prof_.analysisHits / n, prof_.repeats / n, prof_.analyses / n, prof_.texChecks / n, prof_.texUploads / n, prof_.texBytes / n / 1e6, prof_.flushes / n, prof_.passes / n,
                      prof_.barriers / n, prof_.pipelinesMade, prof_.pipelineWaits, vramBytes_ / 1e6, prof_.vramCopies / n,
                      prof_.vramCopyBytes / n / 1e6);
+        std::fprintf(stderr, "[prof] t=%.1f launches not repeating the last: other shader %.0f, new submission %.0f, user data %.0f, other %.0f per frame; user data words differing:",
+                     profile::seconds(), prof_.missWhy[0] / n, prof_.missWhy[1] / n, prof_.missWhy[2] / n, prof_.missWhy[3] / n);
+        for (int i = 0; i < 16; ++i)
+            if (prof_.missUser[i]) std::fprintf(stderr, " s%d %.0f", i, prof_.missUser[i] / n);
+        std::fprintf(stderr, "\n");
         windowFrames_ = slowFrames_ = 0;
         worstFrameMs_ = 0;
         const bool on = prof_.on;
@@ -3215,6 +3224,16 @@ private:
             return last.program;
         }
         memoHit_ = false;
+        if (aprof_.on && last.program) { // LPN_PROFILE: why the launch did not repeat
+            if (last.launch.entry != l.entry) ++aprof_.missWhy[0];
+            else if (last.submit != submit_) ++aprof_.missWhy[1];
+            else {
+                bool user = false;
+                for (int i = 0; i < 16; ++i)
+                    if (last.launch.userData[i] != l.userData[i]) ++aprof_.missUser[i], user = true;
+                ++aprof_.missWhy[user ? 2 : 3];
+            }
+        }
         last.program = analyzedUncached(l, bindingBase);
         last.launch = l;
         last.bindingBase = bindingBase;
@@ -3803,6 +3822,11 @@ private:
             captureProgram(vs, vsm, "vs");
             if (psm) captureProgram(ps, psm, "ps");
             for (const auto* prog : {&vs, &ps}) {
+                if (prog == &vs || psm) {
+                    std::fprintf(traceOut_, "[trace]   %s user:", prog == &vs ? "vs" : "ps");
+                    for (uint32_t i = 0; i < prog->launch.userSgprs() && i < 16; ++i) std::fprintf(traceOut_, " %x", prog->launch.userData[i]);
+                    std::fprintf(traceOut_, "\n");
+                }
                 if (prog->data.size() <= gcn::data::kSmrd) continue;
                 std::fprintf(traceOut_, "[trace]   %s smrd:", prog == &vs ? "vs" : "ps");
                 for (size_t i = gcn::data::kSmrd; i < prog->data.size() && i < gcn::data::kSmrd + 24; ++i) {
