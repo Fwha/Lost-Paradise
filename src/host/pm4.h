@@ -65,6 +65,8 @@ public:
     virtual void onAnalyzeWrite(uint64_t /*addr*/, const uint32_t* /*values*/, uint32_t /*count*/) {}
     virtual void onAnalyzeSubmitEnd() {}
     virtual void onAnalyzeFrameEnd() {}
+    // The analysis of the draws so far must not wait for more: their recording is about to be queued.
+    virtual void onAnalyzeFlush() {}
     // WRITE_DATA wrote memory (after onMemoryWrite): the counterpart of onAnalyzeWrite.
     virtual void onCpWrite(uint64_t /*addr*/, uint64_t /*size*/) {}
     // CP DMA from memory (or a fill) to memory: true when the listener runs it on the GPU timeline,

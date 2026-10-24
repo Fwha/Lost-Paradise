@@ -46,7 +46,10 @@ void draw(const DrawCall& d, Pm4Stats* st) {
     }
     (d.kind >= DrawCall::kDispatch ? st->dispatches : st->draws)++;
     for (DrawListener* l : gListeners) {
-        if (inlineAnalysis()) l->onAnalyzeDraw(d, *tRegs);
+        if (inlineAnalysis()) {
+            l->onAnalyzeDraw(d, *tRegs);
+            l->onAnalyzeFlush();
+        }
         l->onDraw(d, *tRegs);
     }
 }
@@ -503,9 +506,12 @@ void analysisThread() {
         gAna.cv.notify_all();
         if (!w.chunk.empty()) {
             execute(w.chunk.data(), w.chunk.data() + w.chunk.size(), &dry, 0);
+            for (DrawListener* l : gListeners) l->onAnalyzeFlush();
             queueRecord([chunk = std::move(w.chunk), st = w.st] { execute(chunk.data(), chunk.data() + chunk.size(), st, 0); });
         }
         if (w.analyze) w.analyze();
+        if (w.analyze || w.record)
+            for (DrawListener* l : gListeners) l->onAnalyzeFlush();
         if (w.record) queueRecord(std::move(w.record));
     }
 }
