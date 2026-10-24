@@ -113,6 +113,7 @@ public:
                 return false;
             }
         }
+        p_.userRead = userRead_;
         return work.empty();
     }
 
@@ -144,6 +145,7 @@ private:
     // Value of a scalar source operand, if known.
     bool src(const State& st, uint32_t code, const Instruction& in, uint32_t& v) {
         if (code < 104 || code == kVcc || code == kVcc + 1 || code == kM0) {
+            if (code < 16) userRead_ |= 1u << code;
             v = st.s[code];
             return st.known[code];
         }
@@ -515,6 +517,7 @@ private:
     bool sharp(const State& st, uint32_t first, unsigned n, uint32_t* out, uint64_t pc, const char* what) {
         bool ok = true;
         for (unsigned i = 0; i < n; ++i) {
+            if (first + i < 16) userRead_ |= 1u << (first + i);
             out[i] = st.s[first + i];
             ok &= st.known[first + i];
         }
@@ -601,6 +604,7 @@ private:
     const Program* prior_; // replaying this program's trace
     bool diverged_ = false;
     uint32_t slot_ = ~0u; // the stepped instruction's TraceStep::slot
+    uint32_t userRead_ = 0; // see Program::userRead
     // Kept per thread: a replay runs for every launch, and these would allocate each time.
     static std::vector<bool>& seenStorage(int i) {
         thread_local std::vector<bool> v[2];
@@ -626,6 +630,7 @@ bool replay(const Program& p, const LaunchState& launch, const ReadMemory& readD
     q.images.swap(out.images);
     const bool ok = a.replay();
     out.launch = q.launch;
+    out.userRead = q.userRead;
     out.data.swap(q.data);
     out.buffers.swap(q.buffers);
     out.images.swap(q.images);
@@ -649,6 +654,7 @@ bool adopt(Program& p, Program& r) {
     }
     // Swapped rather than moved: r takes p's old storage, for the caller's next replay.
     p.launch = r.launch;
+    p.userRead = r.userRead;
     p.data.swap(r.data);
     p.buffers.swap(r.buffers);
     p.images.swap(r.images);
