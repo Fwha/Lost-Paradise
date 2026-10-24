@@ -17,6 +17,7 @@ add_executable(lpn-host
     equeue.cpp
     pm4.cpp
     profile.cpp
+    coverage.cpp
     gpu/frame_dump.cpp
     gpu/formats.cpp
     gpu/renderer.cpp
