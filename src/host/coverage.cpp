@@ -22,10 +22,13 @@ namespace host::coverage {
 
 namespace {
 
+constexpr int kDepth = 16;
+
 struct Hit {
     uint32_t fn, caller; // eboot offsets (caller 0: not in the eboot)
     uint64_t flip;
     int phase;
+    uint32_t stack[kDepth]; // phase 2 on: return addresses up the %rbp chain, 0-terminated
 };
 
 constexpr size_t kMaxHits = 1 << 17;
@@ -52,7 +55,23 @@ void onTrap(int sig, siginfo_t* info, void* ctx) {
         g[REG_RIP] = int64_t(at);
         const uint64_t ret = *reinterpret_cast<const uint64_t*>(g[REG_RSP]) - uint64_t(gText);
         const size_t i = gHitCount.fetch_add(1);
-        if (i < kMaxHits) gHits[i] = {uint32_t(off), ret < gTextSize ? uint32_t(ret) : 0, flipCount(), gPhase.load()};
+        if (i >= kMaxHits) return;
+        Hit& h = gHits[i];
+        h = {uint32_t(off), ret < gTextSize ? uint32_t(ret) : 0, flipCount(), gPhase.load(), {}};
+        if (h.phase >= 2) {
+            // The function has not pushed %rbp yet, so %rbp is still its caller's frame.
+            auto* fp = reinterpret_cast<const uint64_t*>(g[REG_RBP]);
+            const auto* sp = reinterpret_cast<const uint64_t*>(g[REG_RSP]);
+            if (fp < sp || fp - sp > 0x20000) fp = nullptr; // %rbp not a frame on this stack
+            for (int d = 0; d < kDepth && fp; ++d) {
+                const uint64_t r = fp[1] - uint64_t(gText);
+                if (r >= gTextSize) break;
+                h.stack[d] = uint32_t(r);
+                const auto* next = reinterpret_cast<const uint64_t*>(fp[0]);
+                if (next <= fp || next - fp > 0x10000) break; // stacks grow down: callers sit higher
+                fp = next;
+            }
+        }
         return;
     }
     if (gText && off < gTextSize && gOriginal[off] && *(gText + off) != 0xcc) {
@@ -74,8 +93,11 @@ void flusher() {
                 ++warm;
                 continue;
             }
-            std::fprintf(stderr, "[cover] phase %d flip %llu fn 0x%x from 0x%x\n", h.phase,
-                         (unsigned long long)h.flip, h.fn, h.caller);
+            char chain[kDepth * 10 + 1] = "";
+            for (int d = 0, n = 0; d < kDepth && h.stack[d]; ++d)
+                n += std::snprintf(chain + n, sizeof chain - n, " %x", h.stack[d]);
+            std::fprintf(stderr, "[cover] phase %d flip %llu fn 0x%x from 0x%x <-%s\n", h.phase,
+                         (unsigned long long)h.flip, h.fn, h.caller, chain);
         }
         static size_t lastWarm = 0;
         if (warm != lastWarm && gPhase.load() == 1) {
