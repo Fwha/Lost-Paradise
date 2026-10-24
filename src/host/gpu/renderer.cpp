@@ -402,6 +402,7 @@ struct ShaderModule {
     VkShaderModule module = VK_NULL_HANDLE;
     gcn::Translation translation;
     uint32_t id = 0;
+    std::string name; // its SPIR-V cache name: a hash of the GLSL, the same in every run
 };
 
 struct BufferRange {
@@ -442,7 +443,7 @@ struct Profiler {
     uint64_t ns[kProfCount] = {};
     uint64_t passWhy[4] = {}; // why a new render pass started, by PassWhy
     uint64_t feedbackOn[2] = {}; // a draw sampled the open pass's depth / color attachment
-    uint64_t barriers = 0, calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0;
+    uint64_t barriers = 0, calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -529,6 +530,7 @@ public:
         }
         prof_.on = aprof_.on = getenv("LPN_PROFILE") != nullptr;
         openPipelineCache();
+        startPipelineWorkers();
         dumpGlsl_ = getenv("LPN_GPU_GLSL") != nullptr;
         return true;
     }
@@ -845,9 +847,9 @@ public:
         std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / 300, prof_.dmas / 300.0,
                      prof_.dmaBytes / 300.0 / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
-        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made\n",
+        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " draws skipped for one\n",
                      prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.analyses / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0, prof_.passes / 300.0,
-                     prof_.barriers / 300.0, prof_.pipelinesMade);
+                     prof_.barriers / 300.0, prof_.pipelinesMade, prof_.pipelineWaits);
         const bool on = prof_.on;
         std::fill(std::begin(frameNs_), std::end(frameNs_), 0);
         frameAnalyses_ = framePipelines_ = 0;
@@ -1533,6 +1535,7 @@ private:
             }
         }
         m->module = module(m->translation.glsl, stage);
+        m->name = spirvName(m->translation.glsl, stage);
         m->id = uint32_t(shaders_.size() + 1);
         if (dumpGlsl_) { // debugging: every translation as gpu-glsl-<stage>-<entry>-<id>.glsl
             const char* st = stage == gcn::GlslStage::Fragment ? "ps" : stage == gcn::GlslStage::Compute ? "cs" : "vs";
@@ -1571,6 +1574,9 @@ private:
     std::string spirvCachePath(const std::string& glsl, gcn::GlslStage stage) {
         cacheDir();
         if (spirvDir_ == "-") return {};
+        return spirvDir_ + "/" + spirvName(glsl, stage) + ".spv";
+    }
+    static std::string spirvName(const std::string& glsl, gcn::GlslStage stage) {
         std::string text = glsl;
         text += char('0' + int(stage));
         text.resize((text.size() + 7) & ~size_t(7), '\0');
@@ -1578,8 +1584,8 @@ private:
         for (char& c : text) c = char(c ^ 0x5a); // a second, independent hash
         const uint64_t b = hashBytes(text.data(), text.size());
         char name[40];
-        std::snprintf(name, sizeof name, "%016" PRIx64 "%016" PRIx64 ".spv", a, b);
-        return spirvDir_ + "/" + name;
+        std::snprintf(name, sizeof name, "%016" PRIx64 "%016" PRIx64, a, b);
+        return name;
     }
     // The on-disk caches' folder: $LPN_SHADER_CACHE (default ~/.cache/lpn-host/spirv; "off": none).
     void cacheDir() {
@@ -1629,13 +1635,25 @@ private:
     // (tens of MB) stalled the frame ~190 ms every 5 s in crowds, where pipelines keep coming, so
     // it is written on its own thread (pipeline caches are internally synchronized).
     void savePipelineCache() {
-        if (pipelineCachePath_.empty() || newPipelines_ < 16 || pipelineSaving_.load()) return;
+        if (pipelineCachePath_.empty() || !newPipelines_ || pipelineSaving_.load()) return;
         const auto now = std::chrono::steady_clock::now();
-        if (now - lastPipelineSave_ < std::chrono::seconds(30)) return;
+        if (now - lastPipelineSave_ < std::chrono::seconds(20)) return;
         newPipelines_ = 0;
         lastPipelineSave_ = now;
         pipelineSaving_ = true;
-        std::thread([this] {
+        std::thread([this] { writePipelineCache(); }).detach();
+    }
+public:
+    // At exit: pipelines made since the last save would otherwise be compiled again next run.
+    void savePipelineCacheNow() {
+        if (pipelineCachePath_.empty()) return;
+        while (pipelineSaving_.exchange(true)) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (newPipelines_) writePipelineCache();
+        else pipelineSaving_ = false;
+    }
+private:
+    void writePipelineCache() {
+        {
             size_t n = 0;
             std::vector<char> data;
             if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, nullptr) == VK_SUCCESS && n) {
@@ -1650,7 +1668,7 @@ private:
                     else std::remove(tmp.c_str());
                 }
             pipelineSaving_ = false;
-        }).detach();
+        }
     }
 
     static std::vector<uint32_t> loadSpirv(const std::string& path) {
@@ -1833,12 +1851,242 @@ private:
         }
     }
 
-    VkPipeline graphicsPipeline(const GraphicsState& s, ShaderModule* vs, ShaderModule* ps, VkPipelineLayout layout) {
+    // ---- pipeline builds off the recorder ----
+    // The driver takes 10-100 ms to build a pipeline it has not cached, and a new area or effect
+    // needs dozens at once: built in line, they froze the game for up to seconds. Pipelines are
+    // built by worker threads instead, and a draw whose pipeline is still being built is skipped
+    // (a new effect can be missing for a frame or two). Every pipeline is also recorded in
+    // pipelines.list beside the SPIR-V (state, shader names, bindings), and each run builds the
+    // recorded ones at startup, so places seen before have them ready.
+    // LPN_SYNC_PIPELINES=1 builds in line as before (no skipped draws); LPN_PREBUILD=0 skips the startup builds.
+    struct BuiltPipeline {
+        std::atomic<bool> ready{false};
+        VkPipeline pipeline = VK_NULL_HANDLE;
+    };
+    struct PipelineJob {
+        GraphicsState state; // vs and ps are 0: the modules below
+        VkShaderModule vs = VK_NULL_HANDLE, ps = VK_NULL_HANDLE, geom = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        std::shared_ptr<BuiltPipeline> out;
+        std::string record; // appended to pipelines.list once built, unless it came from there
+        bool prebuild = false; // from pipelines.list: vs and ps are its own, destroyed after
+    };
+    static constexpr uint32_t kRecordVersion = 1;
+
+    // What identifies a pipeline across runs (its key in built_ and its pipelines.list entry).
+    static std::string pipelineRecord(const GraphicsState& s, const std::string& vs, const std::string& ps,
+                                      const std::vector<VkDescriptorSetLayoutBinding>& bindings) {
+        std::string r;
+        auto put = [&](const void* p, size_t n) { r.append(static_cast<const char*>(p), n); };
+        const uint32_t head[] = {kRecordVersion, uint32_t(sizeof(GraphicsState)), uint32_t(vs.size()), uint32_t(ps.size()),
+                                 uint32_t(bindings.size())};
+        put(head, sizeof head);
+        put(&s, sizeof s);
+        r += vs;
+        r += ps;
+        for (const auto& b : bindings) {
+            const uint32_t k[] = {b.binding, uint32_t(b.descriptorType), b.stageFlags};
+            put(k, sizeof k);
+        }
+        return r;
+    }
+    static bool parseRecord(const std::string& r, GraphicsState& s, std::string& vs, std::string& ps,
+                            std::vector<VkDescriptorSetLayoutBinding>& bindings) {
+        uint32_t head[5];
+        if (r.size() < sizeof head) return false;
+        std::memcpy(head, r.data(), sizeof head);
+        if (head[0] != kRecordVersion || head[1] != sizeof(GraphicsState) ||
+            r.size() != sizeof head + sizeof s + head[2] + head[3] + size_t(head[4]) * 12)
+            return false;
+        size_t at = sizeof head;
+        std::memcpy(&s, r.data() + at, sizeof s);
+        at += sizeof s;
+        vs = r.substr(at, head[2]);
+        ps = r.substr(at + head[2], head[3]);
+        at += head[2] + head[3];
+        bindings.resize(head[4]);
+        for (auto& b : bindings) {
+            uint32_t k[3];
+            std::memcpy(k, r.data() + at, sizeof k);
+            at += sizeof k;
+            b = {k[0], VkDescriptorType(k[1]), 1, k[2], nullptr};
+        }
+        return true;
+    }
+
+    VkShaderModule geometryFor(const GraphicsState& s) {
+        if (s.topology == 17) return expandShader(false, s.vsOutputs);
+        if (s.topology == 19) return expandShader(true, s.vsOutputs);
+        return VK_NULL_HANDLE;
+    }
+
+    VkPipeline graphicsPipeline(const GraphicsState& s, ShaderModule* vs, ShaderModule* ps, VkPipelineLayout layout,
+                                const std::vector<VkDescriptorSetLayoutBinding>& bindings) {
         thread_local std::string key; // per draw: built in a reused buffer
         key.assign(reinterpret_cast<const char*>(&s), sizeof(s));
         auto it = pipelines_.find(key);
         if (it != pipelines_.end()) return it->second;
+        if (!vs->module || (ps && !ps->module)) return pipelines_[key] = VK_NULL_HANDLE;
+        GraphicsState c = s;
+        c.vs = c.ps = 0;
+        std::string record = pipelineRecord(c, vs->name, ps ? ps->name : std::string(), bindings);
+        std::shared_ptr<BuiltPipeline> b;
+        bool fresh = false;
+        {
+            std::lock_guard lock(buildMutex_);
+            auto& slot = built_[record];
+            if (!slot) slot = std::make_shared<BuiltPipeline>(), fresh = true;
+            b = slot;
+        }
+        if (fresh) {
+            ++prof_.pipelinesMade;
+            PipelineJob j{c, vs->module, ps ? ps->module : VK_NULL_HANDLE, geometryFor(s), layout, b, std::move(record), false};
+            if (syncPipelines_) runJob(j);
+            else queueJob(std::move(j), true);
+        }
+        if (!b->ready.load(std::memory_order_acquire)) {
+            ++prof_.pipelineWaits;
+            return VK_NULL_HANDLE; // still being built: the draw is skipped
+        }
+        return pipelines_[key] = b->pipeline;
+    }
 
+    void startPipelineWorkers() {
+        syncPipelines_ = getenv("LPN_SYNC_PIPELINES") != nullptr;
+        if (spirvDir_ != "-") {
+            pipelineListPath_ = spirvDir_ + "/pipelines.list";
+            pipelineList_ = std::fopen(pipelineListPath_.c_str(), "ab");
+        }
+        if (syncPipelines_) return;
+        const unsigned n = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 8u);
+        for (unsigned i = 0; i < n; ++i)
+            std::thread([this] {
+                for (;;) {
+                    PipelineJob j;
+                    {
+                        std::unique_lock lock(buildMutex_);
+                        buildCv_.wait(lock, [&] { return !jobs_.empty(); });
+                        j = std::move(jobs_.front());
+                        jobs_.pop_front();
+                    }
+                    runJob(j);
+                }
+            }).detach();
+        const char* pb = getenv("LPN_PREBUILD");
+        if (!pipelineListPath_.empty() && !(pb && !std::strcmp(pb, "0"))) std::thread([this] { prebuildPipelines(); }).detach();
+    }
+
+    // Draws' pipelines go ahead of the startup builds.
+    void queueJob(PipelineJob&& j, bool urgent) {
+        {
+            std::lock_guard lock(buildMutex_);
+            if (urgent) jobs_.push_front(std::move(j));
+            else jobs_.push_back(std::move(j));
+        }
+        buildCv_.notify_one();
+    }
+
+    void runJob(PipelineJob& j) {
+        j.out->pipeline = buildGraphics(j.state, j.vs, j.ps, j.geom, j.layout);
+        j.out->ready.store(true, std::memory_order_release);
+        ++newPipelines_;
+        if (j.prebuild) {
+            vkDestroyShaderModule(vk_.device, j.vs, nullptr);
+            if (j.ps) vkDestroyShaderModule(vk_.device, j.ps, nullptr);
+        } else if (j.out->pipeline && pipelineList_) {
+            std::lock_guard lock(listMutex_);
+            const uint32_t n = uint32_t(j.record.size());
+            std::fwrite(&n, 4, 1, pipelineList_);
+            std::fwrite(j.record.data(), 1, n, pipelineList_);
+            std::fflush(pipelineList_);
+        }
+    }
+
+    VkShaderModule loadModule(const std::string& name) {
+        if (name.empty()) return VK_NULL_HANDLE;
+        const std::vector<uint32_t> spirv = loadSpirv(spirvDir_ + "/" + name + ".spv");
+        if (spirv.empty()) return VK_NULL_HANDLE;
+        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        ci.codeSize = spirv.size() * 4;
+        ci.pCode = spirv.data();
+        VkShaderModule m = VK_NULL_HANDLE;
+        return vkCreateShaderModule(vk_.device, &ci, nullptr, &m) == VK_SUCCESS ? m : VK_NULL_HANDLE;
+    }
+
+    // Queues every pipeline in pipelines.list (newest first) for the workers.
+    void prebuildPipelines() {
+        std::vector<std::string> records;
+        if (FILE* f = std::fopen(pipelineListPath_.c_str(), "rb")) {
+            uint32_t n;
+            std::string r;
+            while (std::fread(&n, 4, 1, f) == 1 && n < (1u << 20)) {
+                r.resize(n);
+                if (std::fread(r.data(), 1, n, f) != n) break;
+                records.push_back(r);
+            }
+            std::fclose(f);
+        }
+        std::unordered_set<std::string> seen;
+        size_t queued = 0;
+        for (auto r = records.rbegin(); r != records.rend(); ++r) {
+            if (!seen.insert(*r).second) continue;
+            GraphicsState s;
+            std::string vsName, psName;
+            std::vector<VkDescriptorSetLayoutBinding> bindings;
+            if (!parseRecord(*r, s, vsName, psName, bindings)) continue;
+            PipelineJob j;
+            j.state = s;
+            j.prebuild = true;
+            j.vs = loadModule(vsName);
+            j.ps = loadModule(psName);
+            if (!j.vs || (!psName.empty() && !j.ps)) {
+                if (j.vs) vkDestroyShaderModule(vk_.device, j.vs, nullptr);
+                if (j.ps) vkDestroyShaderModule(vk_.device, j.ps, nullptr);
+                continue;
+            }
+            {
+                std::lock_guard lock(m_); // layouts and expanders belong to the recorder
+                j.layout = layout(bindings).pipeline;
+                j.geom = geometryFor(s);
+            }
+            {
+                std::lock_guard lock(buildMutex_);
+                auto& slot = built_[*r];
+                if (slot) { // a draw got there first
+                    vkDestroyShaderModule(vk_.device, j.vs, nullptr);
+                    if (j.ps) vkDestroyShaderModule(vk_.device, j.ps, nullptr);
+                    continue;
+                }
+                slot = j.out = std::make_shared<BuiltPipeline>();
+            }
+            queueJob(std::move(j), false);
+            ++queued;
+        }
+        std::fprintf(stderr, "[gpu] building %zu pipelines from earlier runs\n", queued);
+        // Keep the list from growing without bound: rewrite it without duplicates.
+        if (records.size() > seen.size() + 1024) {
+            std::lock_guard lock(listMutex_);
+            const std::string tmp = pipelineListPath_ + ".tmp" + std::to_string(getpid());
+            if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+                std::unordered_set<std::string> written;
+                for (const auto& r : records)
+                    if (written.insert(r).second) {
+                        const uint32_t n = uint32_t(r.size());
+                        std::fwrite(&n, 4, 1, f);
+                        std::fwrite(r.data(), 1, n, f);
+                    }
+                if (std::fclose(f) == 0) {
+                    std::rename(tmp.c_str(), pipelineListPath_.c_str());
+                    if (pipelineList_) std::fclose(pipelineList_);
+                    pipelineList_ = std::fopen(pipelineListPath_.c_str(), "ab");
+                }
+            }
+        }
+    }
+
+    // Thread-safe: only the device and the pipeline cache (internally synchronized).
+    VkPipeline buildGraphics(const GraphicsState& s, VkShaderModule vsModule, VkShaderModule psModule, VkShaderModule geom,
+                             VkPipelineLayout layout) {
         std::vector<VkPipelineShaderStageCreateInfo> stages;
         auto stage = [&](VkShaderStageFlagBits st, VkShaderModule m) {
             VkPipelineShaderStageCreateInfo i{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -1847,8 +2095,7 @@ private:
             i.pName = "main";
             stages.push_back(i);
         };
-        if (!vs->module || (ps && !ps->module)) return pipelines_[key] = VK_NULL_HANDLE;
-        stage(VK_SHADER_STAGE_VERTEX_BIT, vs->module);
+        stage(VK_SHADER_STAGE_VERTEX_BIT, vsModule);
         VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         switch (s.topology) {
         case 1: topo = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
@@ -1856,14 +2103,14 @@ private:
         case 3: topo = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
         case 5: topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
         case 6: topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
-        case 17: stage(VK_SHADER_STAGE_GEOMETRY_BIT, expandShader(false, s.vsOutputs)); break;
+        case 17: stage(VK_SHADER_STAGE_GEOMETRY_BIT, geom); break;
         case 19:
             topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
-            stage(VK_SHADER_STAGE_GEOMETRY_BIT, expandShader(true, s.vsOutputs));
+            stage(VK_SHADER_STAGE_GEOMETRY_BIT, geom);
             break;
         default: break;
         }
-        if (ps) stage(VK_SHADER_STAGE_FRAGMENT_BIT, ps->module);
+        if (psModule) stage(VK_SHADER_STAGE_FRAGMENT_BIT, psModule);
 
         VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -1959,9 +2206,8 @@ private:
         gci.layout = layout;
         VkPipeline p = VK_NULL_HANDLE;
         const VkResult r = vkCreateGraphicsPipelines(vk_.device, pipelineCache_, 1, &gci, nullptr, &p);
-        ++newPipelines_, ++prof_.pipelinesMade;
         if (r != VK_SUCCESS) std::fprintf(stderr, "[gpu] graphics pipeline creation failed: %s\n", vkResultName(r));
-        return pipelines_[key] = p;
+        return p;
     }
 
     void setDynamicState(const DynamicState& d, uint32_t depthControl) {
@@ -2926,7 +3172,7 @@ private:
         {
             ProfScope pp(prof_, kProfPipeline);
             layp = &layout(lb);
-            pipe = graphicsPipeline(gs, vsm, psm, layp->pipeline);
+            pipe = graphicsPipeline(gs, vsm, psm, layp->pipeline, lb);
         }
         if (!pipe) return;
         Layout& lay = *layp;
@@ -3254,7 +3500,14 @@ private:
     std::string spirvDir_; // "-": no SPIR-V cache
     VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
     std::string pipelineCachePath_;
-    uint32_t newPipelines_ = 0;
+    std::atomic<uint32_t> newPipelines_{0};
+    bool syncPipelines_ = false;
+    std::mutex buildMutex_, listMutex_; // built_ and jobs_; pipelines.list
+    std::condition_variable buildCv_;
+    std::unordered_map<std::string, std::shared_ptr<BuiltPipeline>> built_; // by pipelineRecord
+    std::deque<PipelineJob> jobs_;
+    std::string pipelineListPath_;
+    FILE* pipelineList_ = nullptr;
     std::chrono::steady_clock::time_point lastPipelineSave_{};
     std::atomic<bool> pipelineSaving_{false};
 };
@@ -3289,6 +3542,10 @@ void fetchDisplayCopy(const DisplayCopy& c, uint32_t width, uint32_t height, std
 
 void captureNextFrame(const std::string& dir) {
     if (gRenderer) gRenderer->captureNextFrame(dir);
+}
+
+void saveCaches() {
+    if (gRenderer) gRenderer->savePipelineCacheNow();
 }
 
 } // namespace host::render
