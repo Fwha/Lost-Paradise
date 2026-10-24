@@ -2277,6 +2277,7 @@ private:
         }
         if (fresh) {
             ++prof_.pipelinesMade;
+            notePipeline(c, vs->name, ps ? ps->name : std::string(), prof_.on);
             PipelineJob j{c, vs->module, ps ? ps->module : VK_NULL_HANDLE, geometryFor(s), layout, b, std::move(record), false};
             if (syncPipelines_) runJob(j);
             else {
@@ -2294,6 +2295,60 @@ private:
             b->ready.wait(false, std::memory_order_acquire);
         }
         return pipelines_[key] = b->pipeline;
+    }
+
+    // LPN_PROFILE: why a pipeline made during play was not among those built before: new shaders,
+    // or which state differs from the closest one with the same shaders ([pipe] lines).
+    std::unordered_map<std::string, std::vector<GraphicsState>> pipelinesByShaders_;
+    std::unordered_set<std::string> knownShaders_;
+    std::mutex notedMutex_;
+    void notePipeline(const GraphicsState& s, const std::string& vs, const std::string& ps, bool report,
+                      const char* when = "at draw") {
+        std::lock_guard lock(notedMutex_);
+        auto& known = pipelinesByShaders_[vs + "/" + ps];
+        if (report) {
+            std::string why;
+            if (known.empty()) {
+                why = std::string("new shader pair (vs ") + (knownShaders_.count(vs) ? "seen" : "NEW") + ", ps " +
+                      (ps.empty() ? "none" : knownShaders_.count(ps) ? "seen" : "NEW") + ")";
+            } else {
+                const GraphicsState* best = nullptr;
+                int bestDiff = 1 << 30;
+                auto fields = [](const GraphicsState& x) {
+                    std::vector<std::pair<std::string, uint32_t>> f = {
+                        {"topology", x.topology}, {"modeCntl", x.modeCntl}, {"depthControl", x.depthControl},
+                        {"stencilControl", x.stencilControl}, {"depthFormat", x.depthFormat}, {"stencil", x.stencil},
+                        {"depthWriteOff", x.depthWriteOff}, {"writeMasks", x.writeMasks}, {"vsOutputs", x.vsOutputs}};
+                    for (int i = 0; i < 8; ++i) {
+                        f.push_back({"colorFormat" + std::to_string(i), x.colorFormats[i]});
+                        f.push_back({"blend" + std::to_string(i), x.blend[i]});
+                    }
+                    return f;
+                };
+                const auto mine = fields(s);
+                for (const GraphicsState& k : known) {
+                    const auto theirs = fields(k);
+                    int diff = 0;
+                    for (size_t i = 0; i < mine.size(); ++i) diff += mine[i].second != theirs[i].second;
+                    if (diff < bestDiff) bestDiff = diff, best = &k;
+                }
+                char buf[96];
+                std::snprintf(buf, sizeof buf, "%zu known with these shaders; closest differs in", known.size());
+                why = buf;
+                const auto theirs = fields(*best);
+                for (size_t i = 0; i < mine.size(); ++i)
+                    if (mine[i].second != theirs[i].second) {
+                        std::snprintf(buf, sizeof buf, " %s 0x%x->0x%x", mine[i].first.c_str(), theirs[i].second, mine[i].second);
+                        why += buf;
+                    }
+                if (!bestDiff) why += " nothing (bindings differ)";
+            }
+            std::fprintf(stderr, "[pipe] t=%.1f made %s, vs %.12s ps %.12s: %s\n", profile::seconds(), when, vs.c_str(),
+                         ps.c_str(), why.c_str());
+        }
+        known.push_back(s);
+        knownShaders_.insert(vs);
+        if (!ps.empty()) knownShaders_.insert(ps);
     }
 
     // Blended into the color targets and writing no depth: nothing later depends on it.
@@ -2411,6 +2466,7 @@ private:
             std::string vsName, psName;
             std::vector<VkDescriptorSetLayoutBinding> bindings;
             if (!parseRecord(*r, s, vsName, psName, bindings)) continue;
+            notePipeline(s, vsName, psName, false);
             PipelineJob j;
             j.state = s;
             j.prebuild = true;
@@ -3677,6 +3733,7 @@ private:
             slot = b = std::make_shared<BuiltPipeline>();
         }
         ++c.prof.pipelinesMade;
+        notePipeline(gs, a.vsm->name, a.psm ? a.psm->name : std::string(), c.prof.on, "ahead");
         queueJob(PipelineJob{gs, a.vsm->module, a.psm ? a.psm->module : VK_NULL_HANDLE, geometryFor(gs), layout(lb).pipeline,
                              std::move(b), std::move(record), false},
                  true);
