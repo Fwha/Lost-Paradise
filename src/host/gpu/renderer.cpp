@@ -489,6 +489,7 @@ struct Profiler {
     uint64_t fastKind[3] = {}; // of kFastKind: other draw kind, other shaders, other prim/instances/index type
     uint64_t fastRes[3] = {}; // of kFastResources: resource counts, a buffer, an image
     uint64_t fastMoved = 0; // fast draws that bound a buffer again
+    uint64_t fastSwitches = 0; // fast draws that switched shaders (switchDraw)
     std::unordered_map<uint32_t, uint64_t> fastCtx; // the context registers that differed
     uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
@@ -845,6 +846,7 @@ public:
     void onMemoryWrite(uint64_t addr, uint64_t size) override {
         std::lock_guard lock(m_);
         fast_.valid = false;
+        ++fastEpoch_;
         if (raceCheck_) noteWrite(addr, size);
         cpWrites(addr, size);
     }
@@ -861,6 +863,7 @@ public:
 
     bool onDmaCopy(uint64_t dst, uint64_t src, uint64_t bytes, bool fill, uint32_t value) override {
         fast_.valid = false; // memory changes (recorder thread, like fastDraw)
+        ++fastEpoch_;
         uint64_t id = 0; // the analysis thread's overlay for this copy
         {
             std::lock_guard lock(analysesMutex_);
@@ -1078,9 +1081,9 @@ public:
             if (prof_.missUser[i]) std::fprintf(stderr, " s%d %.0f", i, prof_.missUser[i] / n);
         std::fprintf(stderr, "\n[prof] t=%.1f draws recorded in full:", profile::seconds());
         for (int i = 0; i < kFastMissCount; ++i) std::fprintf(stderr, " %s %.0f", kFastMissNames[i], prof_.fastMiss[i] / n);
-        std::fprintf(stderr, " (kind %.0f, shaders %.0f, prim %.0f; resource counts %.0f, buffer %.0f, image %.0f); fast draws binding a buffer again %.0f",
+        std::fprintf(stderr, " (kind %.0f, shaders %.0f, prim %.0f; resource counts %.0f, buffer %.0f, image %.0f); fast draws binding a buffer again %.0f, switching shaders %.0f",
                      prof_.fastKind[0] / n, prof_.fastKind[1] / n, prof_.fastKind[2] / n, prof_.fastRes[0] / n,
-                     prof_.fastRes[1] / n, prof_.fastRes[2] / n, prof_.fastMoved / n);
+                     prof_.fastRes[1] / n, prof_.fastRes[2] / n, prof_.fastMoved / n, prof_.fastSwitches / n);
         if (!prof_.fastCtx.empty()) {
             std::vector<std::pair<uint64_t, uint32_t>> regs;
             for (auto [reg, count] : prof_.fastCtx) regs.push_back({count, reg});
@@ -3920,8 +3923,8 @@ private:
         }
 
         if (!a.ok) return;
-        if (fastDraw(d, r, a)) return;
-        fast_.valid = false;
+        if (fastDraw(d, r, a) || switchDraw(d, r, a)) return;
+        stashFast();
         gcn::Program& vs = a.vs;
 
         // Render targets. The pass and vectors below are reused from draw to draw (no allocations).
@@ -4131,6 +4134,7 @@ private:
             rec([c = cmd_, ri] { vkCmdBeginRendering(c, &ri); });
             std::swap(pass_, pass); // the old pass's storage is reused by the next draw
             pass_.open = true;
+            ++passSerial_;
             ++prof_.passes;
         }
         if (bound_.pipeline != pipe) {
@@ -4207,6 +4211,17 @@ private:
             f.layout = lay.pipeline;
             f.vsm = vsm;
             f.psm = psm;
+            f.pipe = pipe;
+            f.dyn = dyn;
+            f.depthControl = gs.depthControl;
+            f.width = width;
+            f.height = height;
+            f.pass = passSerial_;
+            f.epoch = fastEpoch_;
+            f.sampled = sampledSurfaces_;
+            f.writes = writes;
+            f.bufs = bufs;
+            f.imgs = imgs;
             keepDraw_ = true;
         }
     }
@@ -4226,7 +4241,142 @@ private:
         uint32_t ctx[::gpu::kContextRegs];
         VkPipelineLayout layout = VK_NULL_HANDLE;
         ShaderModule *vsm = nullptr, *psm = nullptr;
+        // What switchDraw sets again: the pipeline, dynamic state and every descriptor as the
+        // full draw bound them, in pass `pass` with memory as of `epoch`.
+        VkPipeline pipe = VK_NULL_HANDLE;
+        DynamicState dyn{};
+        uint32_t depthControl = 0, width = 0, height = 0;
+        uint64_t pass = 0, epoch = 0;
+        std::vector<VkImage> sampled;
+        std::vector<VkWriteDescriptorSet> writes;
+        std::vector<VkDescriptorBufferInfo> bufs;
+        std::vector<VkDescriptorImageInfo> imgs;
     };
+    // Draws switching back and forth between a few shaders in one pass (~1,000 of the 6,350
+    // looking up the steps after New Game): the fast states of the ones not bound now, with
+    // their last draws.
+    struct FastSlot {
+        FastDraw f;
+        DrawAnalysis prev;
+        uint64_t used = 0;
+    };
+    static constexpr size_t kFastSlots = 4;
+    std::array<FastSlot, kFastSlots> fastSlots_;
+    uint64_t passSerial_ = 0, fastEpoch_ = 0, fastUse_ = 0;
+
+    // The bound fast state, before a full draw replaces it: kept in a slot (its shaders' one, or
+    // the least recently used) while its pass lasts.
+    void stashFast() {
+        if (fast_.valid && fast_.pass == passSerial_ && pass_.open && fast_.epoch == fastEpoch_ && fast_.frame == frame_) {
+            FastSlot* slot = &fastSlots_[0];
+            for (FastSlot& sl : fastSlots_) {
+                if (sl.f.vsm == fast_.vsm && sl.f.psm == fast_.psm) {
+                    slot = &sl;
+                    break;
+                }
+                if (sl.used < slot->used) slot = &sl;
+            }
+            std::swap(slot->f, fast_);
+            std::swap(slot->prev, prevDraw_);
+            slot->used = ++fastUse_;
+        }
+        fast_.valid = false;
+    }
+
+    // A draw repeating one in a slot (see FastSlot) but for its user data, constants and buffer
+    // placement, with only draws recorded since in the same pass: its pipeline, dynamic state and
+    // descriptors are set again from the slot, and its state becomes the bound one.
+    bool switchDraw(const DrawCall& d, const GpuRegs& r, DrawAnalysis& a) {
+        if (!recording_ || !pass_.open || !ringFits(1 << 16)) return false;
+        FastSlot* slot = nullptr;
+        for (FastSlot& sl : fastSlots_)
+            if (sl.f.valid && sl.f.vsm == a.vsm && sl.f.psm == a.psm) slot = &sl;
+        if (!slot) return false;
+        FastDraw& f = slot->f;
+        if (f.pass != passSerial_ || f.epoch != fastEpoch_ || f.frame != frame_ || f.imageGen != imageGen_ ||
+            d.kind != f.kind || r.indexType != f.indexType || r.numInstances != f.numInstances ||
+            r.uconfig[reg::kPrimitiveType] != f.prim || std::memcmp(r.ctx, f.ctx, sizeof f.ctx) != 0)
+            return false;
+        for (VkImage im : f.sampled) // sampling what a draw since has rendered to needs a new pass
+            if (std::find(drawWritten_.begin(), drawWritten_.end(), im) != drawWritten_.end()) return false;
+        uint32_t moved;
+        if (sameButUserData(a.vs, slot->prev.vs, moved) >= 0 || (a.psm && sameButUserData(a.ps, slot->prev.ps, moved) >= 0))
+            return false;
+        VkBuffer indexBuffer = VK_NULL_HANDLE;
+        VkDeviceSize indexOffset = 0;
+        if (d.kind == DrawCall::kIndexed) {
+            const uint32_t isz = r.indexType ? 4 : 2;
+            if (!vramBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset, true) &&
+                !guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset))
+                return false;
+        }
+        ProfScope pb(prof_, kProfBind);
+        std::vector<VkWriteDescriptorSet>& writes = drawWrites_;
+        std::vector<VkDescriptorBufferInfo>& bufs = drawBufs_;
+        std::vector<VkDescriptorImageInfo>& imgs = drawImgs_;
+        writes = f.writes;
+        bufs = f.bufs;
+        imgs = f.imgs;
+        // Every buffer and the draw data again (images are the slot's); bufs is in write order.
+        auto bufferAt = [&](uint32_t binding) -> VkDescriptorBufferInfo* {
+            size_t n = 0;
+            for (const auto& w : writes)
+                if (w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                    if (w.dstBinding == binding) return &bufs[n];
+                    ++n;
+                }
+            return nullptr;
+        };
+        auto bind = [&](gcn::Program& p, gcn::Program& bound, uint32_t base) {
+            for (size_t i = 0; i < p.buffers.size(); ++i)
+                if (VkDescriptorBufferInfo* b = bufferAt(base + 1 + uint32_t(i))) {
+                    *b = bindBuffer(p, p.buffers[i], true);
+                    std::memcpy(bound.buffers[i].sharp, p.buffers[i].sharp, sizeof p.buffers[i].sharp);
+                }
+            const VkDeviceSize bytes = p.data.size() * 4;
+            const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
+            std::memcpy(static_cast<uint8_t*>(ringPtr_) + at, p.data.data(), bytes);
+            if (VkDescriptorBufferInfo* b = bufferAt(base)) *b = {ring_, at, bytes};
+            std::memcpy(bound.data.data(), p.data.data(), bytes);
+        };
+        bind(a.vs, slot->prev.vs, 0);
+        if (a.psm) bind(a.ps, slot->prev.ps, kPsBindingBase);
+        if (bound_.pipeline != f.pipe) {
+            rec([c = cmd_, pipe = f.pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); });
+            bound_.pipeline = f.pipe;
+        }
+        pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, f.layout, writes, bufs, imgs);
+        setViewportScissor(r, f.width, f.height);
+        if (!bound_.state || std::memcmp(bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
+            std::memcpy(bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
+            rec([c = cmd_, b = std::bit_cast<std::array<float, 4>>(bound_.blend)] { vkCmdSetBlendConstants(c, b.data()); });
+        }
+        setDynamicState(f.dyn, f.depthControl);
+        bound_.state = true;
+        if (d.kind == DrawCall::kIndexed) {
+            const VkIndexType it = r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+            if (bound_.index != indexBuffer || bound_.indexOffset != indexOffset || bound_.indexType != it) {
+                rec([c = cmd_, indexBuffer, indexOffset, it] { vkCmdBindIndexBuffer(c, indexBuffer, indexOffset, it); });
+                bound_.index = indexBuffer, bound_.indexOffset = indexOffset, bound_.indexType = it;
+            }
+            rec([c = cmd_, n = d.count, inst = std::max(r.numInstances, 1u), first = d.indexOffset] {
+                vkCmdDrawIndexed(c, n, inst, first, 0, 0);
+            });
+        } else {
+            rec([c = cmd_, n = d.count, inst = std::max(r.numInstances, 1u)] { vkCmdDraw(c, n, inst, 0, 0); });
+        }
+        // The slot's state is the bound one now; the one bound before takes its slot.
+        const bool keepOld = fast_.valid && fast_.pass == passSerial_ && fast_.epoch == fastEpoch_ && fast_.frame == frame_;
+        std::swap(slot->f, fast_);
+        std::swap(slot->prev, prevDraw_);
+        slot->f.valid = keepOld;
+        slot->used = ++fastUse_;
+        fast_.rec = recCount_;
+        ++stats_.draws;
+        ++prof_.fastDraws;
+        ++prof_.fastSwitches;
+        return true;
+    }
     bool fastDraw(const DrawCall& d, const GpuRegs& r, DrawAnalysis& a) {
         const FastDraw& f = fast_;
         auto miss = [&](FastMiss why) {
