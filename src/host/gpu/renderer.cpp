@@ -207,6 +207,19 @@ private:
     std::atomic<bool> failed_{false};
 };
 
+// GuestHasher::hash on the calling thread alone: the same chunks, the same result.
+uint64_t hashGuestSerial(uint64_t addr, size_t size) {
+    constexpr size_t kChunk = 128 << 10;
+    thread_local std::vector<uint8_t> buf(kChunk);
+    uint64_t h = 0xcbf29ce484222325ull ^ size;
+    for (size_t off = 0; off < size; off += kChunk) {
+        const size_t n = std::min(kChunk, size - off);
+        if (!readGuest(addr + off, buf.data(), n)) return 0;
+        h = (h ^ hashBytes(buf.data(), n)) * 0x100000001b3ull;
+    }
+    return h | 1;
+}
+
 // Guest reads for shader analysis, a page at a time. Analysis reads instruction by
 // instruction, and a syscall each made it the renderer's main cost. Memory a submission
 // references cannot change until the GPU is done with it, except where the command processor
@@ -394,8 +407,15 @@ struct Surface {
     uint64_t checkedFrame = ~0ull;
 };
 
+// A texture's full hash, computed off the recorder (see Renderer::guestTexture).
+struct AsyncHash {
+    std::atomic<int> state{0}; // 0 idle, 1 queued or running, 2 result ready
+    uint64_t result = 0;       // 0: unreadable
+};
+
 struct GuestTexture {
     Image img;
+    std::shared_ptr<AsyncHash> check;
     uint64_t hash = 0;
     uint64_t checkedFrame = ~0ull;
     uint64_t changedFrame = 0; // the contents were last (re)uploaded in this frame
@@ -583,6 +603,8 @@ public:
         sync_ = getenv("LPN_GPU_SYNC") != nullptr;
         std::thread([this] { completeBatches(); }).detach();
         if (!syncRecord_) std::thread([this] { commandThread(); }).detach();
+        if (asyncTexChecks_)
+            for (int i = 0; i < 3; ++i) std::thread([this] { texHashWorker(); }).detach();
         storageAlign_ = std::max<VkDeviceSize>(vk_.props.limits.minStorageBufferOffsetAlignment, 16);
         if (const char* t = getenv("LPN_GPU_TRACE")) traceFrame_ = std::strtoull(t, nullptr, 0);
         if (const char* sn = getenv("LPN_GPU_SNAP")) {
@@ -2585,6 +2607,26 @@ private:
         const size_t tiled = slice * slices;
         const VkDeviceSize bytes = VkDeviceSize(ew) * eh * bpe * slices;
         if (!bytes || bytes > kRingSize / 2 || tiled > (256u << 20)) return nullptr;
+        // The full check of a texture already uploaded runs on a hasher thread, its result taken
+        // at the next use (~2.7 ms a frame off the recorder in crowds). The fingerprint is still
+        // taken now, so a texture rewritten as a whole (a video frame) is uploaded at once; a
+        // partial rewrite shows one use later than before. LPN_SYNC_TEX_CHECKS=1: all in line.
+        if (tex.img.image && asyncTexChecks_) {
+            tex.checkedFrame = frame_;
+            if (sampleHash(t.base(), span) == tex.sample) {
+                if (!tex.check) tex.check = std::make_shared<AsyncHash>();
+                AsyncHash& c = *tex.check;
+                const int st = c.state.load(std::memory_order_acquire);
+                if (st == 2) {
+                    c.state.store(0, std::memory_order_relaxed);
+                    if (c.result == tex.hash) return &tex;
+                    // changed (or unreadable): checked again in line below
+                } else {
+                    if (st == 0) queueTexHash(tex.check, t.base(), tiled);
+                    return &tex;
+                }
+            }
+        }
         uint64_t h64;
         {
             ProfScope ps(prof_, kProfTexRead);
@@ -2638,6 +2680,37 @@ private:
         rec([cb = cmd_, buf = ring_, im = tex.img.image, c] { vkCmdCopyBufferToImage(cb, buf, im, VK_IMAGE_LAYOUT_GENERAL, 1, &c); });
         return &tex;
     }
+
+    void queueTexHash(const std::shared_ptr<AsyncHash>& c, uint64_t addr, size_t size) {
+        c->state.store(1, std::memory_order_relaxed);
+        {
+            std::lock_guard lock(texHashMutex_);
+            texHashJobs_.push_back({c, addr, size});
+        }
+        texHashCv_.notify_one();
+    }
+    void texHashWorker() {
+        for (;;) {
+            TexHashJob j;
+            {
+                std::unique_lock lock(texHashMutex_);
+                texHashCv_.wait(lock, [&] { return !texHashJobs_.empty(); });
+                j = std::move(texHashJobs_.front());
+                texHashJobs_.pop_front();
+            }
+            j.check->result = hashGuestSerial(j.addr, j.size);
+            j.check->state.store(2, std::memory_order_release);
+        }
+    }
+    struct TexHashJob {
+        std::shared_ptr<AsyncHash> check;
+        uint64_t addr = 0;
+        size_t size = 0;
+    };
+    const bool asyncTexChecks_ = getenv("LPN_SYNC_TEX_CHECKS") == nullptr;
+    std::mutex texHashMutex_;
+    std::condition_variable texHashCv_;
+    std::deque<TexHashJob> texHashJobs_;
 
     struct ImageBinding {
         VkImageView view = VK_NULL_HANDLE;
