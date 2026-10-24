@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <mutex>
@@ -212,8 +213,17 @@ void vblankThread() {
     uint64_t lastFlipVblank = 0, statFrom = 0;
     uint64_t intervals[5] = {}; // flips 1, 2, 3, 4, 5+ vblanks apart
     double lateMax = 0;
+    // Loading screens (the game's 20 fps flip rate) move on once per frame, about 890 frames for a
+    // save, so they run as fast as the game can draw them: the vblank clock speeds up to
+    // LPN_LOADING_HZ (default 500) and neither the flip rate nor the fps cap applies.
+    // LPN_FAST_LOADING=0 keeps them at 20 fps.
+    const char* fastEnv = std::getenv("LPN_FAST_LOADING");
+    const bool fastLoading = !fastEnv || std::strcmp(fastEnv, "0") != 0;
+    const char* hzEnv = std::getenv("LPN_LOADING_HZ");
+    const double loadingHz = hzEnv ? std::max(30.0, std::atof(hzEnv)) : 500.0;
+    bool loading = false; // from the previous vblank's flip rate
     for (;;) {
-        const double hz = gVblankHz;
+        const double hz = loading ? std::max(loadingHz, double(gVblankHz)) : double(gVblankHz);
         const auto period = std::chrono::nanoseconds(int64_t(1e9 / hz));
         next += period;
         std::this_thread::sleep_until(next);
@@ -231,11 +241,10 @@ void vblankThread() {
             // scenes (it steps them by 1/30 and 1/20 s) keep their speed when the clock runs faster
             // than the PS4's. Half a vblank of slack keeps an on-time flip from slipping to the next.
             const double cap = gFpsCap;
-            // LPN_FAST_LOADING=1 (experiment): the loading screen's 20 fps flip rate is ignored.
-            static const bool fastLoading = std::getenv("LPN_FAST_LOADING") != nullptr;
-            const bool ignoreRate = fastLoading && gDisplay.flipRate == 2;
-            const double interval = std::max(gDisplay.flipRate > 0 && !ignoreRate ? (gDisplay.flipRate + 1) / kPs4Hz : 0.0,
-                                             cap > 0 ? std::max(1.0, std::round(hz / cap)) / hz : 0.0);
+            loading = fastLoading && gDisplay.flipRate == 2;
+            const double interval = loading ? 0.0
+                                            : std::max(gDisplay.flipRate > 0 ? (gDisplay.flipRate + 1) / kPs4Hz : 0.0,
+                                                       cap > 0 ? std::max(1.0, std::round(hz / cap)) / hz : 0.0);
             if (!gDisplay.pending.empty() && now >= flipDue - period / 2 && render::gpuDone(gDisplay.pending.front().gpuMark)) {
                 const auto step = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(interval));
                 flipDue = std::max(flipDue, now - step) + step;
