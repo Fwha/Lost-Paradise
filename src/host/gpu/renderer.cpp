@@ -79,7 +79,7 @@ constexpr uint32_t kPrimitiveType = 0x242;
 
 constexpr uint32_t kPsBindingBase = 32;
 constexpr VkDeviceSize kRingSize = 64ull << 20;
-// Batches in flight. A long submission is cut into several (see kFlushDraws), so the GPU
+// Batches in flight. A long submission is cut into several (see LPN_FLUSH_DRAWS in onDraw), so the GPU
 // starts on a frame while the rest is still being recorded.
 constexpr uint32_t kBatches = 4;
 constexpr uint64_t kImportGranule = 2ull << 20;
@@ -837,7 +837,9 @@ public:
                                    d.kind == DrawCall::kDispatch, prof_.passes != passesBefore, d.count});
         }
         if (++drawsSinceHandOff_ >= 32) handOff(); // the command thread trails by a few draws
-        static const uint32_t flushDraws = getenv("LPN_FLUSH_DRAWS") ? std::atoi(getenv("LPN_FLUSH_DRAWS")) : 400;
+        // Every 1,000 draws: at 400, the 6,350 draws looking up the steps after New Game made 16
+        // batches a frame, and with kBatches in flight the recorder waited on the GPU (80 fps, 90 at 1,000).
+        static const uint32_t flushDraws = getenv("LPN_FLUSH_DRAWS") ? std::atoi(getenv("LPN_FLUSH_DRAWS")) : 1000;
         if (flushDraws && recording_ && ++drawsSinceFlush_ >= flushDraws) flush();
     }
 
