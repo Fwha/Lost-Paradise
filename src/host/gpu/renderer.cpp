@@ -442,7 +442,7 @@ struct Profiler {
     uint64_t ns[kProfCount] = {};
     uint64_t passWhy[4] = {}; // why a new render pass started, by PassWhy
     uint64_t feedbackOn[2] = {}; // a draw sampled the open pass's depth / color attachment
-    uint64_t barriers = 0, calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0;
+    uint64_t barriers = 0, calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -742,11 +742,13 @@ public:
         if (ms > 50 && frame_ > 0) {
             std::fprintf(stderr, "[prof] slow frame %" PRIu64 ": %.1f ms;", frame_, ms);
             for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.1f", kProfNames[i], (prof_.ns[i] - frameNs_[i]) / 1e6);
-            std::fprintf(stderr, "; %" PRIu64 " analyses\n", prof_.analyses - frameAnalyses_);
+            std::fprintf(stderr, "; %" PRIu64 " analyses, %" PRIu64 " pipelines made\n", prof_.analyses - frameAnalyses_,
+                         prof_.pipelinesMade - framePipelines_);
         }
         lastFrameEnd_ = now;
         std::copy(std::begin(prof_.ns), std::end(prof_.ns), frameNs_);
         frameAnalyses_ = prof_.analyses;
+        framePipelines_ = prof_.pipelinesMade;
     }
 
     // LPN_GPU_TIMING=<frame>, or the frame after an F12 capture: GPU time of every draw and
@@ -843,12 +845,12 @@ public:
         std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / 300, prof_.dmas / 300.0,
                      prof_.dmaBytes / 300.0 / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
-        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame\n",
+        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made\n",
                      prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.analyses / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0, prof_.passes / 300.0,
-                     prof_.barriers / 300.0);
+                     prof_.barriers / 300.0, prof_.pipelinesMade);
         const bool on = prof_.on;
         std::fill(std::begin(frameNs_), std::end(frameNs_), 0);
-        frameAnalyses_ = 0;
+        frameAnalyses_ = framePipelines_ = 0;
         prof_ = Profiler{};
         prof_.on = on;
         prof_.windowStart = now;
@@ -1775,6 +1777,12 @@ private:
         uint32_t writeMasks = 0;
         uint32_t blend[8] = {};
         uint32_t vsOutputs = 0;
+        // Stencil reference/masks and the depth bias are dynamic state: they vary per character
+        // and per shadow cascade, and as pipeline state each value made a new pipeline (a frame
+        // building a dozen of them hitched 0.2-0.4 s in crowds). Not part of the key; draw() sets them.
+    };
+    struct DynamicState {
+        uint32_t stencilMasks = 0, stencilMasksBf = 0; // DB_STENCILREFMASK(_BF)
         uint32_t polyOffset[3] = {}; // clamp, scale, offset (float bits) while polygon offset is on
     };
 
@@ -1873,10 +1881,7 @@ private:
         rs.lineWidth = 1.0f;
         if (s.modeCntl & (3u << 11)) { // POLY_OFFSET_FRONT/BACK_ENABLE
             // Scale is in 1/16ths of the slope; the offset is in the depth format's units, as Vulkan's.
-            rs.depthBiasEnable = VK_TRUE;
-            rs.depthBiasClamp = std::bit_cast<float>(s.polyOffset[0]);
-            rs.depthBiasSlopeFactor = std::bit_cast<float>(s.polyOffset[1]) / 16.0f;
-            rs.depthBiasConstantFactor = std::bit_cast<float>(s.polyOffset[2]);
+            rs.depthBiasEnable = VK_TRUE; // the factors are dynamic (setDynamicState)
         }
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -1887,20 +1892,16 @@ private:
             ds.depthCompareOp = VkCompareOp((s.depthControl >> 4) & 7);
             if (s.stencil) {
                 ds.stencilTestEnable = s.depthControl & 1;
-                auto face = [&](uint32_t func, uint32_t ops, uint32_t masks) {
+                auto face = [&](uint32_t func, uint32_t ops) { // masks and reference are dynamic
                     VkStencilOpState f{};
                     f.compareOp = VkCompareOp(func);
                     f.failOp = stencilOp(ops & 0xF);
                     f.passOp = stencilOp((ops >> 4) & 0xF);
                     f.depthFailOp = stencilOp((ops >> 8) & 0xF);
-                    f.compareMask = (masks >> 8) & 0xFF;
-                    f.writeMask = (masks >> 16) & 0xFF;
-                    f.reference = masks & 0xFF;
                     return f;
                 };
-                ds.front = face((s.depthControl >> 8) & 7, s.stencilControl, s.stencilMasks);
-                ds.back = (s.depthControl >> 7) & 1 ? face((s.depthControl >> 20) & 7, s.stencilControl >> 12, s.stencilMasksBf)
-                                                    : ds.front;
+                ds.front = face((s.depthControl >> 8) & 7, s.stencilControl);
+                ds.back = (s.depthControl >> 7) & 1 ? face((s.depthControl >> 20) & 7, s.stencilControl >> 12) : ds.front;
             }
         }
         VkPipelineColorBlendAttachmentState att[8]{};
@@ -1930,10 +1931,12 @@ private:
         VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         cb.attachmentCount = colorCount;
         cb.pAttachments = att;
-        const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                      VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+        const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
+                                      VK_DYNAMIC_STATE_BLEND_CONSTANTS,   VK_DYNAMIC_STATE_DEPTH_BIAS,
+                                      VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                                      VK_DYNAMIC_STATE_STENCIL_REFERENCE};
         VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dy.dynamicStateCount = 3;
+        dy.dynamicStateCount = uint32_t(std::size(dyn));
         dy.pDynamicStates = dyn;
         VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
         ri.colorAttachmentCount = colorCount;
@@ -1956,9 +1959,21 @@ private:
         gci.layout = layout;
         VkPipeline p = VK_NULL_HANDLE;
         const VkResult r = vkCreateGraphicsPipelines(vk_.device, pipelineCache_, 1, &gci, nullptr, &p);
-        ++newPipelines_;
+        ++newPipelines_, ++prof_.pipelinesMade;
         if (r != VK_SUCCESS) std::fprintf(stderr, "[gpu] graphics pipeline creation failed: %s\n", vkResultName(r));
         return pipelines_[key] = p;
+    }
+
+    void setDynamicState(const DynamicState& d, uint32_t depthControl) {
+        // Scale is in 1/16ths of the slope; the offset is in the depth format's units, as Vulkan's.
+        vkCmdSetDepthBias(cmd_, std::bit_cast<float>(d.polyOffset[2]), std::bit_cast<float>(d.polyOffset[0]),
+                          std::bit_cast<float>(d.polyOffset[1]) / 16.0f);
+        const uint32_t back = (depthControl >> 7) & 1 ? d.stencilMasksBf : d.stencilMasks;
+        for (auto [face, m] : {std::pair{VK_STENCIL_FACE_FRONT_BIT, d.stencilMasks}, std::pair{VK_STENCIL_FACE_BACK_BIT, back}}) {
+            vkCmdSetStencilCompareMask(cmd_, face, (m >> 8) & 0xFF);
+            vkCmdSetStencilWriteMask(cmd_, face, (m >> 16) & 0xFF);
+            vkCmdSetStencilReference(cmd_, face, m & 0xFF);
+        }
     }
 
     static bool isIntegerFormat(VkFormat f) {
@@ -2810,6 +2825,7 @@ private:
         pass.written.clear();
         pass.depthImage = VK_NULL_HANDLE;
         GraphicsState gs{};
+        DynamicState dyn{};
         VkRenderingAttachmentInfo colors[8]{};
         uint32_t colorCount = 0;
         uint32_t width = 16384, height = 16384;
@@ -2875,8 +2891,8 @@ private:
                 gs.stencil = stencil;
                 gs.depthControl = depthControl;
                 gs.stencilControl = r.ctx[reg::kDbStencilControl];
-                gs.stencilMasks = r.ctx[reg::kDbStencilRefMask];
-                gs.stencilMasksBf = r.ctx[reg::kDbStencilRefMaskBf];
+                dyn.stencilMasks = r.ctx[reg::kDbStencilRefMask];
+                dyn.stencilMasksBf = r.ctx[reg::kDbStencilRefMaskBf];
                 width = std::min(width, dw);
                 height = std::min(height, dh);
                 clearDepth = dbRender & 1;
@@ -2898,7 +2914,7 @@ private:
         gs.topology = prim;
         gs.modeCntl = r.ctx[reg::kPaSuScModeCntl];
         if (gs.modeCntl & (3u << 11))
-            for (int i = 0; i < 3; ++i) gs.polyOffset[i] = r.ctx[reg::kPaSuPolyOffsetClamp + i];
+            for (int i = 0; i < 3; ++i) dyn.polyOffset[i] = r.ctx[reg::kPaSuPolyOffsetClamp + i];
         gs.vsOutputs = vsm->translation.outputs;
 
         std::vector<VkDescriptorSetLayoutBinding>& lb = drawBindings_;
@@ -3010,6 +3026,7 @@ private:
                                  writes.data());
         setViewportScissor(r, width, height);
         vkCmdSetBlendConstants(cmd_, reinterpret_cast<const float*>(&r.ctx[reg::kCbBlendRed]));
+        setDynamicState(dyn, gs.depthControl);
         if (clearDepth) {
             VkClearAttachment ca{};
             ca.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -3159,7 +3176,7 @@ private:
     std::vector<uint8_t> scratch_;
     GuestHasher hasher_;
     std::chrono::steady_clock::time_point lastFrameEnd_ = std::chrono::steady_clock::now();
-    uint64_t frameNs_[kProfCount] = {}, frameAnalyses_ = 0;
+    uint64_t frameNs_[kProfCount] = {}, frameAnalyses_ = 0, framePipelines_ = 0;
 
     std::map<uint64_t, Import> imports_;
     std::unordered_map<uint64_t, Surface> colors_, depths_;
