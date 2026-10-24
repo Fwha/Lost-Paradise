@@ -4,6 +4,7 @@
 #include "host/gpu/renderer.h"
 #include "host/hle.h"
 #include "host/save_menu.h"
+#include "host/videoout.h"
 
 #include <algorithm>
 #include <atomic>
@@ -25,7 +26,7 @@ bool displayMenuOpen() { return gOpen; }
 namespace {
 
 std::mutex gM;
-int gRow = 0;         // 0 window mode, 1 resolution, 2 exit game
+int gRow = 0;         // 0 window mode, 1 resolution, 2 fps, 3 exit game
 bool gList = false;   // a drop-down is open under gRow
 int gItem = 0;        // highlighted drop-down entry
 
@@ -41,6 +42,12 @@ const Res kResolutions[] = {
     {2560, 1440, "2560X1440"},
 };
 constexpr int kResCount = int(sizeof kResolutions / sizeof kResolutions[0]);
+// The game runs at 60 and drops itself to 30 in cutscenes and 20 on loading screens. Uncapped
+// leaves the rate to the game; the vblank clock still ticks at 59.94 Hz, so that is at most 60
+// (a faster clock would also run the game faster).
+const int kFps[] = {30, 60, 0};
+constexpr int kFpsCount = int(sizeof kFps / sizeof kFps[0]);
+constexpr int kRows = 4;
 
 int resIndex(uint32_t w, uint32_t h) {
     for (int i = 0; i < kResCount; ++i)
@@ -53,13 +60,29 @@ std::string resLabel(uint32_t w, uint32_t h) {
     return i >= 0 ? kResolutions[i].label : std::to_string(w) + "X" + std::to_string(h);
 }
 
-int itemCount() { return gRow == 0 ? 3 : kResCount; }
+int fpsIndex(int fps) {
+    for (int i = 0; i < kFpsCount; ++i)
+        if (kFps[i] == fps) return i;
+    return -1;
+}
+
+std::string fpsLabel(int fps) { return fps ? std::to_string(fps) : "UNCAPPED"; }
+
+int itemCount() { return gRow == 0 ? 3 : gRow == 1 ? kResCount : kFpsCount; }
+
+std::string itemLabel(int i) {
+    return gRow == 0 ? kModes[i] : gRow == 1 ? kResolutions[i].label : fpsLabel(kFps[i]);
+}
 
 void pick(SDL_Window* win) {
     DisplaySettings& s = displaySettings();
     if (gRow == 0) {
         s.window = WindowMode(gItem);
         applyWindowMode(win);
+    } else if (gRow == 2) {
+        s.fps = kFps[gItem];
+        setFpsCap(s.fps);
+        std::fprintf(stderr, "[display] fps cap %s\n", fpsLabel(s.fps).c_str());
     } else {
         s.width = kResolutions[gItem].w;
         s.height = kResolutions[gItem].h;
@@ -71,14 +94,16 @@ void pick(SDL_Window* win) {
 
 void select(SDL_Window* win) {
     if (gList) return pick(win);
-    if (gRow == 2) { // as closing the window does
+    if (gRow == 3) { // as closing the window does
         std::fprintf(stderr, "[window] exit from the display menu\n");
         printUnimplementedSummary();
         render::saveCaches();
         std::_Exit(0);
     }
     const DisplaySettings& s = displaySettings();
-    gItem = gRow == 0 ? int(s.window) : std::max(0, resIndex(s.width, s.height));
+    gItem = gRow == 0   ? int(s.window)
+            : gRow == 1 ? std::max(0, resIndex(s.width, s.height))
+                        : std::max(0, fpsIndex(s.fps));
     gList = true;
 }
 
@@ -89,7 +114,7 @@ void back() {
 
 void move(int d) {
     if (gList) gItem = (gItem + d + itemCount()) % itemCount();
-    else gRow = (gRow + d + 3) % 3;
+    else gRow = (gRow + d + kRows) % kRows;
 }
 
 } // namespace
@@ -158,10 +183,10 @@ void drawDisplayMenu(SDL_Renderer* ren) {
     SDL_GetRendererOutputSize(ren, &w, &h);
     const int px = std::max(1, h / 240);
     const int line = 12 * px;
-    const std::string values[2] = {kModes[int(s.window)], resLabel(s.width, s.height)};
-    const char* const labels[2] = {"WINDOW MODE", "RESOLUTION"};
+    const std::string values[3] = {kModes[int(s.window)], resLabel(s.width, s.height), fpsLabel(s.fps)};
+    const char* const labels[3] = {"WINDOW MODE", "RESOLUTION", "FPS"};
     const int listRows = gList ? itemCount() : 0;
-    const int panelW = std::min(w - 4 * px, 230 * px), panelH = (7 + listRows + (restart ? 1 : 0)) * line;
+    const int panelW = std::min(w - 4 * px, 230 * px), panelH = (8 + listRows + (restart ? 1 : 0)) * line;
     const int x0 = (w - panelW) / 2, y0 = (h - panelH) / 2;
     const int xv = x0 + 6 * px + menuTextWidth("WINDOW MODE  ", px);
 
@@ -174,7 +199,7 @@ void drawDisplayMenu(SDL_Renderer* ren) {
     drawMenuText(ren, x0 + 6 * px, y0 + 4 * px, px, "DISPLAY");
 
     int y = y0 + 2 * line;
-    for (int r = 0; r < 2; ++r, y += line) {
+    for (int r = 0; r < 3; ++r, y += line) {
         if (r == gRow) {
             SDL_Rect hl{x0 + 3 * px, y - 2 * px, panelW - 6 * px, line - px};
             SDL_SetRenderDrawColor(ren, 90, 70, 30, 255);
@@ -187,7 +212,7 @@ void drawDisplayMenu(SDL_Renderer* ren) {
         // The drop-down, under its row.
         for (int i = 0; i < listRows; ++i) {
             y += line;
-            const std::string item = gRow == 0 ? kModes[i] : kResolutions[i].label;
+            const std::string item = itemLabel(i);
             SDL_Rect box{xv - 3 * px, y - 2 * px, panelW - (xv - x0) - 3 * px, line};
             SDL_SetRenderDrawColor(ren, 45, 45, 55, 255);
             SDL_RenderFillRect(ren, &box);
@@ -201,7 +226,7 @@ void drawDisplayMenu(SDL_Renderer* ren) {
             drawMenuText(ren, xv, y, px, item);
         }
     }
-    if (gRow == 2) {
+    if (gRow == 3) {
         SDL_Rect hl{x0 + 3 * px, y - 2 * px, panelW - 6 * px, line - px};
         SDL_SetRenderDrawColor(ren, 90, 70, 30, 255);
         SDL_RenderFillRect(ren, &hl);

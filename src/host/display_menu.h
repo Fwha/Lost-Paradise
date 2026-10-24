@@ -1,4 +1,5 @@
-// The F11 display menu: window mode and the game's render resolution, drawn over the game.
+// The F11 display menu: window mode, the game's render resolution and the fps cap, drawn over
+// the game.
 // The game keeps running while it is open but gets no input.
 #pragma once
 

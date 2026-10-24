@@ -1,5 +1,5 @@
-// Display settings the F11 menu changes: how the window is shown and the resolution the game
-// renders at. They are kept in lpn-display.ini in the working directory.
+// Display settings the F11 menu changes: how the window is shown, the resolution the game
+// renders at and the frame rate cap. They are kept in lpn-display.ini in the working directory.
 #pragma once
 
 #include <cstdint>
@@ -14,6 +14,8 @@ struct DisplaySettings {
     WindowMode window = WindowMode::Windowed;
     // The game's 3D resolution; 0 keeps the game's own (1600x896, as on a base PS4).
     uint32_t width = 0, height = 0;
+    // Frames a second shown at most (see setFpsCap); 0 leaves the rate to the game.
+    int fps = 30;
 };
 
 DisplaySettings& displaySettings();

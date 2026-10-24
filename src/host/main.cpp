@@ -41,7 +41,7 @@ int usage() {
                  "  --no-gpu       do not render (no Vulkan)\n"
                  "  --compute-only run GPU compute work but skip draws (fast; the game still progresses)\n"
                  "  --vblank HZ    display refresh rate (default 59.94)\n"
-                 "  --fps-cap N    show at most N frames a second, at even intervals (default 30; 0: uncapped)\n"
+                 "  --fps-cap N    show at most N frames a second, at even intervals (default: the F11 menu's; 0: uncapped)\n"
                  "  --data DIR     host folder for saves and downloads (default ./lpn-data)\n"
                  "  --trace-hle N  log each system call's first use, and its first use after frame N\n"
                  "  --strict       stop at the first call to an unimplemented import\n"
@@ -63,6 +63,7 @@ void onGuestExit() { std::fprintf(stderr, "[host] guest exit handler called\n");
 int main(int argc, char** argv) {
     std::string gameDir, nidPath, dataDir = "lpn-data";
     bool listUnimplemented = false, headless = false, gpu = true, computeOnly = false;
+    double fpsCap = -1; // -1: the F11 menu's
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--nids") && i + 1 < argc) nidPath = argv[++i];
         else if (!std::strcmp(argv[i], "--data") && i + 1 < argc) dataDir = argv[++i];
@@ -88,7 +89,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--compute-only")) computeOnly = true;
         else if (!std::strcmp(argv[i], "--trace-files")) host::process().traceFiles = true;
         else if (!std::strcmp(argv[i], "--vblank") && i + 1 < argc) host::setVblankRate(std::atof(argv[++i]));
-        else if (!std::strcmp(argv[i], "--fps-cap") && i + 1 < argc) host::setFpsCap(std::atof(argv[++i]));
+        else if (!std::strcmp(argv[i], "--fps-cap") && i + 1 < argc) fpsCap = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--list-unimplemented")) listUnimplemented = true;
         else if (!std::strcmp(argv[i], "--log-limit") && i + 1 < argc)
             host::hleOptions().logLimitPerImport = std::strtoull(argv[++i], nullptr, 0);
@@ -132,8 +133,9 @@ int main(int argc, char** argv) {
     host::layoutStaticTls(modules);
 
     // F11 menu settings (lpn-display.ini): the render resolution has to be in place before the
-    // game starts, the window mode before the window opens.
+    // game starts, the window mode before the window opens. --fps-cap wins over the menu's cap.
     host::loadDisplaySettings();
+    host::setFpsCap(fpsCap >= 0 ? fpsCap : host::displaySettings().fps);
     host::patchRenderResolution(*modules[0], host::displaySettings().width, host::displaySettings().height);
 
     const int32_t fsOffset = host::guestThreadPointerFsOffset();

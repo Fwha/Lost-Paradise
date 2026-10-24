@@ -82,7 +82,7 @@ struct Display {
 
 double gVblankHz = 59.94;
 double gFpsCap = 30;   // even 30 fps; uncapped, crowded areas swing between 20 and 30
-int32_t gMinFlipRate = 1; // from the cap
+std::atomic<int32_t> gMinFlipRate{1}; // from the cap; the F11 menu changes it
 uint64_t gScreenshotFlip = 0;
 uint64_t gScreenshotEvery = 0;
 std::string gScreenshotPath;
@@ -218,7 +218,7 @@ void vblankThread() {
         {
             std::lock_guard lock(gDisplay.m);
             vblank = ++gDisplay.vblankCount;
-            if (!gDisplay.pending.empty() && gDisplay.vblankCount % (std::max(gDisplay.flipRate, gMinFlipRate) + 1) == 0 &&
+            if (!gDisplay.pending.empty() && gDisplay.vblankCount % (std::max(gDisplay.flipRate, gMinFlipRate.load()) + 1) == 0 &&
                 render::gpuDone(gDisplay.pending.front().gpuMark)) {
                 const Flip f = gDisplay.pending.front();
                 gDisplay.pending.pop_front();

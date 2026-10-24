@@ -3,6 +3,7 @@
 #include "host/module.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -37,6 +38,10 @@ void loadDisplaySettings() {
             if (std::sscanf(value, "%ux%u", &w, &h) == 2 && w >= 320 && h >= 180 && w <= 7680 && h <= 4320)
                 gSettings.width = w, gSettings.height = h;
             else gSettings.width = gSettings.height = 0;
+        } else if (!std::strcmp(key, "fps")) {
+            const int fps = std::atoi(value);
+            if (!std::strcmp(value, "uncapped")) gSettings.fps = 0;
+            else if (fps >= 10 && fps <= 240) gSettings.fps = fps;
         }
     }
     std::fclose(f);
@@ -51,6 +56,8 @@ void saveDisplaySettings() {
     std::fprintf(f, "window = %s\n", modeName(gSettings.window));
     if (gSettings.width) std::fprintf(f, "resolution = %ux%u\n", gSettings.width, gSettings.height);
     else std::fprintf(f, "resolution = default\n");
+    if (gSettings.fps) std::fprintf(f, "fps = %d\n", gSettings.fps);
+    else std::fprintf(f, "fps = uncapped\n");
     std::fclose(f);
 }
 
