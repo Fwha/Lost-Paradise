@@ -4071,6 +4071,21 @@ private:
             }
         }
         if (!colorCount && !hasDepth) return;
+        // A draw writing only depth into the open pass's depth buffer joins that pass, its color
+        // targets attached but not written. Outside the city gate the game interleaves depth-only
+        // draws with color ones on the same depth buffer: each switch was a new pass and barrier,
+        // ~430 a frame (60 fps).
+        if (!colorCount && hasDepth && pass_.open && pass_.colorCount && pass_.depth == depth.imageView &&
+            pass_.stencil == gs.stencil && pass_.width == width && pass_.height == height && !noDepthJoin_) {
+            colorCount = pass_.colorCount;
+            for (uint32_t i = 0; i < colorCount; ++i) {
+                colors[i].imageView = pass_.views[i];
+                colors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                colors[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                colors[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                gs.colorFormats[i] = pass_.formats[i];
+            }
+        }
 
         if (!ringFits(1 << 20)) flush();
         begin();
@@ -4156,7 +4171,7 @@ private:
         // full barrier, as before every draw, so earlier passes, copies and dispatches are visible.
         // Inside a pass only its own attachments change, so a draw sampling one of them (or one
         // after a draw that wrote memory from a shader) needs a new pass.
-        for (uint32_t i = 0; i < colorCount; ++i) pass.views[i] = colors[i].imageView;
+        for (uint32_t i = 0; i < colorCount; ++i) pass.views[i] = colors[i].imageView, pass.formats[i] = gs.colorFormats[i];
         pass.depth = hasDepth ? depth.imageView : VK_NULL_HANDLE;
         pass.colorCount = colorCount;
         pass.stencil = hasDepth && gs.stencil;
@@ -4715,6 +4730,7 @@ private:
     DrawAnalysis prevDraw_; // the last draw recorded in full, if fast_.valid
     bool keepDraw_ = false; // onDraw keeps the draw as prevDraw_
     const bool noFastDraws_ = getenv("LPN_NO_FAST_DRAWS") != nullptr;
+    const bool noDepthJoin_ = getenv("LPN_NO_DEPTH_JOIN") != nullptr; // depth-only draws get their own pass
     Profiler aprof_; // the analysis thread's slots and counts, merged into prof_'s reports
     std::mutex analysesMutex_;
     std::condition_variable analysesCv_; // a DrawAnalysis is ready
@@ -4738,6 +4754,7 @@ private:
     struct Pass {
         bool open = false;
         VkImageView views[8] = {}, depth = VK_NULL_HANDLE;
+        uint32_t formats[8] = {}; // VkFormat, as in GraphicsState
         uint32_t colorCount = 0, width = 0, height = 0;
         bool stencil = false;
         std::vector<VkImage> images; // attachments
