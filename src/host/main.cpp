@@ -40,7 +40,7 @@ int usage() {
                  "  --press LIST   scripted button presses, e.g. cross@1800,options@2400 (frame numbers)\n"
                  "  --no-gpu       do not render (no Vulkan)\n"
                  "  --compute-only run GPU compute work but skip draws (fast; the game still progresses)\n"
-                 "  --vblank HZ    display refresh rate (default 59.94)\n"
+                 "  --vblank HZ    display refresh rate (default 59.94; uncapped: the monitor's)\n"
                  "  --fps-cap N    show at most N frames a second, at even intervals (default: the F11 menu's; 0: uncapped)\n"
                  "  --data DIR     host folder for saves and downloads (default ./lpn-data)\n"
                  "  --trace-hle N  log each system call's first use, and its first use after frame N\n"
@@ -136,6 +136,7 @@ int main(int argc, char** argv) {
     // game starts, the window mode before the window opens. --fps-cap wins over the menu's cap.
     host::loadDisplaySettings();
     host::setFpsCap(fpsCap >= 0 ? fpsCap : host::displaySettings().fps);
+    if (host::prepareFrameClock(*modules[0])) host::setFrameClock(int(fpsCap >= 0 ? fpsCap : host::displaySettings().fps));
     host::patchRenderResolution(*modules[0], host::displaySettings().width, host::displaySettings().height);
 
     const int32_t fsOffset = host::guestThreadPointerFsOffset();

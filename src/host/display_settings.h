@@ -29,4 +29,16 @@ bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height);
 // The resolution the running game was started with (0x0: the game's own).
 void activeRenderResolution(uint32_t* width, uint32_t* height);
 
+// The game's frame clock (0xd9ee40) steps the world by a fixed 1/60 s a frame in some scenes
+// (1/30 in cutscenes, 1/20 while loading) and by the measured frame time, but never less than
+// 1/60 s, in others. Held at 30 fps it would run at half speed, shown above 60 it would run
+// fast. With a 30 fps cap or none, these patches step it by the measured time wherever it
+// would step 1/60 (the 1/30 and 1/20 scenes keep their fixed steps). Returns false when the
+// eboot does not hold the expected instructions; the clock is then left as the game's.
+bool prepareFrameClock(Module& eboot);
+// The frame rate cap the clock should suit (0: uncapped). Takes effect at the next flip.
+void setFrameClock(int fps);
+// Called on the game's thread as it flips, between two runs of the clock: applies a change.
+void syncFrameClock();
+
 } // namespace host

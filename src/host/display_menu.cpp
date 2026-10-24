@@ -79,9 +79,12 @@ void pick(SDL_Window* win) {
     if (gRow == 0) {
         s.window = WindowMode(gItem);
         applyWindowMode(win);
+        applyFrameRate(win);
     } else if (gRow == 2) {
         s.fps = kFps[gItem];
         setFpsCap(s.fps);
+        setFrameClock(s.fps);
+        applyFrameRate(win);
         std::fprintf(stderr, "[display] fps cap %s\n", fpsLabel(s.fps).c_str());
     } else {
         s.width = kResolutions[gItem].w;
@@ -133,7 +136,18 @@ void applyWindowMode(SDL_Window* win) {
         std::fprintf(stderr, "[display] cannot change the window mode: %s\n", SDL_GetError());
 }
 
+void applyFrameRate(SDL_Window* win) {
+    // Uncapped shows a frame at every refresh of the monitor the window is on.
+    SDL_DisplayMode dm;
+    if (displaySettings().fps == 0 && SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(win), &dm) == 0 &&
+        dm.refresh_rate > 60)
+        setDisplayRefresh(dm.refresh_rate);
+    else
+        setDisplayRefresh(0);
+}
+
 bool displayMenuEvent(const SDL_Event& e, SDL_Window* win) {
+    if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_MOVED) applyFrameRate(win); // another monitor?
     if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F11) {
         if (!e.key.repeat && !saveMenuOpen()) {
             std::lock_guard lock(gM);

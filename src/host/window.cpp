@@ -133,6 +133,7 @@ void presenterThread() {
         return;
     }
     applyWindowMode(win);
+    applyFrameRate(win);
     SDL_GameController* gc = nullptr;
     SDL_Texture* tex = nullptr;
     uint32_t texW = 0, texH = 0, texFormat = 0;
