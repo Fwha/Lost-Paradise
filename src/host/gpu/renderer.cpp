@@ -475,7 +475,7 @@ struct Profiler {
     uint64_t ns[kProfCount] = {};
     uint64_t passWhy[4] = {}; // why a new render pass started, by PassWhy
     uint64_t feedbackOn[2] = {}; // a draw sampled the open pass's depth / color attachment
-    uint64_t barriers = 0, calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0;
+    uint64_t barriers = 0, calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -739,6 +739,7 @@ public:
     void onMemoryWrite(uint64_t addr, uint64_t size) override {
         std::lock_guard lock(m_);
         if (raceCheck_) noteWrite(addr, size);
+        cpWrites(addr, size);
     }
     void onCpWrite(uint64_t, uint64_t) override { // written now: the analysis overlay is done
         uint64_t id;
@@ -786,6 +787,7 @@ public:
             rec([c = cmd_, sb, db, bc] { vkCmdCopyBuffer(c, sb, db, 1, &bc); });
         }
         if (raceCheck_) noteWrite(dst, bytes);
+        gpuWrites(dst, bytes);
         ++prof_.dmas, prof_.dmaBytes += bytes;
         if (id) pendingDone_.push_back([this, id] { codePages_.dropOverlay(id); }); // once the GPU has copied
         return true;
@@ -829,6 +831,7 @@ public:
             if (!traceOut_) traceOut_ = stderr;
         }
         if (prof_.on && frame_ % 300 == 0) reportProfile();
+        if (frame_ % 300 == 0) std::erase_if(vramCandidates_, [&](const auto& c) { return c.second + 60 < frame_; });
         if (frame_ == timingFrame_ + 1) reportTiming();
         if (frame_ == timingFrame_) startTiming();
         drawIndex_ = 0;
@@ -946,9 +949,10 @@ public:
         std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / 300, prof_.dmas / 300.0,
                      prof_.dmaBytes / 300.0 / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
-        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " blended draws skipped for one\n",
+        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " blended draws skipped for one; VRAM buffers %.0f MB, %.1f copies (%.2f MB) per frame\n",
                      prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.analyses / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0, prof_.passes / 300.0,
-                     prof_.barriers / 300.0, prof_.pipelinesMade, prof_.pipelineWaits);
+                     prof_.barriers / 300.0, prof_.pipelinesMade, prof_.pipelineWaits, vramBytes_ / 1e6, prof_.vramCopies / 300.0,
+                     prof_.vramCopyBytes / 300.0 / 1e6);
         const bool on = prof_.on;
         std::fill(std::begin(frameNs_), std::end(frameNs_), 0);
         frameAnalyses_ = framePipelines_ = 0;
@@ -2879,6 +2883,192 @@ private:
         }
     }
 
+    // ---- read-only buffers in VRAM ----------------------------------------------------------------
+    // Guest memory is imported host memory, so every vertex, index and constant fetch crossed
+    // PCIe (a third of the GPU's time in a crowd). A buffer of 64 KiB or more that shaders only
+    // read gets a copy in VRAM, made by the GPU in order with the draws. It is checked like a
+    // texture: fingerprinted on its first use in each frame and fully hashed (on a hasher thread)
+    // on every 8th; a change copies it again. Memory the command processor writes is copied again
+    // at its next use; memory a shader, a GPU copy or a fill writes is never shadowed, as the copy
+    // would go stale. A buffer that keeps changing is left in host memory for a while.
+    // LPN_NO_VRAM_BUFFERS=1 reads every buffer from host memory as before.
+    struct VramBuffer {
+        uint64_t base = 0, size = 0;
+        VkBuffer buf = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        uint64_t sample = 0, hash = 0;
+        uint64_t checkedFrame = ~0ull, changedFrame = 0, lastUse = 0, hostUntil = 0;
+        uint32_t uses = 0, phase = 0, changes = 0;
+        bool gpuWritten = false, dirty = false;
+        std::shared_ptr<AsyncHash> check;
+    };
+    struct PairHash {
+        size_t operator()(const std::pair<uint64_t, uint64_t>& k) const { return std::hash<uint64_t>()(k.first * 0x9E3779B97F4A7C15ull ^ k.second); }
+    };
+    static constexpr uint64_t kVramMin = 64 << 10, kVramMax = 64ull << 20, kVramBudget = 1536ull << 20;
+    static constexpr size_t kVramEntries = 1500; // each is a memory allocation of its own
+    const bool vramOn_ = getenv("LPN_NO_VRAM_BUFFERS") == nullptr;
+    std::unordered_map<std::pair<uint64_t, uint64_t>, std::unique_ptr<VramBuffer>, PairHash> vram_;
+    std::multimap<uint64_t, VramBuffer*> vramByBase_; // for overlap queries
+    std::map<uint64_t, uint64_t> gpuWrittenRanges_;  // [start, end), merged
+    uint64_t vramBytes_ = 0, vramCount_ = 0;
+    std::unordered_map<std::pair<uint64_t, uint64_t>, uint64_t, PairHash> vramCandidates_; // first seen in frame
+
+    // Each VRAM buffer overlapping [lo, hi), via fn.
+    template <typename F> void forVramOverlapping(uint64_t lo, uint64_t hi, F&& fn) {
+        for (auto it = vramByBase_.lower_bound(lo >= kVramMax ? lo - kVramMax : 0); it != vramByBase_.end() && it->first < hi; ++it)
+            if (it->second->base + it->second->size > lo) fn(*it->second);
+    }
+    // The GPU writes [addr, addr + size): copies of it would go stale.
+    void gpuWrites(uint64_t addr, uint64_t size) {
+        if (!vramOn_ || !size) return;
+        const uint64_t end = addr + size;
+        auto it = gpuWrittenRanges_.upper_bound(addr);
+        if (it != gpuWrittenRanges_.begin() && std::prev(it)->second >= end) return; // known
+        uint64_t lo = addr, hi = end;
+        if (it != gpuWrittenRanges_.begin() && std::prev(it)->second >= lo) --it;
+        while (it != gpuWrittenRanges_.end() && it->first <= hi) {
+            lo = std::min(lo, it->first);
+            hi = std::max(hi, it->second);
+            it = gpuWrittenRanges_.erase(it);
+        }
+        gpuWrittenRanges_[lo] = hi;
+        forVramOverlapping(addr, end, [](VramBuffer& v) { v.gpuWritten = true; });
+    }
+    bool gpuWritten(uint64_t addr, uint64_t size) const {
+        auto it = gpuWrittenRanges_.upper_bound(addr + size - 1);
+        return it != gpuWrittenRanges_.begin() && std::prev(it)->second > addr;
+    }
+    void cpWrites(uint64_t addr, uint64_t size) {
+        if (vramOn_) forVramOverlapping(addr, addr + size, [](VramBuffer& v) { v.dirty = true; });
+    }
+
+    // A fingerprint of imported guest memory, read directly: 64 samples of 16 bytes. Memory the
+    // GPU reads through an import has to stay mapped anyway, so no syscall guards the reads.
+    static uint64_t importedSample(uint64_t base, uint64_t size) {
+        uint64_t h = 0xcbf29ce484222325ull;
+        const uint64_t stride = std::max<uint64_t>(16, (size / 64) & ~15ull);
+        for (uint64_t off = 0; off + 16 <= size; off += stride) {
+            uint64_t w[2];
+            std::memcpy(w, reinterpret_cast<const void*>(base + off), 16);
+            h = ((h ^ w[0]) * 0x100000001b3ull ^ w[1]) * 0x100000001b3ull;
+        }
+        return h | 1;
+    }
+
+    // A VRAM copy of [base, base + size) for reading, or false to read host memory.
+    bool vramBuffer(uint64_t base, uint64_t size, VkBuffer& out, VkDeviceSize& off) {
+        if (!vramOn_ || size < kVramMin || size > kVramMax || base % 4 || size % 4) return false;
+        auto found = vram_.find({base, size});
+        if (found == vram_.end()) {
+            // Only a buffer used again in a later frame gets a copy: per-frame data in rings sits at
+            // a new address each frame, and copying it would cost more than it saves.
+            if (gpuWritten(base, size)) return false;
+            auto [cand, fresh] = vramCandidates_.try_emplace({base, size}, frame_);
+            if (fresh || cand->second == frame_) return false;
+            vramCandidates_.erase(cand);
+            VkBuffer imported;
+            VkDeviceSize at;
+            if (!guestBuffer(base, size, imported, at)) return false; // mapped (importedSample reads it directly)
+            if (vram_.size() >= kVramEntries) evictVram();
+            found = vram_.emplace(std::make_pair(base, size), std::make_unique<VramBuffer>()).first;
+        }
+        auto& slot = found->second;
+        if (!slot->size) {
+            slot->base = base, slot->size = size, slot->phase = uint32_t(vramCount_++ % 8);
+            slot->gpuWritten = gpuWritten(base, size);
+            vramByBase_.emplace(base, slot.get());
+        }
+        VramBuffer& v = *slot;
+        if (v.gpuWritten || frame_ < v.hostUntil) return false;
+        v.lastUse = frame_;
+        if (v.checkedFrame != frame_ || v.dirty) {
+            v.checkedFrame = frame_;
+            const uint64_t smp = importedSample(base, size);
+            bool changed = v.dirty || (v.buf && smp != v.sample);
+            v.dirty = false;
+            if (v.buf && !changed) {
+                if (!v.check) v.check = std::make_shared<AsyncHash>();
+                const int st = v.check->state.load(std::memory_order_acquire);
+                if (st == 2) {
+                    v.check->state.store(0, std::memory_order_relaxed);
+                    changed = v.check->result != v.hash;
+                } else if (st == 0 && (++v.uses + v.phase) % 8 == 0) {
+                    queueTexHash(v.check, base, size);
+                }
+            }
+            if (changed) {
+                if (frame_ - v.changedFrame < 30 && ++v.changes >= 2) { // keeps changing: host memory for a while
+                    v.hostUntil = frame_ + 600;
+                    v.changes = 0;
+                    return false;
+                }
+                v.changedFrame = frame_;
+            }
+            v.sample = smp;
+            if (!v.buf || changed) {
+                VkBuffer src;
+                VkDeviceSize soff;
+                if (!guestBuffer(base, size, src, soff)) return false;
+                if (!v.buf && !allocVram(v)) return false;
+                v.hash = hasher_.hash(base, size); // what the copy holds (the game does not write memory the GPU is about to read)
+                if (v.check) v.check->state.store(0, std::memory_order_relaxed); // a result in flight is about the old contents
+                fullBarrier();
+                const VkBufferCopy bc{soff, 0, size};
+                rec([c = cmd_, src, dst = v.buf, bc] { vkCmdCopyBuffer(c, src, dst, 1, &bc); });
+                ++prof_.vramCopies, prof_.vramCopyBytes += size;
+            }
+        }
+        out = v.buf;
+        off = 0;
+        return true;
+    }
+    bool allocVram(VramBuffer& v) {
+        if (vramBytes_ + v.size > kVramBudget) evictVram();
+        if (vramBytes_ + v.size > kVramBudget) return false;
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = v.size;
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (vkCreateBuffer(vk_.device, &bci, nullptr, &v.buf) != VK_SUCCESS) return v.buf = VK_NULL_HANDLE, false;
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(vk_.device, v.buf, &req);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = vk_.memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(vk_.device, &mai, nullptr, &v.mem) != VK_SUCCESS) {
+            vkDestroyBuffer(vk_.device, v.buf, nullptr);
+            v.buf = VK_NULL_HANDLE;
+            return false;
+        }
+        VK_CHECK(vkBindBufferMemory(vk_.device, v.buf, v.mem, 0));
+        vramBytes_ += v.size;
+        return true;
+    }
+    // Frees the copies used longest ago (a quarter of them), once the GPU is done with them.
+    void evictVram() {
+        std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> byUse;
+        for (auto& [k, v] : vram_)
+            if (v->lastUse + 2 < frame_) byUse.push_back({v->lastUse, k});
+        std::sort(byUse.begin(), byUse.end());
+        for (size_t i = 0; i < std::max<size_t>(byUse.size() / 4, std::min<size_t>(byUse.size(), 16)); ++i) {
+            auto it = vram_.find(byUse[i].second);
+            VramBuffer* v = it->second.get();
+            for (auto b = vramByBase_.lower_bound(v->base); b != vramByBase_.end() && b->first == v->base; ++b)
+                if (b->second == v) {
+                    vramByBase_.erase(b);
+                    break;
+                }
+            if (v->buf) {
+                vramBytes_ -= v->size;
+                afterFlush_.push_back([this, buf = v->buf, mem = v->mem] {
+                    vkDestroyBuffer(vk_.device, buf, nullptr);
+                    vkFreeMemory(vk_.device, mem, nullptr);
+                });
+            }
+            vram_.erase(it);
+        }
+    }
+
     void bindResources(gcn::Program& p, uint32_t base, VkShaderStageFlags, std::vector<VkWriteDescriptorSet>& writes,
                        std::vector<VkDescriptorBufferInfo>& bufInfos, std::vector<VkDescriptorImageInfo>& imgInfos) {
         ProfScope pb(prof_, kProfBind);
@@ -2888,7 +3078,8 @@ private:
             size = std::min<uint64_t>(size ? size : 16, std::min<uint64_t>(vk_.props.limits.maxStorageBufferRange, 64ull << 20));
             BufferRange r;
             VkDeviceSize off = 0;
-            if (b.known && guestBuffer(b.base(), size, r.buffer, off)) {
+            if (b.store && b.known) gpuWrites(b.base(), size);
+            if (b.known && ((!b.store && vramBuffer(b.base(), size, r.buffer, off)) || guestBuffer(b.base(), size, r.buffer, off))) {
                 if (raceCheck_) b.store ? noteWrite(b.base(), size) : noteRead(b.base(), size, 'b');
                 r.offset = off & ~(storageAlign_ - 1);
                 r.byteOffset = uint32_t(off - r.offset);
@@ -3189,6 +3380,7 @@ private:
         fullBarrier();
         rec([c = cmd_, buffer, offset, bytes = records * 16, v = value[0]] { vkCmdFillBuffer(c, buffer, offset, bytes, v); });
         if (raceCheck_) noteWrite(b.base(), records * 16);
+        gpuWrites(b.base(), records * 16);
         ++stats_.dispatches;
         fastClear(b.base());
         return true;
@@ -3304,6 +3496,7 @@ private:
         VkBuffer buffer;
         VkDeviceSize offset = 0;
         if (!guestBuffer(t.base(), bytes, buffer, offset)) return;
+        gpuWrites(t.base(), bytes);
         if (offset % std::max<uint32_t>(s.elementBytes, 4)) {
             warnOnce("linear image at 0x" + hex(t.base()) + " is not aligned for a copy back");
             return;
@@ -3499,7 +3692,8 @@ private:
         VkDeviceSize indexOffset = 0;
         if (d.kind == DrawCall::kIndexed) {
             const uint32_t isz = r.indexType ? 4 : 2;
-            if (!guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset)) return;
+            if (!vramBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset) &&
+                !guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset)) return;
             if (trace_ && !traceDir_.empty() && uint64_t(d.indexOffset + d.count) * isz <= (1u << 20)) { // captures: the indices
                 std::vector<uint8_t> idx(size_t(d.count) * isz);
                 if (readGuest(d.indexAddr + uint64_t(d.indexOffset) * isz, idx.data(), idx.size()))
