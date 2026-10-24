@@ -4488,8 +4488,9 @@ private:
             if (std::find(drawWritten_.begin(), drawWritten_.end(), im) != drawWritten_.end()) return miss(3);
         uint32_t moved, vsImages = 0, psImages = 0;
         ImageBinding vsImg[32], psImg[32];
+        uint32_t psMoved = 0;
         if (sameButUserData(a.vs, slot->prev.vs, moved, noFastTextures_ ? nullptr : &vsImages) >= 0 ||
-            (a.psm && sameButUserData(a.ps, slot->prev.ps, moved, noFastTextures_ ? nullptr : &psImages) >= 0) ||
+            (a.psm && sameButUserData(a.ps, slot->prev.ps, psMoved, noFastTextures_ ? nullptr : &psImages) >= 0) ||
             !peekImages(a.vs, vsImages, vsImg) || !peekImages(a.ps, psImages, psImg))
             return miss(4);
         VkBuffer indexBuffer = VK_NULL_HANDLE;
@@ -4509,33 +4510,37 @@ private:
         writes.clear(), imgs.clear();
         rebindImages(a.vs, slot->prev.vs, vsImages, vsImg, 0, f);
         if (a.psm) rebindImages(a.ps, slot->prev.ps, psImages, psImg, kPsBindingBase, f);
-        writes = f.writes;
-        bufs = f.bufs;
-        imgs = f.imgs;
-        // Every buffer and the draw data again (images are the slot's); bufs is in write order.
+        // The buffers that moved and the draw data, bound again in the slot's descriptors (bufs is in
+        // write order); the rest stay as the slot has them. Rebinding every buffer (15-20 a draw
+        // outside the city gate) was most of the recorder's bind time.
+        std::array<int16_t, 256> bufIndex;
+        bufIndex.fill(-1);
+        for (size_t k = 0, n = 0; k < f.writes.size(); ++k)
+            if (f.writes[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                if (f.writes[k].dstBinding < bufIndex.size()) bufIndex[f.writes[k].dstBinding] = int16_t(n);
+                ++n;
+            }
         auto bufferAt = [&](uint32_t binding) -> VkDescriptorBufferInfo* {
-            size_t n = 0;
-            for (const auto& w : writes)
-                if (w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-                    if (w.dstBinding == binding) return &bufs[n];
-                    ++n;
-                }
-            return nullptr;
+            return binding < bufIndex.size() && bufIndex[binding] >= 0 ? &f.bufs[bufIndex[binding]] : nullptr;
         };
-        auto bind = [&](gcn::Program& p, gcn::Program& bound, uint32_t base) {
-            for (size_t i = 0; i < p.buffers.size(); ++i)
-                if (VkDescriptorBufferInfo* b = bufferAt(base + 1 + uint32_t(i))) {
-                    *b = bindBuffer(p, p.buffers[i], true);
-                    std::memcpy(bound.buffers[i].sharp, p.buffers[i].sharp, sizeof p.buffers[i].sharp);
-                }
+        auto bind = [&](gcn::Program& p, gcn::Program& bound, uint32_t moved, uint32_t base) {
+            for (uint32_t i = 0; moved; ++i, moved >>= 1)
+                if (moved & 1)
+                    if (VkDescriptorBufferInfo* b = bufferAt(base + 1 + i)) {
+                        *b = bindBuffer(p, p.buffers[i], true);
+                        std::memcpy(bound.buffers[i].sharp, p.buffers[i].sharp, sizeof p.buffers[i].sharp);
+                    }
             const VkDeviceSize bytes = p.data.size() * 4;
             const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
             std::memcpy(static_cast<uint8_t*>(ringPtr_) + at, p.data.data(), bytes);
             if (VkDescriptorBufferInfo* b = bufferAt(base)) *b = {ring_, at, bytes};
             std::memcpy(bound.data.data(), p.data.data(), bytes);
         };
-        bind(a.vs, slot->prev.vs, 0);
-        if (a.psm) bind(a.ps, slot->prev.ps, kPsBindingBase);
+        bind(a.vs, slot->prev.vs, moved, 0);
+        if (a.psm) bind(a.ps, slot->prev.ps, psMoved, kPsBindingBase);
+        writes = f.writes;
+        bufs = f.bufs;
+        imgs = f.imgs;
         if (bound_.pipeline != f.pipe) {
             rec([c = cmd_, pipe = f.pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); });
             bound_.pipeline = f.pipe;
@@ -4643,6 +4648,15 @@ private:
                     bufs.push_back(bindBuffer(p, p.buffers[i], true));
                     writes.push_back(kBufferWrite);
                     writes.back().dstBinding = base + 1 + i;
+                    // Also in the fast state, which switchDraw binds again unchanged but for moved buffers.
+                    for (size_t k = 0, n = 0; k < fast_.writes.size(); ++k)
+                        if (fast_.writes[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                            if (fast_.writes[k].dstBinding == base + 1 + i) {
+                                fast_.bufs[n] = bufs.back();
+                                break;
+                            }
+                            ++n;
+                        }
                     std::memcpy(bound.buffers[i].sharp, p.buffers[i].sharp, sizeof p.buffers[i].sharp);
                 }
         };
