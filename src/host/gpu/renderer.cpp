@@ -2622,9 +2622,11 @@ private:
             return false;
         uint32_t code[std::size(kFillCode)];
         if (!readGuest(cs.launch.entry, code, sizeof code) || std::memcmp(code, kFillCode, sizeof code) != 0) return false;
-        const auto v = cs.smrd.find(cs.launch.entry + 0xc); // s_buffer_load_dwordx4: the value
-        if (v == cs.smrd.end() || v->second + 4 > cs.data.size()) return false;
-        const uint32_t* value = &cs.data[v->second];
+        // s_buffer_load_dwordx4 s[4:7], s[4:7], 0: the value is the first record of the V# in
+        // user data s[4:7].
+        const uint64_t constants = cs.launch.userData[4] | (uint64_t(cs.launch.userData[5] & 0xFFF) << 32);
+        uint32_t value[4];
+        if (cs.launch.userSgprs() < 8 || !readGuest(constants, value, sizeof value)) return false;
         if (value[1] != value[0] || value[2] != value[0] || value[3] != value[0]) return false;
         const gcn::BufferResource& b = cs.buffers[0];
         for (const auto& o : cs.buffers) // both stores go through s[0:3]
