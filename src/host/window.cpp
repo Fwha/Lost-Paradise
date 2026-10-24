@@ -3,6 +3,7 @@
 #include "host/display_menu.h"
 #include "host/gpu/renderer.h"
 #include "host/hle.h"
+#include "host/profile.h"
 #include "host/save_menu.h"
 #include "host/videoout.h"
 
@@ -119,6 +120,7 @@ void pollPad(SDL_GameController* gc) {
 }
 
 void presenterThread() {
+    profile::nameThread("lpn-window");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::fprintf(stderr, "[window] SDL_Init failed: %s\n", SDL_GetError());
         gEnabled = false;
@@ -150,6 +152,7 @@ void presenterThread() {
                 std::_Exit(0);
             }
             if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F12 && !e.key.repeat) requestCapture();
+            if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F10 && !e.key.repeat) profile::mark();
             if (e.type == SDL_CONTROLLERDEVICEADDED && !gc) gc = SDL_GameControllerOpen(e.cdevice.which);
             if (e.type == SDL_CONTROLLERDEVICEREMOVED && gc) {
                 SDL_GameControllerClose(gc);

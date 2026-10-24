@@ -102,8 +102,10 @@ Last updated 2026-10-16.
 - Rendering needs Vulkan 1.3 with VK_EXT_external_memory_host (any current Linux driver;
   lavapipe works for testing) and glslang to build (`libvulkan-dev glslang-dev`).
   `--no-gpu` skips it, `--screenshot N` saves the Nth frame as screenshot.ppm,
-  `LPN_PROFILE=1` prints fps and where the renderer's time goes every 300 frames, and each frame
-  over 50 ms (`[prof] slow frame`),
+  `LPN_PROFILE=1` prints, once a second and stamped `t=<seconds>`, fps with the worst frame and
+  where the renderer's time goes (`[prof]`), the command processor's waits (`[pm4]`) and each
+  thread's CPU use (`[cpu]`, host threads are named `lpn-*`), plus each frame over 50 ms
+  (`[prof] slow frame`); F10 writes `[mark] N at t=...` to tag a spot where the fps drops,
   `LPN_GPU_SYNC=1` waits for the GPU after every submission (to rule out async issues),
   `LPN_GPU_TRACE=<frame>` logs every draw of that frame and dumps its render targets,
   adding `LPN_GPU_SNAP=1` saves the target after each draw (or `LPN_GPU_SNAP=2750-2760,2886` for

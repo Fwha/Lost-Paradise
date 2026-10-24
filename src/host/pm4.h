@@ -65,6 +65,8 @@ public:
     virtual void onAnalyzeWrite(uint64_t /*addr*/, const uint32_t* /*values*/, uint32_t /*count*/) {}
     virtual void onAnalyzeSubmitEnd() {}
     virtual void onAnalyzeFrameEnd() {}
+    // The analysis of the draws so far must not wait for more: their recording is about to be queued.
+    virtual void onAnalyzeFlush() {}
     // WRITE_DATA wrote memory (after onMemoryWrite): the counterpart of onAnalyzeWrite.
     virtual void onCpWrite(uint64_t /*addr*/, uint64_t /*size*/) {}
     // CP DMA from memory (or a fill) to memory: true when the listener runs it on the GPU timeline,
@@ -89,6 +91,8 @@ void afterCommandsRecorded(std::function<void()> fn);
 
 // LPN_TIMELINE=<seconds>: logs what happens on the GPU side for 100 ms from then, with times.
 bool timelineOn();
+// Turns the timeline on for `seconds` from now (F10 with LPN_PROFILE=1).
+void startTimeline(double seconds);
 void timeline(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
 // A PM4 NOP occupying exactly numDwords (used where GNM would emit real packets).

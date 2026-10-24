@@ -40,7 +40,12 @@ unsigned formatComponents(uint32_t dfmt) {
 
 class Emitter {
 public:
-    Emitter(const Program& p, uint32_t base) : p_(p), base_(base) {}
+    Emitter(const Program& p, uint32_t base) : p_(p), base_(base) {
+        // Code regions for label(): the entry's, then each callee's in call order.
+        regions_.push_back(p.launch.entry);
+        for (const auto& [site, callee] : p.calls)
+            if (std::find(regions_.begin(), regions_.end(), callee) == regions_.end()) regions_.push_back(callee);
+    }
 
     Translation run() {
         const Stage stage = p_.launch.stage;
@@ -386,7 +391,20 @@ vec3 cubeDir(vec3 c) {
         }
     }
 
-    std::string label(uint64_t a) { return hex(uint32_t(a)).substr(0, 10) + "u"; }
+    // The value standing for code address `a` in pc and in the registers s_getpc and s_swappc
+    // write: its offset in its region (the entry's or a callee's, the closest start at or below
+    // it) with the region's index in the top byte. The same shader loaded elsewhere then
+    // translates to the same GLSL: with addresses as they are, a shader the game had moved by a
+    // few bytes made a new module and new pipelines, and combat hitched on them again and again.
+    // Offsets keep their differences within a region, so pc arithmetic there still works.
+    std::string label(uint64_t a) {
+        size_t best = regions_.size();
+        for (size_t i = 0; i < regions_.size(); ++i)
+            if (regions_[i] <= a && (best == regions_.size() || regions_[i] > regions_[best])) best = i;
+        if (best == regions_.size() || a - regions_[best] >= (1u << 24) || best >= 255)
+            return hex(uint32_t(a)).substr(0, 10) + "u"; // outside them all: as is
+        return hex(uint32_t(best << 24 | (a - regions_[best]))).substr(0, 10) + "u";
+    }
     void jump(const std::string& cond, uint64_t target) {
         if (!p_.labels.count(target)) return; // the analysis proved this branch is never taken
         if (cond.empty()) out("pc = " + label(target) + "; break;\n");
@@ -1278,6 +1296,7 @@ vec3 cubeDir(vec3 c) {
     }
 
     const Program& p_;
+    std::vector<uint64_t> regions_; // code region starts (see label)
     uint32_t base_;
     Translation t_;
     std::string decls_, init_, body_;

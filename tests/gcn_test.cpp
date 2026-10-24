@@ -205,6 +205,48 @@ int main() {
         ++failures;
     }
 
+    // A vertex shader calling a fetch shader (s_swappc_b64 to the address in s[2:3], which returns
+    // with s_setpc_b64): moved elsewhere in memory, it must translate to the same GLSL.
+    const std::vector<uint32_t> caller = {
+        0xbe9e2102, // s_swappc_b64 s[30:31], s[2:3]
+        0xbf810000, // s_endpgm
+    };
+    const std::vector<uint32_t> callee = {
+        0xbe80201e, // s_setpc_b64 s[30:31]
+    };
+    auto translated = [&](uint64_t entry, uint64_t fetch) {
+        gcn::LaunchState vl;
+        vl.stage = gcn::Stage::Vertex;
+        vl.entry = entry;
+        vl.rsrc2 = 4 << 1;
+        vl.userData[2] = uint32_t(fetch);
+        vl.userData[3] = uint32_t(fetch >> 32);
+        auto readCall = [&](uint64_t addr, void* dst, size_t size) {
+            for (const auto& [at, words] : {std::pair{entry, &caller}, std::pair{fetch, &callee}})
+                if (addr >= at && addr + size <= at + words->size() * 4) {
+                    std::memcpy(dst, reinterpret_cast<const char*>(words->data()) + (addr - at), size);
+                    return true;
+                }
+            return false;
+        };
+        const gcn::Program vp = gcn::analyze(vl, readCall);
+        if (!vp.controlFlow || vp.calls.size() != 1) {
+            std::fprintf(stderr, "call: control flow %d, %zu calls\n", int(vp.controlFlow), vp.calls.size());
+            ++failures;
+        }
+        return gcn::translate(vp, 0).glsl;
+    };
+    const std::string at1 = translated(0x2'e822'6260ull, 0x3c3a'0000ull);
+    const std::string at2 = translated(0x2'e822'6280ull, 0x3c3a'0040ull);
+    if (at1 != at2) {
+        std::fprintf(stderr, "a moved shader translated differently:\n%s\n---\n%s\n", at1.c_str(), at2.c_str());
+        ++failures;
+    }
+    if (gcn::compileGlsl(at1, gcn::GlslStage::Vertex, &error).empty()) {
+        std::fprintf(stderr, "GLSL with a call did not compile:\n%s\n%s\n", error.c_str(), at1.c_str());
+        ++failures;
+    }
+
     if (failures) std::fprintf(stderr, "%d failure(s)\n", failures);
     return failures ? 1 : 0;
 }

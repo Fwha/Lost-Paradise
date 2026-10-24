@@ -1,6 +1,7 @@
 #include "host/pm4.h"
 
 #include "host/equeue.h"
+#include "host/profile.h"
 
 #include <atomic>
 #include <chrono>
@@ -45,7 +46,10 @@ void draw(const DrawCall& d, Pm4Stats* st) {
     }
     (d.kind >= DrawCall::kDispatch ? st->dispatches : st->draws)++;
     for (DrawListener* l : gListeners) {
-        if (inlineAnalysis()) l->onAnalyzeDraw(d, *tRegs);
+        if (inlineAnalysis()) {
+            l->onAnalyzeDraw(d, *tRegs);
+            l->onAnalyzeFlush();
+        }
         l->onDraw(d, *tRegs);
     }
 }
@@ -152,10 +156,12 @@ void waitRegMem(const uint32_t* b, Pm4Stats* st, bool selfOk = true) {
             ++ws.waits, ws.ns += ns;
             if (ns > ws.maxNs) ws.maxNs = ns, ws.maxAddr = uint64_t(reinterpret_cast<uintptr_t>(mem));
             static uint64_t reportedFrame = 0;
-            if (gFrame >= reportedFrame + 300) {
-                std::fprintf(stderr, "[pm4] frames to %" PRIu64 ": %" PRIu64 " waits, %.2f ms per frame, longest %.2f ms on 0x%" PRIx64 "\n",
-                             gFrame.load(), ws.waits, ws.ns / 1e6 / double(gFrame - reportedFrame), ws.maxNs / 1e6, ws.maxAddr);
+            static double reportedAt = 0;
+            if (gFrame > reportedFrame && profile::seconds() >= reportedAt + 1) {
+                std::fprintf(stderr, "[pm4] t=%.1f frames to %" PRIu64 ": %" PRIu64 " waits, %.2f ms per frame, longest %.2f ms on 0x%" PRIx64 "\n",
+                             profile::seconds(), gFrame.load(), ws.waits, ws.ns / 1e6 / double(gFrame - reportedFrame), ws.maxNs / 1e6, ws.maxAddr);
                 reportedFrame = gFrame;
+                reportedAt = profile::seconds();
                 ws = {};
             }
         }
@@ -444,6 +450,7 @@ struct {
 constexpr size_t kRecQueueLimit = 1024;
 
 void recorderThread() {
+    profile::nameThread("lpn-record");
     for (;;) {
         std::function<void()> fn;
         {
@@ -484,6 +491,7 @@ struct {
 } gAna;
 
 void analysisThread() {
+    profile::nameThread("lpn-analyze");
     tDry = true;
     tRegs = &gAnalysisRegs;
     Pm4Stats dry;
@@ -498,9 +506,12 @@ void analysisThread() {
         gAna.cv.notify_all();
         if (!w.chunk.empty()) {
             execute(w.chunk.data(), w.chunk.data() + w.chunk.size(), &dry, 0);
+            for (DrawListener* l : gListeners) l->onAnalyzeFlush();
             queueRecord([chunk = std::move(w.chunk), st = w.st] { execute(chunk.data(), chunk.data() + chunk.size(), st, 0); });
         }
         if (w.analyze) w.analyze();
+        if (w.analyze || w.record)
+            for (DrawListener* l : gListeners) l->onAnalyzeFlush();
         if (w.record) queueRecord(std::move(w.record));
     }
 }
@@ -547,12 +558,22 @@ void queueChunk(std::vector<uint32_t> chunk, Pm4Stats* st) {
 
 } // namespace
 
+namespace {
+const auto gTimelineStart = std::chrono::steady_clock::now();
+std::atomic<double> gTimelineAt{getenv("LPN_TIMELINE") ? std::atof(getenv("LPN_TIMELINE")) : -1};
+std::atomic<double> gTimelineFor{0.1};
+} // namespace
+
 bool timelineOn() {
-    static const double at = getenv("LPN_TIMELINE") ? std::atof(getenv("LPN_TIMELINE")) : -1;
-    static const auto start = std::chrono::steady_clock::now();
+    const double at = gTimelineAt.load(std::memory_order_relaxed);
     if (at < 0) return false;
-    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    return t >= at && t < at + 0.1;
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - gTimelineStart).count();
+    return t >= at && t < at + gTimelineFor.load(std::memory_order_relaxed);
+}
+
+void startTimeline(double seconds) {
+    gTimelineFor = seconds;
+    gTimelineAt = std::chrono::duration<double>(std::chrono::steady_clock::now() - gTimelineStart).count();
 }
 
 void timeline(const char* fmt, ...) {
@@ -569,6 +590,7 @@ void addDrawListener(DrawListener* l) { gListeners.push_back(l); }
 void notifySubmitEnd() {
     Stage w;
     w.analyze = [] {
+        if (timelineOn()) timeline("analysis: submission analysed");
         for (DrawListener* l : gListeners) l->onAnalyzeSubmitEnd();
     };
     w.record = [] {
@@ -580,6 +602,7 @@ void notifySubmitEnd() {
 void notifyFrameEnd() {
     Stage w;
     w.analyze = [] {
+        if (timelineOn()) timeline("analysis: frame analysed");
         for (DrawListener* l : gListeners) l->onAnalyzeFrameEnd();
     };
     w.record = [] {
@@ -627,6 +650,7 @@ struct {
 constexpr size_t kCpQueueLimit = 64;
 
 void commandProcessorThread() {
+    profile::nameThread("lpn-cp");
     for (;;) {
         std::function<void()> fn;
         {
