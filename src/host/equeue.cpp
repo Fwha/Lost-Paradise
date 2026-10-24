@@ -1,10 +1,12 @@
 #include "host/equeue.h"
 
 #include "host/hle.h"
+#include "host/pm4.h"
 #include "host/kernel.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 
 namespace host {
 
@@ -87,7 +89,10 @@ int32_t sceKernelWaitEqueue(EventQueue* q, KernelEvent* ev, int32_t num, int32_t
     if (!q) return sceError(ps4errno::kEBADF);
     if (!ev || num < 1) return sceError(ps4errno::kEINVAL);
     WaitLog w{"equeue wait", timeoutUs ? int64_t(*timeoutUs) : -1};
+    const bool tl = timelineOn();
+    if (tl) timeline("game: equeue wait");
     const int n = q->wait(ev, num, timeoutUs ? int64_t(*timeoutUs) : -1);
+    if (tl) timeline("game: equeue wait done (%d events, first id 0x%" PRIx64 ")", n, n > 0 ? uint64_t(ev[0].ident) : 0);
     if (out) *out = n;
     return n == 0 ? sceError(ps4errno::kETIMEDOUT) : 0;
 }

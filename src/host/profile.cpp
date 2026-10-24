@@ -1,5 +1,7 @@
 #include "host/profile.h"
 
+#include "host/pm4.h"
+
 #include <dirent.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -109,6 +111,7 @@ void nameThread(const char* name) { pthread_setname_np(pthread_self(), name); }
 void mark() {
     const int n = ++gMarks;
     std::fprintf(stderr, "[mark] %d at t=%.1f%s\n", n, seconds(), on() ? "" : " (LPN_PROFILE is off: no fps reports)");
+    if (on()) startTimeline(0.25); // what each thread does over a few frames from here ([tl] lines)
 }
 
 void start() {

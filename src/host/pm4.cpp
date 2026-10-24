@@ -558,12 +558,22 @@ void queueChunk(std::vector<uint32_t> chunk, Pm4Stats* st) {
 
 } // namespace
 
+namespace {
+const auto gTimelineStart = std::chrono::steady_clock::now();
+std::atomic<double> gTimelineAt{getenv("LPN_TIMELINE") ? std::atof(getenv("LPN_TIMELINE")) : -1};
+std::atomic<double> gTimelineFor{0.1};
+} // namespace
+
 bool timelineOn() {
-    static const double at = getenv("LPN_TIMELINE") ? std::atof(getenv("LPN_TIMELINE")) : -1;
-    static const auto start = std::chrono::steady_clock::now();
+    const double at = gTimelineAt.load(std::memory_order_relaxed);
     if (at < 0) return false;
-    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    return t >= at && t < at + 0.1;
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - gTimelineStart).count();
+    return t >= at && t < at + gTimelineFor.load(std::memory_order_relaxed);
+}
+
+void startTimeline(double seconds) {
+    gTimelineFor = seconds;
+    gTimelineAt = std::chrono::duration<double>(std::chrono::steady_clock::now() - gTimelineStart).count();
 }
 
 void timeline(const char* fmt, ...) {
@@ -580,6 +590,7 @@ void addDrawListener(DrawListener* l) { gListeners.push_back(l); }
 void notifySubmitEnd() {
     Stage w;
     w.analyze = [] {
+        if (timelineOn()) timeline("analysis: submission analysed");
         for (DrawListener* l : gListeners) l->onAnalyzeSubmitEnd();
     };
     w.record = [] {
@@ -591,6 +602,7 @@ void notifySubmitEnd() {
 void notifyFrameEnd() {
     Stage w;
     w.analyze = [] {
+        if (timelineOn()) timeline("analysis: frame analysed");
         for (DrawListener* l : gListeners) l->onAnalyzeFrameEnd();
     };
     w.record = [] {

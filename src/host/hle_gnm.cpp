@@ -76,7 +76,10 @@ void execute(const CommandBuffers& cbs) {
 int32_t sceGnmSubmitCommandBuffers(uint32_t count, void* const* dcb, const uint32_t* dcbBytes, void* const* ccb,
                                    const uint32_t* ccbBytes) {
     if (timelineOn()) timeline("game: submit");
-    queueCommandProcessor([cbs = CommandBuffers(count, dcb, dcbBytes, ccb, ccbBytes)] { execute(cbs); });
+    queueCommandProcessor([cbs = CommandBuffers(count, dcb, dcbBytes, ccb, ccbBytes)] {
+        if (timelineOn()) timeline("cp: submission");
+        execute(cbs);
+    });
     return 0;
 }
 
@@ -85,6 +88,7 @@ int32_t sceGnmSubmitAndFlipCommandBuffers(uint32_t count, void* const* dcb, cons
                                           int32_t bufferIndex, int32_t flipMode, int64_t flipArg) {
     if (timelineOn()) timeline("game: submit and flip");
     queueCommandProcessor([cbs = CommandBuffers(count, dcb, dcbBytes, ccb, ccbBytes)] {
+        if (timelineOn()) timeline("cp: submission and flip");
         execute(cbs);
         notifyFrameEnd();
     });
