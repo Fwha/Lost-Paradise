@@ -533,6 +533,7 @@ struct Profiler {
     uint64_t fastRes[3] = {}; // of kFastResources: resource counts, a buffer, an image
     uint64_t fastMoved = 0; // fast draws that bound a buffer again
     uint64_t fastImages = 0; // fast draws that bound other textures
+    uint64_t diffsTaken = 0; // fastDraw checks an analysis worker had done
     uint64_t fastSwitches = 0; // fast draws that switched shaders (switchDraw)
     uint64_t switchMiss[6] = {}; // other shaders not switched to: no slot, slot stale, state, sampled, resources, index
     uint64_t depthJoins = 0, depthOnly = 0; // depth-only draws that joined the open pass, of all depth-only ones
@@ -738,6 +739,14 @@ public:
         a->ok = a->repeat = false;
         a->vsm = a->psm = nullptr;
         a->vsc = a->psc = nullptr;
+        a->diffPrev = false;
+        a->seq = ++analysisSeq_;
+        // Most draws keep the last one's context registers: a compare here, a hash only on a change.
+        if (std::memcmp(r.ctx, lastCtx_, sizeof lastCtx_) != 0) {
+            std::memcpy(lastCtx_, r.ctx, sizeof lastCtx_);
+            lastCtxHash_ = hashBytes(lastCtx_, sizeof lastCtx_);
+        }
+        a->ctxHash = lastCtxHash_;
         pending_.emplace_back();
         DrawJob& j = pending_.back();
         j.out = a;
@@ -747,6 +756,8 @@ public:
         if (pending_.size() >= kAnalysisBatch) submitBatch();
     }
     void onAnalyzeFlush() override { submitBatch(); }
+    uint64_t analysisSeq_ = 0, lastCtxHash_ = 0; // the analysis thread's
+    uint32_t lastCtx_[::gpu::kContextRegs] = {};
 
     // Memory the command processor writes reaches guest memory only when the recorder (or the
     // GPU) gets there: until then analysis reads it through an overlay on its page caches.
@@ -871,6 +882,8 @@ public:
         else if (computeOnly_) return;
         else if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r, a);
         else warnOnce("indirect draws and dispatches are not rendered yet");
+        // prevDraw_ holds this draw's resources if it was recorded (fast, or in full and kept).
+        prevSeq_ = keepDraw_ || recordedSeq_ == a.seq ? a.seq : 0;
         if (keepDraw_) { // the next draw may repeat this one (see fastDraw)
             keepDraw_ = false;
             std::swap(a, prevDraw_);
@@ -1133,9 +1146,9 @@ public:
         std::fprintf(stderr, " (kind %.0f, shaders %.0f, prim %.0f; resource counts %.0f, buffer %.0f, image %.0f); fast draws binding a buffer again %.0f, other textures %.0f, switching shaders %.0f",
                      prof_.fastKind[0] / n, prof_.fastKind[1] / n, prof_.fastKind[2] / n, prof_.fastRes[0] / n,
                      prof_.fastRes[1] / n, prof_.fastRes[2] / n, prof_.fastMoved / n, prof_.fastImages / n, prof_.fastSwitches / n);
-        std::fprintf(stderr, " (not switched: no slot %.0f, slot stale %.0f, state %.0f, sampled %.0f, resources %.0f, index %.0f)",
+        std::fprintf(stderr, " (not switched: no slot %.0f, slot stale %.0f, state %.0f, sampled %.0f, resources %.0f, index %.0f); checks done ahead %.0f",
                      prof_.switchMiss[0] / n, prof_.switchMiss[1] / n, prof_.switchMiss[2] / n, prof_.switchMiss[3] / n,
-                     prof_.switchMiss[4] / n, prof_.switchMiss[5] / n);
+                     prof_.switchMiss[4] / n, prof_.switchMiss[5] / n, prof_.diffsTaken / n);
         if (!prof_.fastCtx.empty()) {
             std::vector<std::pair<uint64_t, uint32_t>> regs;
             for (auto [reg, count] : prof_.fastCtx) regs.push_back({count, reg});
@@ -3502,6 +3515,16 @@ private:
         const void *vsc = nullptr, *psc = nullptr; // the cached programs (analysis only)
         ShaderModule *vsm = nullptr, *psm = nullptr; // a dispatch's module is vsm
         gcn::Program vs, ps;
+        // Worked out off the recorder, which compared these itself for every draw (fastDraw):
+        uint64_t seq = 0;     // the draw's place in submission order
+        uint64_t ctxHash = 0; // of its context registers (the analysis thread)
+        // Its resources against the previous draw's (an analysis worker, see compareResources),
+        // when that draw was in the same batch.
+        struct Diff {
+            int why = 0;
+            uint32_t moved = 0, images = 0;
+        } vsDiff, psDiff;
+        bool diffPrev = false;
     };
     // A draw's launches as the registers give them, for a worker to analyse.
     struct DrawJob {
@@ -3537,6 +3560,16 @@ private:
     }
     void runBatch(AnalysisCtx& c, std::vector<DrawJob>& b) {
         for (DrawJob& j : b) runJob(c, j);
+        for (size_t i = 1; i < b.size(); ++i) {
+            DrawAnalysis &a = *b[i].out, &p = *b[i - 1].out;
+            if (b[i].kind != DrawJob::kDraw || b[i - 1].kind != DrawJob::kDraw || !a.ok || !p.ok || a.vsm != p.vsm ||
+                a.psm != p.psm)
+                continue;
+            a.vsDiff.why = compareResources(a.vs, p.vs, a.vsDiff.moved, &a.vsDiff.images);
+            if (a.psm) a.psDiff.why = compareResources(a.ps, p.ps, a.psDiff.moved, &a.psDiff.images);
+            else a.psDiff = {-1, 0, 0};
+            a.diffPrev = true;
+        }
         {
             std::lock_guard lock(analysesMutex_);
             for (DrawJob& j : b) j.out->ready = true;
@@ -4352,7 +4385,8 @@ private:
             f.indexType = r.indexType;
             f.numInstances = r.numInstances;
             f.prim = prim;
-            std::memcpy(f.ctx, r.ctx, sizeof f.ctx);
+            f.ctxHash = a.ctxHash;
+            if (prof_.on) f.ctx.assign(r.ctx, r.ctx + ::gpu::kContextRegs);
             f.layout = lay.pipeline;
             f.vsm = vsm;
             f.psm = psm;
@@ -4383,7 +4417,8 @@ private:
         uint64_t rec = 0, frame = 0, imageGen = 0;
         DrawCall::Kind kind = DrawCall::kIndexed;
         uint32_t indexType = 0, numInstances = 0, prim = 0;
-        uint32_t ctx[::gpu::kContextRegs];
+        uint64_t ctxHash = 0;      // DrawAnalysis::ctxHash
+        std::vector<uint32_t> ctx; // the registers themselves, with LPN_PROFILE (which ones differ)
         VkPipelineLayout layout = VK_NULL_HANDLE;
         ShaderModule *vsm = nullptr, *psm = nullptr;
         // What switchDraw sets again: the pipeline, dynamic state and every descriptor as the
@@ -4447,7 +4482,7 @@ private:
         FastDraw& f = slot->f;
         if (f.pass != passSerial_ || f.epoch != fastEpoch_ || f.frame != frame_ || f.imageGen != imageGen_) return miss(1);
         if (d.kind != f.kind || r.indexType != f.indexType || r.numInstances != f.numInstances ||
-            r.uconfig[reg::kPrimitiveType] != f.prim || std::memcmp(r.ctx, f.ctx, sizeof f.ctx) != 0)
+            r.uconfig[reg::kPrimitiveType] != f.prim || a.ctxHash != f.ctxHash)
             return miss(2);
         for (VkImage im : f.sampled) // sampling what a draw since has rendered to needs a new pass
             if (std::find(drawWritten_.begin(), drawWritten_.end(), im) != drawWritten_.end()) return miss(3);
@@ -4532,6 +4567,7 @@ private:
         slot->f.valid = keepOld;
         slot->used = ++fastUse_;
         fast_.rec = recCount_;
+        recordedSeq_ = a.seq;
         ++stats_.draws;
         ++prof_.fastDraws;
         ++prof_.fastSwitches;
@@ -4551,17 +4587,33 @@ private:
             if (prof_.on) ++prof_.fastKind[d.kind != f.kind ? 0 : a.vsm != f.vsm || a.psm != f.psm ? 1 : 2];
             return miss(kFastKind);
         }
-        if (std::memcmp(r.ctx, f.ctx, sizeof f.ctx) != 0) {
-            if (prof_.on)
+        if (a.ctxHash != f.ctxHash) {
+            if (prof_.on && f.ctx.size() == ::gpu::kContextRegs)
                 for (uint32_t i = 0; i < ::gpu::kContextRegs; ++i)
                     if (r.ctx[i] != f.ctx[i]) ++prof_.fastCtx[i];
             return miss(kFastCtx);
         }
         uint32_t vsMoved = 0, psMoved = 0, vsImages = 0, psImages = 0;
-        uint32_t* const vi = noFastTextures_ ? nullptr : &vsImages;
-        uint32_t* const pi = noFastTextures_ ? nullptr : &psImages;
-        int why = sameButUserData(a.vs, prevDraw_.vs, vsMoved, vi);
-        if (why < 0 && a.psm) why = sameButUserData(a.ps, prevDraw_.ps, psMoved, pi);
+        int why;
+        if (a.diffPrev && prevSeq_ + 1 == a.seq) { // prevDraw_'s resources are the previous draw's
+            ++prof_.diffsTaken;
+            why = a.vsDiff.why;
+            if (why < 0 && a.psm) why = a.psDiff.why;
+            if (why < 0) {
+                vsMoved = a.vsDiff.moved, vsImages = a.vsDiff.images;
+                psMoved = a.psDiff.moved, psImages = a.psDiff.images;
+                if (noFastTextures_ && (vsImages || psImages)) why = 2;
+            }
+            if (why < 0) {
+                fillFromPrev(a.vs, prevDraw_.vs, vsMoved, vsImages);
+                if (a.psm) fillFromPrev(a.ps, prevDraw_.ps, psMoved, psImages);
+            }
+        } else {
+            uint32_t* const vi = noFastTextures_ ? nullptr : &vsImages;
+            uint32_t* const pi = noFastTextures_ ? nullptr : &psImages;
+            why = sameButUserData(a.vs, prevDraw_.vs, vsMoved, vi);
+            if (why < 0 && a.psm) why = sameButUserData(a.ps, prevDraw_.ps, psMoved, pi);
+        }
         // Other textures (another material on the same shaders): only ones already resolved this frame.
         ImageBinding vsImg[32], psImg[32];
         if (why < 0 && !(peekImages(a.vs, vsImages, vsImg) && peekImages(a.ps, psImages, psImg))) why = 2;
@@ -4626,6 +4678,7 @@ private:
             rec([c = cmd_, n = d.count, inst = std::max(r.numInstances, 1u)] { vkCmdDraw(c, n, inst, 0, 0); });
         }
         fast_.rec = recCount_;
+        recordedSeq_ = a.seq;
         ++stats_.draws;
         ++prof_.fastDraws;
         return true;
@@ -4669,6 +4722,12 @@ private:
     // (same type, number kind, coordinates, compare): it gets those to bind again, their scale
     // words left for the caller.
     static int sameButUserData(gcn::Program& cur, const gcn::Program& prev, uint32_t& moved, uint32_t* images = nullptr) {
+        const int why = compareResources(cur, prev, moved, images);
+        if (why < 0) fillFromPrev(cur, prev, moved, images ? *images : 0);
+        return why;
+    }
+    // sameButUserData's check, which reads only what analysis produced (an analysis worker can run it).
+    static int compareResources(const gcn::Program& cur, const gcn::Program& prev, uint32_t& moved, uint32_t* images) {
         moved = 0;
         if (images) *images = 0;
         if (cur.data.size() != prev.data.size() || cur.buffers.size() != prev.buffers.size() ||
@@ -4692,12 +4751,15 @@ private:
                 *images |= 1u << i;
             }
         }
+        return -1;
+    }
+    // sameButUserData's fill: the words resolution put in prev's data, for the resources that stay.
+    static void fillFromPrev(gcn::Program& cur, const gcn::Program& prev, uint32_t moved, uint32_t images) {
         std::memcpy(&cur.data[gcn::data::kPosTransform], &prev.data[gcn::data::kPosTransform], 16);
         for (size_t i = 0; i < prev.buffers.size(); ++i)
             if (!(moved >> i & 1)) std::memcpy(&cur.data[prev.buffers[i].data], &prev.data[prev.buffers[i].data], 16);
         for (size_t i = 0; i < prev.images.size(); ++i)
-            if (!(images && (*images >> i & 1))) std::memcpy(&cur.data[prev.images[i].data], &prev.data[prev.images[i].data], 8);
-        return -1;
+            if (!(images >> i & 1)) std::memcpy(&cur.data[prev.images[i].data], &prev.data[prev.images[i].data], 8);
     }
 
     void endPass() {
@@ -4862,6 +4924,7 @@ private:
     FastDraw fast_;
     DrawAnalysis prevDraw_; // the last draw recorded in full, if fast_.valid
     bool keepDraw_ = false; // onDraw keeps the draw as prevDraw_
+    uint64_t prevSeq_ = 0, recordedSeq_ = 0; // DrawAnalysis::seq of prevDraw_'s draw / the last fast one
     const bool noFastDraws_ = getenv("LPN_NO_FAST_DRAWS") != nullptr;
     const bool noDepthJoin_ = getenv("LPN_NO_DEPTH_JOIN") != nullptr; // depth-only draws get their own pass
     Profiler aprof_; // the analysis thread's slots and counts, merged into prof_'s reports
