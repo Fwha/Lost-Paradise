@@ -3223,25 +3223,6 @@ private:
             memoHit_ = true;
             return last.program;
         }
-        // Or repeats it but for user data the evaluation never read: per-draw pointers the
-        // translated shader reads at run time (looking up the steps after New Game, s2 and s12
-        // change on almost every draw, ~5,700 launches a frame). Only the data's copy of the user
-        // SGPRs changes then.
-        if (last.program && last.submit == submit_ && last.bindingBase == bindingBase) {
-            uint32_t differ = 0;
-            for (int i = 0; i < 16; ++i)
-                if (last.launch.userData[i] != l.userData[i]) differ |= 1u << i;
-            gcn::Program& p = last.program->prog;
-            if (!(differ & p.userRead) && p.data.size() >= gcn::data::kUserData + 16 &&
-                sameLaunch(last.launch, l, /*ignoreUser=*/true)) {
-                std::memcpy(&p.data[gcn::data::kUserData], l.userData, sizeof(l.userData));
-                p.launch = l;
-                last.launch = l;
-                ++aprof_.analysisHits, ++aprof_.repeats;
-                memoHit_ = true;
-                return last.program;
-            }
-        }
         memoHit_ = false;
         if (aprof_.on && last.program) { // LPN_PROFILE: why the launch did not repeat
             if (last.launch.entry != l.entry) ++aprof_.missWhy[0];
@@ -3259,8 +3240,8 @@ private:
         last.submit = submit_;
         return last.program;
     }
-    static bool sameLaunch(const gcn::LaunchState& a, const gcn::LaunchState& b, bool ignoreUser = false) {
-        return a.stage == b.stage && a.entry == b.entry && (ignoreUser || !std::memcmp(a.userData, b.userData, sizeof(a.userData))) &&
+    static bool sameLaunch(const gcn::LaunchState& a, const gcn::LaunchState& b) {
+        return a.stage == b.stage && a.entry == b.entry && !std::memcmp(a.userData, b.userData, sizeof(a.userData)) &&
                a.rsrc1 == b.rsrc1 && a.rsrc2 == b.rsrc2 && a.glClipZ == b.glClipZ && a.psInputEna == b.psInputEna &&
                !std::memcmp(a.psInputCntl, b.psInputCntl, sizeof(a.psInputCntl)) && a.numInterp == b.numInterp &&
                a.colorFormat == b.colorFormat && a.colorUint == b.colorUint && a.colorSint == b.colorSint &&

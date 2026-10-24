@@ -102,10 +102,6 @@ struct Program {
     std::vector<BufferResource> buffers;
     std::vector<ImageResource> images;
     std::vector<std::string> warnings;
-    // User SGPRs (bit n: s[n]) whose values the evaluation read. A launch that differs only in
-    // the others evaluates alike but for the user data words in `data`. All of them until a replay
-    // has measured it (an analysis also steps instructions a replay skips).
-    uint32_t userRead = 0xFFFF;
 
     // The evaluation as it ran (work items started and instructions stepped, in order), so a
     // launch of the same code with other user data or memory can be re-evaluated without walking
