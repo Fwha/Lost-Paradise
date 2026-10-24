@@ -231,7 +231,10 @@ void vblankThread() {
             // scenes (it steps them by 1/30 and 1/20 s) keep their speed when the clock runs faster
             // than the PS4's. Half a vblank of slack keeps an on-time flip from slipping to the next.
             const double cap = gFpsCap;
-            const double interval = std::max(gDisplay.flipRate > 0 ? (gDisplay.flipRate + 1) / kPs4Hz : 0.0,
+            // LPN_FAST_LOADING=1 (experiment): the loading screen's 20 fps flip rate is ignored.
+            static const bool fastLoading = std::getenv("LPN_FAST_LOADING") != nullptr;
+            const bool ignoreRate = fastLoading && gDisplay.flipRate == 2;
+            const double interval = std::max(gDisplay.flipRate > 0 && !ignoreRate ? (gDisplay.flipRate + 1) / kPs4Hz : 0.0,
                                              cap > 0 ? std::max(1.0, std::round(hz / cap)) / hz : 0.0);
             if (!gDisplay.pending.empty() && now >= flipDue - period / 2 && render::gpuDone(gDisplay.pending.front().gpuMark)) {
                 const auto step = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(interval));
@@ -370,6 +373,7 @@ int32_t sceVideoOutIsFlipPending(int32_t handle) {
 int32_t sceVideoOutWaitVblank(int32_t handle) {
     if (timelineOn()) timeline("game: wait vblank");
     if (handle != kHandle) return kErrInvalidHandle;
+    WaitLog w{"wait vblank", -1, __builtin_frame_address(0)};
     std::unique_lock lock(gDisplay.m);
     const uint64_t target = gDisplay.vblankCount + 1;
     gDisplay.vblank.wait(lock, [&] { return gDisplay.vblankCount >= target; });

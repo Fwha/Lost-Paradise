@@ -123,6 +123,7 @@ int32_t scePthreadCreate(Thread** out, Attr** attr, void* (*entry)(void*), void*
 Thread* scePthreadSelf() { return self(); }
 int32_t scePthreadEqual(Thread* a, Thread* b) { return a == b; }
 int32_t scePthreadJoin(Thread* t, void** value) {
+    WaitLog w{"join", -1, __builtin_frame_address(0)};
     const int e = pthread_join(t->host, nullptr);
     if (e) return sceErrorFromHost(e);
     if (value) *value = t->result;
@@ -212,7 +213,10 @@ int32_t scePthreadMutexDestroy(Mutex** slot) {
 }
 int32_t scePthreadMutexLock(Mutex** slot) {
     Mutex* m = getMutex(slot);
-    return m ? ret(pthread_mutex_lock(&m->m)) : sceError(ps4errno::kEINVAL);
+    if (!m) return sceError(ps4errno::kEINVAL);
+    if (pthread_mutex_trylock(&m->m) == 0) return 0;
+    WaitLog w{"mutex lock", -1, __builtin_frame_address(0)};
+    return ret(pthread_mutex_lock(&m->m));
 }
 int32_t scePthreadMutexTrylock(Mutex** slot) {
     Mutex* m = getMutex(slot);
@@ -265,11 +269,11 @@ int32_t scePthreadCondDestroy(Cond** slot) {
     return 0;
 }
 int32_t scePthreadCondWait(Cond** c, Mutex** m) {
-    WaitLog w{"cond wait", -1};
+    WaitLog w{"cond wait", -1, __builtin_frame_address(0)};
     return ret(pthread_cond_wait(&getCond(c)->c, &getMutex(m)->m));
 }
 int32_t scePthreadCondTimedwait(Cond** c, Mutex** m, uint32_t usec) {
-    WaitLog w{"cond timedwait", usec};
+    WaitLog w{"cond timedwait", usec, __builtin_frame_address(0)};
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     ts.tv_sec += usec / 1000000;
@@ -358,7 +362,7 @@ int32_t sceKernelDeleteSema(Sema* s) {
 }
 int32_t sceKernelWaitSema(Sema* s, int32_t need, uint32_t* timeoutUs) {
     if (!s || need <= 0 || need > s->max) return sceError(ps4errno::kEINVAL);
-    WaitLog w{"sema wait", timeoutUs ? int64_t(*timeoutUs) : -1};
+    WaitLog w{"sema wait", timeoutUs ? int64_t(*timeoutUs) : -1, __builtin_frame_address(0)};
     std::unique_lock lock(s->m);
     auto ready = [&] { return s->count >= need; };
     if (timeoutUs) {

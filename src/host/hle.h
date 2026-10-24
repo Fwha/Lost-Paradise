@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
+#include <atomic>
 #include <chrono>
 
 #include <cstdint>
@@ -13,13 +14,35 @@
 
 namespace host {
 
+// LPN_PROFILE=1: what each game thread is blocked in, sampled by profile.cpp ([wait] lines).
+// seq is odd while the thread is inside a wait; stack is the guest stack at the HLE call, return
+// address first, so the sampler can name the game code that is waiting.
+struct WaitSlot {
+    std::atomic<uint32_t> seq{0};
+    std::atomic<const char*> what{nullptr};
+    std::atomic<const uint64_t*> stack{nullptr};
+    int tid = 0;
+};
+WaitSlot& waitSlot(); // this thread's, registered with the sampler on first use
+bool waitSamplingOn();
+
 // LPN_WAITLOG=1 (debugging): a blocking call that waited over 100 ms (or LPN_WAITLOG=<ms>) logs
-// its name and timeout.
+// its name and timeout. frame is __builtin_frame_address(0) of the HLE function the game called.
 struct WaitLog {
     const char* what;
     int64_t timeoutUs;
+    WaitSlot* slot = nullptr;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    WaitLog(const char* w, int64_t timeout, const void* frame) : what(w), timeoutUs(timeout) {
+        if (!waitSamplingOn()) return;
+        slot = &waitSlot();
+        slot->what.store(w, std::memory_order_relaxed);
+        slot->stack.store(frame ? static_cast<const uint64_t*>(frame) + 1 : nullptr, std::memory_order_relaxed);
+        slot->seq.fetch_add(1, std::memory_order_release);
+    }
+    WaitLog(const WaitLog&) = delete;
     ~WaitLog() {
+        if (slot) slot->seq.fetch_add(1, std::memory_order_release);
         static const long limit = std::getenv("LPN_WAITLOG") ? std::max(1L, std::atol(std::getenv("LPN_WAITLOG"))) : 0;
         if (!limit) return;
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
