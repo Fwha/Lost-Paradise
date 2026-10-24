@@ -533,6 +533,7 @@ struct Profiler {
     uint64_t fastRes[3] = {}; // of kFastResources: resource counts, a buffer, an image
     uint64_t fastMoved = 0; // fast draws that bound a buffer again
     uint64_t fastSwitches = 0; // fast draws that switched shaders (switchDraw)
+    uint64_t switchMiss[6] = {}; // other shaders not switched to: no slot, slot stale, state, sampled, resources, index
     uint64_t depthJoins = 0, depthOnly = 0; // depth-only draws that joined the open pass, of all depth-only ones
     std::unordered_map<uint32_t, uint64_t> fastCtx; // the context registers that differed
     uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0;
@@ -1131,6 +1132,9 @@ public:
         std::fprintf(stderr, " (kind %.0f, shaders %.0f, prim %.0f; resource counts %.0f, buffer %.0f, image %.0f); fast draws binding a buffer again %.0f, switching shaders %.0f",
                      prof_.fastKind[0] / n, prof_.fastKind[1] / n, prof_.fastKind[2] / n, prof_.fastRes[0] / n,
                      prof_.fastRes[1] / n, prof_.fastRes[2] / n, prof_.fastMoved / n, prof_.fastSwitches / n);
+        std::fprintf(stderr, " (not switched: no slot %.0f, slot stale %.0f, state %.0f, sampled %.0f, resources %.0f, index %.0f)",
+                     prof_.switchMiss[0] / n, prof_.switchMiss[1] / n, prof_.switchMiss[2] / n, prof_.switchMiss[3] / n,
+                     prof_.switchMiss[4] / n, prof_.switchMiss[5] / n);
         if (!prof_.fastCtx.empty()) {
             std::vector<std::pair<uint64_t, uint32_t>> regs;
             for (auto [reg, count] : prof_.fastCtx) regs.push_back({count, reg});
@@ -4385,7 +4389,8 @@ private:
         DrawAnalysis prev;
         uint64_t used = 0;
     };
-    static constexpr size_t kFastSlots = 4;
+    // 16: the city gate switches between more shaders in a pass than the steps (4 were enough there).
+    static constexpr size_t kFastSlots = 16;
     std::array<FastSlot, kFastSlots> fastSlots_;
     uint64_t passSerial_ = 0, fastEpoch_ = 0, fastUse_ = 0;
 
@@ -4413,27 +4418,31 @@ private:
     // descriptors are set again from the slot, and its state becomes the bound one.
     bool switchDraw(const DrawCall& d, const GpuRegs& r, DrawAnalysis& a) {
         if (!recording_ || !pass_.open || !ringFits(1 << 16)) return false;
+        auto miss = [&](int why) {
+            if (prof_.on && (fast_.vsm != a.vsm || fast_.psm != a.psm)) ++prof_.switchMiss[why];
+            return false;
+        };
         FastSlot* slot = nullptr;
         for (FastSlot& sl : fastSlots_)
             if (sl.f.valid && sl.f.vsm == a.vsm && sl.f.psm == a.psm) slot = &sl;
-        if (!slot) return false;
+        if (!slot) return miss(0);
         FastDraw& f = slot->f;
-        if (f.pass != passSerial_ || f.epoch != fastEpoch_ || f.frame != frame_ || f.imageGen != imageGen_ ||
-            d.kind != f.kind || r.indexType != f.indexType || r.numInstances != f.numInstances ||
+        if (f.pass != passSerial_ || f.epoch != fastEpoch_ || f.frame != frame_ || f.imageGen != imageGen_) return miss(1);
+        if (d.kind != f.kind || r.indexType != f.indexType || r.numInstances != f.numInstances ||
             r.uconfig[reg::kPrimitiveType] != f.prim || std::memcmp(r.ctx, f.ctx, sizeof f.ctx) != 0)
-            return false;
+            return miss(2);
         for (VkImage im : f.sampled) // sampling what a draw since has rendered to needs a new pass
-            if (std::find(drawWritten_.begin(), drawWritten_.end(), im) != drawWritten_.end()) return false;
+            if (std::find(drawWritten_.begin(), drawWritten_.end(), im) != drawWritten_.end()) return miss(3);
         uint32_t moved;
         if (sameButUserData(a.vs, slot->prev.vs, moved) >= 0 || (a.psm && sameButUserData(a.ps, slot->prev.ps, moved) >= 0))
-            return false;
+            return miss(4);
         VkBuffer indexBuffer = VK_NULL_HANDLE;
         VkDeviceSize indexOffset = 0;
         if (d.kind == DrawCall::kIndexed) {
             const uint32_t isz = r.indexType ? 4 : 2;
             if (!vramBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset, true) &&
                 !guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset))
-                return false;
+                return miss(5);
         }
         ProfScope pb(prof_, kProfBind);
         std::vector<VkWriteDescriptorSet>& writes = drawWrites_;
