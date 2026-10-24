@@ -647,6 +647,7 @@ public:
         }
         a.ok = a.repeat = false;
         a.vsm = a.psm = nullptr;
+        a.vsc = a.psc = nullptr;
         if (d.kind == DrawCall::kDispatch) analyzeDispatch(r, a);
         else if (!computeOnly_ && (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed)) {
             ++analysisDraws_;
@@ -3307,6 +3308,7 @@ private:
     struct DrawAnalysis {
         bool ok = false;
         bool repeat = false; // both programs repeat the previous draw's (analysis thread only)
+        const void *vsc = nullptr, *psc = nullptr; // the cached programs (analysis thread only)
         ShaderModule *vsm = nullptr, *psm = nullptr; // a dispatch's module is vsm
         gcn::Program vs, ps;
     };
@@ -3372,6 +3374,18 @@ private:
                             lastPrefetch_.psm == a.psm && !std::memcmp(&lastPrefetch_.gs, &gs, sizeof(gs));
         lastPrefetch_ = {analysisDraws_, a.vsm, a.psm, gs};
         if (repeat) return;
+        // Seen before with the same programs (their bindings follow from them): already queued.
+        // Building the record below (strings, a locked map) cost ~5% of the analysis thread. A
+        // program freed and its address reused can only skip a prefetch: the recorder builds it.
+        uint64_t seen = 0xcbf29ce484222325ull;
+        auto mix = [&](const void* p, size_t n) {
+            for (size_t i = 0; i < n; ++i) seen = (seen ^ static_cast<const uint8_t*>(p)[i]) * 0x100000001b3ull;
+        };
+        mix(&gs, sizeof(gs));
+        mix(&a.vsc, sizeof(a.vsc));
+        mix(&a.psc, sizeof(a.psc));
+        if (prefetched_.size() > 200000) prefetched_.clear();
+        if (!prefetched_.insert(seen).second) return;
         thread_local std::vector<VkDescriptorSetLayoutBinding> lb;
         lb.clear();
         addBindings(lb, a.vs, 0, VK_SHADER_STAGE_VERTEX_BIT);
@@ -3399,6 +3413,7 @@ private:
         CachedProgram* vsc = analyzed(launch(r, gcn::Stage::Vertex), 0);
         if (!vsc) return;
         a.repeat = memoHit_;
+        a.vsc = vsc;
         a.ok = true;
         a.vsm = vsc->module;
         takeDrawPart(a.vs, vsc->prog);
@@ -3416,6 +3431,7 @@ private:
             a.psm = psc->module;
             takeDrawPart(a.ps, psc->prog);
             a.repeat = a.repeat && memoHit_;
+            a.psc = psc;
         }
     }
     static void psTargetLaunch(gcn::LaunchState& l, uint32_t i, uint32_t fmt, uint32_t num, uint32_t info) {
@@ -4017,6 +4033,7 @@ private:
         CachedProgram* program = nullptr;
     };
     LastLaunch lastLaunch_[3];
+    std::unordered_set<uint64_t> prefetched_; // pipelines prefetchPipeline() queued, by state and programs
     bool memoHit_ = false; // the last analyzed() call repeated the launch before it
     uint64_t analysisDraws_ = 0;
     struct {
