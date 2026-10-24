@@ -9,6 +9,7 @@
 #include "host/hle.h"
 #include "host/kernel.h"
 #include "host/pm4.h"
+#include "host/profile.h"
 #include "host/window.h"
 
 #include <algorithm>
@@ -166,6 +167,7 @@ void showFrame(Shown& s) {
 }
 
 void displayThread() {
+    profile::nameThread("lpn-display");
     for (;;) {
         Shown s;
         {
@@ -204,6 +206,7 @@ void queueShow(const Frame& frame, uint64_t flip) {
 }
 
 void vblankThread() {
+    profile::nameThread("lpn-vblank");
     auto next = Clock::now();
     auto flipDue = next; // the earliest time the next flip may show, from the flip rate and the cap
     uint64_t lastFlipVblank = 0, statFrom = 0;

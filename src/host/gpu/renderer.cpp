@@ -15,6 +15,7 @@
 #include "host/gpu/tiling.h"
 #include "host/gpu/vk.h"
 #include "host/pm4.h"
+#include "host/profile.h"
 
 #include <sys/mman.h>
 #include <sys/uio.h>
@@ -170,6 +171,7 @@ private:
     static constexpr size_t kChunk = 128 << 10;
 
     void worker() {
+        profile::nameThread("lpn-texhash");
         uint64_t seen = 0;
         std::unique_lock l(m_);
         for (;;) {
@@ -466,7 +468,7 @@ struct ProgramVariants {
 };
 constexpr size_t kMaxWalks = 8, kMaxShapes = 32;
 
-// LPN_PROFILE=1: where the renderer's time goes, printed every 300 frames.
+// LPN_PROFILE=1: where the renderer's time goes, printed once a second (see host/profile.h).
 enum ProfSlot { kProfRenderer, kProfAnalyze, kProfShaderLookup, kProfTexRead, kProfTexUpload, kProfPipeline, kProfGpuWait, kProfBind, kProfLaunch, kProfCount };
 constexpr const char* kProfNames[kProfCount] = {"renderer", "analyze", "shader-lookup", "tex-read", "tex-upload", "pipeline", "gpu-wait", "bind", "launch"};
 
@@ -833,7 +835,7 @@ public:
             traceOut_ = std::fopen((traceDir_ + "trace.txt").c_str(), "w");
             if (!traceOut_) traceOut_ = stderr;
         }
-        if (prof_.on && frame_ % 300 == 0) reportProfile();
+        if (prof_.on && std::chrono::steady_clock::now() - prof_.windowStart >= std::chrono::seconds(1)) reportProfile();
         if (frame_ % 300 == 0) std::erase_if(vramCandidates_, [&](const auto& c) { return c.second + 60 < frame_; });
         if (frame_ == timingFrame_ + 1) reportTiming();
         if (frame_ == timingFrame_) startTiming();
@@ -844,6 +846,7 @@ public:
     void reportSlowFrame() {
         const auto now = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(now - lastFrameEnd_).count();
+        if (frame_ > 0) ++windowFrames_, worstFrameMs_ = std::max(worstFrameMs_, ms), slowFrames_ += ms > 17;
         if (ms > 50 && frame_ > 0) {
             std::fprintf(stderr, "[prof] slow frame %" PRIu64 ": %.1f ms;", frame_, ms);
             for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.1f", kProfNames[i], (prof_.ns[i] - frameNs_[i]) / 1e6);
@@ -944,19 +947,22 @@ public:
         mergeAnalysisProfile();
         const auto now = std::chrono::steady_clock::now();
         const double wall = std::chrono::duration<double>(now - prof_.windowStart).count();
-        std::fprintf(stderr, "[prof] frames %" PRIu64 "-%" PRIu64 ": %.1f fps, %.1f ms/frame;", frame_ - 300, frame_,
-                     300 / wall, wall * 1000 / 300);
-        for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.2f", kProfNames[i], prof_.ns[i] / 1e6 / 300);
+        const double n = double(std::max<uint64_t>(windowFrames_, 1));
+        std::fprintf(stderr, "[prof] t=%.1f frames %" PRIu64 "-%" PRIu64 ": %.1f fps, %.1f ms/frame, worst %.1f ms, %" PRIu64 " over 17 ms;",
+                     profile::seconds(), frame_ - windowFrames_, frame_, n / wall, wall * 1000 / n, worstFrameMs_, slowFrames_);
+        for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.2f", kProfNames[i], prof_.ns[i] / 1e6 / n);
         std::fprintf(stderr, " passes for targets %.0f feedback %.0f (depth %.0f color %.0f) store %.0f other %.0f;",
-                     prof_.passWhy[0] / 300.0, prof_.passWhy[1] / 300.0, prof_.feedbackOn[0] / 300.0,
-                     prof_.feedbackOn[1] / 300.0, prof_.passWhy[2] / 300.0, prof_.passWhy[3] / 300.0);
-        std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / 300, prof_.dmas / 300.0,
-                     prof_.dmaBytes / 300.0 / 1e6);
+                     prof_.passWhy[0] / n, prof_.passWhy[1] / n, prof_.feedbackOn[0] / n,
+                     prof_.feedbackOn[1] / n, prof_.passWhy[2] / n, prof_.passWhy[3] / n);
+        std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / n, prof_.dmas / n,
+                     prof_.dmaBytes / n / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
         std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " blended draws skipped for one; VRAM buffers %.0f MB, %.1f copies (%.2f MB) per frame\n",
-                     prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.analyses / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0, prof_.passes / 300.0,
-                     prof_.barriers / 300.0, prof_.pipelinesMade, prof_.pipelineWaits, vramBytes_ / 1e6, prof_.vramCopies / 300.0,
-                     prof_.vramCopyBytes / 300.0 / 1e6);
+                     prof_.calls / n, prof_.analysisHits / n, prof_.analyses / n, prof_.texChecks / n, prof_.texUploads / n, prof_.texBytes / n / 1e6, prof_.flushes / n, prof_.passes / n,
+                     prof_.barriers / n, prof_.pipelinesMade, prof_.pipelineWaits, vramBytes_ / 1e6, prof_.vramCopies / n,
+                     prof_.vramCopyBytes / n / 1e6);
+        windowFrames_ = slowFrames_ = 0;
+        worstFrameMs_ = 0;
         const bool on = prof_.on;
         std::fill(std::begin(frameNs_), std::end(frameNs_), 0);
         frameAnalyses_ = framePipelines_ = 0;
@@ -1191,6 +1197,7 @@ private:
         chunk_ = next ? std::move(next) : std::make_unique<CmdChunk>();
     }
     void commandThread() {
+        profile::nameThread("lpn-vkcmd");
         for (;;) {
             std::unique_ptr<CmdChunk> c;
             {
@@ -1338,6 +1345,7 @@ private:
     }
 
     void completeBatches() {
+        profile::nameThread("lpn-gpudone");
         for (;;) {
             uint32_t i;
             {
@@ -2188,6 +2196,7 @@ private:
         const unsigned n = std::clamp(std::thread::hardware_concurrency() >= 8 ? std::thread::hardware_concurrency() - 4 : 2u, 2u, 16u);
         for (unsigned i = 0; i < n; ++i)
             std::thread([this] {
+                profile::nameThread("lpn-pipeline");
                 for (;;) {
                     PipelineJob j;
                     {
@@ -2247,6 +2256,7 @@ private:
 
     // Queues every pipeline in pipelines.list (newest first) for the workers.
     void prebuildPipelines() {
+        profile::nameThread("lpn-prebuild");
         std::vector<std::string> records;
         if (FILE* f = std::fopen(pipelineListPath_.c_str(), "rb")) {
             uint32_t n;
@@ -2708,6 +2718,7 @@ private:
         texHashCv_.notify_one();
     }
     void texHashWorker() {
+        profile::nameThread("lpn-texcheck");
         for (;;) {
             TexHashJob j;
             {
@@ -3992,6 +4003,8 @@ private:
     std::vector<uint8_t> scratch_;
     GuestHasher hasher_;
     std::chrono::steady_clock::time_point lastFrameEnd_ = std::chrono::steady_clock::now();
+    uint64_t windowFrames_ = 0, slowFrames_ = 0; // LPN_PROFILE: frames in the report window, and those over 17 ms
+    double worstFrameMs_ = 0;
     uint64_t frameNs_[kProfCount] = {}, frameAnalyses_ = 0, framePipelines_ = 0;
 
     std::map<uint64_t, Import> imports_;

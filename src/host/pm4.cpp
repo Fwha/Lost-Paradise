@@ -1,6 +1,7 @@
 #include "host/pm4.h"
 
 #include "host/equeue.h"
+#include "host/profile.h"
 
 #include <atomic>
 #include <chrono>
@@ -152,10 +153,12 @@ void waitRegMem(const uint32_t* b, Pm4Stats* st, bool selfOk = true) {
             ++ws.waits, ws.ns += ns;
             if (ns > ws.maxNs) ws.maxNs = ns, ws.maxAddr = uint64_t(reinterpret_cast<uintptr_t>(mem));
             static uint64_t reportedFrame = 0;
-            if (gFrame >= reportedFrame + 300) {
-                std::fprintf(stderr, "[pm4] frames to %" PRIu64 ": %" PRIu64 " waits, %.2f ms per frame, longest %.2f ms on 0x%" PRIx64 "\n",
-                             gFrame.load(), ws.waits, ws.ns / 1e6 / double(gFrame - reportedFrame), ws.maxNs / 1e6, ws.maxAddr);
+            static double reportedAt = 0;
+            if (gFrame > reportedFrame && profile::seconds() >= reportedAt + 1) {
+                std::fprintf(stderr, "[pm4] t=%.1f frames to %" PRIu64 ": %" PRIu64 " waits, %.2f ms per frame, longest %.2f ms on 0x%" PRIx64 "\n",
+                             profile::seconds(), gFrame.load(), ws.waits, ws.ns / 1e6 / double(gFrame - reportedFrame), ws.maxNs / 1e6, ws.maxAddr);
                 reportedFrame = gFrame;
+                reportedAt = profile::seconds();
                 ws = {};
             }
         }
@@ -444,6 +447,7 @@ struct {
 constexpr size_t kRecQueueLimit = 1024;
 
 void recorderThread() {
+    profile::nameThread("lpn-record");
     for (;;) {
         std::function<void()> fn;
         {
@@ -484,6 +488,7 @@ struct {
 } gAna;
 
 void analysisThread() {
+    profile::nameThread("lpn-analyze");
     tDry = true;
     tRegs = &gAnalysisRegs;
     Pm4Stats dry;
@@ -627,6 +632,7 @@ struct {
 constexpr size_t kCpQueueLimit = 64;
 
 void commandProcessorThread() {
+    profile::nameThread("lpn-cp");
     for (;;) {
         std::function<void()> fn;
         {

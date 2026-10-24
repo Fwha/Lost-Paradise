@@ -10,6 +10,7 @@
 #include "host/kernel.h"
 #include "host/linker.h"
 #include "host/module.h"
+#include "host/profile.h"
 #include "host/tls.h"
 #include "host/gpu/renderer.h"
 #include "host/videoout.h"
@@ -61,6 +62,7 @@ void onGuestExit() { std::fprintf(stderr, "[host] guest exit handler called\n");
 } // namespace
 
 int main(int argc, char** argv) {
+    host::profile::start();
     std::string gameDir, nidPath, dataDir = "lpn-data";
     bool listUnimplemented = false, headless = false, gpu = true, computeOnly = false;
     double fpsCap = -1; // -1: the F11 menu's
