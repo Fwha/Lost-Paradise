@@ -2604,7 +2604,14 @@ private:
         // Each texture has its own phase: textures loaded together otherwise all came due on the
         // same frame, a ~20 ms spike every 8th frame in gameplay.
         const size_t span = size_t(ew) * eh * bpe * slices;
-        if (tex.img.image && frame_ - tex.changedFrame >= 60 && (++tex.uses + tex.phase) % 8 != 0) {
+        // A full hash finished on a hasher thread is taken at the very next use, due or not: a
+        // partial rewrite (new glyphs in a font atlas) then shows one use late, not eight.
+        bool asyncChanged = false;
+        if (tex.check && tex.check->state.load(std::memory_order_acquire) == 2) {
+            tex.check->state.store(0, std::memory_order_relaxed);
+            asyncChanged = tex.check->result != tex.hash;
+        }
+        if (!asyncChanged && tex.img.image && frame_ - tex.changedFrame >= 60 && (++tex.uses + tex.phase) % 8 != 0) {
             tex.checkedFrame = frame_;
             if (sampleHash(t.base(), span) == tex.sample) return &tex;
         }
@@ -2622,7 +2629,7 @@ private:
         // at the next use (~2.7 ms a frame off the recorder in crowds). The fingerprint is still
         // taken now, so a texture rewritten as a whole (a video frame) is uploaded at once; a
         // partial rewrite shows one use later than before. LPN_SYNC_TEX_CHECKS=1: all in line.
-        if (tex.img.image && asyncTexChecks_) {
+        if (tex.img.image && asyncTexChecks_ && !asyncChanged) {
             tex.checkedFrame = frame_;
             if (sampleHash(t.base(), span) == tex.sample) {
                 if (!tex.check) tex.check = std::make_shared<AsyncHash>();
