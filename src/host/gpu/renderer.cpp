@@ -486,6 +486,8 @@ struct Profiler {
     uint64_t missWhy[4] = {}; // a launch not repeating the stage's last: shader, submission, user data, other
     uint64_t missUser[16] = {}; // the user data words that differed
     uint64_t fastMiss[8] = {}; // a draw not taking fastDraw, by FastMiss
+    uint64_t fastKind[3] = {}; // of kFastKind: other draw kind, other shaders, other prim/instances/index type
+    uint64_t fastRes[4] = {}; // of kFastResources: resource counts, a buffer, an image, the buffer's base
     std::unordered_map<uint32_t, uint64_t> fastCtx; // the context registers that differed
     uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
@@ -1065,6 +1067,9 @@ public:
             if (prof_.missUser[i]) std::fprintf(stderr, " s%d %.0f", i, prof_.missUser[i] / n);
         std::fprintf(stderr, "\n[prof] t=%.1f draws recorded in full:", profile::seconds());
         for (int i = 0; i < kFastMissCount; ++i) std::fprintf(stderr, " %s %.0f", kFastMissNames[i], prof_.fastMiss[i] / n);
+        std::fprintf(stderr, " (kind %.0f, shaders %.0f, prim %.0f; resource counts %.0f, buffer %.0f, image %.0f, buffer base %.0f)",
+                     prof_.fastKind[0] / n, prof_.fastKind[1] / n, prof_.fastKind[2] / n, prof_.fastRes[0] / n,
+                     prof_.fastRes[1] / n, prof_.fastRes[2] / n, prof_.fastRes[3] / n);
         if (!prof_.fastCtx.empty()) {
             std::vector<std::pair<uint64_t, uint32_t>> regs;
             for (auto [reg, count] : prof_.fastCtx) regs.push_back({count, reg});
@@ -4208,16 +4213,31 @@ private:
         if (f.rec != recCount_) return miss(kFastBetween);
         if (f.frame != frame_ || f.imageGen != imageGen_ || !recording_ || !pass_.open) return miss(kFastFrame);
         if (d.kind != f.kind || a.vsm != f.vsm || a.psm != f.psm || r.indexType != f.indexType ||
-            r.numInstances != f.numInstances || r.uconfig[reg::kPrimitiveType] != f.prim || !ringFits(1 << 16))
+            r.numInstances != f.numInstances || r.uconfig[reg::kPrimitiveType] != f.prim || !ringFits(1 << 16)) {
+            if (prof_.on) ++prof_.fastKind[d.kind != f.kind ? 0 : a.vsm != f.vsm || a.psm != f.psm ? 1 : 2];
             return miss(kFastKind);
+        }
         if (std::memcmp(r.ctx, f.ctx, sizeof f.ctx) != 0) {
             if (prof_.on)
                 for (uint32_t i = 0; i < ::gpu::kContextRegs; ++i)
                     if (r.ctx[i] != f.ctx[i]) ++prof_.fastCtx[i];
             return miss(kFastCtx);
         }
-        if (!sameButUserData(a.vs, prevDraw_.vs) || (a.psm && !sameButUserData(a.ps, prevDraw_.ps)))
+        if (!sameButUserData(a.vs, prevDraw_.vs) || (a.psm && !sameButUserData(a.ps, prevDraw_.ps))) {
+            if (prof_.on) {
+                auto why = [](const gcn::Program& x, const gcn::Program& y) {
+                    if (x.data.size() != y.data.size() || x.buffers.size() != y.buffers.size() || x.images.size() != y.images.size())
+                        return 0;
+                    for (size_t i = 0; i < x.buffers.size(); ++i)
+                        if (x.buffers[i].base() != y.buffers[i].base()) return 3;
+                    for (size_t i = 0; i < x.images.size(); ++i)
+                        if (std::memcmp(x.images[i].t, y.images[i].t, sizeof x.images[i].t)) return 2;
+                    return 1;
+                };
+                ++prof_.fastRes[!sameButUserData(a.vs, prevDraw_.vs) ? why(a.vs, prevDraw_.vs) : why(a.ps, prevDraw_.ps)];
+            }
             return miss(kFastResources);
+        }
         VkBuffer indexBuffer = VK_NULL_HANDLE;
         VkDeviceSize indexOffset = 0;
         if (d.kind == DrawCall::kIndexed) {
@@ -4235,15 +4255,14 @@ private:
         imgs.clear();
         // prevDraw_ holds the user data bound now.
         auto data = [&](const gcn::Program& p, gcn::Program& bound, uint32_t base) {
-            constexpr size_t kUser = gcn::data::kUserData, kWords = 16;
-            if (!std::memcmp(&p.data[kUser], &bound.data[kUser], kWords * 4)) return;
             const VkDeviceSize bytes = p.data.size() * 4;
+            if (!std::memcmp(p.data.data(), bound.data.data(), bytes)) return;
             const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
             std::memcpy(static_cast<uint8_t*>(ringPtr_) + at, p.data.data(), bytes);
             bufs.push_back({ring_, at, bytes});
             writes.push_back(kBufferWrite);
             writes.back().dstBinding = base;
-            std::memcpy(&bound.data[kUser], &p.data[kUser], kWords * 4);
+            std::memcpy(bound.data.data(), p.data.data(), bytes);
         };
         data(a.vs, prevDraw_.vs, 0);
         if (a.psm) data(a.ps, prevDraw_.ps, kPsBindingBase);
@@ -4265,8 +4284,9 @@ private:
         ++prof_.fastDraws;
         return true;
     }
-    // Whether `cur` is `prev` (as bindResources and draw() left it) but for its user data words.
-    // Fills in the words those fill from prev's (the same resources resolve alike).
+    // Whether `cur` is `prev` (as bindResources and draw() left it) but for its user data words and
+    // the scalar loads made from them (constants, uploaded with the draw data). Fills in the words
+    // the resources fill from prev's (the same resources resolve alike).
     static bool sameButUserData(gcn::Program& cur, const gcn::Program& prev) {
         if (cur.data.size() != prev.data.size() || cur.buffers.size() != prev.buffers.size() ||
             cur.images.size() != prev.images.size() || cur.data.size() < gcn::data::kSmrd)
@@ -4286,8 +4306,7 @@ private:
         std::memcpy(&cur.data[gcn::data::kPosTransform], &prev.data[gcn::data::kPosTransform], 16);
         for (const auto& b : prev.buffers) std::memcpy(&cur.data[b.data], &prev.data[b.data], 16);
         for (const auto& im : prev.images) std::memcpy(&cur.data[im.data], &prev.data[im.data], 8);
-        constexpr size_t kAfterUser = gcn::data::kUserData + 16;
-        return !std::memcmp(&cur.data[kAfterUser], &prev.data[kAfterUser], (cur.data.size() - kAfterUser) * 4);
+        return true;
     }
 
     void endPass() {
