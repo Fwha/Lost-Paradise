@@ -4,6 +4,8 @@
 #include "host/linker.h"
 #include "host/module.h"
 
+#include <pthread.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -16,6 +18,8 @@ namespace host {
 
 namespace {
 
+thread_local sigjmp_buf* tGuard = nullptr; // set while guarded() runs on this thread
+
 void describe(const char* what, uint64_t addr) {
     if (Module* m = findModule(addr))
         std::fprintf(stderr, "  %-4s 0x%016lx  %s+0x%lx\n", what, addr, m->name().c_str(),
@@ -25,6 +29,14 @@ void describe(const char* what, uint64_t addr) {
 }
 
 void onFatal(int sig, siginfo_t* info, void* ctx) {
+    if ((sig == SIGSEGV || sig == SIGBUS) && tGuard) {
+        // Entered with sig blocked; sigsetjmp(.., 0) does not restore the mask, so unblock it here.
+        sigset_t s;
+        sigemptyset(&s);
+        sigaddset(&s, sig);
+        pthread_sigmask(SIG_UNBLOCK, &s, nullptr);
+        siglongjmp(*tGuard, 1);
+    }
     const auto& g = static_cast<ucontext_t*>(ctx)->uc_mcontext.gregs;
     std::fprintf(stderr, "\n[crash] signal %d (%s), fault address %p\n", sig, strsignal(sig), info->si_addr);
     describe("rip", g[REG_RIP]);
@@ -52,6 +64,19 @@ void onInterrupt(int) {
 }
 
 } // namespace
+
+bool guarded(void (*fn)(void*), void* ctx) {
+    sigjmp_buf jb;
+    sigjmp_buf* const prev = tGuard;
+    if (sigsetjmp(jb, 0)) { // no signal mask saved: that would be a syscall per call
+        tGuard = prev;
+        return false;
+    }
+    tGuard = &jb;
+    fn(ctx);
+    tGuard = prev;
+    return true;
+}
 
 void installCrashHandler() {
     static char altStack[1 << 16];

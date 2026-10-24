@@ -14,6 +14,7 @@
 #include "host/gpu/registers.h"
 #include "host/gpu/tiling.h"
 #include "host/gpu/vk.h"
+#include "host/crash.h"
 #include "host/pm4.h"
 #include "host/profile.h"
 
@@ -84,10 +85,26 @@ constexpr VkDeviceSize kRingSize = 64ull << 20;
 constexpr uint32_t kBatches = 4;
 constexpr uint64_t kImportGranule = 2ull << 20;
 
+// Guest memory is read in place, a fault (unmapped or PROT_NONE) caught by host::guarded.
+// process_vm_readv did the same safely, but pinning each page in the kernel cost ~20% of the
+// recorder and most of the texture checker outside the city gate. LPN_SYSCALL_READS=1: the old way.
+const bool gSyscallReads = getenv("LPN_SYSCALL_READS") != nullptr;
+
 bool readGuest(uint64_t addr, void* dst, size_t size) {
     if (!addr || addr >= (1ull << 40)) return false;
-    iovec local{dst, size}, remote{reinterpret_cast<void*>(addr), size};
-    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(size);
+    if (gSyscallReads) {
+        iovec local{dst, size}, remote{reinterpret_cast<void*>(addr), size};
+        return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(size);
+    }
+    struct Copy {
+        void* dst;
+        uint64_t addr;
+        size_t size;
+    } c{dst, addr, size};
+    return host::guarded([](void* p) {
+        auto& c = *static_cast<Copy*>(p);
+        std::memcpy(c.dst, reinterpret_cast<const void*>(c.addr), c.size);
+    }, &c);
 }
 
 uint64_t shaderAddress(const GpuRegs& r, uint32_t lo) { return ((uint64_t(r.sh[lo + 1]) << 32) | r.sh[lo]) << 8; }
@@ -111,12 +128,33 @@ uint64_t hashBytes(const void* p, size_t n) {
 // A cheap fingerprint of [addr, addr + size): 64 samples of 64 bytes spread over it (read
 // in one syscall). It catches a texture rewritten as a whole (a video frame) between full hashes.
 // Hash of guest memory, 0 when it is not readable.
+// hashBytes of guest memory read in place, without a copy; false when part is unreadable.
+bool hashGuestBytes(uint64_t addr, size_t size, uint64_t& out) {
+    if (!addr || addr >= (1ull << 40)) return false;
+    if (gSyscallReads) {
+        thread_local std::vector<uint8_t> buf;
+        buf.resize(size);
+        if (!readGuest(addr, buf.data(), size)) return false;
+        out = hashBytes(buf.data(), size);
+        return true;
+    }
+    struct Hash {
+        uint64_t addr;
+        size_t size;
+        uint64_t h;
+    } c{addr, size, 0};
+    if (!host::guarded([](void* p) {
+            auto& c = *static_cast<Hash*>(p);
+            c.h = hashBytes(reinterpret_cast<const void*>(c.addr), c.size);
+        }, &c))
+        return false;
+    out = c.h;
+    return true;
+}
+
 uint64_t memoryHash(uint64_t addr, size_t size) {
-    thread_local std::vector<uint8_t> buf;
-    buf.resize(size);
-    iovec local{buf.data(), size}, remote{reinterpret_cast<void*>(addr), size};
-    if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != ssize_t(size)) return 0;
-    return hashBytes(buf.data(), size) | 1;
+    uint64_t h;
+    return hashGuestBytes(addr, size, h) ? h | 1 : 0;
 }
 
 uint64_t sampleHash(uint64_t addr, size_t size) {
@@ -127,9 +165,16 @@ uint64_t sampleHash(uint64_t addr, size_t size) {
     remote.clear();
     for (size_t off = 0; off + kSample <= size && remote.size() < kMax; off += stride)
         remote.push_back({reinterpret_cast<void*>(addr + off), kSample});
-    if (remote.empty()) return 0;
+    if (remote.empty() || !addr || addr + size > (1ull << 40)) return 0;
     iovec local{buf.data(), remote.size() * kSample};
-    if (process_vm_readv(getpid(), &local, 1, remote.data(), remote.size(), 0) != ssize_t(local.iov_len)) return 0;
+    if (gSyscallReads) {
+        if (process_vm_readv(getpid(), &local, 1, remote.data(), remote.size(), 0) != ssize_t(local.iov_len)) return 0;
+    } else if (!host::guarded([](void*) {
+                   for (size_t i = 0; i < remote.size(); ++i)
+                       std::memcpy(buf.data() + i * kSample, remote[i].iov_base, kSample);
+               }, nullptr)) {
+        return 0;
+    }
     return hashBytes(buf.data(), local.iov_len) | 1;
 }
 
@@ -186,11 +231,9 @@ private:
     }
 
     void work() {
-        thread_local std::vector<uint8_t> buf(kChunk);
         for (size_t i; (i = next_.fetch_add(1)) < chunks_;) {
             const size_t off = i * kChunk, n = std::min(kChunk, size_ - off);
-            if (readGuest(addr_ + off, buf.data(), n)) results_[i] = hashBytes(buf.data(), n);
-            else failed_ = true;
+            if (!hashGuestBytes(addr_ + off, n, results_[i])) failed_ = true;
             if (done_.fetch_add(1) + 1 == chunks_) {
                 std::lock_guard l(m_);
                 idle_.notify_all();
@@ -212,12 +255,12 @@ private:
 // GuestHasher::hash on the calling thread alone: the same chunks, the same result.
 uint64_t hashGuestSerial(uint64_t addr, size_t size) {
     constexpr size_t kChunk = 128 << 10;
-    thread_local std::vector<uint8_t> buf(kChunk);
     uint64_t h = 0xcbf29ce484222325ull ^ size;
     for (size_t off = 0; off < size; off += kChunk) {
         const size_t n = std::min(kChunk, size - off);
-        if (!readGuest(addr + off, buf.data(), n)) return 0;
-        h = (h ^ hashBytes(buf.data(), n)) * 0x100000001b3ull;
+        uint64_t c;
+        if (!hashGuestBytes(addr + off, n, c)) return 0;
+        h = (h ^ c) * 0x100000001b3ull;
     }
     return h | 1;
 }
