@@ -847,7 +847,7 @@ public:
         std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / 300, prof_.dmas / 300.0,
                      prof_.dmaBytes / 300.0 / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
-        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " draws skipped for one\n",
+        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " blended draws skipped for one\n",
                      prof_.calls / 300.0, prof_.analysisHits / 300.0, prof_.analyses / 300.0, prof_.texChecks / 300.0, prof_.texUploads / 300.0, prof_.texBytes / 300.0 / 1e6, prof_.flushes / 300.0, prof_.passes / 300.0,
                      prof_.barriers / 300.0, prof_.pipelinesMade, prof_.pipelineWaits);
         const bool on = prof_.on;
@@ -1854,13 +1854,16 @@ private:
     // ---- pipeline builds off the recorder ----
     // The driver takes 10-100 ms to build a pipeline it has not cached, and a new area or effect
     // needs dozens at once: built in line, they froze the game for up to seconds. Pipelines are
-    // built by worker threads instead, and a draw whose pipeline is still being built is skipped
-    // (a new effect can be missing for a frame or two). Every pipeline is also recorded in
+    // built by worker threads instead. A blended draw that writes no depth (effects, particles,
+    // UI) whose pipeline is still being built is skipped: it can be missing for a frame or two.
+    // Other draws wait for theirs, as skipping one let the ground vanish for a moment and could
+    // leave depth that later draws test against. Every pipeline is also recorded in
     // pipelines.list beside the SPIR-V (state, shader names, bindings), and each run builds the
     // recorded ones at startup, so places seen before have them ready.
     // LPN_SYNC_PIPELINES=1 builds in line as before (no skipped draws); LPN_PREBUILD=0 skips the startup builds.
     struct BuiltPipeline {
         std::atomic<bool> ready{false};
+        std::atomic<bool> started{false}; // a worker has it
         VkPipeline pipeline = VK_NULL_HANDLE;
     };
     struct PipelineJob {
@@ -1945,10 +1948,41 @@ private:
             else queueJob(std::move(j), true);
         }
         if (!b->ready.load(std::memory_order_acquire)) {
-            ++prof_.pipelineWaits;
-            return VK_NULL_HANDLE; // still being built: the draw is skipped
+            if (!b->started.load()) hurry(b);
+            if (skippable(c)) {
+                ++prof_.pipelineWaits;
+                return VK_NULL_HANDLE; // still being built: the draw is skipped
+            }
+            ProfScope pw(prof_, kProfGpuWait);
+            b->ready.wait(false, std::memory_order_acquire);
         }
         return pipelines_[key] = b->pipeline;
+    }
+
+    // Blended into the color targets and writing no depth: nothing later depends on it.
+    static bool skippable(const GraphicsState& s) {
+        if (s.depthFormat && ((s.depthControl >> 2) & 1) && !s.depthWriteOff) return false;
+        bool any = false;
+        for (uint32_t i = 0; i < 8; ++i)
+            if (s.colorFormats[i] && ((s.writeMasks >> (i * 4)) & 0xF)) {
+                if (!((s.blend[i] >> 30) & 1)) return false;
+                any = true;
+            }
+        return any;
+    }
+
+    // A startup build a draw is now waiting for goes to the front of the queue.
+    void hurry(const std::shared_ptr<BuiltPipeline>& b) {
+        std::lock_guard lock(buildMutex_);
+        for (auto it = jobs_.begin(); it != jobs_.end(); ++it)
+            if (it->out == b) {
+                if (it != jobs_.begin()) {
+                    PipelineJob j = std::move(*it);
+                    jobs_.erase(it);
+                    jobs_.push_front(std::move(j));
+                }
+                return;
+            }
     }
 
     void startPipelineWorkers() {
@@ -1968,6 +2002,7 @@ private:
                         buildCv_.wait(lock, [&] { return !jobs_.empty(); });
                         j = std::move(jobs_.front());
                         jobs_.pop_front();
+                        j.out->started = true;
                     }
                     runJob(j);
                 }
@@ -1988,7 +2023,9 @@ private:
 
     void runJob(PipelineJob& j) {
         j.out->pipeline = buildGraphics(j.state, j.vs, j.ps, j.geom, j.layout);
+        j.out->started = true;
         j.out->ready.store(true, std::memory_order_release);
+        j.out->ready.notify_all();
         ++newPipelines_;
         if (j.prebuild) {
             vkDestroyShaderModule(vk_.device, j.vs, nullptr);
