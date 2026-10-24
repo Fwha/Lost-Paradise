@@ -72,9 +72,11 @@ Last updated 2026-10-16.
    In the first fight (2,800 draws) the frame is now ~25 ms: ~8 ms shader-analysis replays,
    ~8 ms waiting for the GPU (~900 render passes, a full barrier before each), ~3 ms binding.
    Static textures are re-checked every 8th frame; recently changed ones every frame.
-2. Slow loading after Continue (~45-75 s): the loading screen is 20 fps by the game's choice, file
-   reads come in fast bursts and the CPU idles in between; not a sleep, lock or disk wait. Use
-   `LPN_IOSTATS=1`, `LPN_WAITLOG=30`, `--trace-files`.
+2. Slow loading after Continue (~45 s): the game advances a loading screen once per frame (~890
+   frames for a save, the same at 20 or 90 fps) and asks for 20 fps there (flip rate 2). The host
+   now runs those screens as fast as they draw (`LPN_LOADING_HZ`, default 500; `LPN_FAST_LOADING=0`
+   turns it off). `LPN_PROFILE=1` adds [wait] lines (what each game thread is blocked in, with
+   guest addresses) and [io] lines.
 3. Fight glitches: a one-frame black wedge over the HP bar (gone with `LPN_GPU_SYNC=1`, so likely
    a race between the game rewriting HUD data and our asynchronous GPU); the kick trail and torch
    flames sometimes draw green (particle colour tables; parked, see the 2026-10-17 session notes).

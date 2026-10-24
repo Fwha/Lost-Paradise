@@ -88,7 +88,7 @@ int32_t sceKernelDeleteEqueue(EventQueue* q) {
 int32_t sceKernelWaitEqueue(EventQueue* q, KernelEvent* ev, int32_t num, int32_t* out, const uint32_t* timeoutUs) {
     if (!q) return sceError(ps4errno::kEBADF);
     if (!ev || num < 1) return sceError(ps4errno::kEINVAL);
-    WaitLog w{"equeue wait", timeoutUs ? int64_t(*timeoutUs) : -1};
+    WaitLog w{"equeue wait", timeoutUs ? int64_t(*timeoutUs) : -1, __builtin_frame_address(0)};
     const bool tl = timelineOn();
     if (tl) timeline("game: equeue wait");
     const int n = q->wait(ev, num, timeoutUs ? int64_t(*timeoutUs) : -1);

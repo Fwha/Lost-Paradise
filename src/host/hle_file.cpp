@@ -2,6 +2,7 @@
 #include "host/hle.h"
 #include "host/videoout.h"
 #include "host/kernel.h"
+#include "host/profile.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -90,13 +91,20 @@ int64_t check64(int64_t r) { return r < 0 ? sceErrorFromHost(errno) : r; }
 int32_t sceKernelOpen(const char* path, int32_t flags, uint16_t mode) {
     const std::string h = hostPath(path);
     const int fd = ::open(h.c_str(), hostOpenFlags(flags), mode ? mode : 0644);
+    if (fd >= 0) profile::io().opens.fetch_add(1, std::memory_order_relaxed);
     if (fd < 0) std::fprintf(stderr, "[file] open %s failed: %s\n", path, std::strerror(errno));
     else if (process().traceFiles) std::fprintf(stderr, "[file] open %s (flip %llu)\n", path, (unsigned long long)flipCount());
     return check(fd);
 }
 int32_t sceKernelClose(int32_t fd) { return check(::close(fd)); }
 // LPN_IOSTATS=1 (debugging): file reads per 2 seconds.
-void ioStat(int64_t got) {
+void ioStat(int64_t got, uint64_t ns) {
+    if (got >= 0) {
+        auto& c = profile::io();
+        c.reads.fetch_add(1, std::memory_order_relaxed);
+        c.bytes.fetch_add(uint64_t(got), std::memory_order_relaxed);
+        c.readNs.fetch_add(ns, std::memory_order_relaxed);
+    }
     static const bool on = getenv("LPN_IOSTATS") != nullptr;
     if (!on || got < 0) return;
     static std::atomic<uint64_t> bytes{0}, calls{0};
@@ -109,9 +117,14 @@ void ioStat(int64_t got) {
         std::fprintf(stderr, "[io] %.1f MB in %llu reads (flip %llu)\n", bytes.exchange(0) / 1e6, (unsigned long long)calls.exchange(0),
                      (unsigned long long)flipCount());
 }
+uint64_t nowNs() {
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 int64_t sceKernelRead(int32_t fd, void* buf, uint64_t n) {
+    WaitLog w{"file read", -1, __builtin_frame_address(0)};
+    const uint64_t t0 = nowNs();
     const int64_t r = check64(::read(fd, buf, n));
-    ioStat(r);
+    ioStat(r, nowNs() - t0);
     return r;
 }
 int64_t sceKernelWrite(int32_t fd, const void* buf, uint64_t n) {
@@ -119,8 +132,10 @@ int64_t sceKernelWrite(int32_t fd, const void* buf, uint64_t n) {
     return check64(::write(fd, buf, n));
 }
 int64_t sceKernelPread(int32_t fd, void* buf, uint64_t n, int64_t off) {
+    WaitLog w{"file read", -1, __builtin_frame_address(0)};
+    const uint64_t t0 = nowNs();
     const int64_t r = check64(::pread(fd, buf, n, off));
-    ioStat(r);
+    ioStat(r, nowNs() - t0);
     return r;
 }
 int64_t sceKernelPwrite(int32_t fd, const void* buf, uint64_t n, int64_t off) {
