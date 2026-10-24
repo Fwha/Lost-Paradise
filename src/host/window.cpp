@@ -176,6 +176,7 @@ void presenterThread() {
         SDL_RenderClear(ren);
         if (tex) SDL_RenderCopy(ren, tex, nullptr, nullptr);
         drawSaveMenu(ren);
+        drawFpsCounter(ren);
         drawDisplayMenu(ren);
         SDL_RenderPresent(ren);
     }

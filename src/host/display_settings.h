@@ -16,6 +16,7 @@ struct DisplaySettings {
     uint32_t width = 0, height = 0;
     // Frames a second shown at most (see setFpsCap); 0 leaves the rate to the game.
     int fps = 30;
+    bool fpsCounter = false; // frames shown a second, in the top right corner
 };
 
 DisplaySettings& displaySettings();
@@ -36,7 +37,7 @@ void activeRenderResolution(uint32_t* width, uint32_t* height);
 // would step 1/60 (the 1/30 and 1/20 scenes keep their fixed steps). Returns false when the
 // eboot does not hold the expected instructions; the clock is then left as the game's.
 bool prepareFrameClock(Module& eboot);
-// The frame rate cap the clock should suit (0: uncapped). Takes effect at the next flip.
+// The frame rate cap the clock should suit (0: uncapped; above 60 is treated as uncapped). Takes effect at the next flip.
 void setFrameClock(int fps);
 // Called on the game's thread as it flips, between two runs of the clock: applies a change.
 void syncFrameClock();

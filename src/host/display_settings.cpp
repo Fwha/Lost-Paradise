@@ -47,6 +47,8 @@ void loadDisplaySettings() {
             const int fps = std::atoi(value);
             if (!std::strcmp(value, "uncapped")) gSettings.fps = 0;
             else if (fps >= 10 && fps <= 240) gSettings.fps = fps;
+        } else if (!std::strcmp(key, "fps_counter")) {
+            gSettings.fpsCounter = !std::strcmp(value, "on");
         }
     }
     std::fclose(f);
@@ -63,6 +65,7 @@ void saveDisplaySettings() {
     else std::fprintf(f, "resolution = default\n");
     if (gSettings.fps) std::fprintf(f, "fps = %d\n", gSettings.fps);
     else std::fprintf(f, "fps = uncapped\n");
+    std::fprintf(f, "fps_counter = %s\n", gSettings.fpsCounter ? "on" : "off");
     std::fclose(f);
 }
 
@@ -180,7 +183,7 @@ bool prepareFrameClock(Module& eboot) {
     return true;
 }
 
-void setFrameClock(int fps) { gClockWanted = fps <= 0 ? 2 : fps < 59 ? 1 : 0; }
+void setFrameClock(int fps) { gClockWanted = fps <= 0 || fps > 61 ? 2 : fps < 59 ? 1 : 0; }
 
 void syncFrameClock() {
     const int want = gClockWanted;

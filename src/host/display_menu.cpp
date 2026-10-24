@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <mutex>
@@ -26,7 +27,7 @@ bool displayMenuOpen() { return gOpen; }
 namespace {
 
 std::mutex gM;
-int gRow = 0;         // 0 window mode, 1 resolution, 2 fps, 3 exit game
+int gRow = 0;         // 0 window mode, 1 resolution, 2 fps, 3 fps counter, 4 exit game
 bool gList = false;   // a drop-down is open under gRow
 int gItem = 0;        // highlighted drop-down entry
 
@@ -42,12 +43,13 @@ const Res kResolutions[] = {
     {2560, 1440, "2560X1440"},
 };
 constexpr int kResCount = int(sizeof kResolutions / sizeof kResolutions[0]);
-// The game runs at 60 and drops itself to 30 in cutscenes and 20 on loading screens. Uncapped
-// leaves the rate to the game; the vblank clock still ticks at 59.94 Hz, so that is at most 60
-// (a faster clock would also run the game faster).
-const int kFps[] = {30, 60, 0};
+// The game runs at 60 and drops itself to 30 in cutscenes and 20 on loading screens. Above 60
+// (90, or uncapped at the monitor's refresh rate) the frame clock is patched to keep its speed,
+// but the rapid punch at the end of the light string stops working somewhere between 90 and
+// 120 fps: some combat window must still count frames.
+const int kFps[] = {30, 60, 90, 0};
 constexpr int kFpsCount = int(sizeof kFps / sizeof kFps[0]);
-constexpr int kRows = 4;
+constexpr int kRows = 5;
 
 int resIndex(uint32_t w, uint32_t h) {
     for (int i = 0; i < kResCount; ++i)
@@ -97,7 +99,13 @@ void pick(SDL_Window* win) {
 
 void select(SDL_Window* win) {
     if (gList) return pick(win);
-    if (gRow == 3) { // as closing the window does
+    if (gRow == 3) { // on or off: no drop-down
+        DisplaySettings& s = displaySettings();
+        s.fpsCounter = !s.fpsCounter;
+        saveDisplaySettings();
+        return;
+    }
+    if (gRow == 4) { // as closing the window does
         std::fprintf(stderr, "[window] exit from the display menu\n");
         printUnimplementedSummary();
         render::saveCaches();
@@ -139,8 +147,11 @@ void applyWindowMode(SDL_Window* win) {
 void applyFrameRate(SDL_Window* win) {
     // Uncapped shows a frame at every refresh of the monitor the window is on.
     SDL_DisplayMode dm;
-    if (displaySettings().fps == 0 && SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(win), &dm) == 0 &&
-        dm.refresh_rate > 60)
+    // A cap above 60 runs the clock at that rate, so every vblank shows a frame.
+    const int fps = displaySettings().fps;
+    if (fps > 61)
+        setDisplayRefresh(fps);
+    else if (fps == 0 && SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(win), &dm) == 0 && dm.refresh_rate > 60)
         setDisplayRefresh(dm.refresh_rate);
     else
         setDisplayRefresh(0);
@@ -197,12 +208,13 @@ void drawDisplayMenu(SDL_Renderer* ren) {
     SDL_GetRendererOutputSize(ren, &w, &h);
     const int px = std::max(1, h / 240);
     const int line = 12 * px;
-    const std::string values[3] = {kModes[int(s.window)], resLabel(s.width, s.height), fpsLabel(s.fps)};
-    const char* const labels[3] = {"WINDOW MODE", "RESOLUTION", "FPS"};
+    const std::string values[4] = {kModes[int(s.window)], resLabel(s.width, s.height), fpsLabel(s.fps),
+                                   s.fpsCounter ? "ON" : "OFF"};
+    const char* const labels[4] = {"WINDOW MODE", "RESOLUTION", "FPS", "FPS COUNTER"};
     const int listRows = gList ? itemCount() : 0;
-    const int panelW = std::min(w - 4 * px, 230 * px), panelH = (8 + listRows + (restart ? 1 : 0)) * line;
+    const int panelW = std::min(w - 4 * px, 230 * px), panelH = (9 + listRows + (restart ? 1 : 0)) * line;
     const int x0 = (w - panelW) / 2, y0 = (h - panelH) / 2;
-    const int xv = x0 + 6 * px + menuTextWidth("WINDOW MODE  ", px);
+    const int xv = x0 + 6 * px + menuTextWidth("FPS COUNTER  ", px);
 
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     SDL_Rect panel{x0, y0, panelW, panelH};
@@ -213,7 +225,7 @@ void drawDisplayMenu(SDL_Renderer* ren) {
     drawMenuText(ren, x0 + 6 * px, y0 + 4 * px, px, "DISPLAY");
 
     int y = y0 + 2 * line;
-    for (int r = 0; r < 3; ++r, y += line) {
+    for (int r = 0; r < 4; ++r, y += line) {
         if (r == gRow) {
             SDL_Rect hl{x0 + 3 * px, y - 2 * px, panelW - 6 * px, line - px};
             SDL_SetRenderDrawColor(ren, 90, 70, 30, 255);
@@ -221,7 +233,7 @@ void drawDisplayMenu(SDL_Renderer* ren) {
         }
         SDL_SetRenderDrawColor(ren, 235, 235, 225, 255);
         drawMenuText(ren, x0 + 6 * px, y, px, labels[r]);
-        drawMenuText(ren, xv, y, px, values[r] + (r == gRow && !gList ? "  >" : ""));
+        drawMenuText(ren, xv, y, px, values[r] + (r == gRow && !gList && r != 3 ? "  >" : ""));
         if (r != gRow || !gList) continue;
         // The drop-down, under its row.
         for (int i = 0; i < listRows; ++i) {
@@ -240,7 +252,7 @@ void drawDisplayMenu(SDL_Renderer* ren) {
             drawMenuText(ren, xv, y, px, item);
         }
     }
-    if (gRow == 3) {
+    if (gRow == 4) {
         SDL_Rect hl{x0 + 3 * px, y - 2 * px, panelW - 6 * px, line - px};
         SDL_SetRenderDrawColor(ren, 90, 70, 30, 255);
         SDL_RenderFillRect(ren, &hl);
@@ -256,6 +268,35 @@ void drawDisplayMenu(SDL_Renderer* ren) {
     SDL_SetRenderDrawColor(ren, 150, 150, 150, 255);
     const int hpx = std::max(1, px * 2 / 3);
     drawMenuText(ren, x0 + 6 * px, y0 + panelH - line + px, hpx, "ENTER SELECT   BACKSPACE BACK   F11 CLOSE");
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+}
+
+void drawFpsCounter(SDL_Renderer* ren) {
+    if (!displaySettings().fpsCounter) return;
+    // Flips counted over half a second, so the number is steady enough to read.
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point from = Clock::now();
+    static uint64_t fromFlips = flipCount();
+    static int fps = 0;
+    const auto now = Clock::now();
+    const double secs = std::chrono::duration<double>(now - from).count();
+    if (secs >= 0.5) {
+        const uint64_t flips = flipCount();
+        fps = int((flips - fromFlips) / secs + 0.5);
+        from = now;
+        fromFlips = flips;
+    }
+    int w = 0, h = 0;
+    SDL_GetRendererOutputSize(ren, &w, &h);
+    const int px = std::max(1, h / 360);
+    const std::string text = std::to_string(fps) + " FPS";
+    const int tw = menuTextWidth(text, px);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_Rect box{w - tw - 8 * px, 2 * px, tw + 6 * px, 11 * px};
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 160);
+    SDL_RenderFillRect(ren, &box);
+    SDL_SetRenderDrawColor(ren, 235, 235, 225, 255);
+    drawMenuText(ren, w - tw - 5 * px, 4 * px, px, text);
     SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
 }
 #endif
