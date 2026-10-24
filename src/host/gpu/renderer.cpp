@@ -710,7 +710,10 @@ public:
             DrawAnalysis& a;
             ~Recycle() {
                 std::lock_guard lock(r.analysesMutex_);
-                if (r.spareAnalyses_.size() < 64) r.spareAnalyses_.push_back(std::move(a));
+                // As many as can be in flight: analysis runs up to a frame ahead, and at ~6,000
+                // draws a frame a smaller pool left most draws allocating a fresh one (12% of the
+                // analysis thread in malloc) and the recorder freeing it (6% in ~Program).
+                if (r.spareAnalyses_.size() < 16384) r.spareAnalyses_.push_back(std::move(a));
             }
         } recycle{*this, a};
         std::lock_guard lock(m_);
