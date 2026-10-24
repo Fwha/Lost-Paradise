@@ -646,7 +646,10 @@ public:
         a.ok = false;
         a.vsm = a.psm = nullptr;
         if (d.kind == DrawCall::kDispatch) analyzeDispatch(r, a);
-        else if (!computeOnly_ && (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed)) analyzeDraw(r, a);
+        else if (!computeOnly_ && (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed)) {
+            analyzeDraw(r, a);
+            if (a.ok) prefetchPipeline(r, a);
+        }
         std::lock_guard lock(analysesMutex_);
         analyses_.push_back(std::move(a));
     }
@@ -934,6 +937,7 @@ public:
         for (int i : {kProfAnalyze, kProfShaderLookup, kProfLaunch}) prof_.ns[i] += std::exchange(aprof_.ns[i], 0);
         prof_.analysisHits += std::exchange(aprof_.analysisHits, 0);
         prof_.analyses += std::exchange(aprof_.analyses, 0);
+        prof_.pipelinesMade += std::exchange(aprof_.pipelinesMade, 0);
     }
 
     void reportProfile() {
@@ -1889,6 +1893,7 @@ private:
 
     // Geometry shader turning each primitive of a RECTLIST (3 corners) or QUADLIST into a strip.
     VkShaderModule expandShader(bool quads, uint32_t outputs) {
+        std::lock_guard lock(layoutMutex_);
         const uint64_t key = (uint64_t(quads) << 32) | outputs;
         auto it = expanders_.find(key);
         if (it != expanders_.end()) return it->second;
@@ -1949,6 +1954,7 @@ private:
     }
 
     Layout& layout(const std::vector<VkDescriptorSetLayoutBinding>& bindings) {
+        std::lock_guard lock(layoutMutex_);
         thread_local std::string key; // per draw: built in a reused buffer
         key.clear();
         for (const auto& b : bindings) {
@@ -2130,7 +2136,10 @@ private:
             ++prof_.pipelinesMade;
             PipelineJob j{c, vs->module, ps ? ps->module : VK_NULL_HANDLE, geometryFor(s), layout, b, std::move(record), false};
             if (syncPipelines_) runJob(j);
-            else queueJob(std::move(j), true);
+            else {
+                queueJob(std::move(j), true);
+                hurry(b); // the recorder needs this one now
+            }
         }
         if (!b->ready.load(std::memory_order_acquire)) {
             if (!b->started.load()) hurry(b);
@@ -2159,15 +2168,14 @@ private:
     // A startup build a draw is now waiting for goes to the front of the queue.
     void hurry(const std::shared_ptr<BuiltPipeline>& b) {
         std::lock_guard lock(buildMutex_);
-        for (auto it = jobs_.begin(); it != jobs_.end(); ++it)
-            if (it->out == b) {
-                if (it != jobs_.begin()) {
+        for (auto* q : {&jobs_, &backgroundJobs_})
+            for (auto it = q->begin(); it != q->end(); ++it)
+                if (it->out == b) {
                     PipelineJob j = std::move(*it);
-                    jobs_.erase(it);
+                    q->erase(it);
                     jobs_.push_front(std::move(j));
+                    return;
                 }
-                return;
-            }
     }
 
     void startPipelineWorkers() {
@@ -2177,16 +2185,17 @@ private:
             pipelineList_ = std::fopen(pipelineListPath_.c_str(), "ab");
         }
         if (syncPipelines_) return;
-        const unsigned n = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 8u);
+        const unsigned n = std::clamp(std::thread::hardware_concurrency() >= 8 ? std::thread::hardware_concurrency() - 4 : 2u, 2u, 16u);
         for (unsigned i = 0; i < n; ++i)
             std::thread([this] {
                 for (;;) {
                     PipelineJob j;
                     {
                         std::unique_lock lock(buildMutex_);
-                        buildCv_.wait(lock, [&] { return !jobs_.empty(); });
-                        j = std::move(jobs_.front());
-                        jobs_.pop_front();
+                        buildCv_.wait(lock, [&] { return !jobs_.empty() || !backgroundJobs_.empty(); });
+                        auto& q = jobs_.empty() ? backgroundJobs_ : jobs_;
+                        j = std::move(q.front());
+                        q.pop_front();
                         j.out->started = true;
                     }
                     runJob(j);
@@ -2200,8 +2209,9 @@ private:
     void queueJob(PipelineJob&& j, bool urgent) {
         {
             std::lock_guard lock(buildMutex_);
-            if (urgent) jobs_.push_front(std::move(j));
-            else jobs_.push_back(std::move(j));
+            // A draw's pipelines in the order they were asked for (a waiting draw's goes first, see
+            // hurry()); the startup builds after all of them.
+            (urgent ? jobs_ : backgroundJobs_).push_back(std::move(j));
         }
         buildCv_.notify_one();
     }
@@ -2266,11 +2276,8 @@ private:
                 if (j.ps) vkDestroyShaderModule(vk_.device, j.ps, nullptr);
                 continue;
             }
-            {
-                std::lock_guard lock(m_); // layouts and expanders belong to the recorder
-                j.layout = layout(bindings).pipeline;
-                j.geom = geometryFor(s);
-            }
+            j.layout = layout(bindings).pipeline;
+            j.geom = geometryFor(s);
             {
                 std::lock_guard lock(buildMutex_);
                 auto& slot = built_[*r];
@@ -3273,6 +3280,61 @@ private:
 
     // The register-only part of draw(): which draws render, and the pixel shader's launch as the
     // render targets' formats shape it.
+    // The analysis thread runs ahead of the recorder (by up to a frame): it works out each draw's
+    // pipeline from the registers as draw() will, and queues any not built yet. A frame that
+    // brings dozens of new pipelines then has them built in parallel by all the workers, rather
+    // than one after another as the recorder reaches each draw. A wrong guess only costs a build.
+    void prefetchPipeline(const GpuRegs& r, const DrawAnalysis& a) {
+        static const bool off = getenv("LPN_NO_PIPELINE_PREFETCH") != nullptr;
+        if (off || syncPipelines_ || !a.vsm || !a.vsm->module || (a.psm && !a.psm->module)) return;
+        const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
+        GraphicsState gs{};
+        bool any = false;
+        const uint32_t targetMask = r.ctx[reg::kCbTargetMask] & r.ctx[reg::kCbShaderMask];
+        for (uint32_t i = 0; i < 8 && cbMode == 1; ++i) {
+            const uint32_t* cb = &r.ctx[reg::kCbColorBase + i * reg::kCbColorStride];
+            const uint32_t info = cb[::gpu::ctx::kCbColorInfo];
+            const uint32_t fmt = (info >> 2) & 0x1F, num = (info >> 8) & 7;
+            if (!fmt || !((targetMask >> (i * 4)) & 0xF)) continue;
+            const VkFormat vf = colorFormat(fmt, num);
+            if (vf == VK_FORMAT_UNDEFINED) continue;
+            gs.colorFormats[i] = vf;
+            gs.writeMasks |= ((targetMask >> (i * 4)) & 0xF) << (i * 4);
+            gs.blend[i] = r.ctx[reg::kCbBlendControl + i];
+            any = true;
+        }
+        const uint32_t zInfo = r.ctx[reg::kDbZInfo];
+        if (zInfo & 3) {
+            const bool stencil = r.ctx[reg::kDbStencilInfo] & 1;
+            gs.depthFormat = stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : (zInfo & 3) == 1 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
+            gs.stencil = stencil;
+            gs.depthControl = r.ctx[reg::kDbDepthControl];
+            gs.stencilControl = r.ctx[reg::kDbStencilControl];
+            gs.depthWriteOff = r.ctx[reg::kDbRenderControl] & 1;
+            any = true;
+        }
+        if (!any) return;
+        gs.topology = r.uconfig[reg::kPrimitiveType];
+        gs.modeCntl = r.ctx[reg::kPaSuScModeCntl];
+        gs.vsOutputs = a.vsm->translation.outputs;
+        thread_local std::vector<VkDescriptorSetLayoutBinding> lb;
+        lb.clear();
+        addBindings(lb, a.vs, 0, VK_SHADER_STAGE_VERTEX_BIT);
+        if (a.psm) addBindings(lb, a.ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT);
+        std::string record = pipelineRecord(gs, a.vsm->name, a.psm ? a.psm->name : std::string(), lb);
+        std::shared_ptr<BuiltPipeline> b;
+        {
+            std::lock_guard lock(buildMutex_);
+            auto& slot = built_[record];
+            if (slot) return;
+            slot = b = std::make_shared<BuiltPipeline>();
+        }
+        ++aprof_.pipelinesMade;
+        queueJob(PipelineJob{gs, a.vsm->module, a.psm ? a.psm->module : VK_NULL_HANDLE, geometryFor(gs), layout(lb).pipeline,
+                             std::move(b), std::move(record), false},
+                 true);
+    }
+
     void analyzeDraw(const GpuRegs& r, DrawAnalysis& a) {
         const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
         const uint32_t dbRender = r.ctx[reg::kDbRenderControl];
@@ -4006,7 +4068,8 @@ private:
     std::mutex buildMutex_, listMutex_; // built_ and jobs_; pipelines.list
     std::condition_variable buildCv_;
     std::unordered_map<std::string, std::shared_ptr<BuiltPipeline>> built_; // by pipelineRecord
-    std::deque<PipelineJob> jobs_;
+    std::deque<PipelineJob> jobs_, backgroundJobs_;
+    std::mutex layoutMutex_; // layouts_ and expanders_: the recorder, the analysis thread (prefetch) and startup builds
     std::string pipelineListPath_;
     FILE* pipelineList_ = nullptr;
     std::chrono::steady_clock::time_point lastPipelineSave_{};
