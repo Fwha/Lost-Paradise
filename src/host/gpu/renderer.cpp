@@ -389,6 +389,7 @@ struct GuestTexture {
     uint64_t changedFrame = 0; // the contents were last (re)uploaded in this frame
     uint64_t sample = 0;       // sampleHash at the last full check
     uint32_t uses = 0;         // frames it was used in while unchanged
+    uint32_t phase = 0;        // which of every 8 uses gets the full check (spread across textures)
 };
 
 struct Import {
@@ -2091,8 +2092,10 @@ private:
         // once; a small partial rewrite is seen up to 8 uses late. Counting uses rather than
         // frames matters: the title video alternates two textures frame by frame, and a schedule
         // by frame number never checked one of them. Another T# at the same address is another entry.
+        // Each texture has its own phase: textures loaded together otherwise all came due on the
+        // same frame, a ~20 ms spike every 8th frame in gameplay.
         const size_t span = size_t(ew) * eh * bpe * slices;
-        if (tex.img.image && frame_ - tex.changedFrame >= 60 && ++tex.uses % 8 != 0) {
+        if (tex.img.image && frame_ - tex.changedFrame >= 60 && (++tex.uses + tex.phase) % 8 != 0) {
             tex.checkedFrame = frame_;
             if (sampleHash(t.base(), span) == tex.sample) return &tex;
         }
@@ -2143,6 +2146,7 @@ private:
         for (uint32_t s = 0; s < slices; ++s)
             detile(mode, scratch_.data() + s * slice, dst + size_t(s) * ew * eh * bpe, ew, eh, ep, bpe);
         if (!tex.img.image) {
+            tex.phase = textureCount_++ % 8;
             const VkImageViewType vt = viewType(t.type());
             if (!createImage(tex.img, format, w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, false,
                              vt, slices))
@@ -2569,6 +2573,7 @@ private:
         gcn::Program& cs = a.vs;
         if (!ringFits(1 << 20)) flush();
         begin();
+        if (fillDispatch(d, cs)) return;
         ShaderModule* m = a.vsm;
         std::vector<VkDescriptorSetLayoutBinding> lb;
         addBindings(lb, cs, 0, VK_SHADER_STAGE_COMPUTE_BIT);
@@ -2600,6 +2605,43 @@ private:
             if (im.storage && im.tileMode() == kTileLinearAligned) writeBack(im);
         for (const auto& b : cs.buffers)
             if (b.store) fastClear(b.base());
+    }
+
+    // The game clears buffers with a small compute shader that stores one 16-byte value from its
+    // constants into records [0, groups x 64): two stores per work item, 32 per group. Guest buffers
+    // live in host memory, where the GPU's scattered dword writes crawl over PCIe (~4 ms for the 4 MB
+    // buffer it clears every gameplay frame at 1440p); a transfer fill writes whole lines instead.
+    // Only that exact code, filling with one repeated dword, takes this path.
+    bool fillDispatch(const DrawCall& d, const gcn::Program& cs) {
+        static constexpr uint32_t kFillCode[] = {0xbeeb03ff, 0x0000000c, 0x936ac008, 0xc2820500, 0xd2840004, 0x01a90500,
+                                                 0xbf8c007f, 0x7e000204, 0x7e020205, 0x7e040206, 0x7e060207, 0xe01c2000,
+                                                 0x80000004, 0xd2ba0004, 0x04110081, 0xe01c2000, 0x80000004, 0xbf810000};
+        static const bool off = getenv("LPN_NO_FILL_DISPATCH") != nullptr;
+        if (off || trace_ || cs.buffers.empty() || !cs.images.empty() || cs.launch.localSize[0] != 32 ||
+            cs.launch.localSize[1] != 1 || cs.launch.localSize[2] != 1)
+            return false;
+        uint32_t code[std::size(kFillCode)];
+        if (!readGuest(cs.launch.entry, code, sizeof code) || std::memcmp(code, kFillCode, sizeof code) != 0) return false;
+        const auto v = cs.smrd.find(cs.launch.entry + 0xc); // s_buffer_load_dwordx4: the value
+        if (v == cs.smrd.end() || v->second + 4 > cs.data.size()) return false;
+        const uint32_t* value = &cs.data[v->second];
+        if (value[1] != value[0] || value[2] != value[0] || value[3] != value[0]) return false;
+        const gcn::BufferResource& b = cs.buffers[0];
+        for (const auto& o : cs.buffers) // both stores go through s[0:3]
+            if (!o.known || !o.store || o.base() != b.base() || o.stride() != b.stride() || o.numRecords() != b.numRecords())
+                return false;
+        if (b.stride() != 16) return false;
+        const uint64_t records = std::min<uint64_t>(b.numRecords(), uint64_t(d.groups[0]) * 64);
+        if (!records) return true;
+        VkBuffer buffer;
+        VkDeviceSize offset;
+        if (b.base() % 4 || !guestBuffer(b.base(), records * 16, buffer, offset)) return false;
+        fullBarrier();
+        vkCmdFillBuffer(cmd_, buffer, offset, records * 16, value[0]);
+        if (raceCheck_) noteWrite(b.base(), records * 16);
+        ++stats_.dispatches;
+        fastClear(b.base());
+        return true;
     }
 
     // ---- fast clears -----------------------------------------------------------------------------
@@ -3090,6 +3132,7 @@ private:
     VkQueryPool timestamps_ = VK_NULL_HANDLE; // LPN_PROFILE: two per batch
     double gpuTickNs_ = 1;
     std::atomic<uint64_t> gpuBusyNs_{0};
+    uint32_t textureCount_ = 0; // textures created, for their check phases
     std::mutex doneMutex_; // guards Batch::busy and done, inFlight_, completing_, the counters
     std::condition_variable doneCv_;
     std::deque<uint32_t> inFlight_;
