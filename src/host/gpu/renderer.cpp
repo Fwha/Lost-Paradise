@@ -477,7 +477,7 @@ struct Profiler {
     uint64_t ns[kProfCount] = {};
     uint64_t passWhy[4] = {}; // why a new render pass started, by PassWhy
     uint64_t feedbackOn[2] = {}; // a draw sampled the open pass's depth / color attachment
-    uint64_t barriers = 0, calls = 0, analysisHits = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0;
+    uint64_t barriers = 0, calls = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -645,12 +645,13 @@ public:
                 spareAnalyses_.pop_back();
             }
         }
-        a.ok = false;
+        a.ok = a.repeat = false;
         a.vsm = a.psm = nullptr;
         if (d.kind == DrawCall::kDispatch) analyzeDispatch(r, a);
         else if (!computeOnly_ && (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed)) {
+            ++analysisDraws_;
             analyzeDraw(r, a);
-            if (a.ok) prefetchPipeline(r, a);
+            if (a.ok) prefetchPipeline(r, a, a.repeat);
         }
         std::lock_guard lock(analysesMutex_);
         analyses_.push_back(std::move(a));
@@ -939,6 +940,7 @@ public:
     void mergeAnalysisProfile() {
         for (int i : {kProfAnalyze, kProfShaderLookup, kProfLaunch}) prof_.ns[i] += std::exchange(aprof_.ns[i], 0);
         prof_.analysisHits += std::exchange(aprof_.analysisHits, 0);
+        prof_.repeats += std::exchange(aprof_.repeats, 0);
         prof_.analyses += std::exchange(aprof_.analyses, 0);
         prof_.pipelinesMade += std::exchange(aprof_.pipelinesMade, 0);
     }
@@ -957,8 +959,8 @@ public:
         std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / n, prof_.dmas / n,
                      prof_.dmaBytes / n / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
-        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits, %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " blended draws skipped for one; VRAM buffers %.0f MB, %.1f copies (%.2f MB) per frame\n",
-                     prof_.calls / n, prof_.analysisHits / n, prof_.analyses / n, prof_.texChecks / n, prof_.texUploads / n, prof_.texBytes / n / 1e6, prof_.flushes / n, prof_.passes / n,
+        std::fprintf(stderr, " (ms/frame); %.0f draws, %.0f analysis hits (%.0f repeats), %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " blended draws skipped for one; VRAM buffers %.0f MB, %.1f copies (%.2f MB) per frame\n",
+                     prof_.calls / n, prof_.analysisHits / n, prof_.repeats / n, prof_.analyses / n, prof_.texChecks / n, prof_.texUploads / n, prof_.texBytes / n / 1e6, prof_.flushes / n, prof_.passes / n,
                      prof_.barriers / n, prof_.pipelinesMade, prof_.pipelineWaits, vramBytes_ / 1e6, prof_.vramCopies / n,
                      prof_.vramCopyBytes / n / 1e6);
         windowFrames_ = slowFrames_ = 0;
@@ -3199,6 +3201,32 @@ private:
     CachedProgram* analyzed(const gcn::LaunchState& l, uint32_t bindingBase) {
         if (!l.entry) return nullptr;
         ProfScope ps(aprof_, kProfAnalyze);
+        // Most draws repeat the previous one's launch with only another index range (72% of the
+        // 6,350 draws looking up the steps after New Game): with memory unchanged since (same
+        // submit_), its program is already re-targeted to this launch.
+        LastLaunch& last = lastLaunch_[size_t(l.stage)];
+        if (last.program && last.submit == submit_ && last.bindingBase == bindingBase && sameLaunch(last.launch, l)) {
+            ++aprof_.analysisHits, ++aprof_.repeats;
+            memoHit_ = true;
+            return last.program;
+        }
+        memoHit_ = false;
+        last.program = analyzedUncached(l, bindingBase);
+        last.launch = l;
+        last.bindingBase = bindingBase;
+        last.submit = submit_;
+        return last.program;
+    }
+    static bool sameLaunch(const gcn::LaunchState& a, const gcn::LaunchState& b) {
+        return a.stage == b.stage && a.entry == b.entry && !std::memcmp(a.userData, b.userData, sizeof(a.userData)) &&
+               a.rsrc1 == b.rsrc1 && a.rsrc2 == b.rsrc2 && a.glClipZ == b.glClipZ && a.psInputEna == b.psInputEna &&
+               !std::memcmp(a.psInputCntl, b.psInputCntl, sizeof(a.psInputCntl)) && a.numInterp == b.numInterp &&
+               a.colorFormat == b.colorFormat && a.colorUint == b.colorUint && a.colorSint == b.colorSint &&
+               !std::memcmp(a.colorSwap, b.colorSwap, sizeof(a.colorSwap)) &&
+               !std::memcmp(a.colorComps, b.colorComps, sizeof(a.colorComps)) && a.depthExport == b.depthExport &&
+               !std::memcmp(a.localSize, b.localSize, sizeof(a.localSize));
+    }
+    CachedProgram* analyzedUncached(const gcn::LaunchState& l, uint32_t bindingBase) {
         auto& walks = programs_[launchKey(l, bindingBase)].walks;
         gcn::Program& r = replayScratch_; // its storage cycles through adopt() (no allocations per launch)
         for (size_t i = 0; i < walks.size(); ++i) {
@@ -3275,6 +3303,7 @@ private:
     // per-draw parts (the cached programs are re-targeted by the next draws meanwhile).
     struct DrawAnalysis {
         bool ok = false;
+        bool repeat = false; // both programs repeat the previous draw's (analysis thread only)
         ShaderModule *vsm = nullptr, *psm = nullptr; // a dispatch's module is vsm
         gcn::Program vs, ps;
     };
@@ -3302,7 +3331,7 @@ private:
     // pipeline from the registers as draw() will, and queues any not built yet. A frame that
     // brings dozens of new pipelines then has them built in parallel by all the workers, rather
     // than one after another as the recorder reaches each draw. A wrong guess only costs a build.
-    void prefetchPipeline(const GpuRegs& r, const DrawAnalysis& a) {
+    void prefetchPipeline(const GpuRegs& r, const DrawAnalysis& a, bool drawRepeats) {
         static const bool off = getenv("LPN_NO_PIPELINE_PREFETCH") != nullptr;
         if (off || syncPipelines_ || !a.vsm || !a.vsm->module || (a.psm && !a.psm->module)) return;
         const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
@@ -3335,6 +3364,11 @@ private:
         gs.topology = r.uconfig[reg::kPrimitiveType];
         gs.modeCntl = r.ctx[reg::kPaSuScModeCntl];
         gs.vsOutputs = a.vsm->translation.outputs;
+        // The previous draw queued this pipeline already when its programs and state repeat.
+        const bool repeat = drawRepeats && lastPrefetch_.draw + 1 == analysisDraws_ && lastPrefetch_.vsm == a.vsm &&
+                            lastPrefetch_.psm == a.psm && !std::memcmp(&lastPrefetch_.gs, &gs, sizeof(gs));
+        lastPrefetch_ = {analysisDraws_, a.vsm, a.psm, gs};
+        if (repeat) return;
         thread_local std::vector<VkDescriptorSetLayoutBinding> lb;
         lb.clear();
         addBindings(lb, a.vs, 0, VK_SHADER_STAGE_VERTEX_BIT);
@@ -3361,6 +3395,7 @@ private:
         if (prim == 0 || prim == 8 || prim == 13) return;
         CachedProgram* vsc = analyzed(launch(r, gcn::Stage::Vertex), 0);
         if (!vsc) return;
+        a.repeat = memoHit_;
         a.ok = true;
         a.vsm = vsc->module;
         takeDrawPart(a.vs, vsc->prog);
@@ -3377,6 +3412,7 @@ private:
         if (CachedProgram* psc = analyzed(psLaunch, kPsBindingBase)) {
             a.psm = psc->module;
             takeDrawPart(a.ps, psc->prog);
+            a.repeat = a.repeat && memoHit_;
         }
     }
     static void psTargetLaunch(gcn::LaunchState& l, uint32_t i, uint32_t fmt, uint32_t num, uint32_t info) {
@@ -3971,6 +4007,20 @@ private:
     double gpuTickNs_ = 1;
     std::atomic<uint64_t> gpuBusyNs_{0};
     gcn::Program replayScratch_; // the analysis thread's
+    struct LastLaunch { // per stage: the last launch analysed, and its program (see analyzed())
+        gcn::LaunchState launch;
+        uint32_t bindingBase = 0;
+        uint64_t submit = 0;
+        CachedProgram* program = nullptr;
+    };
+    LastLaunch lastLaunch_[3];
+    bool memoHit_ = false; // the last analyzed() call repeated the launch before it
+    uint64_t analysisDraws_ = 0;
+    struct {
+        uint64_t draw = 0;
+        ShaderModule *vsm = nullptr, *psm = nullptr;
+        GraphicsState gs{};
+    } lastPrefetch_;
     uint32_t textureCount_ = 0; // textures created, for their check phases
     std::mutex doneMutex_; // guards Batch::busy and done, inFlight_, completing_, the counters
     std::condition_variable doneCv_;
