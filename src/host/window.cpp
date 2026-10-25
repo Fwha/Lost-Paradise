@@ -164,6 +164,7 @@ void presenterThread() {
             }
         }
         pollPad(gc);
+        applyDisplayOptions(win);
 
         std::unique_lock lock(gMutex);
         gCv.wait_for(lock, std::chrono::milliseconds(16), [] { return gNewFrame; });
