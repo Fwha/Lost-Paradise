@@ -44,9 +44,10 @@ void setFrameClock(int fps);
 void syncFrameClock();
 // Whether the clock now steps by the measured time with the low floor (above 60 fps).
 bool frameClockUncapped();
-// Whether the game's 30 fps flip rate is shown at the monitor's rate: uncapped, outside the fixed
-// 1/30 step of cutscenes, unless LPN_KEEP_30FPS_SCENES=1. The title menu's 1/30 step is measured
-// when uncapped, so it runs at the monitor's rate.
+// Whether the game's 30 fps flip rate is shown at the monitor's rate: uncapped, on the title
+// (its 1/30 step is then turned off), unless LPN_KEEP_30FPS_SCENES=1. Elsewhere it is kept: the
+// cutscenes ask for 30 fps with a fixed 1/30 step or, like the one before the Shin fight, with
+// measured steps, and flash when shown faster.
 bool uncap30FpsScenes();
 
 } // namespace host

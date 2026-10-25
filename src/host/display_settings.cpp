@@ -402,7 +402,7 @@ void titleStep(bool uncapped) {
 } // namespace
 
 bool uncap30FpsScenes() {
-    return frameClockUncapped() && !keep30FpsScenes() && !(gEbootText && fixedStepKept(clock()));
+    return frameClockUncapped() && !keep30FpsScenes() && titleRunning();
 }
 
 void syncFrameClock() {

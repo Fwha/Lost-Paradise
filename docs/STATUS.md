@@ -90,7 +90,9 @@ Last updated 2026-10-16.
    from that push to its destructor's pop (0x9bc1a2/0x9bc1e2); uncapped, while it runs the host
    turns the 1/30 step off in the clock (+0x90/+0x94 = 0, as 0xd9f0f0 leaves it). Rewriting the
    request, or measuring with the step left on, broke the Shin cutscene or the menu's options, and
-   the object's vtable is no sign of life (freed memory keeps it).
+   the object's vtable is no sign of life (freed memory keeps it). Flip rate 1 is shown at the
+   monitor's rate only while the title runs: the cutscene before the Shin fight asks for 30 fps
+   with measured steps (event request 0x80000002 from 0x9c455b) and flashed when shown faster.
    `LPN_KEEP_30FPS_SCENES=1` keeps the title screen at 30 too. `[clock]` lines count fixed / bit-2 / floored / capped / override steps.
 3. Fight glitches: a one-frame black wedge over the HP bar (gone with `LPN_GPU_SYNC=1`, so likely
    a race between the game rewriting HUD data and our asynchronous GPU); the kick trail and torch
