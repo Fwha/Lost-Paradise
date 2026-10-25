@@ -242,8 +242,11 @@ void vblankThread() {
             // than the PS4's. Half a vblank of slack keeps an on-time flip from slipping to the next.
             const double cap = gFpsCap;
             loading = fastLoading && gDisplay.flipRate == 2;
+            // Uncapped, the title screen's 30 fps (flip rate 1) runs at the monitor's rate;
+            // cutscenes keep it (uncap30FpsScenes).
+            const int32_t rate = gDisplay.flipRate == 1 && uncap30FpsScenes() ? 0 : gDisplay.flipRate;
             const double interval = loading ? 0.0
-                                            : std::max(gDisplay.flipRate > 0 ? (gDisplay.flipRate + 1) / kPs4Hz : 0.0,
+                                            : std::max(rate > 0 ? (rate + 1) / kPs4Hz : 0.0,
                                                        cap > 0 ? std::max(1.0, std::round(hz / cap)) / hz : 0.0);
             if (!gDisplay.pending.empty() && now >= flipDue - period / 2 && render::gpuDone(gDisplay.pending.front().gpuMark)) {
                 const auto step = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(interval));

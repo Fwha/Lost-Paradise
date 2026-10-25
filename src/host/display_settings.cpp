@@ -2,6 +2,7 @@
 
 #include "host/kernel.h"
 #include "host/module.h"
+#include "host/videoout.h"
 
 #include <algorithm>
 #include <atomic>
@@ -129,12 +130,6 @@ struct CodePatch {
 // 0 the game's clock, 1 the measured time instead of 1/60 steps (30 fps cap), 2 that and a lower
 // floor (uncapped).
 const CodePatch kMeasured[] = {
-    // The clock: `if (fixed) dt = fixedDt` becomes `if (fixedDt > 1/60) dt = fixedDt`.
-    //   mov 0x90(%r14),%rcx; test %ecx,%ecx; je measured; shr $32,%rcx
-    //   -> mov 0x94(%r14),%ecx; cmp $0x3c88888a,%ecx (just above 1/60 as a float); jb measured
-    {0xd9ee98,
-     {0x49, 0x8b, 0x8e, 0x90, 0, 0, 0, 0x85, 0xc9, 0x74, 0x28, 0x48, 0xc1, 0xe9, 0x20},
-     {0x41, 0x8b, 0x8e, 0x94, 0, 0, 0, 0x81, 0xf9, 0x8a, 0x88, 0x88, 0x3c, 0x72, 0x24}},
     // Turning the fixed step off clears the step too (movl $0,0x90 -> movq $0,0x90), so a stale
     // 1/30 is not taken for a fixed step.
     {0xd9f0f7,
@@ -150,16 +145,170 @@ const CodePatch kMeasured[] = {
      {0x81, 0xb8, 0x94, 0, 0, 0, 0x8a, 0x88, 0x88, 0x3c, 0x72, 0x14, 0xc5, 0xfa, 0x10, 0x40,
       0x60, 0xc5, 0xfa, 0x59, 0x05, 0x38, 0x73, 0x27, 0x01, 0xc5, 0xfa, 0x2d, 0xf8, 0x0f, 0x1f, 0x00}},
 };
-// The measured time is rounded up to 1/60 s when under 17.25 ms: lower that to 2 ms (500 fps).
-//   cmp $17250000,%eax; mov $16666666,%edx -> cmp $2000000,%eax; mov $2000000,%edx
-const CodePatch kFloor[] = {
-    {0xd9eeda, {0x3d, 0xd0, 0x36, 0x07, 0x01, 0xba, 0x2a, 0x50, 0xfe, 0x00},
-     {0x3d, 0x80, 0x84, 0x1e, 0x00, 0xba, 0x80, 0x84, 0x1e, 0x00}},
-};
+
+// The clock's choice of step (0xd9ee98-0xd9eef5, measured ns in %eax, the result in %ecx) is
+// handed to stepNs below:
+//   mov %eax,%edi; movabs $stepNs,%rax; call *%rax; mov %eax,%ecx;
+//   vmovss 0x88(%r14),%xmm0 (the raw step, which the call clobbered); jmp 0xd9eef5
+constexpr uint32_t kStepAt = 0xd9ee98;
+const std::vector<uint8_t> kStepWas = {0x49, 0x8b, 0x8e, 0x90, 0, 0, 0, 0x85, 0xc9, 0x74, 0x28, 0x48, 0xc1, 0xe9, 0x20,
+                                       0xc5, 0xf9, 0x6e, 0xc9, 0xb9, 0x00, 0xc2, 0xeb, 0x0b, 0xc5, 0xf2, 0x5a, 0xc9,
+                                       0xc5, 0xf3};
+// The title screen's 30 fps flip rate, kept when uncapped with LPN_KEEP_30FPS_SCENES=1.
+bool keep30FpsScenes() {
+    static const bool keep = [] {
+        const char* v = std::getenv("LPN_KEEP_30FPS_SCENES");
+        return v && std::strcmp(v, "0") != 0;
+    }();
+    return keep;
+}
 
 uint8_t* gEbootText = nullptr; // set once the code is known to match
 std::atomic<int> gClockWanted{0};
 std::atomic<int> gClockActive{0};
+
+// The frame clock object (0x2486080), from +0x60.
+struct Clock {
+    float dt;            // +0x60
+    int32_t ticks;       // +0x64, dt in 1/3000 s, rounded
+    uint8_t pad0[0x10];
+    float time;          // +0x78
+    float rawTime;       // +0x7c
+    uint32_t totalTicks; // +0x80
+    float overrideDt;    // +0x84, a one-shot step the clock takes and clears
+    float rawDt;         // +0x88
+    float pad1;
+    uint32_t fixedOn;    // +0x90
+    float fixedDt;       // +0x94
+    uint32_t flags;      // +0x98: bit 0 paused, bit 2 step 1/60
+};
+static_assert(offsetof(Clock, time) == 0x18 && offsetof(Clock, overrideDt) == 0x24 && offsetof(Clock, fixedOn) == 0x30);
+constexpr uint32_t kClock = 0x2486080 + 0x60;
+Clock& clock() { return *reinterpret_cast<Clock*>(gEbootText + kClock); }
+
+// How each frame's step was chosen, for the [clock] lines.
+struct StepCounts {
+    int fixed = 0, forced = 0, floored = 0, capped = 0, override = 0;
+};
+StepCounts gSteps;
+int64_t gCarryNs = 0; // measured time not yet given out as whole 1/3000 s ticks
+
+// The title sequence (made at 0x9bdd16) asks for the same 1/30 step as cutscenes. It runs from
+// its push of that request (kTitleStepCaller) to its destructor's pop of it (0x9bc170 and
+// 0x9bc1b0 call the pop, 0xd6e50, returning to kTitlePopCallers).
+std::atomic<bool> gTitleAlive{false};
+constexpr uint32_t kPopStep = 0xd6e50;
+constexpr uint32_t kTitlePopCallers[] = {0x9bc1a2, 0x9bc1e2};
+const uint8_t kPopWas[] = {0x48, 0x63, 0x87, 0x98, 0, 0, 0, 0xc7, 0x84, 0x87, 0x9c, 0, 0, 0};
+
+bool titleRunning() { return gTitleAlive.load(std::memory_order_relaxed); }
+
+// The 1/30 cutscene and 1/20 loading steps stay fixed. (Cutscenes stepped by the measured time
+// flashed frames from later in the scene, so they stay at 30.) The game's table holds 1/60 as
+// this same float.
+bool fixedStepKept(const Clock& c) { return c.fixedOn && c.fixedDt > 1.0f / 60; }
+
+constexpr uint32_t kNs60 = 16666666, kMaxFixedNs = 200000000, kMaxNs = 50000000;
+constexpr uint32_t kFloorNs = 2000000; // uncapped: 500 fps
+
+// The step, in ns, the clock takes this frame (the game's thread). The game's own rules: a fixed
+// step when one is on, else 1/60 when flag bit 2 is set, else the measured time rounded up to 1/60
+// below 17.25 ms and capped at 50 ms. With a 30 fps cap the 1/60 fixed step and flag bit 2 take
+// the measured time instead (the title's menus set bit 2 most frames, and would run at half
+// speed). Uncapped, the floor drops to 2 ms, and the step is a whole number of the
+// clock's 1/3000 s ticks, carrying the rest, so that its rounded tick count (+0x64) keeps real
+// time at rates such as 144 (20.8 ticks a frame, otherwise 21: 0.8% fast).
+extern "C" uint32_t stepNs(uint32_t measured) {
+    const Clock& c = clock();
+    const bool uncapped = gClockActive.load(std::memory_order_relaxed) == 2;
+    if (c.overrideDt > 0) ++gSteps.override; // the clock replaces this step after the call
+    if (fixedStepKept(c)) {
+        ++gSteps.fixed;
+        const double ns = double(c.fixedDt) * 1e9;
+        return ns <= kMaxFixedNs ? uint32_t(ns) : kMaxFixedNs;
+    }
+    if (c.flags & 4) ++gSteps.forced;
+    uint32_t ns = measured;
+    if (!uncapped) {
+        if (ns < 17250000) ns = kNs60, ++gSteps.floored;
+        return std::min(ns, kMaxNs);
+    }
+    if (ns < kFloorNs) ns = kFloorNs, ++gSteps.floored;
+    if (ns > kMaxNs) ns = kMaxNs, ++gSteps.capped, gCarryNs = 0;
+    const int64_t total = gCarryNs + ns;
+    const int64_t ticks = std::max<int64_t>(1, (total * 3 + 500000) / 1000000);
+    const int64_t out = (ticks * 1000000 + 1) / 3;
+    gCarryNs = std::clamp<int64_t>(total - out, -int64_t(kFloorNs), int64_t(kFloorNs));
+    return uint32_t(out);
+}
+
+CodePatch stepPatch() {
+    std::vector<uint8_t> now = {0x89, 0xc7, 0x48, 0xb8};
+    const uint64_t fn = reinterpret_cast<uint64_t>(&stepNs);
+    for (int i = 0; i < 8; ++i) now.push_back(uint8_t(fn >> (8 * i)));
+    const uint8_t tail[] = {0xff, 0xd0, 0x89, 0xc1, 0xc4, 0xc1, 0x7a, 0x10, 0x86, 0x88, 0, 0, 0, 0xe9};
+    now.insert(now.end(), std::begin(tail), std::end(tail));
+    const int32_t rel = int32_t(0xd9eef5 - (kStepAt + kStepWas.size()));
+    for (int i = 0; i < 4; ++i) now.push_back(uint8_t(rel >> (8 * i)));
+    return {kStepAt, kStepWas, now};
+}
+
+// Scenes ask for a fixed step by pushing a request on a stack (0xd6e20 pushes a step index,
+// 0xd6dd0 the same with bit 31 set, which the clock takes as no fixed step; 0xd4f00 applies
+// them). These replacements do the same and log who asks for what with LPN_PROFILE=1.
+constexpr uint32_t kPushStep = 0xd6e20, kPushMeasured = 0xd6dd0, kWake = 0x108030, kWakeArg = 0x247e630 + 0x178;
+constexpr uint32_t kTitleStepCaller = 0x9bdd60; // return address of the title sequence's push of step 2
+const uint8_t kPushWas[] = {0x48, 0x63, 0x87, 0x98, 0, 0, 0};
+
+uint64_t pushRequest(uint8_t* stack, uint32_t value, uintptr_t caller) {
+    int32_t& n = *reinterpret_cast<int32_t*>(stack + 0x98);
+    reinterpret_cast<uint32_t*>(stack + 0x9c)[n] = value;
+    ++n;
+    static const bool log = std::getenv("LPN_PROFILE") != nullptr;
+    static std::atomic<int> logged{0};
+    if (log && logged.fetch_add(1, std::memory_order_relaxed) < 400)
+        std::fprintf(stderr, "[step] request 0x%x from eboot+0x%lx at flip %llu\n", value,
+                     (unsigned long)(caller - uintptr_t(gEbootText)), (unsigned long long)flipCount());
+    if (value & 0x7fffffff) return 0;
+    auto wake = reinterpret_cast<uint64_t (*)(void*)>(gEbootText + kWake);
+    return wake(*reinterpret_cast<void**>(gEbootText + kWakeArg));
+}
+
+extern "C" uint64_t pushStep(uint8_t* stack, uint32_t index) {
+    const uintptr_t caller = uintptr_t(__builtin_return_address(0));
+    if (caller - uintptr_t(gEbootText) == kTitleStepCaller) gTitleAlive = true;
+    return pushRequest(stack, index, caller);
+}
+
+extern "C" void popStep(uint8_t* stack) {
+    const uintptr_t at = uintptr_t(__builtin_return_address(0)) - uintptr_t(gEbootText);
+    int32_t& n = *reinterpret_cast<int32_t*>(stack + 0x98);
+    reinterpret_cast<uint32_t*>(stack + 0x9c)[n] = 0xffffffffu;
+    ++n;
+    if (at != kTitlePopCallers[0] && at != kTitlePopCallers[1]) return;
+    gTitleAlive = false;
+    static const bool log = std::getenv("LPN_PROFILE") != nullptr;
+    if (log) std::fprintf(stderr, "[step] title ends at flip %llu\n", (unsigned long long)flipCount());
+}
+
+extern "C" uint64_t pushMeasured(uint8_t* stack, uint32_t index) {
+    return pushRequest(stack, index ? index | 0x80000000u : 0, uintptr_t(__builtin_return_address(0)));
+}
+
+void jumpTo(uint32_t at, const void* fn) {
+    // movabs $fn, %rax; jmp *%rax
+    uint8_t jump[12] = {0x48, 0xb8};
+    const uint64_t target = reinterpret_cast<uint64_t>(fn);
+    std::memcpy(jump + 2, &target, 8);
+    jump[10] = 0xff, jump[11] = 0xe0;
+    const uintptr_t page = uintptr_t(sysconf(_SC_PAGESIZE));
+    uint8_t* p = gEbootText + at;
+    void* start = reinterpret_cast<void*>(uintptr_t(p) & ~(page - 1));
+    // Left writable: the loader still rewrites thread pointer reads on these pages, and
+    // Module::protect sets the final protection afterwards.
+    mprotect(start, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+    std::memcpy(p, jump, sizeof jump);
+}
 
 void write(const CodePatch& p, bool on) {
     const std::vector<uint8_t>& bytes = on ? p.now : p.was;
@@ -182,9 +331,15 @@ bool prepareFrameClock(Module& eboot) {
     };
     for (const CodePatch& p : kMeasured)
         if (!matches(p)) return false;
-    for (const CodePatch& p : kFloor)
-        if (!matches(p)) return false;
+    if (!matches(stepPatch())) return false;
     gEbootText = eboot.base();
+    if (std::memcmp(gEbootText + kPushStep, kPushWas, sizeof kPushWas) == 0 &&
+        std::memcmp(gEbootText + kPushMeasured, kPushWas, sizeof kPushWas) == 0 &&
+        std::memcmp(gEbootText + kPopStep, kPopWas, sizeof kPopWas) == 0) {
+        jumpTo(kPushStep, reinterpret_cast<const void*>(&pushStep));
+        jumpTo(kPushMeasured, reinterpret_cast<const void*>(&pushMeasured));
+        jumpTo(kPopStep, reinterpret_cast<const void*>(&popStep));
+    }
     return true;
 }
 
@@ -196,25 +351,13 @@ void setFrameClock(int fps) {
 namespace {
 
 // LPN_PROFILE=1: a [clock] line a second with what the game's frame clock (0x2486080) stepped:
-// frame times, game seconds per real second for its float time and its 1/3000 s ticks, and how
-// many frames were too short to count as one 60 Hz or 30 Hz frame when rounded.
+// frame times, game seconds per real second for its float time and its 1/3000 s ticks, how many
+// frames were too short to count as one 60 Hz or 30 Hz frame when rounded, and how many steps
+// were fixed, asked as 1/60 by flag bit 2 (now measured), floored, capped or overridden.
 void clockStats() {
     static const bool enabled = std::getenv("LPN_PROFILE") != nullptr;
     if (!enabled) return;
-    struct Clock {
-        float dt;           // +0x60
-        int32_t ticks;      // +0x64
-        uint8_t pad0[0x10];
-        float time;         // +0x78
-        float rawTime;      // +0x7c
-        uint32_t totalTicks; // +0x80
-        uint8_t pad1[0xc];
-        uint32_t fixedOn;   // +0x90
-        float fixedDt;      // +0x94
-        uint32_t flags;     // +0x98
-    };
-    static_assert(offsetof(Clock, time) == 0x18 && offsetof(Clock, fixedOn) == 0x30);
-    const Clock& c = *reinterpret_cast<const Clock*>(gEbootText + 0x2486080 + 0x60);
+    const Clock& c = clock();
     using Wall = std::chrono::steady_clock;
     static Wall::time_point start = Wall::now();
     static float time0 = c.time;
@@ -228,11 +371,14 @@ void clockStats() {
     const double wall = std::chrono::duration<double>(Wall::now() - start).count();
     if (wall < 1.0) return;
     static int second = 0;
+    const StepCounts n = gSteps;
+    gSteps = {};
     std::fprintf(stderr,
                  "[clock] t=%d fps=%.0f dt=%.2f/%.2f/%.2f ms speed=%.3f ticks=%.3f round0@60=%d round0@30=%d "
-                 "fixed=%u/%.4f flags=0x%x\n",
+                 "fixed=%u/%.4f steps fixed=%d bit2=%d floored=%d capped=%d override=%d\n",
                  ++second, frames / wall, dtMin * 1e3f, dtSum / frames * 1e3f, dtMax * 1e3f, (c.time - time0) / wall,
-                 (c.totalTicks - ticks0) / 3000.0 / wall, under60, under30, c.fixedOn, c.fixedDt, c.flags);
+                 (c.totalTicks - ticks0) / 3000.0 / wall, under60, under30, c.fixedOn, c.fixedDt, n.fixed, n.forced,
+                 n.floored, n.capped, n.override);
     start = Wall::now(), time0 = c.time, ticks0 = c.totalTicks;
     frames = under60 = under30 = 0;
     dtMin = 1e9f, dtMax = dtSum = 0;
@@ -242,12 +388,32 @@ void clockStats() {
 
 bool frameClockUncapped() { return gClockActive.load(std::memory_order_relaxed) == 2; }
 
+namespace {
+
+// Uncapped, the title menu runs with its 1/30 step turned off, as the clock's own off switch
+// (0xd9f0f0, patched to clear the step too) leaves it: measured steps and no 30 fps flip
+// interval. (Measured steps with the fixed step still on stopped the menu's options appearing.)
+// The title's pop makes 0xd4f00 set the step of the scene below again.
+void titleStep(bool uncapped) {
+    Clock& c = clock();
+    if (uncapped && titleRunning() && c.fixedOn && c.fixedDt == 1.0f / 30) c.fixedOn = 0, c.fixedDt = 0;
+}
+
+} // namespace
+
+bool uncap30FpsScenes() {
+    return frameClockUncapped() && !keep30FpsScenes() && titleRunning();
+}
+
 void syncFrameClock() {
     if (gEbootText) clockStats();
     const int want = gClockWanted;
+    if (gEbootText) titleStep(want == 2 && gClockActive == want && !keep30FpsScenes());
     if (!gEbootText || want == gClockActive) return;
-    for (const CodePatch& p : kMeasured) write(p, want >= 1);
-    for (const CodePatch& p : kFloor) write(p, want >= 2);
+    write(kMeasured[0], want >= 1);
+    write(kMeasured[1], want >= 1);
+    write(stepPatch(), want >= 1);
+    gCarryNs = 0;
     gClockActive = want;
     std::fprintf(stderr, "[display] frame clock: %s\n",
                  want == 2 ? "measured time, uncapped" : want == 1 ? "measured time" : "the game's");
