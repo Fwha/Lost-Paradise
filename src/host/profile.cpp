@@ -143,8 +143,12 @@ struct StackScan {
 };
 void scanStack(void* p) {
     auto* s = static_cast<StackScan*>(p);
-    for (int i = 0; i < 160 && s->n < 3; ++i)
-        if (findModule(s->stack[i])) s->found[s->n++] = s->stack[i];
+    // The stack belongs to a running thread: read each word once, so the address kept is the one
+    // that was checked.
+    for (int i = 0; i < 160 && s->n < 3; ++i) {
+        const uint64_t a = reinterpret_cast<const volatile uint64_t*>(s->stack)[i];
+        if (findModule(a)) s->found[s->n++] = a;
+    }
 }
 
 std::string where(const uint64_t* stack) {
@@ -153,6 +157,7 @@ std::string where(const uint64_t* stack) {
     std::string out;
     for (int i = 0; i < s.n; ++i) {
         Module* m = findModule(s.found[i]);
+        if (!m) continue;
         std::string name = m->name();
         if (const size_t dot = name.find('.'); dot != std::string::npos) name.resize(dot);
         char cell[64];
