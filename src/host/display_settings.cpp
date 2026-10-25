@@ -245,11 +245,9 @@ CodePatch stepPatch() {
 
 // Scenes ask for a fixed step by pushing a request on a stack (0xd6e20 pushes a step index,
 // 0xd6dd0 the same with bit 31 set, which the clock takes as no fixed step; 0xd4f00 applies
-// them). These replacements do the same, log who asks for what with LPN_PROFILE=1, and when
-// uncapped turn the title screen's 1/30 request (sequence_title.inl) into a measured one, as
-// the event scenes ask for: the title then runs at the monitor's rate while cutscenes keep 1/30.
+// them). These replacements do the same and log who asks for what with LPN_PROFILE=1.
 constexpr uint32_t kPushStep = 0xd6e20, kPushMeasured = 0xd6dd0, kWake = 0x108030, kWakeArg = 0x247e630 + 0x178;
-constexpr uint32_t kTitleStepCaller = 0x9bdd60; // return address of the title's push of step 2
+constexpr uint32_t kTitleStepCaller = 0x9bdd60; // return address of the title sequence's push of step 2
 const uint8_t kPushWas[] = {0x48, 0x63, 0x87, 0x98, 0, 0, 0};
 
 uint64_t pushRequest(uint8_t* stack, uint32_t value, uintptr_t caller) {
@@ -266,12 +264,25 @@ uint64_t pushRequest(uint8_t* stack, uint32_t value, uintptr_t caller) {
     return wake(*reinterpret_cast<void**>(gEbootText + kWakeArg));
 }
 
-extern "C" uint64_t pushStep(uint8_t* stack, uint32_t index) {
+// The title sequence object (0x4870 bytes, made at 0x9bdd16), in %rbx at its push. It runs both
+// the title menu and the opening cutscene under the one 1/30 request, so the request is left as
+// is; F7 dumps the object (dumpTitleSequence) to find what tells the two apart.
+std::atomic<uint8_t*> gTitleSequence{nullptr};
+constexpr size_t kTitleSequenceSize = 0x4870;
+
+extern "C" __attribute__((used)) uint64_t pushStepWithRbx(uint8_t* stack, uint32_t index, uint8_t* rbx) {
     const uintptr_t caller = uintptr_t(__builtin_return_address(0));
-    if (caller - uintptr_t(gEbootText) == kTitleStepCaller && index == 2 && frameClockUncapped() && !keep30FpsScenes())
-        index |= 0x80000000u;
+    if (caller - uintptr_t(gEbootText) == kTitleStepCaller) {
+        gTitleSequence = rbx;
+        std::fprintf(stderr, "[step] title sequence at %p\n", static_cast<void*>(rbx));
+    }
     return pushRequest(stack, index, caller);
 }
+
+// The push's entry: hands the caller's %rbx (the title sequence at kTitleStepCaller) over as the
+// third argument (the caller's %rdx, a source file name, is not used) and keeps the return address.
+extern "C" void pushStep();
+asm(".text\n.globl pushStep\n.type pushStep,@function\npushStep:\n  mov %rbx, %rdx\n  jmp pushStepWithRbx\n");
 
 extern "C" uint64_t pushMeasured(uint8_t* stack, uint32_t index) {
     return pushRequest(stack, index ? index | 0x80000000u : 0, uintptr_t(__builtin_return_address(0)));
@@ -367,6 +378,23 @@ void clockStats() {
 } // namespace
 
 bool frameClockUncapped() { return gClockActive.load(std::memory_order_relaxed) == 2; }
+
+void dumpTitleSequence() {
+    uint8_t* seq = gTitleSequence;
+    if (!seq) {
+        std::fprintf(stderr, "[step] F7: no title sequence yet\n");
+        return;
+    }
+    static int n = 0;
+    char name[64];
+    std::snprintf(name, sizeof name, "lpn-title-%d.bin", ++n);
+    if (FILE* f = std::fopen(name, "wb")) {
+        std::fwrite(seq, 1, kTitleSequenceSize, f);
+        std::fclose(f);
+    }
+    std::fprintf(stderr, "[step] F7: title sequence %p written to %s at flip %llu\n", static_cast<void*>(seq), name,
+                 (unsigned long long)flipCount());
+}
 
 bool uncap30FpsScenes() {
     return frameClockUncapped() && !keep30FpsScenes() && !(gEbootText && fixedStepKept(clock()));

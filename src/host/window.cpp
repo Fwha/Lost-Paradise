@@ -1,5 +1,7 @@
 #include "host/window.h"
 
+#include "host/display_settings.h"
+
 #include "host/combo_trace.h"
 #include "host/coverage.h"
 #include "host/display_menu.h"
@@ -157,6 +159,7 @@ void presenterThread() {
             if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F10 && !e.key.repeat) profile::mark();
             if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F9 && !e.key.repeat) coverage::onKey();
             if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F8 && !e.key.repeat) combo_trace::onKey();
+            if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F7 && !e.key.repeat) dumpTitleSequence();
             if (e.type == SDL_CONTROLLERDEVICEADDED && !gc) gc = SDL_GameControllerOpen(e.cdevice.which);
             if (e.type == SDL_CONTROLLERDEVICEREMOVED && gc) {
                 SDL_GameControllerClose(gc);
