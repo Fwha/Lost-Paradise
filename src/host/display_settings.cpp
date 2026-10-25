@@ -159,7 +159,7 @@ const CodePatch kFloor[] = {
 
 uint8_t* gEbootText = nullptr; // set once the code is known to match
 std::atomic<int> gClockWanted{0};
-int gClockActive = 0;
+std::atomic<int> gClockActive{0};
 
 void write(const CodePatch& p, bool on) {
     const std::vector<uint8_t>& bytes = on ? p.now : p.was;
@@ -239,6 +239,8 @@ void clockStats() {
 }
 
 } // namespace
+
+bool frameClockUncapped() { return gClockActive.load(std::memory_order_relaxed) == 2; }
 
 void syncFrameClock() {
     if (gEbootText) clockStats();
