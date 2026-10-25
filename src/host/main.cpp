@@ -6,6 +6,7 @@
 #include "host/crash.h"
 #include "host/display_settings.h"
 #include "host/input_history.h"
+#include "host/pause_menu.h"
 #include "host/title_menu.h"
 #include "host/gpu/frame_dump.h"
 #include "host/hle.h"
@@ -142,7 +143,7 @@ int main(int argc, char** argv) {
     host::setFpsCap(fpsCap >= 0 ? fpsCap : host::displaySettings().fps);
     if (host::prepareFrameClock(*modules[0])) host::setFrameClock(int(fpsCap >= 0 ? fpsCap : host::displaySettings().fps));
     host::patchInputHistory(*modules[0]);
-    host::patchTitleMenu(*modules[0]);
+    if (host::patchTitleMenu(*modules[0])) host::patchPauseMenu(*modules[0]);
     host::patchRenderResolution(*modules[0], host::displaySettings().width, host::displaySettings().height);
 
     const int32_t fsOffset = host::guestThreadPointerFsOffset();

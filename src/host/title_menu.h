@@ -24,6 +24,10 @@ class Module;
 // changed then).
 bool patchTitleMenu(Module& eboot);
 
+// The next settings screen the game opens shows the PC settings (the pause menu's PC Settings).
+// Does nothing unless patchTitleMenu succeeded, as it hooks that screen.
+void openPcSettingsNext();
+
 // The data patches, for a decompressed file; each returns false (and leaves it) unless the
 // buffer is exactly the game's file.
 bool patchTitleMenuLayout(uint8_t* sbb, size_t size);

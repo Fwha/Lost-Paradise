@@ -1,5 +1,6 @@
 #include "host/title_menu.h"
 
+#include "host/hooks.h"
 #include "host/module.h"
 #include "host/pc_settings.h"
 
@@ -8,11 +9,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <string>
 #include <vector>
-
-#include <sys/mman.h>
-#include <unistd.h>
 
 namespace host {
 
@@ -141,13 +140,6 @@ std::vector<std::string> gNames[kMaxPcSettings];
 
 uint8_t* row(uint8_t* screen, int i) { return at<uint8_t*>(screen, kRows) + kRowSize * i; }
 uint8_t* options() { return at<uint8_t*>(gEboot, kOptions) + 8; }
-
-void writeData(uint8_t* p, const void* v, size_t n) {
-    const uintptr_t page = uintptr_t(sysconf(_SC_PAGESIZE));
-    void* start = reinterpret_cast<void*>(uintptr_t(p) & ~(page - 1));
-    mprotect(start, page * 2, PROT_READ | PROT_WRITE);
-    std::memcpy(p, v, n);
-}
 
 // The value ranges of the ids our rows take: ours while our screen is up, else the game's.
 void setRanges(bool pc) {
@@ -294,22 +286,11 @@ uint32_t commit(uint8_t* self, void* e) {
     return r;
 }
 
-void writeJump(uint8_t* p, const void* fn) {
-    // movabs $fn, %rax; jmp *%rax
-    p[0] = 0x48, p[1] = 0xb8;
-    const uint64_t target = reinterpret_cast<uint64_t>(fn);
-    std::memcpy(p + 2, &target, 8);
-    p[10] = 0xff, p[11] = 0xe0;
-}
-
-struct Hook {
-    uint32_t at;
-    std::vector<uint8_t> was; // the function's first instructions, position independent
-    const void* fn;
-    void** original; // set to a copy of `was` followed by a jump back (null: replaced outright)
-};
-
 } // namespace
+
+void openPcSettingsNext() {
+    if (gEboot) gPcPending = true;
+}
 
 bool patchTitleMenuLayout(uint8_t* s, size_t size) {
     constexpr size_t kSize = 0x19800, kRects = 0x130, kSlots = 0x7be0, kSlotStride = 0x100, kLists = 0x18568,
@@ -431,29 +412,8 @@ bool patchTitleMenu(Module& eboot) {
          reinterpret_cast<const void*>(&cancelEdit), reinterpret_cast<void**>(&gCancelEdit)},
     };
     uint8_t* base = eboot.base();
-    for (const Hook& h : hooks)
-        if (std::memcmp(base + h.at, h.was.data(), h.was.size()) != 0) {
-            std::fprintf(stderr, "[title] unexpected eboot code at 0x%x: no PC SETTINGS row\n", h.at);
-            return false;
-        }
+    if (!installHooks(base, hooks, std::size(hooks), "title")) return false;
     gEboot = base;
-    void* mem = mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mem == MAP_FAILED) return false;
-    uint8_t* tramp = static_cast<uint8_t*>(mem);
-    const uintptr_t page = uintptr_t(sysconf(_SC_PAGESIZE));
-    for (const Hook& h : hooks) {
-        if (h.original) {
-            std::memcpy(tramp, h.was.data(), h.was.size());
-            writeJump(tramp + h.was.size(), base + h.at + h.was.size());
-            *h.original = tramp;
-            tramp += 32;
-        }
-        uint8_t* p = base + h.at;
-        // Left writable: the loader still rewrites thread pointer reads on these pages, and
-        // Module::protect sets the final protection afterwards.
-        mprotect(reinterpret_cast<void*>(uintptr_t(p) & ~(page - 1)), page * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
-        writeJump(p, h.fn);
-    }
     std::fprintf(stderr, "[title] PC SETTINGS row on the title menu\n");
     return true;
 }
