@@ -145,14 +145,6 @@ const CodePatch kMeasured[] = {
       0x60, 0xc5, 0xfa, 0x59, 0x05, 0x38, 0x73, 0x27, 0x01, 0xc5, 0xfa, 0x2d, 0xf8, 0x0f, 0x1f, 0x00}},
 };
 
-// Uncapped, the 1/30 step is measured too, and the flip interval would then come from the measured
-// dt (rounding to 0): only the 1/20 loading step sets it (cmpl $0x3d08888a, just above 1/30).
-CodePatch interval30() {
-    CodePatch p = kMeasured[1];
-    p.now[6] = 0x8a, p.now[7] = 0x88, p.now[8] = 0x08, p.now[9] = 0x3d;
-    return p;
-}
-
 // The clock's choice of step (0xd9ee98-0xd9eef5, measured ns in %eax, the result in %ecx) is
 // handed to stepNs below:
 //   mov %eax,%edi; movabs $stepNs,%rax; call *%rax; mov %eax,%ecx;
@@ -161,8 +153,7 @@ constexpr uint32_t kStepAt = 0xd9ee98;
 const std::vector<uint8_t> kStepWas = {0x49, 0x8b, 0x8e, 0x90, 0, 0, 0, 0x85, 0xc9, 0x74, 0x28, 0x48, 0xc1, 0xe9, 0x20,
                                        0xc5, 0xf9, 0x6e, 0xc9, 0xb9, 0x00, 0xc2, 0xeb, 0x0b, 0xc5, 0xf2, 0x5a, 0xc9,
                                        0xc5, 0xf3};
-// Kept in the 30 and 20 fps scenes when uncapped (LPN_KEEP_30FPS_SCENES=1): their fixed steps
-// and flip rate, as with a 30 fps cap.
+// The title screen's 30 fps flip rate, kept when uncapped with LPN_KEEP_30FPS_SCENES=1.
 bool keep30FpsScenes() {
     static const bool keep = [] {
         const char* v = std::getenv("LPN_KEEP_30FPS_SCENES");
@@ -201,6 +192,11 @@ struct StepCounts {
 StepCounts gSteps;
 int64_t gCarryNs = 0; // measured time not yet given out as whole 1/3000 s ticks
 
+// The 1/30 cutscene and 1/20 loading steps stay fixed. (Cutscenes stepped by the measured time
+// flashed frames from later in the scene, so they stay at 30.) The game's table holds 1/60 as
+// this same float.
+bool fixedStepKept(const Clock& c) { return c.fixedOn && c.fixedDt > 1.0f / 60; }
+
 constexpr uint32_t kNs60 = 16666666, kMaxFixedNs = 200000000, kMaxNs = 50000000;
 constexpr uint32_t kFloorNs = 2000000; // uncapped: 500 fps
 
@@ -208,17 +204,14 @@ constexpr uint32_t kFloorNs = 2000000; // uncapped: 500 fps
 // step when one is on, else 1/60 when flag bit 2 is set, else the measured time rounded up to 1/60
 // below 17.25 ms and capped at 50 ms. With a 30 fps cap the 1/60 fixed step and flag bit 2 take
 // the measured time instead (the title's menus set bit 2 most frames, and would run at half
-// speed). Uncapped, the 1/30 cutscene step does too (they then run at the monitor's rate; the
-// 1/20 loading step stays), the floor drops to 2 ms, and the step is a whole number of the
+// speed). Uncapped, the floor drops to 2 ms, and the step is a whole number of the
 // clock's 1/3000 s ticks, carrying the rest, so that its rounded tick count (+0x64) keeps real
 // time at rates such as 144 (20.8 ticks a frame, otherwise 21: 0.8% fast).
 extern "C" uint32_t stepNs(uint32_t measured) {
     const Clock& c = clock();
     const bool uncapped = gClockActive.load(std::memory_order_relaxed) == 2;
-    // The game's table holds 1/60 and 1/30 as these same floats.
-    const float fixedAbove = uncapped && !keep30FpsScenes() ? 1.0f / 30 : 1.0f / 60;
     if (c.overrideDt > 0) ++gSteps.override; // the clock replaces this step after the call
-    if (c.fixedOn && c.fixedDt > fixedAbove) {
+    if (fixedStepKept(c)) {
         ++gSteps.fixed;
         const double ns = double(c.fixedDt) * 1e9;
         return ns <= kMaxFixedNs ? uint32_t(ns) : kMaxFixedNs;
@@ -320,16 +313,16 @@ void clockStats() {
 
 bool frameClockUncapped() { return gClockActive.load(std::memory_order_relaxed) == 2; }
 
-bool uncap30FpsScenes() { return frameClockUncapped() && !keep30FpsScenes(); }
+bool uncap30FpsScenes() {
+    return frameClockUncapped() && !keep30FpsScenes() && !(gEbootText && fixedStepKept(clock()));
+}
 
 void syncFrameClock() {
     if (gEbootText) clockStats();
     const int want = gClockWanted;
     if (!gEbootText || want == gClockActive) return;
     write(kMeasured[0], want >= 1);
-    write(kMeasured[1], false);
-    if (want == 2 && !keep30FpsScenes()) write(interval30(), true);
-    else write(kMeasured[1], want >= 1);
+    write(kMeasured[1], want >= 1);
     write(stepPatch(), want >= 1);
     gCarryNs = 0;
     gClockActive = want;
