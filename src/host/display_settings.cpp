@@ -146,16 +146,6 @@ const CodePatch kMeasured[] = {
       0x60, 0xc5, 0xfa, 0x59, 0x05, 0x38, 0x73, 0x27, 0x01, 0xc5, 0xfa, 0x2d, 0xf8, 0x0f, 0x1f, 0x00}},
 };
 
-// While the title menu is uncapped its 1/30 step is measured, and the flip interval would then
-// come from the measured dt (rounding to 0): only the 1/20 loading step sets it then
-// (cmpl $0x3d08888a, just above 1/30).
-CodePatch interval30() {
-    CodePatch p = kMeasured[1];
-    p.now[6] = 0x8a, p.now[7] = 0x88, p.now[8] = 0x08, p.now[9] = 0x3d;
-    return p;
-}
-bool gInterval30 = false; // interval30 written in place of kMeasured[1]
-
 // The clock's choice of step (0xd9ee98-0xd9eef5, measured ns in %eax, the result in %ecx) is
 // handed to stepNs below:
 //   mov %eax,%edi; movabs $stepNs,%rax; call *%rax; mov %eax,%ecx;
@@ -208,6 +198,8 @@ int64_t gCarryNs = 0; // measured time not yet given out as whole 1/3000 s ticks
 // fight ran under it, flashing when uncapped). The object, captured at its push, is the title's
 // while its vtable is: its destructor resets the vtable to its base class's.
 std::atomic<uint8_t*> gTitleSequence{nullptr};
+uint8_t* gStepStack = nullptr; // the request stack (0xd4f00's object): the current index at +0x10
+bool gTitleStepOff = false;    // the host turned the title's 1/30 step off
 constexpr uint32_t kTitleVtable = 0x233fba8 + 0x10;
 
 bool titleRunning() {
@@ -215,16 +207,10 @@ bool titleRunning() {
     return seq && *reinterpret_cast<const uint64_t*>(seq) == uint64_t(gEbootText + kTitleVtable);
 }
 
-// Uncapped, the title menu takes the measured time instead of its 1/30 step.
-bool titleUncapped(const Clock& c) {
-    return gClockActive.load(std::memory_order_relaxed) == 2 && !keep30FpsScenes() && c.fixedDt <= 1.0f / 30 &&
-           titleRunning();
-}
-
 // The 1/30 cutscene and 1/20 loading steps stay fixed. (Cutscenes stepped by the measured time
-// flashed frames from later in the scene, so they stay at 30.) The game's table holds 1/60 and
-// 1/30 as these same floats.
-bool fixedStepKept(const Clock& c) { return c.fixedOn && c.fixedDt > 1.0f / 60 && !titleUncapped(c); }
+// flashed frames from later in the scene, so they stay at 30.) The game's table holds 1/60 as
+// this same float.
+bool fixedStepKept(const Clock& c) { return c.fixedOn && c.fixedDt > 1.0f / 60; }
 
 constexpr uint32_t kNs60 = 16666666, kMaxFixedNs = 200000000, kMaxNs = 50000000;
 constexpr uint32_t kFloorNs = 2000000; // uncapped: 500 fps
@@ -279,6 +265,7 @@ constexpr uint32_t kTitleStepCaller = 0x9bdd60; // return address of the title s
 const uint8_t kPushWas[] = {0x48, 0x63, 0x87, 0x98, 0, 0, 0};
 
 uint64_t pushRequest(uint8_t* stack, uint32_t value, uintptr_t caller) {
+    gStepStack = stack;
     int32_t& n = *reinterpret_cast<int32_t*>(stack + 0x98);
     reinterpret_cast<uint32_t*>(stack + 0x9c)[n] = value;
     ++n;
@@ -400,6 +387,30 @@ void clockStats() {
 
 bool frameClockUncapped() { return gClockActive.load(std::memory_order_relaxed) == 2; }
 
+namespace {
+
+// Uncapped, the title menu runs with its 1/30 step turned off, as the clock's own off switch
+// (0xd9f0f0, patched to clear the step too) leaves it: measured steps and no 30 fps flip
+// interval. (Measured steps with the fixed step still on stopped the menu's options appearing.)
+// When the title sequence ends while its request is still the current one, the step is put back
+// as 0xd9f0c0(2) sets it, so the scenes running on that request keep 1/30.
+void titleStep(bool uncapped) {
+    Clock& c = clock();
+    if (uncapped && titleRunning()) {
+        if (c.fixedOn && c.fixedDt == 1.0f / 30) {
+            c.fixedOn = 0, c.fixedDt = 0;
+            gTitleStepOff = true;
+        }
+        return;
+    }
+    if (!gTitleStepOff) return;
+    gTitleStepOff = false;
+    if (!c.fixedOn && gStepStack && *reinterpret_cast<const int32_t*>(gStepStack + 0x10) == 2)
+        c.fixedDt = 1.0f / 30, c.fixedOn = 1;
+}
+
+} // namespace
+
 bool uncap30FpsScenes() {
     return frameClockUncapped() && !keep30FpsScenes() && !(gEbootText && fixedStepKept(clock()));
 }
@@ -407,17 +418,10 @@ bool uncap30FpsScenes() {
 void syncFrameClock() {
     if (gEbootText) clockStats();
     const int want = gClockWanted;
-    if (gEbootText && want == gClockActive && want == 2) {
-        const bool title = titleUncapped(clock());
-        if (title != gInterval30) {
-            write(title ? interval30() : kMeasured[1], true);
-            gInterval30 = title;
-        }
-    }
+    if (gEbootText) titleStep(want == 2 && gClockActive == want && !keep30FpsScenes());
     if (!gEbootText || want == gClockActive) return;
     write(kMeasured[0], want >= 1);
     write(kMeasured[1], want >= 1);
-    gInterval30 = false;
     write(stepPatch(), want >= 1);
     gCarryNs = 0;
     gClockActive = want;

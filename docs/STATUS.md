@@ -89,8 +89,9 @@ Last updated 2026-10-16.
    stays on the stack under later scenes (the opening cutscene before the Shin fight runs on it;
    changing the request itself made that cutscene flash). The host's step-request pushes
    (0xd6e20/0xd6dd0, logged as [step] with LPN_PROFILE=1) capture the title sequence object;
-   uncapped, the 1/30 step is measured only while that object still has the title's vtable
-   (0x233fbb8).
+   uncapped, while that object still has the title's vtable (0x233fbb8) the host turns the 1/30
+   step off in the clock (+0x90/+0x94 = 0, as 0xd9f0f0 leaves it; measuring with the step left on
+   stopped the menu's options appearing) and puts it back when the title ends on that request.
    `LPN_KEEP_30FPS_SCENES=1` keeps the title screen at 30 too. `[clock]` lines count fixed / bit-2 / floored / capped / override steps.
 3. Fight glitches: a one-frame black wedge over the HP bar (gone with `LPN_GPU_SYNC=1`, so likely
    a race between the game rewriting HUD data and our asynchronous GPU); the kick trail and torch
