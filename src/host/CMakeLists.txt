@@ -22,6 +22,8 @@ add_executable(lpn-host
     input_history.cpp
     title_menu.cpp
     pc_settings.cpp
+    pause_menu.cpp
+    hooks.cpp
     gpu/frame_dump.cpp
     gpu/formats.cpp
     gpu/renderer.cpp
