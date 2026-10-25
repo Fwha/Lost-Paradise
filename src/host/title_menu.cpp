@@ -1,7 +1,7 @@
 #include "host/title_menu.h"
 
-#include "host/display_menu.h"
 #include "host/module.h"
+#include "host/pc_settings.h"
 
 #include <algorithm>
 #include <atomic>
@@ -112,7 +112,11 @@ constexpr size_t kOptionsSize = 0x58;         // what the screen edits, from +0
 // Each id's value range, 20 bytes apart: +4 the last value. Editing shows that many + 1.
 constexpr uint32_t kRanges = 0x23a2700;
 constexpr size_t kRangeSize = 20, kRangeLast = 4;
-constexpr uint8_t kFirstId = 1; // ids 1..4 (tips, cameras): plain choices the screen has no special case for
+// The ids and fields our rows take: ids of plain choices the screen has no special case for
+// (not 0, 0xa, 0xb, 0xe..0x10; 8 is a plain one but a special field), fields within what the screen
+// keeps (its +0x140 copy) and not 8.
+constexpr uint8_t kPcIds[kMaxPcSettings] = {1, 2, 3, 4, 5, 6, 7, 9, 0xc, 0xd, 0x11, 0x12, 0x13};
+constexpr uint8_t kPcFields[kMaxPcSettings] = {0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13};
 
 // The header: the title layout shows frame 5 of three lists for SETTINGS (rect 39); PC SETTINGS
 // shows the menu label (rect 37) there instead, while its screen is up. The loaded layout is the
@@ -121,14 +125,6 @@ constexpr size_t kHeaderLists[] = {0x18bb0, 0x18bfc, 0x18c48};
 constexpr size_t kHeaderRecord = 4 * 17; // frame 5's
 constexpr uint16_t kRectHeader = 39, kRectLabel = 37;
 
-constexpr int kPcRows = 4;
-const char* const kPcLabels[kPcRows] = {"Window Mode", "Resolution", "Frame Rate Cap", "FPS Counter"};
-const char* const kPcDescs[kPcRows] = {
-    "Play in a window, a borderless window or fullscreen.",
-    "Set the 3D rendering resolution. Takes effect after restarting the game.",
-    "Set the most frames shown per second. Uncapped follows the monitor's refresh rate.",
-    "Show the frame rate in the top right corner of the screen.",
-};
 
 void (*gSettingsState)(uint8_t*) = nullptr;
 void (*gScreenInit)(uint8_t*) = nullptr;
@@ -139,8 +135,9 @@ uint32_t (*gCancelEdit)(uint8_t*, void*) = nullptr;
 
 std::atomic<bool> gPcPending{false}; // PC SETTINGS chosen: the next screen built is ours
 uint8_t* gPcScreen = nullptr;        // the game thread's, as all below
-int32_t gOldLast[kPcRows];
-std::vector<std::string> gNames[kPcRows];
+int gPcRows = 0;
+int32_t gOldLast[kMaxPcSettings];
+std::vector<std::string> gNames[kMaxPcSettings];
 
 uint8_t* row(uint8_t* screen, int i) { return at<uint8_t*>(screen, kRows) + kRowSize * i; }
 uint8_t* options() { return at<uint8_t*>(gEboot, kOptions) + 8; }
@@ -157,12 +154,12 @@ void setRanges(bool pc) {
     static bool saved = false;
     uint8_t* r = gEboot + kRanges + kRangeLast;
     if (!saved) {
-        for (int i = 0; i < kPcRows; ++i) std::memcpy(&gOldLast[i], r + kRangeSize * (kFirstId + i), 4);
+        for (int i = 0; i < kMaxPcSettings; ++i) std::memcpy(&gOldLast[i], r + kRangeSize * kPcIds[i], 4);
         saved = true;
     }
-    for (int i = 0; i < kPcRows; ++i) {
-        const int32_t last = pc ? int32_t(gNames[i].size()) - 1 : gOldLast[i];
-        writeData(r + kRangeSize * (kFirstId + i), &last, 4);
+    for (int i = 0; i < kMaxPcSettings; ++i) {
+        const int32_t last = pc && i < gPcRows ? int32_t(gNames[i].size()) - 1 : gOldLast[i];
+        writeData(r + kRangeSize * kPcIds[i], &last, 4);
     }
 }
 
@@ -171,13 +168,19 @@ void setHeader(uint16_t rect) {
     if (!s) return;
     // Still the loaded layout: our label's rect, now in native floats, and frame 5's records.
     const float want[4] = {1 / 1024.0f, 400 / 512.0f, 545 / 1024.0f, 446 / 512.0f};
-    if (std::memcmp(s + 0x130 + kRectLabel * 16, want, 16) != 0) return;
+    if (std::memcmp(s + 0x130 + kRectLabel * 16, want, 16) != 0) {
+        std::fprintf(stderr, "[title] header: the layout is not where it was decompressed\n");
+        return;
+    }
     const uint16_t other = rect == kRectLabel ? kRectHeader : kRectLabel;
     for (size_t list : kHeaderLists) {
         const uint8_t* rec = s + list + kHeaderRecord;
         uint16_t frame, tex, r;
         std::memcpy(&frame, rec, 2), std::memcpy(&tex, rec + 4, 2), std::memcpy(&r, rec + 6, 2);
-        if (frame != 5 || tex != 3 || (r != rect && r != other)) return;
+        if (frame != 5 || tex != 3 || (r != rect && r != other)) {
+            std::fprintf(stderr, "[title] header: frame 5 is %u %u %u at +0x%zx\n", frame, tex, r, list);
+            return;
+        }
     }
     for (size_t list : kHeaderLists) std::memcpy(s + list + kHeaderRecord + 6, &rect, 2);
 }
@@ -205,32 +208,37 @@ void screenInit(uint8_t* self) {
     const bool pc = gPcPending.exchange(false);
     gPcScreen = pc ? self : nullptr;
     if (!pc) return setRanges(false);
-    bool ok = at<uint32_t>(self, kRowCap) >= uint32_t(kPcRows); // always: the game's own are more
-    for (int i = 0; i < kPcRows; ++i) ok = ok && displayOptionCount(i) > 0; // none without a window
+    const std::vector<PcSetting>& settings = pcSettings();
+    const int n = std::min(int(settings.size()), kMaxPcSettings);
+    bool ok = n > 0 && at<uint32_t>(self, kRowCap) >= uint32_t(n); // always: the game's own are more
+    for (int i = 0; i < n && ok; ++i) {
+        gNames[i] = settings[i].choices();
+        if (gNames[i].size() > kMaxNames) gNames[i].resize(kMaxNames);
+        ok = !gNames[i].empty(); // none without a window
+    }
     if (!ok) {
         gPcScreen = nullptr;
+        gPcRows = 0;
         return setRanges(false);
     }
-    for (int i = 0; i < kPcRows; ++i) {
-        gNames[i].clear();
-        for (int k = 0, n = std::min(displayOptionCount(i), int(kMaxNames)); k < n; ++k)
-            gNames[i].push_back(displayOptionName(i, k));
+    gPcRows = n;
+    for (int i = 0; i < n; ++i) {
         uint8_t* r = row(self, i);
         std::memset(r, 0, kRowSize);
-        r[kRowField] = uint8_t(i);
-        r[kRowId] = uint8_t(kFirstId + i);
-        at<const char*>(r, kRowLabel) = kPcLabels[i];
-        at<const char*>(r, kRowDesc) = kPcDescs[i];
+        r[kRowField] = kPcFields[i];
+        r[kRowId] = kPcIds[i];
+        at<const char*>(r, kRowLabel) = settings[i].label;
+        at<const char*>(r, kRowDesc) = settings[i].description;
         for (size_t k = 0; k < gNames[i].size(); ++k) at<const char*>(r, kRowNames + 8 * k) = gNames[i][k].c_str();
-        const uint32_t v = uint32_t(std::clamp(displayOptionValue(i), 0, int(gNames[i].size()) - 1));
+        const uint32_t v = uint32_t(std::clamp(settings[i].value(), 0, int(gNames[i].size()) - 1));
         at<uint32_t>(r, kRowValue) = v;
-        self[kCommitted + i] = uint8_t(v);
+        self[kCommitted + kPcFields[i]] = uint8_t(v);
     }
-    at<uint32_t>(self, kRowCount) = kPcRows;
+    at<uint32_t>(self, kRowCount) = uint32_t(n);
     setRanges(true);
     auto list = reinterpret_cast<uint8_t* (*)(uint8_t*, uint32_t)>(gEboot + kListOf);
     auto listSize = reinterpret_cast<void (*)(uint8_t*, uint32_t, uint32_t)>(gEboot + kListSize);
-    listSize(list(self, 0), 0xb, kPcRows);
+    listSize(list(self, 0), 0xb, uint32_t(n));
 }
 
 // Keeps the rows as the settings are, which the F11 menu can change too (not while one is edited).
@@ -238,11 +246,11 @@ void screenDraw(uint8_t* self) {
     static std::atomic<bool> seen{false};
     traceFirst("screen draw", seen);
     if (self == gPcScreen && at<uint64_t>(self, kScreenState) != uint64_t(gEboot + kEditState))
-        for (int i = 0; i < kPcRows; ++i) {
-            const int v = displayOptionValue(i);
+        for (int i = 0; i < gPcRows; ++i) {
+            const int v = pcSettings()[i].value();
             if (v < 0 || v >= int(gNames[i].size())) continue;
             at<uint32_t>(row(self, i), kRowValue) = uint32_t(v);
-            self[kCommitted + i] = uint8_t(v);
+            self[kCommitted + kPcFields[i]] = uint8_t(v);
         }
     gScreenDraw(self);
 }
@@ -278,9 +286,9 @@ uint32_t commit(uint8_t* self, void* e) {
     traceFirst("commit", seen);
     const uint32_t r = gCommit(self, e);
     if (self == gPcScreen)
-        for (int i = 0; i < kPcRows; ++i) {
+        for (int i = 0; i < gPcRows; ++i) {
             const int v = int(at<uint32_t>(row(self, i), kRowValue));
-            if (v != displayOptionValue(i)) setDisplayOption(i, v);
+            if (v != pcSettings()[i].value()) pcSettings()[i].choose(v);
         }
     return r;
 }

@@ -9,7 +9,7 @@
 //    out of the game's SLLZ decompressor (0xe2ebc0).
 //  - its description (text table 7, row 8) is swapped for one of ours.
 //  - its confirm state (0xb4f090) opens the game's settings screen as SETTINGS does, with the
-//    F11 menu's settings as its rows (display_menu.h) and the menu label as its header.
+//    rows of pc_settings.h (the F11 menu's settings) and the menu label as its header.
 // LPN_PC_SETTINGS=0 leaves the title menu as the game's.
 #pragma once
 
