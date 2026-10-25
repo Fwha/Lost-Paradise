@@ -50,7 +50,7 @@ void loadDisplaySettings() {
             else gSettings.width = gSettings.height = 0;
         } else if (!std::strcmp(key, "fps")) {
             const int fps = std::atoi(value);
-            if (!std::strcmp(value, "uncapped")) gSettings.fps = 90; // no longer offered
+            if (!std::strcmp(value, "uncapped")) gSettings.fps = 0;
             else if (fps >= 10 && fps <= 240) gSettings.fps = fps;
         } else if (!std::strcmp(key, "fps_counter")) {
             gSettings.fpsCounter = !std::strcmp(value, "on");
