@@ -40,6 +40,12 @@ void** (*gText)(void**, uint32_t, uint32_t) = nullptr;
 
 template <class T> T& at(uint8_t* p, size_t off) { return *reinterpret_cast<T*>(p + off); }
 
+// LPN_TITLE_TRACE=1 (debugging): each hooked function's first call.
+void traceFirst(const char* name, std::atomic<bool>& seen) {
+    static const bool on = std::getenv("LPN_TITLE_TRACE") != nullptr;
+    if (on && !seen.exchange(true)) std::fprintf(stderr, "[title] first call: %s\n", name);
+}
+
 uint32_t be32(const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
 void putBe16(uint8_t* p, uint16_t v) { p[0] = uint8_t(v >> 8), p[1] = uint8_t(v); }
 void putBe32(uint8_t* p, uint32_t v) { putBe16(p, uint16_t(v >> 16)), putBe16(p + 2, uint16_t(v)); }
@@ -65,6 +71,8 @@ int32_t decompress(uint8_t* dst, uint32_t cap, const uint8_t* src) {
 }
 
 void buildItems(uint8_t* self) {
+    static std::atomic<bool> seen{false};
+    traceFirst("build items", seen);
     gBuildItems(self);
     int64_t& n = at<int64_t>(self, kItemCount);
     if (n < 0 || n >= kMaxItems) return;
@@ -175,18 +183,24 @@ void setHeader(uint16_t rect) {
 }
 
 void settingsState(uint8_t* self) {
+    static std::atomic<bool> seen{false};
+    traceFirst("settings state", seen);
     const bool pc = gPcPending;
     setHeader(pc ? kRectLabel : kRectHeader);
     gSettingsState(self);
 }
 
 void chosen(uint8_t* self) {
+    static std::atomic<bool> seen{false};
+    traceFirst("chosen", seen);
     std::fprintf(stderr, "[title] PC SETTINGS\n");
     gPcPending = true;
     settingsState(self);
 }
 
 void screenInit(uint8_t* self) {
+    static std::atomic<bool> seen{false};
+    traceFirst("screen init", seen);
     gScreenInit(self);
     const bool pc = gPcPending.exchange(false);
     gPcScreen = pc ? self : nullptr;
@@ -221,6 +235,8 @@ void screenInit(uint8_t* self) {
 
 // Keeps the rows as the settings are, which the F11 menu can change too (not while one is edited).
 void screenDraw(uint8_t* self) {
+    static std::atomic<bool> seen{false};
+    traceFirst("screen draw", seen);
     if (self == gPcScreen && at<uint64_t>(self, kScreenState) != uint64_t(gEboot + kEditState))
         for (int i = 0; i < kPcRows; ++i) {
             const int v = displayOptionValue(i);
@@ -244,16 +260,22 @@ struct KeepOptions {
 };
 
 void valueChange(uint8_t* self, uint32_t a, uint32_t b) {
+    static std::atomic<bool> seen{false};
+    traceFirst("value change", seen);
     KeepOptions keep(self);
     gValueChange(self, a, b);
 }
 
 uint32_t cancelEdit(uint8_t* self, void* e) {
+    static std::atomic<bool> seen{false};
+    traceFirst("cancel edit", seen);
     KeepOptions keep(self);
     return gCancelEdit(self, e);
 }
 
 uint32_t commit(uint8_t* self, void* e) {
+    static std::atomic<bool> seen{false};
+    traceFirst("commit", seen);
     const uint32_t r = gCommit(self, e);
     if (self == gPcScreen)
         for (int i = 0; i < kPcRows; ++i) {
