@@ -280,9 +280,10 @@ void jumpTo(uint32_t at, const void* fn) {
     const uintptr_t page = uintptr_t(sysconf(_SC_PAGESIZE));
     uint8_t* p = gEbootText + at;
     void* start = reinterpret_cast<void*>(uintptr_t(p) & ~(page - 1));
+    // Left writable: the loader still rewrites thread pointer reads on these pages, and
+    // Module::protect sets the final protection afterwards.
     mprotect(start, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
     std::memcpy(p, jump, sizeof jump);
-    mprotect(start, page * 2, PROT_READ | PROT_EXEC);
 }
 
 void write(const CodePatch& p, bool on) {
