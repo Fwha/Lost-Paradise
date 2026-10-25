@@ -85,13 +85,12 @@ Last updated 2026-10-16.
    time; uncapped, flip rate 1 outside a fixed step (the title screen) is shown at the monitor's
    rate, and steps are whole 1/3000 s ticks with the rest carried. Cutscenes stay at fixed 1/30
    and 30 fps: uncapped they flashed frames from later in the scene (owner-tested 2026-10-25).
-   The title sequence (sequence_title.inl, push at 0x9bdd5b) also asks for 1/30, and that request
-   stays on the stack under later scenes (the opening cutscene before the Shin fight runs on it;
-   changing the request itself made that cutscene flash). The host's step-request pushes
-   (0xd6e20/0xd6dd0, logged as [step] with LPN_PROFILE=1) capture the title sequence object;
-   uncapped, while that object still has the title's vtable (0x233fbb8) the host turns the 1/30
-   step off in the clock (+0x90/+0x94 = 0, as 0xd9f0f0 leaves it; measuring with the step left on
-   stopped the menu's options appearing) and puts it back when the title ends on that request.
+   The title sequence (sequence_title.inl, push at 0x9bdd5b) also asks for 1/30. The host's
+   step-request push/pop (0xd6e20/0xd6dd0/0xd6e50, [step] lines with LPN_PROFILE=1) track the title
+   from that push to its destructor's pop (0x9bc1a2/0x9bc1e2); uncapped, while it runs the host
+   turns the 1/30 step off in the clock (+0x90/+0x94 = 0, as 0xd9f0f0 leaves it). Rewriting the
+   request, or measuring with the step left on, broke the Shin cutscene or the menu's options, and
+   the object's vtable is no sign of life (freed memory keeps it).
    `LPN_KEEP_30FPS_SCENES=1` keeps the title screen at 30 too. `[clock]` lines count fixed / bit-2 / floored / capped / override steps.
 3. Fight glitches: a one-frame black wedge over the HP bar (gone with `LPN_GPU_SYNC=1`, so likely
    a race between the game rewriting HUD data and our asynchronous GPU); the kick trail and torch

@@ -193,19 +193,15 @@ struct StepCounts {
 StepCounts gSteps;
 int64_t gCarryNs = 0; // measured time not yet given out as whole 1/3000 s ticks
 
-// The title sequence (0x4870 bytes, made at 0x9bdd16) asks for the same 1/30 step as cutscenes,
-// and its request stays on the stack below later scenes' (the opening cutscene before the Shin
-// fight ran under it, flashing when uncapped). The object, captured at its push, is the title's
-// while its vtable is: its destructor resets the vtable to its base class's.
-std::atomic<uint8_t*> gTitleSequence{nullptr};
-uint8_t* gStepStack = nullptr; // the request stack (0xd4f00's object): the current index at +0x10
-bool gTitleStepOff = false;    // the host turned the title's 1/30 step off
-constexpr uint32_t kTitleVtable = 0x233fba8 + 0x10;
+// The title sequence (made at 0x9bdd16) asks for the same 1/30 step as cutscenes. It runs from
+// its push of that request (kTitleStepCaller) to its destructor's pop of it (0x9bc170 and
+// 0x9bc1b0 call the pop, 0xd6e50, returning to kTitlePopCallers).
+std::atomic<bool> gTitleAlive{false};
+constexpr uint32_t kPopStep = 0xd6e50;
+constexpr uint32_t kTitlePopCallers[] = {0x9bc1a2, 0x9bc1e2};
+const uint8_t kPopWas[] = {0x48, 0x63, 0x87, 0x98, 0, 0, 0, 0xc7, 0x84, 0x87, 0x9c, 0, 0, 0};
 
-bool titleRunning() {
-    const uint8_t* seq = gTitleSequence.load(std::memory_order_relaxed);
-    return seq && *reinterpret_cast<const uint64_t*>(seq) == uint64_t(gEbootText + kTitleVtable);
-}
+bool titleRunning() { return gTitleAlive.load(std::memory_order_relaxed); }
 
 // The 1/30 cutscene and 1/20 loading steps stay fixed. (Cutscenes stepped by the measured time
 // flashed frames from later in the scene, so they stay at 30.) The game's table holds 1/60 as
@@ -265,7 +261,6 @@ constexpr uint32_t kTitleStepCaller = 0x9bdd60; // return address of the title s
 const uint8_t kPushWas[] = {0x48, 0x63, 0x87, 0x98, 0, 0, 0};
 
 uint64_t pushRequest(uint8_t* stack, uint32_t value, uintptr_t caller) {
-    gStepStack = stack;
     int32_t& n = *reinterpret_cast<int32_t*>(stack + 0x98);
     reinterpret_cast<uint32_t*>(stack + 0x9c)[n] = value;
     ++n;
@@ -279,18 +274,22 @@ uint64_t pushRequest(uint8_t* stack, uint32_t value, uintptr_t caller) {
     return wake(*reinterpret_cast<void**>(gEbootText + kWakeArg));
 }
 
-extern "C" __attribute__((used)) uint64_t pushStepWithRbx(uint8_t* stack, uint32_t index, uint8_t* rbx) {
+extern "C" uint64_t pushStep(uint8_t* stack, uint32_t index) {
     const uintptr_t caller = uintptr_t(__builtin_return_address(0));
-    if (caller - uintptr_t(gEbootText) == kTitleStepCaller) {
-        gTitleSequence = rbx;
-    }
+    if (caller - uintptr_t(gEbootText) == kTitleStepCaller) gTitleAlive = true;
     return pushRequest(stack, index, caller);
 }
 
-// The push's entry: hands the caller's %rbx (the title sequence at kTitleStepCaller) over as the
-// third argument (the caller's %rdx, a source file name, is not used) and keeps the return address.
-extern "C" void pushStep();
-asm(".text\n.globl pushStep\n.type pushStep,@function\npushStep:\n  mov %rbx, %rdx\n  jmp pushStepWithRbx\n");
+extern "C" void popStep(uint8_t* stack) {
+    const uintptr_t at = uintptr_t(__builtin_return_address(0)) - uintptr_t(gEbootText);
+    int32_t& n = *reinterpret_cast<int32_t*>(stack + 0x98);
+    reinterpret_cast<uint32_t*>(stack + 0x9c)[n] = 0xffffffffu;
+    ++n;
+    if (at != kTitlePopCallers[0] && at != kTitlePopCallers[1]) return;
+    gTitleAlive = false;
+    static const bool log = std::getenv("LPN_PROFILE") != nullptr;
+    if (log) std::fprintf(stderr, "[step] title ends at flip %llu\n", (unsigned long long)flipCount());
+}
 
 extern "C" uint64_t pushMeasured(uint8_t* stack, uint32_t index) {
     return pushRequest(stack, index ? index | 0x80000000u : 0, uintptr_t(__builtin_return_address(0)));
@@ -335,9 +334,11 @@ bool prepareFrameClock(Module& eboot) {
     if (!matches(stepPatch())) return false;
     gEbootText = eboot.base();
     if (std::memcmp(gEbootText + kPushStep, kPushWas, sizeof kPushWas) == 0 &&
-        std::memcmp(gEbootText + kPushMeasured, kPushWas, sizeof kPushWas) == 0) {
+        std::memcmp(gEbootText + kPushMeasured, kPushWas, sizeof kPushWas) == 0 &&
+        std::memcmp(gEbootText + kPopStep, kPopWas, sizeof kPopWas) == 0) {
         jumpTo(kPushStep, reinterpret_cast<const void*>(&pushStep));
         jumpTo(kPushMeasured, reinterpret_cast<const void*>(&pushMeasured));
+        jumpTo(kPopStep, reinterpret_cast<const void*>(&popStep));
     }
     return true;
 }
@@ -392,21 +393,10 @@ namespace {
 // Uncapped, the title menu runs with its 1/30 step turned off, as the clock's own off switch
 // (0xd9f0f0, patched to clear the step too) leaves it: measured steps and no 30 fps flip
 // interval. (Measured steps with the fixed step still on stopped the menu's options appearing.)
-// When the title sequence ends while its request is still the current one, the step is put back
-// as 0xd9f0c0(2) sets it, so the scenes running on that request keep 1/30.
+// The title's pop makes 0xd4f00 set the step of the scene below again.
 void titleStep(bool uncapped) {
     Clock& c = clock();
-    if (uncapped && titleRunning()) {
-        if (c.fixedOn && c.fixedDt == 1.0f / 30) {
-            c.fixedOn = 0, c.fixedDt = 0;
-            gTitleStepOff = true;
-        }
-        return;
-    }
-    if (!gTitleStepOff) return;
-    gTitleStepOff = false;
-    if (!c.fixedOn && gStepStack && *reinterpret_cast<const int32_t*>(gStepStack + 0x10) == 2)
-        c.fixedDt = 1.0f / 30, c.fixedOn = 1;
+    if (uncapped && titleRunning() && c.fixedOn && c.fixedDt == 1.0f / 30) c.fixedOn = 0, c.fixedDt = 0;
 }
 
 } // namespace
