@@ -2,6 +2,7 @@
 
 #include "host/kernel.h"
 #include "host/module.h"
+#include "host/videoout.h"
 
 #include <algorithm>
 #include <atomic>
@@ -242,6 +243,48 @@ CodePatch stepPatch() {
     return {kStepAt, kStepWas, now};
 }
 
+// Scenes ask for a fixed step by pushing a request on a stack (0xd6e20 pushes a step index,
+// 0xd6dd0 the same with bit 31 set, which the clock takes as no fixed step; 0xd4f00 applies
+// them). These replacements do the same and log who asks for what, so the title screen's
+// 1/30 request can be told from the cutscenes'.
+constexpr uint32_t kPushStep = 0xd6e20, kPushMeasured = 0xd6dd0, kWake = 0x108030, kWakeArg = 0x247e630 + 0x178;
+const uint8_t kPushWas[] = {0x48, 0x63, 0x87, 0x98, 0, 0, 0};
+
+uint64_t pushRequest(uint8_t* stack, uint32_t value, uintptr_t caller) {
+    int32_t& n = *reinterpret_cast<int32_t*>(stack + 0x98);
+    reinterpret_cast<uint32_t*>(stack + 0x9c)[n] = value;
+    ++n;
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 400)
+        std::fprintf(stderr, "[step] request 0x%x from eboot+0x%lx at flip %llu\n", value,
+                     (unsigned long)(caller - uintptr_t(gEbootText)), (unsigned long long)flipCount());
+    if (value & 0x7fffffff) return 0;
+    auto wake = reinterpret_cast<uint64_t (*)(void*)>(gEbootText + kWake);
+    return wake(*reinterpret_cast<void**>(gEbootText + kWakeArg));
+}
+
+extern "C" uint64_t pushStep(uint8_t* stack, uint32_t index) {
+    return pushRequest(stack, index, uintptr_t(__builtin_return_address(0)));
+}
+
+extern "C" uint64_t pushMeasured(uint8_t* stack, uint32_t index) {
+    return pushRequest(stack, index ? index | 0x80000000u : 0, uintptr_t(__builtin_return_address(0)));
+}
+
+void jumpTo(uint32_t at, const void* fn) {
+    // movabs $fn, %rax; jmp *%rax
+    uint8_t jump[12] = {0x48, 0xb8};
+    const uint64_t target = reinterpret_cast<uint64_t>(fn);
+    std::memcpy(jump + 2, &target, 8);
+    jump[10] = 0xff, jump[11] = 0xe0;
+    const uintptr_t page = uintptr_t(sysconf(_SC_PAGESIZE));
+    uint8_t* p = gEbootText + at;
+    void* start = reinterpret_cast<void*>(uintptr_t(p) & ~(page - 1));
+    mprotect(start, page * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+    std::memcpy(p, jump, sizeof jump);
+    mprotect(start, page * 2, PROT_READ | PROT_EXEC);
+}
+
 void write(const CodePatch& p, bool on) {
     const std::vector<uint8_t>& bytes = on ? p.now : p.was;
     const uintptr_t page = uintptr_t(sysconf(_SC_PAGESIZE));
@@ -265,6 +308,11 @@ bool prepareFrameClock(Module& eboot) {
         if (!matches(p)) return false;
     if (!matches(stepPatch())) return false;
     gEbootText = eboot.base();
+    if (std::memcmp(gEbootText + kPushStep, kPushWas, sizeof kPushWas) == 0 &&
+        std::memcmp(gEbootText + kPushMeasured, kPushWas, sizeof kPushWas) == 0) {
+        jumpTo(kPushStep, reinterpret_cast<const void*>(&pushStep));
+        jumpTo(kPushMeasured, reinterpret_cast<const void*>(&pushMeasured));
+    }
     return true;
 }
 
