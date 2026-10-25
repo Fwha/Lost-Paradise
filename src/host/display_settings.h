@@ -45,8 +45,8 @@ void syncFrameClock();
 // Whether the clock now steps by the measured time with the low floor (above 60 fps).
 bool frameClockUncapped();
 // Whether the game's 30 fps flip rate is shown at the monitor's rate: uncapped, outside the fixed
-// 1/30 step of cutscenes (the title screen asks for 30 with a measured step), unless
-// LPN_KEEP_30FPS_SCENES=1.
+// 1/30 step of cutscenes, unless LPN_KEEP_30FPS_SCENES=1. The title screen's 1/30 request is
+// made a measured one when uncapped, so it runs at the monitor's rate.
 bool uncap30FpsScenes();
 
 } // namespace host

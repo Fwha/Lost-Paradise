@@ -245,17 +245,20 @@ CodePatch stepPatch() {
 
 // Scenes ask for a fixed step by pushing a request on a stack (0xd6e20 pushes a step index,
 // 0xd6dd0 the same with bit 31 set, which the clock takes as no fixed step; 0xd4f00 applies
-// them). These replacements do the same and log who asks for what, so the title screen's
-// 1/30 request can be told from the cutscenes'.
+// them). These replacements do the same, log who asks for what with LPN_PROFILE=1, and when
+// uncapped turn the title screen's 1/30 request (sequence_title.inl) into a measured one, as
+// the event scenes ask for: the title then runs at the monitor's rate while cutscenes keep 1/30.
 constexpr uint32_t kPushStep = 0xd6e20, kPushMeasured = 0xd6dd0, kWake = 0x108030, kWakeArg = 0x247e630 + 0x178;
+constexpr uint32_t kTitleStepCaller = 0x9bdd60; // return address of the title's push of step 2
 const uint8_t kPushWas[] = {0x48, 0x63, 0x87, 0x98, 0, 0, 0};
 
 uint64_t pushRequest(uint8_t* stack, uint32_t value, uintptr_t caller) {
     int32_t& n = *reinterpret_cast<int32_t*>(stack + 0x98);
     reinterpret_cast<uint32_t*>(stack + 0x9c)[n] = value;
     ++n;
+    static const bool log = std::getenv("LPN_PROFILE") != nullptr;
     static std::atomic<int> logged{0};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 400)
+    if (log && logged.fetch_add(1, std::memory_order_relaxed) < 400)
         std::fprintf(stderr, "[step] request 0x%x from eboot+0x%lx at flip %llu\n", value,
                      (unsigned long)(caller - uintptr_t(gEbootText)), (unsigned long long)flipCount());
     if (value & 0x7fffffff) return 0;
@@ -264,7 +267,10 @@ uint64_t pushRequest(uint8_t* stack, uint32_t value, uintptr_t caller) {
 }
 
 extern "C" uint64_t pushStep(uint8_t* stack, uint32_t index) {
-    return pushRequest(stack, index, uintptr_t(__builtin_return_address(0)));
+    const uintptr_t caller = uintptr_t(__builtin_return_address(0));
+    if (caller - uintptr_t(gEbootText) == kTitleStepCaller && index == 2 && frameClockUncapped() && !keep30FpsScenes())
+        index |= 0x80000000u;
+    return pushRequest(stack, index, caller);
 }
 
 extern "C" uint64_t pushMeasured(uint8_t* stack, uint32_t index) {

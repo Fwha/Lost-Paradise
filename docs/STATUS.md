@@ -85,6 +85,9 @@ Last updated 2026-10-16.
    time; uncapped, flip rate 1 outside a fixed step (the title screen) is shown at the monitor's
    rate, and steps are whole 1/3000 s ticks with the rest carried. Cutscenes stay at fixed 1/30
    and 30 fps: uncapped they flashed frames from later in the scene (owner-tested 2026-10-25).
+   The title screen (sequence_title.inl, push at 0x9bdd5b) also asks for 1/30; uncapped, the
+   host's step-request pushes (0xd6e20/0xd6dd0, logged as [step] with LPN_PROFILE=1) turn that one
+   request into a measured one, so only the title runs at the monitor's rate.
    `LPN_KEEP_30FPS_SCENES=1` keeps the title screen at 30 too. `[clock]` lines count fixed / bit-2 / floored / capped / override steps.
 3. Fight glitches: a one-frame black wedge over the HP bar (gone with `LPN_GPU_SYNC=1`, so likely
    a race between the game rewriting HUD data and our asynchronous GPU); the kick trail and torch
