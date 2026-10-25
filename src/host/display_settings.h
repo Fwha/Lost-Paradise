@@ -31,11 +31,13 @@ bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height);
 void activeRenderResolution(uint32_t* width, uint32_t* height);
 
 // The game's frame clock (0xd9ee40) steps the world by a fixed 1/60 s a frame in some scenes
-// (1/30 in cutscenes, 1/20 while loading) and by the measured frame time, but never less than
-// 1/60 s, in others. Held at 30 fps it would run at half speed, shown above 60 it would run
-// fast. With a 30 fps cap or none, these patches step it by the measured time wherever it
-// would step 1/60 (the 1/30 and 1/20 scenes keep their fixed steps). Returns false when the
-// eboot does not hold the expected instructions; the clock is then left as the game's.
+// (1/30 in cutscenes, 1/20 while loading, 1/60 through flag bit 2 in the title's menus) and by
+// the measured frame time, but never less than 1/60 s, in others. Held at 30 fps it would run
+// at half speed, shown above 60 it would run fast. With a 30 fps cap or none, the host picks the
+// step (stepNs) and takes the measured time wherever the game would step 1/60; uncapped, the
+// 1/30 cutscenes do too (LPN_KEEP_30FPS_SCENES=1 keeps them at 30). Only loading keeps its fixed
+// 1/20. Returns false when the eboot does not hold the expected instructions; the clock is then
+// left as the game's.
 bool prepareFrameClock(Module& eboot);
 // The frame rate cap the clock should suit (0: uncapped; above 60 is treated as uncapped). Takes effect at the next flip.
 void setFrameClock(int fps);
@@ -43,5 +45,8 @@ void setFrameClock(int fps);
 void syncFrameClock();
 // Whether the clock now steps by the measured time with the low floor (above 60 fps).
 bool frameClockUncapped();
+// Whether the game's 30 fps scenes (flip rate 1: the title screen, cutscenes) are shown at the
+// monitor's rate: uncapped, unless LPN_KEEP_30FPS_SCENES=1.
+bool uncap30FpsScenes();
 
 } // namespace host

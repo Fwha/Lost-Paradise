@@ -77,6 +77,14 @@ Last updated 2026-10-16.
    now runs those screens as fast as they draw (`LPN_LOADING_HZ`, default 500; `LPN_FAST_LOADING=0`
    turns it off). `LPN_PROFILE=1` adds [wait] lines (what each game thread is blocked in, with
    guest addresses) and [io] lines.
+2b. Uncapped title and cutscenes: the title's menus ask the frame clock for 1/60 steps through
+   flag bit 2 (set by the root task's post-tick, 0x206b10), which ran them up to 1.6x fast above
+   60 fps; the title screen (flip rate 1 from the interval callback at 0x2658370) and in-engine
+   cutscenes (fixed 1/30 step) were held at 30. With a 30 cap or uncapped the host now picks the
+   clock's step (`stepNs`, hooked at 0xd9ee98): bit 2 and the 1/60 fixed step take the measured
+   time, uncapped the 1/30 step too (flip rate 1 is then shown at the monitor's rate), and
+   uncapped steps are whole 1/3000 s ticks with the rest carried. `LPN_KEEP_30FPS_SCENES=1` keeps
+   those scenes at 30. `[clock]` lines count fixed / bit-2 / floored / capped / override steps.
 3. Fight glitches: a one-frame black wedge over the HP bar (gone with `LPN_GPU_SYNC=1`, so likely
    a race between the game rewriting HUD data and our asynchronous GPU); the kick trail and torch
    flames sometimes draw green (particle colour tables; parked, see the 2026-10-17 session notes).
