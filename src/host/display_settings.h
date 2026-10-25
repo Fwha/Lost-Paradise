@@ -41,5 +41,7 @@ bool prepareFrameClock(Module& eboot);
 void setFrameClock(int fps);
 // Called on the game's thread as it flips, between two runs of the clock: applies a change.
 void syncFrameClock();
+// Whether the clock now steps by the measured time with the low floor (above 60 fps).
+bool frameClockUncapped();
 
 } // namespace host

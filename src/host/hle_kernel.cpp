@@ -141,21 +141,17 @@ int32_t sceKernelGettimeofday(Timeval* tv) {
     return gettimeofday_(tv, nullptr);
 }
 
-uint64_t sceKernelGetProcessTime() {
-    return std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - gStart).count();
-}
-uint64_t sceKernelGetProcessTimeCounter() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - gStart).count();
-}
+uint64_t sceKernelGetProcessTime() { return gameClockNs() / 1000; }
+uint64_t sceKernelGetProcessTimeCounter() { return gameClockNs(); }
 uint64_t sceKernelGetProcessTimeCounterFrequency() { return 1000000000ull; }
 
 int32_t sceKernelUsleep(uint32_t us) {
-    WaitLog w{"usleep", us};
+    WaitLog w{"usleep", us, __builtin_frame_address(0)};
     usleep(us);
     return 0;
 }
 int32_t nanosleep_(const Timespec* req, Timespec* rem) {
-    WaitLog w{"nanosleep", int64_t(req->sec) * 1000000 + req->nsec / 1000};
+    WaitLog w{"nanosleep", int64_t(req->sec) * 1000000 + req->nsec / 1000, __builtin_frame_address(0)};
     timespec r{req->sec, req->nsec}, left{};
     const int ret = ::nanosleep(&r, &left);
     if (rem) *rem = {left.tv_sec, left.tv_nsec};
@@ -194,6 +190,21 @@ int32_t sceLibcHeapGetTraceInfo(HeapTraceInfo* info) {
 }
 
 } // namespace
+
+double gameTimeScale() {
+    static const double scale = [] {
+        const char* v = std::getenv("LPN_TIME_SCALE");
+        const double f = v ? std::atof(v) : 1.0;
+        if (f > 0 && f != 1.0) std::fprintf(stderr, "[clock] LPN_TIME_SCALE: the game's clock runs at %.3gx\n", f);
+        return f > 0 ? f : 1.0;
+    }();
+    return scale;
+}
+
+uint64_t gameClockNs() {
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - gStart).count();
+    return uint64_t(double(ns) * gameTimeScale());
+}
 
 void registerKernelHle() {
     HLE("libSceLibcInternalExt", sceLibcHeapGetTraceInfo);

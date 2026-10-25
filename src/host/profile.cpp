@@ -1,9 +1,15 @@
 #include "host/profile.h"
 
+#include "host/crash.h"
+#include "host/hle.h"
+#include "host/linker.h"
+#include "host/module.h"
 #include "host/pm4.h"
+#include "host/videoout.h"
 
 #include <dirent.h>
 #include <pthread.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -13,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -97,7 +104,147 @@ void sampler() {
     }
 }
 
+// --- [wait]: what the game's threads are blocked in ------------------------------------
+
+std::mutex gSlotsMutex; // held by the sampler while it reads a slot, so its thread's stack stays put
+std::vector<WaitSlot*> gSlots;
+
+struct SlotOwner {
+    WaitSlot slot;
+    SlotOwner() {
+        slot.tid = int(syscall(SYS_gettid));
+        std::lock_guard lock(gSlotsMutex);
+        gSlots.push_back(&slot);
+    }
+    ~SlotOwner() {
+        std::lock_guard lock(gSlotsMutex);
+        std::erase(gSlots, &slot);
+    }
+};
+
+std::string threadName(int tid) {
+    char path[64], buf[32] = {};
+    std::snprintf(path, sizeof path, "/proc/self/task/%d/comm", tid);
+    FILE* f = std::fopen(path, "r");
+    if (!f) return std::to_string(tid);
+    const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+    std::fclose(f);
+    std::string s(buf, n);
+    while (!s.empty() && s.back() == '\n') s.pop_back();
+    return s;
+}
+
+// The return address the HLE call goes back to, then the first guest code addresses above it on
+// the stack: the game function that waits and (likely) its callers.
+struct StackScan {
+    const uint64_t* stack;
+    uint64_t found[3];
+    int n;
+};
+void scanStack(void* p) {
+    auto* s = static_cast<StackScan*>(p);
+    for (int i = 0; i < 160 && s->n < 3; ++i)
+        if (findModule(s->stack[i])) s->found[s->n++] = s->stack[i];
+}
+
+std::string where(const uint64_t* stack) {
+    StackScan s{stack, {}, 0};
+    if (!stack || !guarded(scanStack, &s)) return {};
+    std::string out;
+    for (int i = 0; i < s.n; ++i) {
+        Module* m = findModule(s.found[i]);
+        std::string name = m->name();
+        if (const size_t dot = name.find('.'); dot != std::string::npos) name.resize(dot);
+        char cell[64];
+        std::snprintf(cell, sizeof cell, "%s%s+0x%lx", i ? "<" : " @", name.c_str(), (unsigned long)(s.found[i] - uint64_t(m->base())));
+        out += cell;
+    }
+    return out;
+}
+
+void waitSampler() {
+    nameThread("lpn-waits");
+    struct Seen {
+        std::map<std::string, int> states;
+        int samples = 0;
+        uint32_t seqFrom = 0, seqTo = 0;
+    };
+    std::unordered_map<int, Seen> seen;
+    auto next = std::chrono::steady_clock::now();
+    auto report = next + std::chrono::seconds(1);
+    IoCounters last{};
+    for (;;) {
+        next += std::chrono::milliseconds(5);
+        std::this_thread::sleep_until(next);
+        {
+            std::lock_guard lock(gSlotsMutex);
+            for (WaitSlot* s : gSlots) {
+                const uint32_t a = s->seq.load(std::memory_order_acquire);
+                std::string state = "not waiting";
+                if (a & 1) {
+                    const char* what = s->what.load(std::memory_order_relaxed);
+                    std::string at = where(s->stack.load(std::memory_order_relaxed));
+                    if (s->seq.load(std::memory_order_acquire) == a) state = std::string(what) + at;
+                }
+                auto [it, fresh] = seen.try_emplace(s->tid);
+                Seen& t = it->second;
+                if (fresh) t.seqFrom = a;
+                t.seqTo = a;
+                ++t.states[state];
+                ++t.samples;
+            }
+        }
+        if (next < report) continue;
+        report += std::chrono::seconds(1);
+        const double t = seconds();
+        // Threads that sat in one wait the whole second are listed by name only.
+        std::string asleep;
+        std::vector<std::pair<std::string, std::string>> lines;
+        for (auto& [tid, s] : seen) {
+            const std::string name = threadName(tid);
+            if (s.states.size() == 1 && s.seqFrom == s.seqTo && (s.seqFrom & 1)) {
+                asleep += (asleep.empty() ? " " : ", ") + name;
+                continue;
+            }
+            std::vector<std::pair<int, std::string>> rows;
+            for (const auto& [state, n] : s.states) rows.push_back({n, state});
+            std::sort(rows.rbegin(), rows.rend());
+            std::string line;
+            for (size_t i = 0; i < std::min<size_t>(rows.size(), 3); ++i) {
+                const int pct = int(100.0 * rows[i].first / std::max(1, s.samples) + 0.5);
+                if (i && pct < 5) break;
+                line += (i ? ", " : " ") + rows[i].second + " " + std::to_string(pct) + "%";
+            }
+            line += " (" + std::to_string((s.seqTo - s.seqFrom) / 2) + " waits)";
+            lines.push_back({name, line});
+        }
+        seen.clear();
+        std::sort(lines.begin(), lines.end());
+        for (const auto& [name, line] : lines) std::fprintf(stderr, "[wait] t=%.1f %s:%s\n", t, name.c_str(), line.c_str());
+        if (!asleep.empty()) std::fprintf(stderr, "[wait] t=%.1f asleep all second:%s\n", t, asleep.c_str());
+        IoCounters& c = io();
+        auto delta = [](std::atomic<uint64_t>& now, std::atomic<uint64_t>& before) {
+            const uint64_t v = now.load(std::memory_order_relaxed);
+            const uint64_t d = v - before.load(std::memory_order_relaxed);
+            before.store(v, std::memory_order_relaxed);
+            return d;
+        };
+        const uint64_t opens = delta(c.opens, last.opens), reads = delta(c.reads, last.reads);
+        const uint64_t bytes = delta(c.bytes, last.bytes), readNs = delta(c.readNs, last.readNs);
+        const uint64_t inflates = delta(c.inflates, last.inflates), inflateNs = delta(c.inflateNs, last.inflateNs);
+        if (opens || reads || inflates)
+            std::fprintf(stderr, "[io] t=%.1f %llu opens, %llu reads %.1f MB in %.0f ms, %llu inflates in %.0f ms (flip %llu)\n", t,
+                         (unsigned long long)opens, (unsigned long long)reads, bytes / 1e6, readNs / 1e6,
+                         (unsigned long long)inflates, inflateNs / 1e6, (unsigned long long)flipCount());
+    }
+}
+
 } // namespace
+
+IoCounters& io() {
+    static IoCounters c;
+    return c;
+}
 
 bool on() {
     static const bool enabled = std::getenv("LPN_PROFILE") != nullptr;
@@ -115,7 +262,20 @@ void mark() {
 }
 
 void start() {
-    if (on()) std::thread(sampler).detach();
+    if (!on()) return;
+    std::thread(sampler).detach();
+    std::thread(waitSampler).detach();
 }
 
 } // namespace host::profile
+
+namespace host {
+
+bool waitSamplingOn() { return profile::on(); }
+
+WaitSlot& waitSlot() {
+    thread_local profile::SlotOwner owner;
+    return owner.slot;
+}
+
+} // namespace host

@@ -43,11 +43,10 @@ const Res kResolutions[] = {
     {2560, 1440, "2560X1440"},
 };
 constexpr int kResCount = int(sizeof kResolutions / sizeof kResolutions[0]);
-// The game runs at 60 and drops itself to 30 in cutscenes and 20 on loading screens. At 90 the
-// frame clock is patched to keep its speed. There is no uncapped choice: the rapid punch at the
-// end of the light string stops working somewhere between 90 and 120 fps (some combat window
-// must still count frames).
-const int kFps[] = {30, 60, 90};
+// The game runs at 60 and drops itself to 30 in cutscenes and 20 on loading screens. Above 60
+// (90, or uncapped at the monitor's refresh rate) the frame clock is patched to keep its speed,
+// and the pad history keeps one entry per 1/60 s so mashing moves still count (input_history.h).
+const int kFps[] = {30, 60, 90, 0};
 constexpr int kFpsCount = int(sizeof kFps / sizeof kFps[0]);
 constexpr int kRows = 5;
 

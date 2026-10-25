@@ -3,6 +3,7 @@
 // clocks, audio pacing and zlib. Each answers the way an offline console would.
 #include "host/hle.h"
 #include "host/kernel.h"
+#include "host/profile.h"
 #include "host/save_menu.h"
 #include "host/videoout.h"
 #include "host/window.h"
@@ -151,9 +152,10 @@ int32_t scePadReadState(int32_t, PadData* d) {
     d->acceleration[1] = 1.0f; // gravity, pad lying flat
     d->connected = true;
     d->connectedCount = 1;
-    d->timestamp = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch())
-                                .count());
+    d->timestamp = gameTimeScale() != 1.0 ? gameClockNs() / 1000
+                                          : uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                         std::chrono::steady_clock::now().time_since_epoch())
+                                                         .count());
     return 0;
 }
 struct PadControllerInformation {
@@ -597,6 +599,7 @@ std::map<uint64_t, ZlibRequest> gZlib;
 uint64_t gNextZlib = 1;
 
 int32_t sceZlibInflate(const void* src, uint32_t srcLen, void* dst, uint32_t dstLen, uint64_t* id) {
+    const auto t0 = std::chrono::steady_clock::now();
     z_stream z{};
     // Raw deflate unless the data carries a zlib header.
     const auto* s = static_cast<const uint8_t*>(src);
@@ -608,6 +611,10 @@ int32_t sceZlibInflate(const void* src, uint32_t srcLen, void* dst, uint32_t dst
     z.avail_out = dstLen;
     const int r = inflate(&z, Z_FINISH);
     inflateEnd(&z);
+    auto& io = profile::io();
+    io.inflates.fetch_add(1, std::memory_order_relaxed);
+    io.inflateNs.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
+                           std::memory_order_relaxed);
     std::lock_guard lock(gZlibMutex);
     *id = gNextZlib++;
     gZlib[*id] = {uint32_t(z.total_out), r == Z_STREAM_END ? 0 : int32_t(0x81120002)};
