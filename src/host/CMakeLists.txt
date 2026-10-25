@@ -20,6 +20,7 @@ add_executable(lpn-host
     coverage.cpp
     combo_trace.cpp
     input_history.cpp
+    title_menu.cpp
     gpu/frame_dump.cpp
     gpu/formats.cpp
     gpu/renderer.cpp

@@ -10,6 +10,8 @@
 namespace host {
 
 bool displayMenuOpen();
+// Opens the menu from the game (the title menu's PC SETTINGS row); false without a window.
+bool openDisplayMenu();
 
 #ifdef LPN_HAVE_SDL2
 // Shows the window as the settings say (at startup and after a change).

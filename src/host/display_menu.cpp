@@ -299,6 +299,16 @@ void drawFpsCounter(SDL_Renderer* ren) {
     drawMenuText(ren, w - tw - 5 * px, 4 * px, px, text);
     SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
 }
+
+bool openDisplayMenu() {
+    std::lock_guard lock(gM);
+    gOpen = true;
+    gList = false;
+    gRow = 0;
+    return true;
+}
+#else
+bool openDisplayMenu() { return false; }
 #endif
 
 } // namespace host
