@@ -18,6 +18,7 @@ add_executable(lpn-host
     pm4.cpp
     profile.cpp
     coverage.cpp
+    combo_trace.cpp
     gpu/frame_dump.cpp
     gpu/formats.cpp
     gpu/renderer.cpp
