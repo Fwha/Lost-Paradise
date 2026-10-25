@@ -3,9 +3,12 @@
 #include "host/display_menu.h"
 #include "host/module.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <sys/mman.h>
@@ -19,7 +22,6 @@ constexpr uint32_t kDecompress = 0xe2ebc0; // SLLZ (dst, capacity, src): every c
 constexpr uint32_t kBuildItems = 0xb429b0; // fills the title's row kinds (self+0x338, count +0x340)
 constexpr uint32_t kText = 0x84a320;       // text lookup (out, table, row) -> out, *out = the string
 constexpr uint32_t kChosen = 0xb4f090;     // kind 7's confirm state (the unused attention screen)
-constexpr uint32_t kMenuState = 0x2393e28; // the title menu's setup state (b43f90), relocated
 
 constexpr uint64_t kKind = 7;
 constexpr int kMaxItems = 8; // the rows' inline storage
@@ -28,10 +30,10 @@ constexpr char kGameDesc[] = "Read before starting the game.";
 constexpr char kDesc[] = "Change PC display and frame rate settings.";
 
 // The title sequence (rdi of the states above).
-constexpr size_t kItems = 0x338, kItemCount = 0x340, kNextState = 0x218, kNextAdj = 0x220, kPending = 0x228,
-                 kReturning = 0x388;
+constexpr size_t kItems = 0x338, kItemCount = 0x340;
 
 uint8_t* gEboot = nullptr;
+uint8_t* gLayout = nullptr; // the title layout, as decompressed (then loaded in place)
 int32_t (*gDecompress)(uint8_t*, uint32_t, const uint8_t*) = nullptr;
 void (*gBuildItems)(uint8_t*) = nullptr;
 void** (*gText)(void**, uint32_t, uint32_t) = nullptr;
@@ -54,7 +56,10 @@ int32_t decompress(uint8_t* dst, uint32_t cap, const uint8_t* src) {
     std::memcpy(&size, src + 8, 4);
     if (src[4]) size = __builtin_bswap32(size);
     if (size > cap) return r;
-    if (patchTitleMenuLayout(dst, size)) std::fprintf(stderr, "[title] layout: PC SETTINGS row added\n");
+    if (patchTitleMenuLayout(dst, size)) {
+        gLayout = dst;
+        std::fprintf(stderr, "[title] layout: PC SETTINGS row added\n");
+    }
     else if (patchTitleMenuAtlas(dst, size)) std::fprintf(stderr, "[title] atlas: PC SETTINGS label drawn\n");
     return r;
 }
@@ -73,24 +78,189 @@ void** text(void** out, uint32_t table, uint32_t row) {
     return out;
 }
 
-void setState(uint8_t* self, uint64_t fn) {
-    at<uint64_t>(self, kNextState) = fn;
-    at<uint64_t>(self, kNextAdj) = 0;
-    at<uint64_t>(self, kPending) = 1; // and no transition time
+// PC SETTINGS opens the game's own settings screen ("option", 0x8b6170), as SETTINGS does, with
+// the F11 menu's settings as its rows. The screen is data driven: a list of 0xa0-byte rows, each
+// a label, a description, up to 15 value names and the value shown; the game's code draws and
+// edits them by row. Its writes to the game's options for a row are undone here and the value
+// goes to the display settings instead.
+//   +0 u8 kind (0: a choice of names), +1 u8 field (in the options, at +8), +2 u8 id,
+//   +8 label, +0x10 u32 value, +0x18 description, +0x20 names[15]
+constexpr size_t kRowSize = 0xa0, kRowField = 1, kRowId = 2, kRowLabel = 8, kRowValue = 0x10, kRowDesc = 0x18,
+                 kRowNames = 0x20, kMaxNames = 15;
+// The screen: rows (+0xe0, capacity +0xe8, count +0xec), the values set so far (+0x140, by field;
+// cancelling an edit puts the row's back), its state (+0xb0, as the title's).
+constexpr size_t kRows = 0xe0, kRowCap = 0xe8, kRowCount = 0xec, kCommitted = 0x140, kScreenState = 0xb0;
+constexpr uint32_t kSettingsState = 0xb4e0c0; // the title's SETTINGS confirm state: opens the screen
+constexpr uint32_t kScreenInit = 0x8b63d0;    // builds the rows and the list
+constexpr uint32_t kScreenDraw = 0x8b9490;    // each frame: the shown rows' text
+constexpr uint32_t kValueChange = 0x8ba160;   // editing: the value moved (writes the option)
+constexpr uint32_t kCommit = 0x8b9bc0;        // editing: confirmed
+constexpr uint32_t kCancelEdit = 0x8b9d70;    // editing: cancelled (writes the option back)
+constexpr uint32_t kEditState = 0x8ba330;     // the screen's state while a row is edited
+constexpr uint32_t kListOf = 0x57daa0;        // (screen, 0) -> its row list
+constexpr uint32_t kListSize = 0x5828f0;      // (list, rows shown, rows)
+constexpr uint32_t kOptions = 0x2638df8;      // -> the game's options (relocated)
+constexpr size_t kOptionsSize = 0x58;         // what the screen edits, from +0
+// Each id's value range, 20 bytes apart: +4 the last value. Editing shows that many + 1.
+constexpr uint32_t kRanges = 0x23a2700;
+constexpr size_t kRangeSize = 20, kRangeLast = 4;
+constexpr uint8_t kFirstId = 1; // ids 1..4 (tips, cameras): plain choices the screen has no special case for
+
+// The header: the title layout shows frame 5 of three lists for SETTINGS (rect 39); PC SETTINGS
+// shows the menu label (rect 37) there instead, while its screen is up. The loaded layout is the
+// decompressed buffer, its fields byte-swapped in place.
+constexpr size_t kHeaderLists[] = {0x18bb0, 0x18bfc, 0x18c48};
+constexpr size_t kHeaderRecord = 4 * 17; // frame 5's
+constexpr uint16_t kRectHeader = 39, kRectLabel = 37;
+
+constexpr int kPcRows = 4;
+const char* const kPcLabels[kPcRows] = {"Window Mode", "Resolution", "Frame Rate Cap", "FPS Counter"};
+const char* const kPcDescs[kPcRows] = {
+    "Play in a window, a borderless window or fullscreen.",
+    "Set the 3D rendering resolution. Takes effect after restarting the game.",
+    "Set the most frames shown per second. Uncapped follows the monitor's refresh rate.",
+    "Show the frame rate in the top right corner of the screen.",
+};
+
+void (*gSettingsState)(uint8_t*) = nullptr;
+void (*gScreenInit)(uint8_t*) = nullptr;
+void (*gScreenDraw)(uint8_t*) = nullptr;
+void (*gValueChange)(uint8_t*, uint32_t, uint32_t) = nullptr;
+uint32_t (*gCommit)(uint8_t*, void*) = nullptr;
+uint32_t (*gCancelEdit)(uint8_t*, void*) = nullptr;
+
+std::atomic<bool> gPcPending{false}; // PC SETTINGS chosen: the next screen built is ours
+uint8_t* gPcScreen = nullptr;        // the game thread's, as all below
+int32_t gOldLast[kPcRows];
+std::vector<std::string> gNames[kPcRows];
+
+uint8_t* row(uint8_t* screen, int i) { return at<uint8_t*>(screen, kRows) + kRowSize * i; }
+uint8_t* options() { return at<uint8_t*>(gEboot, kOptions) + 8; }
+
+void writeData(uint8_t* p, const void* v, size_t n) {
+    const uintptr_t page = uintptr_t(sysconf(_SC_PAGESIZE));
+    void* start = reinterpret_cast<void*>(uintptr_t(p) & ~(page - 1));
+    mprotect(start, page * 2, PROT_READ | PROT_WRITE);
+    std::memcpy(p, v, n);
 }
 
-// A state: the title menu waits (getting no input) while the F11 menu is open, then sets itself up
-// again as when coming back from SETTINGS. Even, as a member function pointer must be.
-__attribute__((aligned(16))) void waitForMenu(uint8_t* self) {
-    if (displayMenuOpen()) return;
-    at<int32_t>(self, kReturning) = 1;
-    setState(self, at<uint64_t>(gEboot, kMenuState));
+// The value ranges of the ids our rows take: ours while our screen is up, else the game's.
+void setRanges(bool pc) {
+    static bool saved = false;
+    uint8_t* r = gEboot + kRanges + kRangeLast;
+    if (!saved) {
+        for (int i = 0; i < kPcRows; ++i) std::memcpy(&gOldLast[i], r + kRangeSize * (kFirstId + i), 4);
+        saved = true;
+    }
+    for (int i = 0; i < kPcRows; ++i) {
+        const int32_t last = pc ? int32_t(gNames[i].size()) - 1 : gOldLast[i];
+        writeData(r + kRangeSize * (kFirstId + i), &last, 4);
+    }
+}
+
+void setHeader(uint16_t rect) {
+    uint8_t* s = gLayout;
+    if (!s) return;
+    // Still the loaded layout: our label's rect, now in native floats, and frame 5's records.
+    const float want[4] = {1 / 1024.0f, 400 / 512.0f, 545 / 1024.0f, 446 / 512.0f};
+    if (std::memcmp(s + 0x130 + kRectLabel * 16, want, 16) != 0) return;
+    const uint16_t other = rect == kRectLabel ? kRectHeader : kRectLabel;
+    for (size_t list : kHeaderLists) {
+        const uint8_t* rec = s + list + kHeaderRecord;
+        uint16_t frame, tex, r;
+        std::memcpy(&frame, rec, 2), std::memcpy(&tex, rec + 4, 2), std::memcpy(&r, rec + 6, 2);
+        if (frame != 5 || tex != 3 || (r != rect && r != other)) return;
+    }
+    for (size_t list : kHeaderLists) std::memcpy(s + list + kHeaderRecord + 6, &rect, 2);
+}
+
+void settingsState(uint8_t* self) {
+    const bool pc = gPcPending;
+    setHeader(pc ? kRectLabel : kRectHeader);
+    gSettingsState(self);
 }
 
 void chosen(uint8_t* self) {
-    std::fprintf(stderr, "[title] PC SETTINGS: display menu\n");
-    openDisplayMenu();
-    setState(self, reinterpret_cast<uint64_t>(&waitForMenu));
+    std::fprintf(stderr, "[title] PC SETTINGS\n");
+    gPcPending = true;
+    settingsState(self);
+}
+
+void screenInit(uint8_t* self) {
+    gScreenInit(self);
+    const bool pc = gPcPending.exchange(false);
+    gPcScreen = pc ? self : nullptr;
+    if (!pc) return setRanges(false);
+    bool ok = at<uint32_t>(self, kRowCap) >= uint32_t(kPcRows); // always: the game's own are more
+    for (int i = 0; i < kPcRows; ++i) ok = ok && displayOptionCount(i) > 0; // none without a window
+    if (!ok) {
+        gPcScreen = nullptr;
+        return setRanges(false);
+    }
+    for (int i = 0; i < kPcRows; ++i) {
+        gNames[i].clear();
+        for (int k = 0, n = std::min(displayOptionCount(i), int(kMaxNames)); k < n; ++k)
+            gNames[i].push_back(displayOptionName(i, k));
+        uint8_t* r = row(self, i);
+        std::memset(r, 0, kRowSize);
+        r[kRowField] = uint8_t(i);
+        r[kRowId] = uint8_t(kFirstId + i);
+        at<const char*>(r, kRowLabel) = kPcLabels[i];
+        at<const char*>(r, kRowDesc) = kPcDescs[i];
+        for (size_t k = 0; k < gNames[i].size(); ++k) at<const char*>(r, kRowNames + 8 * k) = gNames[i][k].c_str();
+        const uint32_t v = uint32_t(std::clamp(displayOptionValue(i), 0, int(gNames[i].size()) - 1));
+        at<uint32_t>(r, kRowValue) = v;
+        self[kCommitted + i] = uint8_t(v);
+    }
+    at<uint32_t>(self, kRowCount) = kPcRows;
+    setRanges(true);
+    auto list = reinterpret_cast<uint8_t* (*)(uint8_t*, uint32_t)>(gEboot + kListOf);
+    auto listSize = reinterpret_cast<void (*)(uint8_t*, uint32_t, uint32_t)>(gEboot + kListSize);
+    listSize(list(self, 0), 0xb, kPcRows);
+}
+
+// Keeps the rows as the settings are, which the F11 menu can change too (not while one is edited).
+void screenDraw(uint8_t* self) {
+    if (self == gPcScreen && at<uint64_t>(self, kScreenState) != uint64_t(gEboot + kEditState))
+        for (int i = 0; i < kPcRows; ++i) {
+            const int v = displayOptionValue(i);
+            if (v < 0 || v >= int(gNames[i].size())) continue;
+            at<uint32_t>(row(self, i), kRowValue) = uint32_t(v);
+            self[kCommitted + i] = uint8_t(v);
+        }
+    gScreenDraw(self);
+}
+
+// The game writes the option of the row's field; for our rows that is put back.
+struct KeepOptions {
+    explicit KeepOptions(uint8_t* screen) : on(screen == gPcScreen) {
+        if (on) std::memcpy(saved, options(), kOptionsSize);
+    }
+    ~KeepOptions() {
+        if (on) std::memcpy(options(), saved, kOptionsSize);
+    }
+    bool on;
+    uint8_t saved[kOptionsSize];
+};
+
+void valueChange(uint8_t* self, uint32_t a, uint32_t b) {
+    KeepOptions keep(self);
+    gValueChange(self, a, b);
+}
+
+uint32_t cancelEdit(uint8_t* self, void* e) {
+    KeepOptions keep(self);
+    return gCancelEdit(self, e);
+}
+
+uint32_t commit(uint8_t* self, void* e) {
+    const uint32_t r = gCommit(self, e);
+    if (self == gPcScreen)
+        for (int i = 0; i < kPcRows; ++i) {
+            const int v = int(at<uint32_t>(row(self, i), kRowValue));
+            if (v != displayOptionValue(i)) setDisplayOption(i, v);
+        }
+    return r;
 }
 
 void writeJump(uint8_t* p, const void* fn) {
@@ -216,6 +386,18 @@ bool patchTitleMenu(Module& eboot) {
          reinterpret_cast<const void*>(&text), reinterpret_cast<void**>(&gText)},
         {kChosen, {0xc5, 0xfa, 0x7e, 0x05, 0x40, 0x00, 0x84, 0x01, 0xc5, 0xfa, 0x7e, 0x0d},
          reinterpret_cast<const void*>(&chosen), nullptr},
+        {kSettingsState, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0xbb, 0xa8, 0x02, 0x00, 0x00},
+         reinterpret_cast<const void*>(&settingsState), reinterpret_cast<void**>(&gSettingsState)},
+        {kScreenInit, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53},
+         reinterpret_cast<const void*>(&screenInit), reinterpret_cast<void**>(&gScreenInit)},
+        {kScreenDraw, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53},
+         reinterpret_cast<const void*>(&screenDraw), reinterpret_cast<void**>(&gScreenDraw)},
+        {kValueChange, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50},
+         reinterpret_cast<const void*>(&valueChange), reinterpret_cast<void**>(&gValueChange)},
+        {kCommit, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x31, 0xf6},
+         reinterpret_cast<const void*>(&commit), reinterpret_cast<void**>(&gCommit)},
+        {kCancelEdit, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x31, 0xf6},
+         reinterpret_cast<const void*>(&cancelEdit), reinterpret_cast<void**>(&gCancelEdit)},
     };
     uint8_t* base = eboot.base();
     for (const Hook& h : hooks)

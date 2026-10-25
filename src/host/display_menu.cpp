@@ -76,35 +76,39 @@ std::string itemLabel(int i) {
     return gRow == 0 ? kModes[i] : gRow == 1 ? kResolutions[i].label : fpsLabel(kFps[i]);
 }
 
-void pick(SDL_Window* win) {
+// A choice of a row (0..3) made, from the menu or the game's PC SETTINGS screen.
+void apply(SDL_Window* win, int row, int item) {
     DisplaySettings& s = displaySettings();
-    if (gRow == 0) {
-        s.window = WindowMode(gItem);
+    if (row == 0) {
+        s.window = WindowMode(item);
         applyWindowMode(win);
         applyFrameRate(win);
-    } else if (gRow == 2) {
-        s.fps = kFps[gItem];
+    } else if (row == 2) {
+        if (item >= kFpsCount) return; // the cap it has
+        s.fps = kFps[item];
         setFpsCap(s.fps);
         setFrameClock(s.fps);
         applyFrameRate(win);
         std::fprintf(stderr, "[display] fps cap %s\n", fpsLabel(s.fps).c_str());
+    } else if (row == 1) {
+        if (item >= kResCount) return; // the size it has
+        s.width = kResolutions[item].w;
+        s.height = kResolutions[item].h;
+        std::fprintf(stderr, "[display] resolution %s after a restart\n", kResolutions[item].label);
     } else {
-        s.width = kResolutions[gItem].w;
-        s.height = kResolutions[gItem].h;
-        std::fprintf(stderr, "[display] resolution %s after a restart\n", kResolutions[gItem].label);
+        s.fpsCounter = item != 0;
     }
     saveDisplaySettings();
+}
+
+void pick(SDL_Window* win) {
+    apply(win, gRow, gItem);
     gList = false;
 }
 
 void select(SDL_Window* win) {
     if (gList) return pick(win);
-    if (gRow == 3) { // on or off: no drop-down
-        DisplaySettings& s = displaySettings();
-        s.fpsCounter = !s.fpsCounter;
-        saveDisplaySettings();
-        return;
-    }
+    if (gRow == 3) return apply(win, 3, !displaySettings().fpsCounter); // on or off: no drop-down
     if (gRow == 4) { // as closing the window does
         std::fprintf(stderr, "[window] exit from the display menu\n");
         printUnimplementedSummary();
@@ -300,15 +304,72 @@ void drawFpsCounter(SDL_Renderer* ren) {
     SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
 }
 
-bool openDisplayMenu() {
+namespace {
+// The game's PC SETTINGS screen names choices as the game's own settings do.
+const char* const kModeNames[] = {"Windowed", "Borderless Fullscreen", "Fullscreen"};
+const char* const kResNames[] = {"1280x720", "1600x896 (PS4)", "1920x1080 (PS4 Pro)", "2560x1440"};
+static_assert(sizeof kResNames / sizeof kResNames[0] == kResCount);
+std::vector<std::pair<int, int>> gQueued; // setDisplayOption's (row, choice), under gM
+
+int valueOf(int row) {
+    for (auto it = gQueued.rbegin(); it != gQueued.rend(); ++it)
+        if (it->first == row) return it->second;
+    const DisplaySettings& s = displaySettings();
+    switch (row) {
+    case 0: return int(s.window);
+    case 1: return resIndex(s.width, s.height) >= 0 ? resIndex(s.width, s.height) : kResCount;
+    case 2: return fpsIndex(s.fps) >= 0 ? fpsIndex(s.fps) : kFpsCount;
+    default: return s.fpsCounter ? 1 : 0;
+    }
+}
+} // namespace
+
+int displayOptionCount(int row) {
     std::lock_guard lock(gM);
-    gOpen = true;
-    gList = false;
-    gRow = 0;
-    return true;
+    const DisplaySettings& s = displaySettings();
+    switch (row) {
+    case 0: return 3;
+    case 1: return kResCount + (resIndex(s.width, s.height) < 0);
+    case 2: return kFpsCount + (fpsIndex(s.fps) < 0);
+    case 3: return 2;
+    default: return 0;
+    }
+}
+
+std::string displayOptionName(int row, int i) {
+    std::lock_guard lock(gM);
+    const DisplaySettings& s = displaySettings();
+    switch (row) {
+    case 0: return kModeNames[std::clamp(i, 0, 2)];
+    case 1: return i < kResCount ? kResNames[i] : std::to_string(s.width) + "x" + std::to_string(s.height);
+    case 2: {
+        const int fps = i < kFpsCount ? kFps[i] : s.fps;
+        return fps ? std::to_string(fps) : "Uncapped";
+    }
+    default: return i ? "On" : "Off";
+    }
+}
+
+int displayOptionValue(int row) {
+    std::lock_guard lock(gM);
+    return valueOf(row);
+}
+
+void setDisplayOption(int row, int i) {
+    std::lock_guard lock(gM);
+    gQueued.emplace_back(row, i);
+}
+
+void applyDisplayOptions(SDL_Window* win) {
+    std::lock_guard lock(gM);
+    for (auto [row, item] : gQueued) apply(win, row, item);
+    gQueued.clear();
 }
 #else
-bool openDisplayMenu() { return false; }
+int displayOptionCount(int) { return 0; }
+std::string displayOptionName(int, int) { return {}; }
+int displayOptionValue(int) { return 0; }
+void setDisplayOption(int, int) {}
 #endif
 
 } // namespace host

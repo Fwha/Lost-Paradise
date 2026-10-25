@@ -3,6 +3,8 @@
 // The game keeps running while it is open but gets no input.
 #pragma once
 
+#include <string>
+
 #ifdef LPN_HAVE_SDL2
 #include <SDL.h>
 #endif
@@ -10,8 +12,16 @@
 namespace host {
 
 bool displayMenuOpen();
-// Opens the menu from the game (the title menu's PC SETTINGS row); false without a window.
-bool openDisplayMenu();
+
+// The menu's settings as choices, for the game's own PC SETTINGS screen (title_menu.h): row 0
+// window mode, 1 resolution, 2 fps cap, 3 fps counter. A value is a choice's index; a setting
+// none of them names (a size or cap from the ini or the command line) is a last choice of its own.
+constexpr int kDisplayOptions = 4;
+int displayOptionCount(int row);
+std::string displayOptionName(int row, int i);
+int displayOptionValue(int row); // a choice set but not applied yet counts
+// From any thread: applied by the window thread, as if picked in the menu.
+void setDisplayOption(int row, int i);
 
 #ifdef LPN_HAVE_SDL2
 // Shows the window as the settings say (at startup and after a change).
@@ -23,6 +33,8 @@ void applyFrameRate(SDL_Window* win);
 // it) and drawing over the frame.
 bool displayMenuEvent(const SDL_Event& e, SDL_Window* win);
 void drawDisplayMenu(SDL_Renderer* ren);
+// Applies the choices setDisplayOption queued (each frame).
+void applyDisplayOptions(SDL_Window* win);
 // The frames shown a second, in the top right corner, when the menu's FPS counter is on.
 void drawFpsCounter(SDL_Renderer* ren);
 #endif
