@@ -14,9 +14,10 @@ namespace host {
 bool displayMenuOpen();
 
 // The menu's settings as choices, for the game's own PC SETTINGS screen (title_menu.h): row 0
-// window mode, 1 resolution, 2 fps cap, 3 fps counter. A value is a choice's index; a setting
-// none of them names (a size or cap from the ini or the command line) is a last choice of its own.
-constexpr int kDisplayOptions = 4;
+// window mode, 1 resolution, 2 fps cap, 3 fps counter, 4 exit game (choice 1 quits). A value is a
+// choice's index; a setting none of them names (a size or cap from the ini or the command line)
+// is a last choice of its own.
+constexpr int kDisplayOptions = 5;
 int displayOptionCount(int row);
 std::string displayOptionName(int row, int i);
 int displayOptionValue(int row); // a choice set but not applied yet counts

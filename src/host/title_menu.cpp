@@ -176,13 +176,14 @@ void setHeader(uint16_t rect) {
     for (size_t list : kHeaderLists) {
         const uint8_t* rec = s + list + kHeaderRecord;
         uint16_t frame, tex, r;
-        std::memcpy(&frame, rec, 2), std::memcpy(&tex, rec + 4, 2), std::memcpy(&r, rec + 6, 2);
+        // tex << 16 | rect, swapped as one u32
+        std::memcpy(&frame, rec, 2), std::memcpy(&r, rec + 4, 2), std::memcpy(&tex, rec + 6, 2);
         if (frame != 5 || tex != 3 || (r != rect && r != other)) {
             std::fprintf(stderr, "[title] header: frame 5 is %u %u %u at +0x%zx\n", frame, tex, r, list);
             return;
         }
     }
-    for (size_t list : kHeaderLists) std::memcpy(s + list + kHeaderRecord + 6, &rect, 2);
+    for (size_t list : kHeaderLists) std::memcpy(s + list + kHeaderRecord + 4, &rect, 2);
 }
 
 void settingsState(uint8_t* self) {

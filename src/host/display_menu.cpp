@@ -76,7 +76,7 @@ std::string itemLabel(int i) {
     return gRow == 0 ? kModes[i] : gRow == 1 ? kResolutions[i].label : fpsLabel(kFps[i]);
 }
 
-// A choice of a row (0..3) made, from the menu or the game's PC SETTINGS screen.
+// A choice of a row (0..4) made, from the menu or the game's PC SETTINGS screen.
 void apply(SDL_Window* win, int row, int item) {
     DisplaySettings& s = displaySettings();
     if (row == 0) {
@@ -95,8 +95,15 @@ void apply(SDL_Window* win, int row, int item) {
         s.width = kResolutions[item].w;
         s.height = kResolutions[item].h;
         std::fprintf(stderr, "[display] resolution %s after a restart\n", kResolutions[item].label);
-    } else {
+    } else if (row == 3) {
         s.fpsCounter = item != 0;
+    } else {
+        if (!item) return;
+        // As closing the window does.
+        std::fprintf(stderr, "[window] exit from the display menu\n");
+        printUnimplementedSummary();
+        render::saveCaches();
+        std::_Exit(0);
     }
     saveDisplaySettings();
 }
@@ -109,12 +116,7 @@ void pick(SDL_Window* win) {
 void select(SDL_Window* win) {
     if (gList) return pick(win);
     if (gRow == 3) return apply(win, 3, !displaySettings().fpsCounter); // on or off: no drop-down
-    if (gRow == 4) { // as closing the window does
-        std::fprintf(stderr, "[window] exit from the display menu\n");
-        printUnimplementedSummary();
-        render::saveCaches();
-        std::_Exit(0);
-    }
+    if (gRow == 4) return apply(win, 4, 1);
     const DisplaySettings& s = displaySettings();
     gItem = gRow == 0   ? int(s.window)
             : gRow == 1 ? std::max(0, resIndex(s.width, s.height))
@@ -319,7 +321,8 @@ int valueOf(int row) {
     case 0: return int(s.window);
     case 1: return resIndex(s.width, s.height) >= 0 ? resIndex(s.width, s.height) : kResCount;
     case 2: return fpsIndex(s.fps) >= 0 ? fpsIndex(s.fps) : kFpsCount;
-    default: return s.fpsCounter ? 1 : 0;
+    case 3: return s.fpsCounter ? 1 : 0;
+    default: return 0; // exit: not yet
     }
 }
 } // namespace
@@ -331,7 +334,7 @@ int displayOptionCount(int row) {
     case 0: return 3;
     case 1: return kResCount + (resIndex(s.width, s.height) < 0);
     case 2: return kFpsCount + (fpsIndex(s.fps) < 0);
-    case 3: return 2;
+    case 3: case 4: return 2;
     default: return 0;
     }
 }
@@ -346,7 +349,8 @@ std::string displayOptionName(int row, int i) {
         const int fps = i < kFpsCount ? kFps[i] : s.fps;
         return fps ? std::to_string(fps) : "Uncapped";
     }
-    default: return i ? "On" : "Off";
+    case 3: return i ? "On" : "Off";
+    default: return i ? "Yes" : "No";
     }
 }
 

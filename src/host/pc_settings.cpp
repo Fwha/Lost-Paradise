@@ -27,6 +27,7 @@ const std::vector<PcSetting>& pcSettings() {
         display<2>("Frame Rate Cap",
                    "Set the most frames shown per second. Uncapped follows the monitor's refresh rate."),
         display<3>("FPS Counter", "Show the frame rate in the top right corner of the screen."),
+        display<4>("Exit Game", "Close the game. Progress since your last save is lost."),
     };
     return settings;
 }
