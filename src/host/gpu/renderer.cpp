@@ -2955,7 +2955,14 @@ private:
             tex.check->state.store(0, std::memory_order_relaxed);
             asyncChanged = tex.check->result != tex.hash;
         }
-        if (!asyncChanged && tex.img.image && frame_ - tex.changedFrame >= 60 && (++tex.uses + tex.phase) % 8 != 0) {
+        // The cheap checks below only follow a texture while it is in use. One left unused for a
+        // few frames is fully hashed in line at its next use: the game loads each special move's
+        // banner into the same memory, and an entry last used for an earlier move's banner (never
+        // checked while idle, so "unchanged for 10 s") was bound unchecked or passed the
+        // fingerprint, which mostly samples transparent texels. It flashed the earlier banner.
+        const bool idle = tex.img.image && frame_ - tex.checkedFrame > 2;
+        if (!asyncChanged && !idle && !fullTexChecks_ && tex.img.image && frame_ - tex.changedFrame >= 60 &&
+            (++tex.uses + tex.phase) % 8 != 0) {
             tex.checkedFrame = frame_;
             // Unchanged for 10 s: fingerprinted on every other use only. A syscall each, they
             // took ~16% of the recorder looking up the steps after New Game (hundreds of textures).
@@ -2976,7 +2983,7 @@ private:
         // at the next use (~2.7 ms a frame off the recorder in crowds). The fingerprint is still
         // taken now, so a texture rewritten as a whole (a video frame) is uploaded at once; a
         // partial rewrite shows one use later than before. LPN_SYNC_TEX_CHECKS=1: all in line.
-        if (tex.img.image && asyncTexChecks_ && !asyncChanged) {
+        if (tex.img.image && asyncTexChecks_ && !asyncChanged && !idle && !fullTexChecks_) {
             tex.checkedFrame = frame_;
             if (sampleHash(t.base(), span) == tex.sample) {
                 if (!tex.check) tex.check = std::make_shared<AsyncHash>();
@@ -3074,6 +3081,9 @@ private:
         size_t size = 0;
     };
     const bool asyncTexChecks_ = getenv("LPN_SYNC_TEX_CHECKS") == nullptr;
+    // LPN_FULL_TEX_CHECKS=1: every texture is fully hashed at its first use in each frame (slow;
+    // rules stale textures in or out).
+    const bool fullTexChecks_ = getenv("LPN_FULL_TEX_CHECKS") != nullptr;
     std::mutex texHashMutex_;
     std::condition_variable texHashCv_;
     std::deque<TexHashJob> texHashJobs_;
