@@ -10,11 +10,13 @@
 #include "host/gpu/renderer.h"
 
 #include "gcn/shader.h"
+#include "host/gpu/dlss.h"
 #include "host/gpu/formats.h"
 #include "host/gpu/registers.h"
 #include "host/gpu/tiling.h"
 #include "host/gpu/vk.h"
 #include "host/crash.h"
+#include "host/display_settings.h"
 #include "host/pm4.h"
 #include "host/profile.h"
 
@@ -485,6 +487,7 @@ struct ShaderModule {
     VkShaderModule module = VK_NULL_HANDLE;
     gcn::Translation translation;
     uint32_t id = 0;
+    uint8_t smaa = 0; // one of the game's SMAA pixel shaders: 1 edges, 2 weights, 3 blend (see dlssSmaa)
     std::string name; // its SPIR-V cache name: a hash of the GLSL, the same in every run
 };
 
@@ -642,6 +645,8 @@ public:
             std::fprintf(stderr, "[gpu] no renderer: VK_EXT_external_memory_host is required\n");
             return false;
         }
+        dlss::init(vk_);
+        if (const char* js = getenv("LPN_DLSS_JITTER_SIGN")) std::sscanf(js, "%f,%f", &jitterSign_[0], &jitterSign_[1]);
         VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         pci.queueFamilyIndex = vk_.family;
@@ -992,6 +997,7 @@ public:
         }
         if (prof_.on) reportSlowFrame();
         savePipelineCache();
+        dlssFrameEnd();
         ++frame_;
         if (!pendingCapture_.empty()) { // F12: trace this frame into the capture folder
             traceDir_ = pendingCapture_ + "/";
@@ -1931,6 +1937,11 @@ private:
         }
         m->module = module(m->translation.glsl, stage);
         m->name = spirvName(m->translation.glsl, stage);
+        if (stage == gcn::GlslStage::Fragment) {
+            uint8_t code[256];
+            if (readGuest(p.launch.entry, code, sizeof code)) m->smaa = smaaRole(fnv(code, sizeof code));
+            if (m->smaa == 3) std::fprintf(stderr, "[dlss] found the game's SMAA\n");
+        }
         m->id = uint32_t(shaders_.size() + 1);
         if (dumpGlsl_) { // debugging: every translation as gpu-glsl-<stage>-<entry>-<id>.glsl
             const char* st = stage == gcn::GlslStage::Fragment ? "ps" : stage == gcn::GlslStage::Compute ? "cs" : "vs";
@@ -3180,6 +3191,322 @@ private:
         }
     }
 
+    // ---- DLSS (gpu/dlss.h) ---------------------------------------------------------------------
+    // The game anti-aliases its scene with SMAA in three full-screen draws: edges, blend weights,
+    // then a blend that writes the scene colour back. With DLSS on, the first two are skipped and
+    // the blend becomes DLSS, given the scene colour, its depth and motion vectors this renderer
+    // makes from the depth and the camera (so only the camera's motion: moving characters rely on
+    // DLSS's own handling). Scene draws (with that depth buffer bound, before SMAA) are jittered
+    // by moving the viewport a sub-pixel amount each frame.
+
+    // The SMAA pixel shaders, by a hash of their first 256 bytes of code.
+    static uint8_t smaaRole(uint64_t codeHash) {
+        switch (codeHash) {
+        case 0x675ef5b209a40f60ull: return 1; // edges
+        case 0x344b18cdf849ff76ull: return 2; // blend weights
+        case 0xb267ed0abad15b02ull: return 3; // blend
+        default: return 0;
+        }
+    }
+    static uint64_t fnv(const uint8_t* p, size_t n) {
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 0x100000001b3ull;
+        return h;
+    }
+
+    // What the scene's vertex shaders read: projection rows (16 floats at 0x0 of the constant
+    // buffer whose V# their user SGPRs s[12:13] point at), the view rotation rows (0x40, 0x50,
+    // 0x60) and the camera position (0x220), positions being camera-relative; with the viewport.
+    struct Camera {
+        bool valid = false;
+        double proj[16] = {}, rot[9] = {}, pos[3] = {};
+        float xs = 0, xo = 0, ys = 0, yo = 0, zs = 1, zo = 0;
+    };
+
+    void captureCamera(const gcn::Program& vs, const GpuRegs& r) {
+        if (++camTries_ > 8) return; // shaders of another layout: not this frame
+        const uint64_t table = vs.launch.userData[12] | uint64_t(vs.launch.userData[13]) << 32;
+        uint32_t sharp[4];
+        float c[28], pos[3];
+        if (!readGuest(table, sharp, sizeof sharp)) return;
+        const uint64_t base = sharp[0] | uint64_t(sharp[1] & 0xFFF) << 32;
+        if (!readGuest(base, c, sizeof c) || !readGuest(base + 0x220, pos, sizeof pos)) return;
+        Camera k;
+        for (int i = 0; i < 16; ++i) k.proj[i] = c[i];
+        for (int row = 0; row < 3; ++row)
+            for (int col = 0; col < 3; ++col) k.rot[row * 3 + col] = c[16 + row * 4 + col];
+        for (int i = 0; i < 3; ++i) k.pos[i] = pos[i];
+        // A perspective projection (w = +-view z) and a rotation: otherwise not what we think.
+        bool ok = k.proj[12] == 0 && k.proj[13] == 0 && std::fabs(std::fabs(k.proj[14]) - 1) < 1e-3 && k.proj[15] == 0;
+        for (int row = 0; row < 3 && ok; ++row) {
+            const double* v = &k.rot[row * 3];
+            ok = std::fabs(v[0] * v[0] + v[1] * v[1] + v[2] * v[2] - 1) < 0.01;
+        }
+        for (double x : pos) ok = ok && std::isfinite(x);
+        if (!ok) {
+            if (!camWarned_) std::fprintf(stderr, "[dlss] scene constants not as expected: camera motion off\n");
+            camWarned_ = true;
+            return;
+        }
+        const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
+        k.xs = v[0], k.xo = v[1], k.ys = v[2], k.yo = v[3], k.zs = v[4], k.zo = v[5];
+        k.valid = k.xs != 0 && k.ys != 0 && k.zs != 0;
+        cam_ = k;
+    }
+
+    // Row-major 4x4 inverse (Gauss-Jordan); false when singular.
+    static bool invert(const double* m, double* out) {
+        double a[4][8];
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 8; ++j) a[i][j] = j < 4 ? m[i * 4 + j] : double(j - 4 == i);
+        for (int col = 0; col < 4; ++col) {
+            int p = col;
+            for (int i = col + 1; i < 4; ++i)
+                if (std::fabs(a[i][col]) > std::fabs(a[p][col])) p = i;
+            if (std::fabs(a[p][col]) < 1e-12) return false;
+            std::swap(a[p], a[col]);
+            const double d = a[col][col];
+            for (double& x : a[col]) x /= d;
+            for (int i = 0; i < 4; ++i)
+                if (i != col) {
+                    const double f = a[i][col];
+                    for (int j = 0; j < 8; ++j) a[i][j] -= f * a[col][j];
+                }
+        }
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j) out[i * 4 + j] = a[i][4 + j];
+        return true;
+    }
+    static void mul(const double* a, const double* b, double* out) {
+        double t[16];
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j) {
+                t[i * 4 + j] = 0;
+                for (int k = 0; k < 4; ++k) t[i * 4 + j] += a[i * 4 + k] * b[k * 4 + j];
+            }
+        std::memcpy(out, t, sizeof t);
+    }
+    // Current frame NDC (x, y, depth, 1) to the previous frame's clip position.
+    static bool reprojection(const Camera& cur, const Camera& prev, double* m) {
+        auto view = [](const Camera& k, double* v) {
+            for (int i = 0; i < 16; ++i) v[i] = i == 15;
+            for (int row = 0; row < 3; ++row)
+                for (int col = 0; col < 3; ++col) v[row * 4 + col] = k.rot[row * 3 + col];
+        };
+        double vc[16], vp[16], ivc[16], ipc[16], t[16];
+        view(cur, vc);
+        view(prev, vp);
+        if (!invert(vc, ivc) || !invert(cur.proj, ipc)) return false;
+        for (int i = 0; i < 16; ++i) t[i] = i % 5 == 0;
+        for (int i = 0; i < 3; ++i) t[i * 4 + 3] = cur.pos[i] - prev.pos[i];
+        mul(prev.proj, vp, m);
+        mul(m, t, m);
+        mul(m, ivc, m);
+        mul(m, ipc, m);
+        return true;
+    }
+
+    static constexpr const char* kMotionGlsl = R"(#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D depthTex;
+layout(set = 0, binding = 1, rg16f) uniform writeonly image2D motion;
+layout(push_constant) uniform P {
+    mat4 reproject; // current NDC (x, y, depth, 1) to the previous clip position
+    vec4 vp;        // viewport offset x, y and scale x, y: pixel = ndc * scale + offset
+    vec4 z;         // depth offset, scale; this frame's viewport jitter x, y (pixels)
+    ivec4 size;
+} p;
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= p.size.x || c.y >= p.size.y) return;
+    float d = texelFetch(depthTex, c, 0).r;
+    vec2 pix = vec2(c) + 0.5 - p.z.zw; // where the pixel's surface is without the jitter
+    vec4 prev = p.reproject * vec4((pix - p.vp.xy) / p.vp.zw, (d - p.z.x) / p.z.y, 1.0);
+    vec2 was = prev.xy / prev.w * p.vp.zw + p.vp.xy;
+    imageStore(motion, c, vec4(prev.w > 0.0 ? was - pix : vec2(0.0), 0.0, 0.0));
+}
+)";
+    struct MotionPush {
+        float m[16];
+        float vp[4], z[4];
+        int32_t size[4];
+    };
+
+    bool motionPipeline() {
+        if (mvPipe_) return true;
+        const VkShaderModule sm = module(kMotionGlsl, gcn::GlslStage::Compute);
+        if (!sm) return false;
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        VK_CHECK(vkCreateSampler(vk_.device, &sci, nullptr, &mvSampler_));
+        VkDescriptorSetLayoutBinding b[2]{};
+        b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        dl.bindingCount = 2;
+        dl.pBindings = b;
+        VK_CHECK(vkCreateDescriptorSetLayout(vk_.device, &dl, nullptr, &mvSetLayout_));
+        const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MotionPush)};
+        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pl.setLayoutCount = 1;
+        pl.pSetLayouts = &mvSetLayout_;
+        pl.pushConstantRangeCount = 1;
+        pl.pPushConstantRanges = &pr;
+        VK_CHECK(vkCreatePipelineLayout(vk_.device, &pl, nullptr, &mvLayout_));
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = sm;
+        ci.stage.pName = "main";
+        ci.layout = mvLayout_;
+        return vkCreateComputePipelines(vk_.device, VK_NULL_HANDLE, 1, &ci, nullptr, &mvPipe_) == VK_SUCCESS;
+    }
+
+    // An image of DLSS's own, (re)made at this size and format.
+    bool dlssImage(Image& img, VkFormat format, uint32_t w, uint32_t h) {
+        if (img.image && img.width == w && img.height == h && img.format == format) return true;
+        destroyImage(img);
+        return createImage(img, format, w, h,
+                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                           false);
+    }
+
+    // A draw of one of the SMAA shaders with DLSS on: true when it was handled (skipped, or the
+    // blend replaced by DLSS).
+    bool dlssSmaa(const GpuRegs& r, uint8_t role) {
+        if (!dlss::usable()) return false;
+        smaaSeen_ = true; // later draws are post-processing: not jittered
+        if (role != 3) return true; // edges and weights: DLSS needs neither
+        const uint32_t* cb = &r.ctx[reg::kCbColorBase];
+        const uint32_t info = cb[::gpu::ctx::kCbColorInfo];
+        const uint32_t fmt = (info >> 2) & 0x1F, num = (info >> 8) & 7;
+        const VkFormat vf = colorFormat(fmt, num);
+        const uint32_t zInfo = r.ctx[reg::kDbZInfo];
+        if (vf == VK_FORMAT_UNDEFINED || !(zInfo & 3)) return false;
+        const uint32_t pitch = ((cb[::gpu::ctx::kCbColorPitch] & 0x7FF) + 1) * 8;
+        const uint32_t slice = ((cb[::gpu::ctx::kCbColorSlice] & 0x3FFFFF) + 1) * 64;
+        Surface* out = colorSurface(uint64_t(cb[0]) << 8, pitch, slice / pitch, vf, bytesPerElement(fmt));
+        const bool stencil = r.ctx[reg::kDbStencilInfo] & 1;
+        const VkFormat df = stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : (zInfo & 3) == 1 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
+        const uint32_t size = r.ctx[reg::kDbDepthSize];
+        const uint64_t depthAddr = uint64_t(r.ctx[reg::kDbZReadBase]) << 8;
+        Surface* depth = depthSurface(depthAddr, ((size & 0x7FF) + 1) * 8, (((size >> 11) & 0x7FF) + 1) * 8, df);
+        if (!out || !depth) return false;
+        sceneDepth_ = depthAddr;
+        // The scene's size: the blend's full-screen viewport.
+        const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
+        const uint32_t w = std::min(uint32_t(std::lround(std::fabs(v[0]) * 2)), std::min(out->img.width, depth->img.width));
+        const uint32_t h = std::min(uint32_t(std::lround(std::fabs(v[2]) * 2)), std::min(out->img.height, depth->img.height));
+        if (!w || !h) return false;
+        if (!ringFits(1 << 16)) flush();
+        begin();
+        if (!dlssImage(dlssColor_, vf, out->img.width, out->img.height) ||
+            !dlssImage(dlssMotion_, VK_FORMAT_R16G16_SFLOAT, w, h) || !motionPipeline())
+            return false;
+        fullBarrier();
+
+        // The scene colour, before the blend: DLSS's input (it cannot write where it reads).
+        const VkImageCopy copy{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+        rec([c = cmd_, src = out->img.image, dst = dlssColor_.image, copy] {
+            vkCmdCopyImage(c, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        });
+
+        // Motion vectors from the camera, or none without both frames' cameras or across a cut.
+        MotionPush mp{};
+        double m[16];
+        const bool moved = cam_.valid && prevCam_.valid && dlssRanLast_ &&
+                           std::hypot(cam_.pos[0] - prevCam_.pos[0], cam_.pos[1] - prevCam_.pos[1], cam_.pos[2] - prevCam_.pos[2]) < 10 &&
+                           reprojection(cam_, prevCam_, m);
+        const Camera& k = cam_.valid ? cam_ : Camera{};
+        for (int row = 0; row < 4; ++row)
+            for (int col = 0; col < 4; ++col) mp.m[col * 4 + row] = moved ? float(m[row * 4 + col]) : float(row == col);
+        const float vp[4] = {k.valid ? k.xo : float(w) / 2, k.valid ? k.yo : float(h) / 2, k.valid ? k.xs : float(w) / 2,
+                             k.valid ? k.ys : -float(h) / 2};
+        std::memcpy(mp.vp, vp, sizeof vp);
+        mp.z[0] = k.valid ? k.zo : 0, mp.z[1] = k.valid ? k.zs : 1;
+        mp.z[2] = jitterOn_ ? jitterX_ : 0, mp.z[3] = jitterOn_ ? jitterY_ : 0;
+        mp.size[0] = int32_t(w), mp.size[1] = int32_t(h);
+        const VkImageView depthView = view(depth->img, df, VK_IMAGE_VIEW_TYPE_2D, kIdentity, VK_IMAGE_ASPECT_DEPTH_BIT);
+        const VkImageView mvView = view(dlssMotion_, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
+        rec([this, c = cmd_, mp, depthView, mvView] {
+            const VkDescriptorImageInfo di[2] = {{mvSampler_, depthView, VK_IMAGE_LAYOUT_GENERAL},
+                                                 {VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL}};
+            VkWriteDescriptorSet wr[2]{};
+            for (uint32_t i = 0; i < 2; ++i) {
+                wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                wr[i].dstBinding = i;
+                wr[i].descriptorCount = 1;
+                wr[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                wr[i].pImageInfo = &di[i];
+            }
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, mvPipe_);
+            vk_.cmdPushDescriptorSet(c, VK_PIPELINE_BIND_POINT_COMPUTE, mvLayout_, 0, 2, wr);
+            vkCmdPushConstants(c, mvLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof mp, &mp);
+            vkCmdDispatch(c, (uint32_t(mp.size[0]) + 7) / 8, (uint32_t(mp.size[1]) + 7) / 8, 1);
+        });
+        barrier();
+
+        // DLSS: the jitter is how far the scene was moved on screen (as engines that jitter the
+        // projection pass it; y down).
+        dlss::Frame f;
+        f.color = {dlssColor_.image, view(dlssColor_, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), vf, VK_IMAGE_ASPECT_COLOR_BIT, w, h};
+        f.depth = {depth->img.image, depthView, df, VK_IMAGE_ASPECT_DEPTH_BIT, w, h};
+        f.motion = {dlssMotion_.image, mvView, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, w, h};
+        f.output = {out->img.image, view(out->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), vf, VK_IMAGE_ASPECT_COLOR_BIT, w, h};
+        f.renderW = f.outW = w;
+        f.renderH = f.outH = h;
+        f.jitterX = jitterOn_ ? jitterX_ * jitterSign_[0] : 0;
+        f.jitterY = jitterOn_ ? jitterY_ * jitterSign_[1] : 0;
+        f.reset = !moved;
+        // Every 300 frames: how often the history was dropped, to tell a camera problem.
+        ++dlssStats_[0], dlssStats_[1] += f.reset, dlssStats_[2] += cam_.valid, dlssStats_[3] += jitterOn_;
+        if (dlssStats_[0] == 300) {
+            std::fprintf(stderr, "[dlss] last 300 frames: history reset %u, camera read %u, jittered %u\n", dlssStats_[1],
+                         dlssStats_[2], dlssStats_[3]);
+            std::memset(dlssStats_, 0, sizeof dlssStats_);
+        }
+        f.mode = 1; // DLAA for now: the render size stays the game's
+        rec([c = cmd_, dev = vk_.device, f] { dlss::evaluate(c, dev, f); });
+        fullBarrier();
+        // DLSS bound pipelines and descriptors of its own: everything is set again.
+        bound_ = Bound{};
+        fast_.valid = false;
+        ++fastEpoch_;
+        gpuWrote(*out);
+        dlssRan_ = true;
+        return true;
+    }
+
+    // Each frame: whether DLSS runs, the cameras and the next jitter.
+    void dlssFrameEnd() {
+        prevCam_ = cam_;
+        cam_.valid = false;
+        smaaSeen_ = false;
+        camTries_ = 0;
+        dlssRanLast_ = dlssRan_;
+        dlssRan_ = false;
+        dlssOn_ = displaySettings().dlss != DlssMode::Off && dlss::usable();
+        // Jitter only while DLSS ran last frame: a frame without SMAA (menus) stops it.
+        jitterOn_ = dlssOn_ && dlssRanLast_ && sceneDepth_ && !getenv("LPN_DLSS_NO_JITTER");
+        if (jitterOn_) dlss::jitter(++jitterIndex_, 1, 1, &jitterX_, &jitterY_);
+    }
+
+    bool dlssOn_ = false, smaaSeen_ = false, dlssRan_ = false, dlssRanLast_ = false, jitterOn_ = false, camWarned_ = false;
+    uint64_t sceneDepth_ = 0, jitterIndex_ = 0;
+    uint32_t camTries_ = 0, dlssStats_[4] = {};
+    float jitterX_ = 0, jitterY_ = 0;
+    // LPN_DLSS_JITTER_SIGN=<x>,<y> (each 1 or -1): flips the jitter DLSS is told (debugging).
+    float jitterSign_[2] = {1, 1};
+    Camera cam_, prevCam_;
+    Image dlssColor_, dlssMotion_;
+    VkPipeline mvPipe_ = VK_NULL_HANDLE;
+    VkPipelineLayout mvLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout mvSetLayout_ = VK_NULL_HANDLE;
+    VkSampler mvSampler_ = VK_NULL_HANDLE;
+
     // ---- read-only buffers in VRAM ----------------------------------------------------------------
     // Guest memory is imported host memory, so every vertex, index and constant fetch crossed
     // PCIe (a third of the GPU's time in a crowd). A buffer of 64 KiB or more that shaders only
@@ -4080,6 +4407,7 @@ private:
         }
 
         if (!a.ok) return;
+        if (dlssOn_ && a.psm && a.psm->smaa && dlssSmaa(r, a.psm->smaa)) return;
         if (fastDraw(d, r, a) || switchDraw(d, r, a)) return;
         stashFast();
         gcn::Program& vs = a.vs;
@@ -4169,6 +4497,15 @@ private:
             }
         }
         if (!colorCount && !hasDepth) return;
+        // A scene draw (see dlssSmaa): every draw with the scene's depth buffer bound before SMAA,
+        // full-screen passes too. Jittered alike, the lighting passes rebuild positions where the
+        // depth was rendered: shadows flickered when only the geometry moved. 3D draws that write
+        // depth are where the camera is read.
+        const bool scene = dlssOn_ && !smaaSeen_ && hasDepth && (uint64_t(r.ctx[reg::kDbZReadBase]) << 8) == sceneDepth_;
+        if (scene && !cam_.valid && ((depthControl >> 2) & 1) && ((depthControl >> 1) & 1) && prim != 17 &&
+            (r.ctx[reg::kPaClVteCntl] & 0xF))
+            captureCamera(vs, r);
+        const bool jitter = scene && jitterOn_;
         // A draw writing only depth into the open pass's depth buffer joins that pass, its color
         // targets attached but not written. Outside the city gate the game interleaves depth-only
         // draws with color ones on the same depth buffer: each switch was a new pass and barrier,
@@ -4320,7 +4657,7 @@ private:
             bound_.pipeline = pipe;
         }
         pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, lay.pipeline, writes, bufs, imgs);
-        setViewportScissor(r, width, height);
+        setViewportScissor(r, width, height, jitter);
         if (!bound_.state || std::memcmp(bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
             std::memcpy(bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
             rec([c = cmd_, b = std::bit_cast<std::array<float, 4>>(bound_.blend)] { vkCmdSetBlendConstants(c, b.data()); });
@@ -4393,6 +4730,7 @@ private:
             f.pipe = pipe;
             f.dyn = dyn;
             f.depthControl = gs.depthControl;
+            f.jitter = jitter;
             f.width = width;
             f.height = height;
             f.pass = passSerial_;
@@ -4426,6 +4764,7 @@ private:
         VkPipeline pipe = VK_NULL_HANDLE;
         DynamicState dyn{};
         uint32_t depthControl = 0, width = 0, height = 0;
+        bool jitter = false;
         uint64_t pass = 0, epoch = 0;
         std::vector<VkImage> sampled;
         std::vector<VkWriteDescriptorSet> writes;
@@ -4546,7 +4885,7 @@ private:
             bound_.pipeline = f.pipe;
         }
         pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, f.layout, writes, bufs, imgs);
-        setViewportScissor(r, f.width, f.height);
+        setViewportScissor(r, f.width, f.height, f.jitter);
         if (!bound_.state || std::memcmp(bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
             std::memcpy(bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
             rec([c = cmd_, b = std::bit_cast<std::array<float, 4>>(bound_.blend)] { vkCmdSetBlendConstants(c, b.data()); });
@@ -4784,7 +5123,7 @@ private:
         passClosedBy_ = kPassOther;
     }
 
-    void setViewportScissor(const GpuRegs& r, uint32_t width, uint32_t height) {
+    void setViewportScissor(const GpuRegs& r, uint32_t width, uint32_t height, bool jitter = false) {
         const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
         float xs = v[0], xo = v[1], ys = v[2], yo = v[3], zs = v[4], zo = v[5];
         const uint32_t vte = r.ctx[reg::kPaClVteCntl];
@@ -4814,6 +5153,7 @@ private:
             vp.x += vp.width;
             vp.width = -vp.width;
         }
+        if (jitter) vp.x += jitterX_, vp.y += jitterY_;
         if (!bound_.state || std::memcmp(&bound_.viewport, &vp, sizeof vp) != 0) rec([c = cmd_, vp] { vkCmdSetViewport(c, 0, 1, &vp); }), bound_.viewport = vp;
 
         int32_t x0 = 0, y0 = 0, x1 = int32_t(width), y1 = int32_t(height);

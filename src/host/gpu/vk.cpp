@@ -1,5 +1,8 @@
 #include "host/gpu/vk.h"
 
+#include "host/gpu/dlss.h"
+
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -33,12 +36,23 @@ bool Vk::init(std::string* error) {
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    // DLSS's instance extensions, those the loader has.
+    uint32_t n = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> instanceExts(n);
+    vkEnumerateInstanceExtensionProperties(nullptr, &n, instanceExts.data());
+    const std::vector<std::string> dlssInstance = dlss::instanceExtensions();
+    std::vector<const char*> enableInstance;
+    for (const std::string& e : dlssInstance)
+        for (const auto& have : instanceExts)
+            if (e == have.extensionName) enableInstance.push_back(e.c_str());
+    ici.enabledExtensionCount = uint32_t(enableInstance.size());
+    ici.ppEnabledExtensionNames = enableInstance.data();
     VkResult r = vkCreateInstance(&ici, nullptr, &instance);
     if (r != VK_SUCCESS) {
         *error = std::string("vkCreateInstance: ") + vkResultName(r);
         return false;
     }
-    uint32_t n = 0;
     vkEnumeratePhysicalDevices(instance, &n, nullptr);
     std::vector<VkPhysicalDevice> devices(n);
     vkEnumeratePhysicalDevices(instance, &n, devices.data());
@@ -81,6 +95,12 @@ bool Vk::init(std::string* error) {
     enable.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     hostImport = has(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (hostImport) enable.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    // DLSS's device extensions, those the driver has (none without an NVIDIA driver).
+    const std::vector<std::string> dlssDevice = dlss::deviceExtensions(instance, phys);
+    for (const std::string& e : dlssDevice)
+        if (has(e.c_str()) && std::find_if(enable.begin(), enable.end(), [&](const char* x) { return e == x; }) ==
+                                  enable.end())
+            enable.push_back(e.c_str());
 
     vkGetPhysicalDeviceQueueFamilyProperties(phys, &n, nullptr);
     std::vector<VkQueueFamilyProperties> families(n);
@@ -131,6 +151,8 @@ bool Vk::init(std::string* error) {
     f.fillModeNonSolid = h.fillModeNonSolid;
     f.imageCubeArray = h.imageCubeArray;
     want12.scalarBlockLayout = have12.scalarBlockLayout;
+    // DLSS reads its resources through buffer device addresses.
+    if (!dlssDevice.empty()) want12.bufferDeviceAddress = have12.bufferDeviceAddress;
     want13.dynamicRendering = VK_TRUE;
     want13.synchronization2 = have13.synchronization2;
     want13.maintenance4 = have13.maintenance4;
