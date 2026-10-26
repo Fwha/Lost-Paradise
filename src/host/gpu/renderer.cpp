@@ -906,6 +906,16 @@ public:
         }
     }
 
+    template <typename Run> void spare(Run& run) { // DrawAnalysis is declared further down
+        std::lock_guard lock(analysesMutex_);
+        // As many as can be in flight: analysis runs up to a frame ahead, and at ~6,000
+        // draws a frame a smaller pool left most draws allocating a fresh one (12% of the
+        // analysis thread in malloc) and the recorder freeing it (6% in ~Program).
+        for (auto& x : run)
+            if (spareAnalyses_.size() < 16384) spareAnalyses_.push_back(std::move(x));
+        run.clear();
+    }
+
     void onDraw(const DrawCall& d, const GpuRegs& r) override {
         // Analyses are taken, and handed back, a run at a time: a lock per draw was 4% of the
         // recorder at 6,000 draws a frame.
@@ -936,13 +946,16 @@ public:
             ~Recycle() {
                 r.returned_.push_back(std::move(a));
                 if (r.returned_.size() < kTakeRun) return;
-                std::lock_guard lock(r.analysesMutex_);
-                // As many as can be in flight: analysis runs up to a frame ahead, and at ~6,000
-                // draws a frame a smaller pool left most draws allocating a fresh one (12% of the
-                // analysis thread in malloc) and the recorder freeing it (6% in ~Program).
-                for (auto& x : r.returned_)
-                    if (r.spareAnalyses_.size() < 16384) r.spareAnalyses_.push_back(std::move(x));
-                r.returned_.clear();
+                if (r.syncRecord_ || !r.deferUploads_) {
+                    r.spare(r.returned_);
+                    return;
+                }
+                // After the command thread has copied their data (see uploadData).
+                std::lock_guard lock(r.m_);
+                // Not rec(): a call between draws would end fastDraw's run (see FastDraw::rec).
+                r.chunk_->push([&r = r, run = std::move(r.returned_)]() mutable { r.spare(run); });
+                r.returned_.clear(); // moved from
+                r.returned_.reserve(kTakeRun);
             }
         } recycle{*this, held};
         std::lock_guard lock(m_);
@@ -1710,6 +1723,18 @@ private:
         return at;
     }
     bool ringFits(VkDeviceSize size) const { return ringUsed_ + size + 4096 <= kRingSize; }
+    // A draw's data into the ring, copied by the command thread: the recorder's copies were 15% of
+    // its time at the city overlook, nearly all misses on data the analysis workers had just
+    // written. The data stays put until then: analyses go back to the workers through the command
+    // thread too (see onDraw's Recycle), and only the draw being recorded writes its own data.
+    VkDeviceSize uploadData(const std::vector<uint32_t>& data) {
+        const VkDeviceSize bytes = data.size() * 4;
+        const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
+        uint8_t* dst = static_cast<uint8_t*>(ringPtr_) + at;
+        if (syncRecord_ || !deferUploads_) std::memcpy(dst, data.data(), bytes);
+        else rec([dst, src = data.data(), bytes] { std::memcpy(dst, src, bytes); });
+        return at;
+    }
 
     void warnOnce(const std::string& w) {
         std::lock_guard lock(warnMutex_); // the analysis and recorder threads both warn
@@ -4086,8 +4111,7 @@ void main() {
         }
         // Draw data last: resource resolution above fills parts of it.
         const VkDeviceSize bytes = p.data.size() * 4;
-        const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
-        std::memcpy(static_cast<uint8_t*>(ringPtr_) + at, p.data.data(), bytes);
+        const VkDeviceSize at = uploadData(p.data);
         bufInfos.push_back({ring_, at, bytes});
         writes.push_back(kBufferWrite);
         writes.back().dstBinding = base;
@@ -5328,8 +5352,7 @@ void main() {
                         std::memcpy(bound.buffers[i].sharp, p.buffers[i].sharp, sizeof p.buffers[i].sharp);
                     }
             const VkDeviceSize bytes = p.data.size() * 4;
-            const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
-            std::memcpy(static_cast<uint8_t*>(ringPtr_) + at, p.data.data(), bytes);
+            const VkDeviceSize at = uploadData(p.data);
             if (VkDescriptorBufferInfo* b = bufferAt(base)) *b = {ring_, at, bytes};
             std::swap(bound.data, p.data); // as fastDraw: the analysis is handed back after this draw
         };
@@ -5469,8 +5492,7 @@ void main() {
             const VkDeviceSize bytes = p.data.size() * 4;
             if (alike == 1 && !rebound) return; // the worker found it the same
             if (alike != 0 && !std::memcmp(p.data.data(), bound.data.data(), bytes)) return;
-            const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
-            std::memcpy(static_cast<uint8_t*>(ringPtr_) + at, p.data.data(), bytes);
+            const VkDeviceSize at = uploadData(p.data);
             bufs.push_back({ring_, at, bytes});
             writes.push_back(kBufferWrite);
             writes.back().dstBinding = base;
@@ -5698,6 +5720,7 @@ void main() {
     VkCommandBuffer cmd_ = VK_NULL_HANDLE; // the current batch's
     // The command thread's queue (see CmdChunk): chunks handed over in order, and spare ones.
     bool syncRecord_ = getenv("LPN_SYNC_RECORD") != nullptr;
+    bool deferUploads_ = getenv("LPN_NO_DEFER_UPLOADS") == nullptr; // see uploadData
     std::unique_ptr<CmdChunk> chunk_ = std::make_unique<CmdChunk>(); // being filled
     std::mutex chunkMutex_;
     std::condition_variable chunkCv_;
