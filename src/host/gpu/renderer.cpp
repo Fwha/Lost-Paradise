@@ -836,6 +836,46 @@ public:
         std::unique_lock lock(batchMutex_);
         batchIdleCv_.wait(lock, [&] { return analysisBatches_.empty() && batchesBusy_ == 0; });
     }
+    // The recorder spends most of a draw waiting on memory: the analysis a worker wrote on
+    // another core, then the VRAM copy, import and image memo each resource looks up, one
+    // dependent miss after another. The draws after this one in the run are known, so their
+    // memory is requested ahead in three steps (each reading only what the step before
+    // fetched), and the waits overlap. LPN_NO_PREFETCH=1 turns it off.
+    const bool prefetch_ = getenv("LPN_NO_PREFETCH") == nullptr;
+    static void prefetchRange(const void* p, size_t bytes) {
+        const char* c = static_cast<const char*>(p);
+        for (size_t o = 0; o < std::min<size_t>(bytes, 4096); o += 64) __builtin_prefetch(c + o);
+    }
+    void prefetchAhead() {
+        const size_t n = taken_.size();
+        if (takenNext_ + 3 < n) { // its analysis: the programs' resource lists and draw data
+            const DrawAnalysis& x = *taken_[takenNext_ + 3];
+            prefetchRange(&x, sizeof x);
+            for (const gcn::Program* p : {&x.vs, &x.ps}) {
+                prefetchRange(p->buffers.data(), p->buffers.size() * sizeof(gcn::BufferResource));
+                prefetchRange(p->images.data(), p->images.size() * sizeof(gcn::ImageResource));
+                prefetchRange(p->data.data(), p->data.size() * 4);
+            }
+        }
+        if (takenNext_ + 1 < n) { // the lookup tables' entries for its resources
+            const DrawAnalysis& x = *taken_[takenNext_ + 1];
+            for (const gcn::Program* p : {&x.vs, &x.ps}) {
+                for (const gcn::BufferResource& b : p->buffers) {
+                    if (!b.known) continue;
+                    const uint64_t base = b.base(), size = bindSize(b);
+                    const VramHit& h = vramHits_[vramHitIndex(base, size)];
+                    if (h.v && h.base == base && h.size == size) prefetchRange(h.v, sizeof(VramBuffer));
+                    if (const Import* im = importHits_[(base / kImportGranule) % kImportHits]) __builtin_prefetch(im);
+                }
+                for (const gcn::ImageResource& t : p->images) prefetchRange(&imageMemos_[imageMemoSet(t)], 2 * sizeof(ImageMemo));
+            }
+        }
+        if (takenNext_ + 2 < n) // the hit slots the step above reads next draw
+            for (const gcn::Program* p : {&taken_[takenNext_ + 2]->vs, &taken_[takenNext_ + 2]->ps})
+                for (const gcn::BufferResource& b : p->buffers)
+                    if (b.known) __builtin_prefetch(&vramHits_[vramHitIndex(b.base(), bindSize(b))]);
+    }
+
     void onDraw(const DrawCall& d, const GpuRegs& r) override {
         // Analyses are taken, and handed back, a run at a time: a lock per draw was 4% of the
         // recorder at 6,000 draws a frame.
@@ -860,6 +900,7 @@ public:
         // ~10% of the recorder at 8,000 draws a frame.
         std::unique_ptr<DrawAnalysis>& held = taken_[takenNext_++];
         DrawAnalysis& a = *held;
+        if (prefetch_) prefetchAhead();
         struct Recycle { // hands `a` back to the analysis thread however the draw ends
             Renderer& r;
             std::unique_ptr<DrawAnalysis>& a;
@@ -3132,11 +3173,14 @@ private:
     // Two ways of 4,096 sets: a city view resolves thousands of pairs a frame, and with 1,024
     // single entries they evicted each other.
     static constexpr size_t kImageMemos = 8192;
-    ImageMemo& imageMemo(const gcn::ImageResource& t) {
+    static size_t imageMemoSet(const gcn::ImageResource& t) {
         uint64_t h = 0xcbf29ce484222325ull;
         for (uint32_t w : t.t) h = (h ^ w) * 0x100000001b3ull;
         for (uint32_t w : t.s) h = (h ^ w) * 0x100000001b3ull;
-        const size_t set = ((h ^ (h >> 29) ^ t.compare) & (kImageMemos / 2 - 1)) * 2;
+        return ((h ^ (h >> 29) ^ t.compare) & (kImageMemos / 2 - 1)) * 2;
+    }
+    ImageMemo& imageMemo(const gcn::ImageResource& t) {
+        const size_t set = imageMemoSet(t);
         ImageMemo& a = imageMemos_[set];
         ImageMemo& b = imageMemos_[set + 1];
         if (memoHit(b, t)) return b;
@@ -3631,6 +3675,7 @@ void main() {
         VramBuffer* v = nullptr;
     };
     static constexpr size_t kVramHits = 512;
+    static size_t vramHitIndex(uint64_t base, uint64_t size) { return (base / 64 ^ size * 0x9E3779B97F4A7C15ull >> 40) % kVramHits; }
     std::array<VramHit, kVramHits> vramHits_{}; // cleared when a copy is freed
     std::multimap<uint64_t, VramBuffer*> vramByBase_; // for overlap queries
     std::map<uint64_t, uint64_t> gpuWrittenRanges_;  // [start, end), merged
@@ -3684,7 +3729,7 @@ void main() {
     bool vramBuffer(uint64_t base, uint64_t size, VkBuffer& out, VkDeviceSize& off, bool inPass = false) {
         if (!vramOn_ || size < kVramMin || size > kVramMax || base % 4 || size % 4) return false;
         // The copy last found for this buffer, checked before the hash map (a miss per lookup).
-        VramHit& hit = vramHits_[(base / 64 ^ size * 0x9E3779B97F4A7C15ull >> 40) % kVramHits];
+        VramHit& hit = vramHits_[vramHitIndex(base, size)];
         VramBuffer* vp = nullptr;
         if (hit.v && hit.base == base && hit.size == size) {
             vp = hit.v;
@@ -3846,9 +3891,12 @@ void main() {
         writes.back().dstBinding = base;
     }
     // Resolves buffer `b` of `p` and fills its words in the draw data. inPass: nothing may be recorded.
+    uint64_t bindSize(const gcn::BufferResource& b) const {
+        const uint64_t size = b.stride() ? uint64_t(b.stride()) * b.numRecords() : b.numRecords();
+        return std::min<uint64_t>(size ? size : 16, std::min<uint64_t>(vk_.props.limits.maxStorageBufferRange, 64ull << 20));
+    }
     VkDescriptorBufferInfo bindBuffer(gcn::Program& p, const gcn::BufferResource& b, bool inPass = false) {
-        uint64_t size = b.stride() ? uint64_t(b.stride()) * b.numRecords() : b.numRecords();
-        size = std::min<uint64_t>(size ? size : 16, std::min<uint64_t>(vk_.props.limits.maxStorageBufferRange, 64ull << 20));
+        const uint64_t size = bindSize(b);
         BufferRange r;
         VkDeviceSize off = 0;
         if (b.store && b.known) gpuWrites(b.base(), size);
