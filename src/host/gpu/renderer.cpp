@@ -5304,7 +5304,7 @@ void main() {
             const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
             std::memcpy(static_cast<uint8_t*>(ringPtr_) + at, p.data.data(), bytes);
             if (VkDescriptorBufferInfo* b = bufferAt(base)) *b = {ring_, at, bytes};
-            std::memcpy(bound.data.data(), p.data.data(), bytes);
+            std::swap(bound.data, p.data); // as fastDraw: the analysis is handed back after this draw
         };
         bind(a.vs, slot->prev->vs, moved, 0);
         if (a.psm) bind(a.ps, slot->prev->ps, psMoved, kPsBindingBase);
@@ -5438,7 +5438,7 @@ void main() {
         if (a.psm) rebind(a.ps, prevDraw_->ps, psMoved, kPsBindingBase);
         rebindImages(a.vs, prevDraw_->vs, vsImages, vsImg, 0, fast_);
         if (a.psm) rebindImages(a.ps, prevDraw_->ps, psImages, psImg, kPsBindingBase, fast_);
-        auto data = [&](const gcn::Program& p, gcn::Program& bound, uint32_t base, int alike, bool rebound) {
+        auto data = [&](gcn::Program& p, gcn::Program& bound, uint32_t base, int alike, bool rebound) {
             const VkDeviceSize bytes = p.data.size() * 4;
             if (alike == 1 && !rebound) return; // the worker found it the same
             if (alike != 0 && !std::memcmp(p.data.data(), bound.data.data(), bytes)) return;
@@ -5447,7 +5447,8 @@ void main() {
             bufs.push_back({ring_, at, bytes});
             writes.push_back(kBufferWrite);
             writes.back().dstBinding = base;
-            std::memcpy(bound.data.data(), p.data.data(), bytes);
+            // Now what is bound: swapped, not copied (the analysis is handed back after this draw).
+            std::swap(bound.data, p.data);
         };
         data(a.vs, prevDraw_->vs, 0, vsAlike, vsMoved || vsImages);
         if (a.psm) data(a.ps, prevDraw_->ps, kPsBindingBase, psAlike, psMoved || psImages);
