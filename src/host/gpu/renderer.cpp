@@ -844,22 +844,28 @@ public:
     const bool prefetch_ = getenv("LPN_NO_PREFETCH") == nullptr;
     static void prefetchRange(const void* p, size_t bytes) {
         const char* c = static_cast<const char*>(p);
-        for (size_t o = 0; o < std::min<size_t>(bytes, 4096); o += 64) __builtin_prefetch(c + o);
+        for (size_t o = 0; o < std::min<size_t>(bytes, 1024); o += 64) __builtin_prefetch(c + o);
     }
+    // Only the lines a draw reads: prefetching whole analyses and draw data (~400 lines a draw)
+    // filled the core's miss buffers and stalled on the prefetches themselves.
     void prefetchAhead() {
         const size_t n = taken_.size();
-        if (takenNext_ + 3 < n) { // its analysis: the programs' resource lists and draw data
-            const DrawAnalysis& x = *taken_[takenNext_ + 3];
-            prefetchRange(&x, sizeof x);
-            for (const gcn::Program* p : {&x.vs, &x.ps}) {
+        if (takenNext_ + 6 < n) // the programs' resource list headers
+            for (const gcn::Program* p : {&taken_[takenNext_ + 6]->vs, &taken_[takenNext_ + 6]->ps}) {
+                __builtin_prefetch(&p->buffers);
+                __builtin_prefetch(&p->images);
+            }
+        if (takenNext_ + 3 < n) // the resource lists themselves
+            for (const gcn::Program* p : {&taken_[takenNext_ + 3]->vs, &taken_[takenNext_ + 3]->ps}) {
                 prefetchRange(p->buffers.data(), p->buffers.size() * sizeof(gcn::BufferResource));
                 prefetchRange(p->images.data(), p->images.size() * sizeof(gcn::ImageResource));
-                prefetchRange(p->data.data(), p->data.size() * 4);
             }
-        }
-        if (takenNext_ + 1 < n) { // the lookup tables' entries for its resources
-            const DrawAnalysis& x = *taken_[takenNext_ + 1];
-            for (const gcn::Program* p : {&x.vs, &x.ps}) {
+        if (takenNext_ + 2 < n) // the VRAM hit slots for its buffers
+            for (const gcn::Program* p : {&taken_[takenNext_ + 2]->vs, &taken_[takenNext_ + 2]->ps})
+                for (const gcn::BufferResource& b : p->buffers)
+                    if (b.known) __builtin_prefetch(&vramHits_[vramHitIndex(b.base(), bindSize(b))]);
+        if (takenNext_ + 1 < n) // the entries those slots and the image memo point at
+            for (const gcn::Program* p : {&taken_[takenNext_ + 1]->vs, &taken_[takenNext_ + 1]->ps}) {
                 for (const gcn::BufferResource& b : p->buffers) {
                     if (!b.known) continue;
                     const uint64_t base = b.base(), size = bindSize(b);
@@ -869,11 +875,6 @@ public:
                 }
                 for (const gcn::ImageResource& t : p->images) prefetchRange(&imageMemos_[imageMemoSet(t)], 2 * sizeof(ImageMemo));
             }
-        }
-        if (takenNext_ + 2 < n) // the hit slots the step above reads next draw
-            for (const gcn::Program* p : {&taken_[takenNext_ + 2]->vs, &taken_[takenNext_ + 2]->ps})
-                for (const gcn::BufferResource& b : p->buffers)
-                    if (b.known) __builtin_prefetch(&vramHits_[vramHitIndex(b.base(), bindSize(b))]);
     }
 
     void onDraw(const DrawCall& d, const GpuRegs& r) override {
@@ -900,7 +901,6 @@ public:
         // ~10% of the recorder at 8,000 draws a frame.
         std::unique_ptr<DrawAnalysis>& held = taken_[takenNext_++];
         DrawAnalysis& a = *held;
-        if (prefetch_) prefetchAhead();
         struct Recycle { // hands `a` back to the analysis thread however the draw ends
             Renderer& r;
             std::unique_ptr<DrawAnalysis>& a;
@@ -918,6 +918,7 @@ public:
         } recycle{*this, held};
         std::lock_guard lock(m_);
         ProfScope ps(prof_, kProfRenderer);
+        if (prefetch_) prefetchAhead();
         ++prof_.calls;
         ++drawIndex_;
         trace_ = frame_ == traceFrame_;
