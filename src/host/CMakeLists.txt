@@ -25,6 +25,7 @@ add_executable(lpn-host
     pause_menu.cpp
     hooks.cpp
     gpu/frame_dump.cpp
+    gpu/dlss.cpp
     gpu/formats.cpp
     gpu/renderer.cpp
     gpu/tiling.cpp
@@ -52,4 +53,19 @@ if(SDL2_FOUND)
     target_compile_definitions(lpn-host PRIVATE LPN_HAVE_SDL2)
 else()
     message(STATUS "SDL2 not found: lpn-host will run without a window")
+endif()
+
+# NVIDIA DLSS: scripts/fetch-dlss.sh puts the SDK in third_party/dlss. Without it the host builds
+# without DLSS. The DLSS runtime goes beside lpn-host, where NGX looks for it.
+set(LPN_DLSS_SDK "${PROJECT_SOURCE_DIR}/third_party/dlss" CACHE PATH "NVIDIA DLSS SDK")
+if(EXISTS "${LPN_DLSS_SDK}/include/nvsdk_ngx_vk.h")
+    message(STATUS "DLSS SDK: ${LPN_DLSS_SDK}")
+    target_include_directories(lpn-host SYSTEM PRIVATE "${LPN_DLSS_SDK}/include")
+    target_link_libraries(lpn-host PRIVATE "${LPN_DLSS_SDK}/lib/Linux_x86_64/libnvsdk_ngx.a" ${CMAKE_DL_LIBS})
+    target_compile_definitions(lpn-host PRIVATE LPN_HAVE_DLSS)
+    file(GLOB LPN_DLSS_RUNTIME "${LPN_DLSS_SDK}/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.*")
+    add_custom_command(TARGET lpn-host POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LPN_DLSS_RUNTIME} $<TARGET_FILE_DIR:lpn-host>)
+else()
+    message(STATUS "DLSS SDK not found: lpn-host builds without DLSS (scripts/fetch-dlss.sh)")
 endif()

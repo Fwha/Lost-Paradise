@@ -10,6 +10,7 @@
 #include "host/gpu/renderer.h"
 
 #include "gcn/shader.h"
+#include "host/gpu/dlss.h"
 #include "host/gpu/formats.h"
 #include "host/gpu/registers.h"
 #include "host/gpu/tiling.h"
@@ -642,6 +643,7 @@ public:
             std::fprintf(stderr, "[gpu] no renderer: VK_EXT_external_memory_host is required\n");
             return false;
         }
+        dlss::init(vk_);
         VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         pci.queueFamilyIndex = vk_.family;

@@ -9,6 +9,10 @@ namespace host {
 class Module;
 
 enum class WindowMode { Windowed, Borderless, Fullscreen };
+// NVIDIA DLSS (gpu/dlss.h): anti-aliasing at the render size (DLAA) or upscaling to it.
+enum class DlssMode { Off, Dlaa, Quality, Balanced, Performance };
+constexpr int kDlssModes = 5;
+const char* dlssModeName(DlssMode m); // "Off", "DLAA", "Quality", ...
 
 struct DisplaySettings {
     WindowMode window = WindowMode::Windowed;
@@ -17,6 +21,7 @@ struct DisplaySettings {
     // Frames a second shown at most (see setFpsCap); 0 leaves the rate to the game.
     int fps = 30;
     bool fpsCounter = false; // frames shown a second, in the top right corner
+    DlssMode dlss = DlssMode::Off;
 };
 
 DisplaySettings& displaySettings();
