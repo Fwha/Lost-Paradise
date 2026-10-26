@@ -9,6 +9,7 @@
 
 #include <dirent.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -18,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <string>
@@ -258,7 +260,81 @@ bool on() {
 
 double seconds() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - gStart).count(); }
 
-void nameThread(const char* name) { pthread_setname_np(pthread_self(), name); }
+namespace {
+
+// The recorder (lpn-record) caps the frame rate in crowds, alone at 100% of a core. Left to the
+// scheduler it shared a core with a hashing thread (hyper-threading halves each) and ran on an
+// E-core about a seventh of the time. It gets a P-core of its own: the fastest core's first
+// logical CPU, the core's other logical CPUs left idle, and every other thread kept off that core.
+// LPN_NO_PIN=1: no affinity set.
+struct Cores {
+    bool on = false;
+    cpu_set_t recorder, others;
+};
+std::string readLine(const std::string& path) {
+    std::ifstream f(path);
+    std::string line;
+    std::getline(f, line);
+    return line;
+}
+// "0-1", "4,5": the CPUs listed.
+std::vector<int> cpuList(const std::string& s) {
+    std::vector<int> out;
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t end = s.find(',', i);
+        if (end == std::string::npos) end = s.size();
+        const std::string part = s.substr(i, end - i);
+        const size_t dash = part.find('-');
+        const int a = std::atoi(part.c_str()), b = dash == std::string::npos ? a : std::atoi(part.c_str() + dash + 1);
+        for (int c = a; c <= b; ++c) out.push_back(c);
+        i = end + 1;
+    }
+    return out;
+}
+const Cores& cores() {
+    static const Cores c = [] {
+        Cores c;
+        if (getenv("LPN_NO_PIN")) return c;
+        cpu_set_t allowed;
+        if (sched_getaffinity(0, sizeof allowed, &allowed)) return c;
+        const std::string sys = "/sys/devices/system/cpu/cpu";
+        int best = -1;
+        long bestFreq = -1;
+        for (int i = 0; i < CPU_SETSIZE; ++i) {
+            if (!CPU_ISSET(i, &allowed)) continue;
+            const long f = std::atol(readLine(sys + std::to_string(i) + "/cpufreq/cpuinfo_max_freq").c_str());
+            if (f > bestFreq) best = i, bestFreq = f; // the first of the fastest
+        }
+        if (best < 0) return c;
+        std::vector<int> core = cpuList(readLine(sys + std::to_string(best) + "/topology/thread_siblings_list"));
+        if (core.empty()) core = {best};
+        best = core.front();
+        c.others = allowed;
+        for (int s : core) CPU_CLR(s, &c.others);
+        if (CPU_COUNT(&c.others) < 2) return c; // too few CPUs to set one core aside
+        CPU_ZERO(&c.recorder);
+        CPU_SET(best, &c.recorder);
+        c.on = true;
+        std::fprintf(stderr, "[cpu] the recorder runs on CPU %d (%ld MHz), its core's other CPUs idle (LPN_NO_PIN=1: no pinning)\n",
+                     best, bestFreq / 1000);
+        return c;
+    }();
+    return c;
+}
+
+} // namespace
+
+void avoidRecorderCore() {
+    if (cores().on) sched_setaffinity(0, sizeof(cpu_set_t), &cores().others);
+}
+
+void nameThread(const char* name) {
+    pthread_setname_np(pthread_self(), name);
+    if (!cores().on) return;
+    if (!std::strcmp(name, "lpn-record")) sched_setaffinity(0, sizeof(cpu_set_t), &cores().recorder);
+    else avoidRecorderCore(); // also for threads the recorder starts (they inherit its CPU)
+}
 
 void mark() {
     const int n = ++gMarks;

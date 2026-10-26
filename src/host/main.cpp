@@ -65,6 +65,7 @@ void onGuestExit() { std::fprintf(stderr, "[host] guest exit handler called\n");
 } // namespace
 
 int main(int argc, char** argv) {
+    host::profile::avoidRecorderCore(); // inherited by every thread started from here
     host::profile::start();
     std::string gameDir, nidPath, dataDir = "lpn-data";
     bool listUnimplemented = false, headless = false, gpu = true, computeOnly = false;

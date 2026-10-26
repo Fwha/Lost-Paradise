@@ -17,6 +17,9 @@ IoCounters& io();
 bool on();
 double seconds(); // since the host started
 void nameThread(const char* name); // shown in the [cpu] lines; 15 characters at most
+// Keeps the calling thread (and threads it starts) off the core set aside for the recorder
+// (see nameThread); every thread but the recorder starts so, from main.
+void avoidRecorderCore();
 void mark(); // F10
 void start(); // the [cpu] sampler (CPU use of each thread) and the [wait] sampler, once a second
 
