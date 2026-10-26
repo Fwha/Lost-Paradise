@@ -587,56 +587,79 @@ private:
 // the chunk. LPN_SYNC_RECORD=1 runs each call on the recorder as it is made.
 class CmdChunk {
 public:
+    // Calls and kept arrays go into one stream: a header (the call, or none for an array, and the
+    // record's size) and then its storage. Chunks come back from the command thread with their
+    // memory in that core's cache, so the recorder asks for the lines ahead of where it writes
+    // (a separate list of calls cost a cache miss every few calls).
     template <typename F> void push(F&& f) {
         using T = std::decay_t<F>;
-        void* p = alloc(sizeof(T), alignof(T));
+        static_assert(alignof(T) <= kAlign);
+        void* p = alloc(sizeof(T), [](void* o) {
+            T& t = *static_cast<T*>(o);
+            t();
+            t.~T();
+        });
         new (p) T(std::forward<F>(f));
-        ops_.push_back({[](void* o) {
-                            T& t = *static_cast<T*>(o);
-                            t();
-                            t.~T();
-                        },
-                        p});
     }
     template <typename T> T* keep(const T* src, size_t n) {
         if (!n) return nullptr;
-        T* d = static_cast<T*>(alloc(sizeof(T) * n, alignof(T)));
+        static_assert(alignof(T) <= kAlign);
+        T* d = static_cast<T*>(alloc(sizeof(T) * n, nullptr));
         std::memcpy(static_cast<void*>(d), src, sizeof(T) * n);
         return d;
     }
-    bool empty() const { return ops_.empty(); }
+    bool empty() const { return !calls_; }
     void run() {
-        for (const Op& o : ops_) o.call(o.obj);
-        ops_.clear();
+        for (size_t b = 0; b <= block_ && b < blocks_.size(); ++b) {
+            std::byte* base = blocks_[b].mem.get();
+            const size_t end = b == block_ ? used_ : blocks_[b].used;
+            for (size_t at = 0; at < end;) {
+                Header* h = reinterpret_cast<Header*>(base + at);
+                if (h->call) h->call(h + 1);
+                at += h->size;
+            }
+        }
+        calls_ = 0;
         block_ = 0;
         used_ = 0;
+        ahead_ = 0;
     }
 
 private:
-    static constexpr size_t kBlock = 256 << 10;
-    void* alloc(size_t size, size_t align) {
-        for (;;) {
+    static constexpr size_t kBlock = 256 << 10, kAlign = 16, kAhead = 512;
+    struct alignas(kAlign) Header {
+        void (*call)(void*);
+        size_t size; // of the record, header included
+    };
+    void* alloc(size_t size, void (*call)(void*)) {
+        const size_t n = (sizeof(Header) + size + kAlign - 1) & ~(kAlign - 1);
+        while (block_ >= blocks_.size() || used_ + n > blocks_[block_].size) {
             if (block_ < blocks_.size()) {
-                const size_t at = (used_ + align - 1) & ~(align - 1);
-                if (at + size <= blocks_[block_].second) {
-                    used_ = at + size;
-                    return blocks_[block_].first.get() + at;
-                }
+                blocks_[block_].used = used_;
                 ++block_;
                 used_ = 0;
+                ahead_ = 0;
                 continue;
             }
-            const size_t n = std::max(kBlock, size + align);
-            blocks_.emplace_back(std::make_unique<std::byte[]>(n), n);
+            const size_t sz = std::max(kBlock, n);
+            blocks_.push_back({std::make_unique<std::byte[]>(sz), sz, 0});
         }
+        Block& b = blocks_[block_];
+        std::byte* at = b.mem.get() + used_;
+        used_ += n;
+        for (const size_t to = std::min(used_ + kAhead, b.size); ahead_ < to; ahead_ += 64) __builtin_prefetch(b.mem.get() + ahead_, 1);
+        Header* h = reinterpret_cast<Header*>(at);
+        h->call = call;
+        h->size = n;
+        if (call) ++calls_;
+        return h + 1;
     }
-    struct Op {
-        void (*call)(void*);
-        void* obj;
+    struct Block {
+        std::unique_ptr<std::byte[]> mem;
+        size_t size, used;
     };
-    std::vector<Op> ops_;
-    std::vector<std::pair<std::unique_ptr<std::byte[]>, size_t>> blocks_;
-    size_t block_ = 0, used_ = 0;
+    std::vector<Block> blocks_;
+    size_t block_ = 0, used_ = 0, ahead_ = 0, calls_ = 0;
 };
 
 class Renderer final : public DrawListener {
