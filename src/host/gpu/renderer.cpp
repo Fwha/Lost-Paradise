@@ -541,7 +541,7 @@ struct Profiler {
     uint64_t switchMiss[6] = {}; // other shaders not switched to: no slot, slot stale, state, sampled, resources, index
     uint64_t depthJoins = 0, depthOnly = 0; // depth-only draws that joined the open pass, of all depth-only ones
     std::unordered_map<uint32_t, uint64_t> fastCtx; // the context registers that differed
-    uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0;
+    uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0, imageMisses = 0, imageGens = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -1139,10 +1139,10 @@ public:
         std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / n, prof_.dmas / n,
                      prof_.dmaBytes / n / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
-        std::fprintf(stderr, " (ms/frame); %.0f draws (%.0f fast), %.0f analysis hits (%.0f repeats), %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " blended draws skipped for one; VRAM buffers %.0f MB, %.1f copies (%.2f MB) per frame\n",
+        std::fprintf(stderr, " (ms/frame); %.0f draws (%.0f fast), %.0f analysis hits (%.0f repeats), %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " blended draws skipped for one; VRAM buffers %.0f MB, %.1f copies (%.2f MB) per frame; %.0f image lookups missed, %.1f image changes\n",
                      prof_.calls / n, prof_.fastDraws / n, prof_.analysisHits / n, prof_.repeats / n, prof_.analyses / n, prof_.texChecks / n, prof_.texUploads / n, prof_.texBytes / n / 1e6, prof_.flushes / n, prof_.passes / n,
                      prof_.barriers / n, prof_.pipelinesMade, prof_.pipelineWaits, vramBytes_ / 1e6, prof_.vramCopies / n,
-                     prof_.vramCopyBytes / n / 1e6);
+                     prof_.vramCopyBytes / n / 1e6, prof_.imageMisses / n, prof_.imageGens / n);
         std::fprintf(stderr, "[prof] t=%.1f launches not repeating the last: other shader %.0f, new submission %.0f, user data %.0f, other %.0f per frame; user data words differing:",
                      profile::seconds(), prof_.missWhy[0] / n, prof_.missWhy[1] / n, prof_.missWhy[2] / n, prof_.missWhy[3] / n);
         for (int i = 0; i < 16; ++i)
@@ -1770,6 +1770,7 @@ private:
         ici.usage = usage;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         ++imageGen_; // remembered image bindings may name an image this replaces
+        ++prof_.imageGens;
         if (vkCreateImage(vk_.device, &ici, nullptr, &img.image) != VK_SUCCESS) return false;
         VkMemoryRequirements req;
         vkGetImageMemoryRequirements(vk_.device, img.image, &req);
@@ -3096,7 +3097,7 @@ private:
     void gpuWrote(Surface& s) {
         s.writtenFrame = frame_;
         s.memSample = 0;
-        if (s.cpuOwned) ++imageGen_; // sampled as a render target again, not from memory
+        if (s.cpuOwned) ++imageGen_, ++prof_.imageGens; // sampled as a render target again, not from memory
         s.cpuOwned = false;
     }
     // Whether a render target's memory has been rewritten (by the CPU) since the GPU last
@@ -3111,7 +3112,7 @@ private:
         s.checkedFrame = frame_;
         const uint64_t sample = sampleHash(t.base(), size_t(t.pitch()) * t.height() * s.elementBytes);
         if (!s.memSample) s.memSample = sample;
-        else if (sample && sample != s.memSample) s.cpuOwned = true, ++imageGen_;
+        else if (sample && sample != s.memSample) s.cpuOwned = true, ++imageGen_, ++prof_.imageGens;
         return s.cpuOwned;
     }
 
@@ -3125,12 +3126,22 @@ private:
         ImageBinding b;
         VkImage sampled; // the render target it samples, if any (for feedback checks)
     };
-    static constexpr size_t kImageMemos = 1024;
+    // Two ways of 4,096 sets: a city view resolves thousands of pairs a frame, and with 1,024
+    // single entries they evicted each other.
+    static constexpr size_t kImageMemos = 8192;
     ImageMemo& imageMemo(const gcn::ImageResource& t) {
         uint64_t h = 0xcbf29ce484222325ull;
         for (uint32_t w : t.t) h = (h ^ w) * 0x100000001b3ull;
         for (uint32_t w : t.s) h = (h ^ w) * 0x100000001b3ull;
-        return imageMemos_[(h ^ (h >> 29) ^ t.compare) & (kImageMemos - 1)];
+        const size_t set = ((h ^ (h >> 29) ^ t.compare) & (kImageMemos / 2 - 1)) * 2;
+        ImageMemo& a = imageMemos_[set];
+        ImageMemo& b = imageMemos_[set + 1];
+        if (memoHit(b, t)) return b;
+        if (memoHit(a, t)) return a;
+        // A miss replaces a stale way first, else the older one (the way not hit last moves to b).
+        const bool aLive = a.frame == frame_ && a.gen == imageGen_;
+        if (aLive) std::swap(a, b);
+        return a;
     }
     bool memoHit(const ImageMemo& m, const gcn::ImageResource& t) const {
         return m.frame == frame_ && m.gen == imageGen_ && m.compare == t.compare && std::equal(t.t, t.t + 8, m.t) &&
@@ -3153,6 +3164,7 @@ private:
             return m.b;
         }
         const size_t before = sampledSurfaces_.size();
+        ++prof_.imageMisses;
         const ImageBinding b = resolveImageUncached(t);
         std::copy(t.t, t.t + 8, m.t);
         std::copy(t.s, t.s + 4, m.s);
