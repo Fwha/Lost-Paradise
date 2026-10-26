@@ -43,6 +43,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -541,7 +542,7 @@ struct Profiler {
     uint64_t switchMiss[6] = {}; // other shaders not switched to: no slot, slot stale, state, sampled, resources, index
     uint64_t depthJoins = 0, depthOnly = 0; // depth-only draws that joined the open pass, of all depth-only ones
     std::unordered_map<uint32_t, uint64_t> fastCtx; // the context registers that differed
-    uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0, imageMisses = 0, imageGens = 0;
+    uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0, imageMisses = 0, imageGens = 0, resolvedAhead = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -745,6 +746,7 @@ public:
         a->vsm = a->psm = nullptr;
         a->vsc = a->psc = nullptr;
         a->diffPrev = false;
+        a->resEpoch = 0;
         a->seq = ++analysisSeq_;
         // Most draws keep the last one's context registers: a compare here, a hash only on a change.
         if (std::memcmp(r.ctx, lastCtx_, sizeof lastCtx_) != 0) {
@@ -1043,6 +1045,7 @@ public:
         if (prof_.on) reportSlowFrame();
         savePipelineCache();
         dlssFrameEnd();
+        sweepVram();
         ++frame_;
         if (!pendingCapture_.empty()) { // F12: trace this frame into the capture folder
             traceDir_ = pendingCapture_ + "/";
@@ -1184,10 +1187,10 @@ public:
         std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / n, prof_.dmas / n,
                      prof_.dmaBytes / n / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
-        std::fprintf(stderr, " (ms/frame); %.0f draws (%.0f fast), %.0f analysis hits (%.0f repeats), %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " blended draws skipped for one; VRAM buffers %.0f MB, %.1f copies (%.2f MB) per frame; %.0f image lookups missed, %.1f image changes\n",
+        std::fprintf(stderr, " (ms/frame); %.0f draws (%.0f fast), %.0f analysis hits (%.0f repeats), %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " blended draws skipped for one; VRAM buffers %.0f MB, %.1f copies (%.2f MB) per frame; %.0f image lookups missed, %.1f image changes; %.0f buffers resolved ahead\n",
                      prof_.calls / n, prof_.fastDraws / n, prof_.analysisHits / n, prof_.repeats / n, prof_.analyses / n, prof_.texChecks / n, prof_.texUploads / n, prof_.texBytes / n / 1e6, prof_.flushes / n, prof_.passes / n,
                      prof_.barriers / n, prof_.pipelinesMade, prof_.pipelineWaits, vramBytes_ / 1e6, prof_.vramCopies / n,
-                     prof_.vramCopyBytes / n / 1e6, prof_.imageMisses / n, prof_.imageGens / n);
+                     prof_.vramCopyBytes / n / 1e6, prof_.imageMisses / n, prof_.imageGens / n, prof_.resolvedAhead / n);
         std::fprintf(stderr, "[prof] t=%.1f launches not repeating the last: other shader %.0f, new submission %.0f, user data %.0f, other %.0f per frame; user data words differing:",
                      profile::seconds(), prof_.missWhy[0] / n, prof_.missWhy[1] / n, prof_.missWhy[2] / n, prof_.missWhy[3] / n);
         for (int i = 0; i < 16; ++i)
@@ -1792,7 +1795,10 @@ private:
             warnOnce("cannot import guest memory at 0x" + std::to_string(addr));
             return false;
         }
-        imports_[im.start] = im;
+        {
+            std::unique_lock lock(cacheMutex_);
+            imports_[im.start] = im;
+        }
         buffer = im.buffer;
         offset = addr - im.start;
         return true;
@@ -3663,7 +3669,25 @@ void main() {
         uint32_t uses = 0, phase = 0, changes = 0;
         bool gpuWritten = false, dirty = false;
         std::shared_ptr<AsyncHash> check;
+        // Unchanged for a while and checked once a frame by the sweep (see sweepVram) instead of
+        // at its first use: analysis workers may then resolve it ahead (see resolveAhead).
+        std::atomic<bool> settled{false};
     };
+    // A buffer binding resolved ahead on an analysis worker, valid while bufferEpoch_ is the
+    // one it was resolved at. info.buffer null: resolved by the recorder as before.
+    struct BufRes {
+        VkDescriptorBufferInfo info{};
+        uint32_t words[4] = {};
+        VramBuffer* v = nullptr;
+    };
+    // Bumped (by the recorder, under cacheMutex_ when a lookup structure changes) whenever a
+    // resolution done ahead may have gone stale: a VRAM copy made, freed, written or found changed.
+    std::atomic<uint64_t> bufferEpoch_{1};
+    std::shared_mutex cacheMutex_; // vram_, imports_ and VRAM copies' buffers, for the workers' reads
+    const bool resolveAhead_ = getenv("LPN_NO_RESOLVE_AHEAD") == nullptr && getenv("LPN_RACE_CHECK") == nullptr;
+    void unsettle(VramBuffer& v) {
+        if (v.settled.exchange(false, std::memory_order_relaxed)) bufferEpoch_.fetch_add(1, std::memory_order_release);
+    }
     struct PairHash {
         size_t operator()(const std::pair<uint64_t, uint64_t>& k) const { return std::hash<uint64_t>()(k.first * 0x9E3779B97F4A7C15ull ^ k.second); }
     };
@@ -3702,14 +3726,21 @@ void main() {
             it = gpuWrittenRanges_.erase(it);
         }
         gpuWrittenRanges_[lo] = hi;
-        forVramOverlapping(addr, end, [](VramBuffer& v) { v.gpuWritten = true; });
+        forVramOverlapping(addr, end, [&](VramBuffer& v) {
+            v.gpuWritten = true;
+            unsettle(v);
+        });
     }
     bool gpuWritten(uint64_t addr, uint64_t size) const {
         auto it = gpuWrittenRanges_.upper_bound(addr + size - 1);
         return it != gpuWrittenRanges_.begin() && std::prev(it)->second > addr;
     }
     void cpWrites(uint64_t addr, uint64_t size) {
-        if (vramOn_) forVramOverlapping(addr, addr + size, [](VramBuffer& v) { v.dirty = true; });
+        if (vramOn_)
+            forVramOverlapping(addr, addr + size, [&](VramBuffer& v) {
+                v.dirty = true;
+                unsettle(v);
+            });
     }
 
     // A fingerprint of imported guest memory, read directly: 64 samples of 16 bytes. Memory the
@@ -3741,7 +3772,9 @@ void main() {
         if (inPass) {
             if (!vp) return false;
             const VramBuffer& v = *vp;
-            if (!v.size || !v.buf || v.gpuWritten || frame_ < v.hostUntil || v.checkedFrame != frame_ || v.dirty) return false;
+            if (!v.size || !v.buf || v.gpuWritten || frame_ < v.hostUntil || v.dirty ||
+                (v.checkedFrame != frame_ && !v.settled.load(std::memory_order_relaxed)))
+                return false;
             out = v.buf;
             off = 0;
             return true;
@@ -3756,6 +3789,7 @@ void main() {
             VkBuffer imported;
             VkDeviceSize at;
             if (!guestBuffer(base, size, imported, at)) return false; // mapped (importedSample reads it directly)
+            std::unique_lock lock(cacheMutex_);
             if (vram_.size() >= kVramEntries) evictVram();
             vp = vram_.emplace(std::make_pair(base, size), std::make_unique<VramBuffer>()).first->second.get();
             hit = {base, size, vp};
@@ -3768,8 +3802,10 @@ void main() {
         }
         if (v.gpuWritten || frame_ < v.hostUntil) return false;
         v.lastUse = frame_;
-        // Unchanged for 10 s: fingerprinted every 4th frame only (as textures are on every other
-        // use). The fingerprints' reads of host memory were ~10% of the recorder in the city.
+        // Settled: the sweep checks it (sweepVram). Otherwise, unchanged for 10 s: fingerprinted
+        // every 4th frame only (as textures are on every other use). The fingerprints' reads of
+        // host memory were ~10% of the recorder in the city.
+        if (v.settled.load(std::memory_order_relaxed) && !v.dirty) v.checkedFrame = frame_;
         if (v.checkedFrame != frame_ && !v.dirty && v.buf && frame_ - v.changedFrame >= 600 && (frame_ + v.phase) % 4 != 0)
             v.checkedFrame = frame_;
         if (v.checkedFrame != frame_ || v.dirty) {
@@ -3800,7 +3836,10 @@ void main() {
                 VkBuffer src;
                 VkDeviceSize soff;
                 if (!guestBuffer(base, size, src, soff)) return false;
-                if (!v.buf && !allocVram(v)) return false;
+                if (!v.buf) {
+                    std::unique_lock lock(cacheMutex_);
+                    if (!allocVram(v)) return false;
+                }
                 if (!changed) v.changedFrame = frame_; // the first copy
                 v.hash = hasher_.hash(base, size); // what the copy holds (the game does not write memory the GPU is about to read)
                 if (v.check) v.check->state.store(0, std::memory_order_relaxed); // a result in flight is about the old contents
@@ -3808,13 +3847,86 @@ void main() {
                 const VkBufferCopy bc{soff, 0, size};
                 rec([c = cmd_, src, dst = v.buf, bc] { vkCmdCopyBuffer(c, src, dst, 1, &bc); });
                 ++prof_.vramCopies, prof_.vramCopyBytes += size;
+            } else if (resolveAhead_ && frame_ - v.changedFrame >= kSettleFrames && !v.gpuWritten) {
+                v.settled.store(true, std::memory_order_release); // checked and unchanged for a while
             }
         }
         out = v.buf;
         off = 0;
         return true;
     }
-    bool allocVram(VramBuffer& v) {
+    static constexpr uint64_t kSettleFrames = 60;
+
+    // Once a frame, the settled copies' fingerprints are taken on a thread of their own, as their
+    // first use in a frame took them before; one that changed is copied again at its next use.
+    // Their full hashes run on the hasher threads every 8th frame, as on every 8th use before.
+    struct SweepItem {
+        uint64_t base, size, sample;
+        bool changed;
+    };
+    std::mutex sweepMutex_;
+    std::condition_variable sweepCv_;
+    std::vector<SweepItem> sweep_;
+    bool sweepQueued_ = false, sweepDone_ = true, sweepStarted_ = false;
+    void sweepVram() {
+        if (!resolveAhead_ || !vramOn_) return;
+        {
+            std::lock_guard lock(sweepMutex_);
+            if (!sweepDone_) return; // the last one is still running: next frame
+            for (const SweepItem& it : sweep_) {
+                if (!it.changed) continue;
+                auto f = vram_.find({it.base, it.size});
+                if (f == vram_.end() || f->second->sample != it.sample) continue; // gone, or checked since
+                f->second->dirty = true;
+                unsettle(*f->second);
+            }
+            sweep_.clear();
+            for (auto& [k, up] : vram_) {
+                VramBuffer& v = *up;
+                if (!v.settled.load(std::memory_order_relaxed)) continue;
+                if (!v.check) v.check = std::make_shared<AsyncHash>();
+                const int st = v.check->state.load(std::memory_order_acquire);
+                if (st == 2) {
+                    v.check->state.store(0, std::memory_order_relaxed);
+                    if (v.check->result != v.hash) {
+                        v.dirty = true;
+                        unsettle(v);
+                        continue;
+                    }
+                } else if (st == 0 && (frame_ + v.phase) % 8 == 0) {
+                    queueTexHash(v.check, v.base, v.size);
+                }
+                sweep_.push_back({v.base, v.size, v.sample, false});
+            }
+            if (sweep_.empty()) return;
+            sweepDone_ = false;
+            sweepQueued_ = true;
+            if (!sweepStarted_) {
+                sweepStarted_ = true;
+                std::thread([this] { sweepThread(); }).detach();
+            }
+        }
+        sweepCv_.notify_one();
+    }
+    void sweepThread() {
+        profile::nameThread("lpn-sweep");
+        std::vector<SweepItem> items;
+        for (;;) {
+            {
+                std::unique_lock lock(sweepMutex_);
+                sweepCv_.wait(lock, [&] { return sweepQueued_; });
+                sweepQueued_ = false;
+                items.swap(sweep_);
+            }
+            for (SweepItem& it : items) it.changed = importedSample(it.base, it.size) != it.sample;
+            {
+                std::lock_guard lock(sweepMutex_);
+                items.swap(sweep_);
+                sweepDone_ = true;
+            }
+        }
+    }
+    bool allocVram(VramBuffer& v) { // cacheMutex_ held
         if (vramBytes_ + v.size > kVramBudget) evictVram();
         if (vramBytes_ + v.size > kVramBudget) return false;
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -3836,7 +3948,8 @@ void main() {
         return true;
     }
     // Frees the copies used longest ago (a quarter of them), once the GPU is done with them.
-    void evictVram() {
+    void evictVram() { // cacheMutex_ held
+        bufferEpoch_.fetch_add(1, std::memory_order_release); // resolutions ahead may name a freed copy
         std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> byUse;
         for (auto& [k, v] : vram_)
             if (v->lastUse + 2 < frame_) byUse.push_back({v->lastUse, k});
@@ -3862,11 +3975,13 @@ void main() {
     }
 
     void bindResources(gcn::Program& p, uint32_t base, VkShaderStageFlags, std::vector<VkWriteDescriptorSet>& writes,
-                       std::vector<VkDescriptorBufferInfo>& bufInfos, std::vector<VkDescriptorImageInfo>& imgInfos) {
+                       std::vector<VkDescriptorBufferInfo>& bufInfos, std::vector<VkDescriptorImageInfo>& imgInfos,
+                       const std::vector<BufRes>* pre = nullptr) {
         ProfScope pb(prof_, kProfBind);
         uint32_t n = base + 1;
-        for (auto& b : p.buffers) {
-            bufInfos.push_back(bindBuffer(p, b));
+        for (size_t i = 0; i < p.buffers.size(); ++i) {
+            const gcn::BufferResource& b = p.buffers[i];
+            bufInfos.push_back(bindBuffer(p, b, false, pre ? &(*pre)[i] : nullptr));
             writes.push_back(kBufferWrite); // copied from a constant: built on the stack it stalled on store forwarding
             writes.back().dstBinding = n++;
         }
@@ -3896,7 +4011,14 @@ void main() {
         const uint64_t size = b.stride() ? uint64_t(b.stride()) * b.numRecords() : b.numRecords();
         return std::min<uint64_t>(size ? size : 16, std::min<uint64_t>(vk_.props.limits.maxStorageBufferRange, 64ull << 20));
     }
-    VkDescriptorBufferInfo bindBuffer(gcn::Program& p, const gcn::BufferResource& b, bool inPass = false) {
+    // pre: its resolution on a worker (resolveAhead), if still good.
+    VkDescriptorBufferInfo bindBuffer(gcn::Program& p, const gcn::BufferResource& b, bool inPass = false, const BufRes* pre = nullptr) {
+        if (pre && pre->info.buffer) {
+            std::memcpy(&p.data[b.data], pre->words, sizeof pre->words);
+            if (pre->v) pre->v->lastUse = frame_;
+            ++prof_.resolvedAhead;
+            return pre->info;
+        }
         const uint64_t size = bindSize(b);
         BufferRange r;
         VkDeviceSize off = 0;
@@ -4014,6 +4136,9 @@ void main() {
             uint32_t moved = 0, images = 0;
         } vsDiff, psDiff;
         bool diffPrev = false;
+        // Its buffers' bindings, resolved on the worker (resolveAhead) at bufferEpoch_ resEpoch.
+        std::vector<BufRes> vsRes, psRes;
+        uint64_t resEpoch = 0;
     };
     // A draw's launches as the registers give them, for a worker to analyse.
     struct DrawJob {
@@ -4047,6 +4172,66 @@ void main() {
             batchIdleCv_.notify_all();
         }
     }
+    // On a worker: the bindings bindBuffer would make for the draw's buffers, where they depend
+    // only on lookups that stay put while bufferEpoch_ does: a settled VRAM copy, or an import
+    // for a buffer too small for one. The recorder takes them if the epoch has not moved since.
+    // Those lookups (cache misses one after another) were the largest part of its time.
+    // LPN_NO_RESOLVE_AHEAD=1: all on the recorder as before.
+    void resolveAhead(DrawAnalysis& a) {
+        std::shared_lock lock(cacheMutex_);
+        a.resEpoch = bufferEpoch_.load(std::memory_order_acquire);
+        resolveBuffers(a.vs, a.vsRes);
+        if (a.psm) resolveBuffers(a.ps, a.psRes);
+        else a.psRes.clear();
+    }
+    void resolveBuffers(const gcn::Program& p, std::vector<BufRes>& out) {
+        out.resize(p.buffers.size());
+        for (size_t i = 0; i < p.buffers.size(); ++i) {
+            const gcn::BufferResource& b = p.buffers[i];
+            BufRes& r = out[i];
+            r = {};
+            if (!b.known || b.store) continue;
+            const uint64_t base = b.base(), size = bindSize(b);
+            VkBuffer buf = VK_NULL_HANDLE;
+            VkDeviceSize off = 0;
+            if (vramOn_ && size >= kVramMin && size <= kVramMax && base % 4 == 0 && size % 4 == 0) {
+                auto it = vram_.find({base, size});
+                if (it == vram_.end()) continue; // the recorder decides on a copy
+                VramBuffer* v = it->second.get();
+                if (!v->settled.load(std::memory_order_acquire) || !v->buf) continue;
+                buf = v->buf;
+                r.v = v;
+            } else if (!importFor(base, size, buf, off)) {
+                continue;
+            }
+            const VkDeviceSize offset = off & ~(storageAlign_ - 1);
+            const uint32_t byteOffset = uint32_t(off - offset);
+            const VkDeviceSize range = std::min<VkDeviceSize>(size + byteOffset, vk_.props.limits.maxStorageBufferRange);
+            r.info = {buf, offset, range};
+            r.words[0] = byteOffset;
+            r.words[1] = b.stride();
+            r.words[2] = b.numRecords();
+            r.words[3] = uint32_t(range);
+        }
+    }
+    // guestBuffer's lookup of an existing import, without making one (cacheMutex_ held shared).
+    bool importFor(uint64_t addr, uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) const {
+        if (!addr || addr >= (1ull << 40) || !size) return false;
+        auto it = imports_.upper_bound(addr);
+        if (it == imports_.begin()) return false;
+        --it;
+        if (it->second.end < addr + size) return false;
+        buffer = it->second.buffer;
+        offset = addr - it->first;
+        return true;
+    }
+    // A worker's resolution of `p`'s buffers, if still good (see resolveAhead).
+    const std::vector<BufRes>* aheadFor(const DrawAnalysis& a, const gcn::Program& p) const {
+        if (!a.resEpoch || a.resEpoch != bufferEpoch_.load(std::memory_order_relaxed)) return nullptr;
+        const std::vector<BufRes>& r = &p == &a.vs ? a.vsRes : a.psRes;
+        return r.size() == p.buffers.size() ? &r : nullptr;
+    }
+
     void runBatch(AnalysisCtx& c, std::vector<DrawJob>& b) {
         for (DrawJob& j : b) runJob(c, j);
         for (size_t i = 1; i < b.size(); ++i) {
@@ -4059,6 +4244,9 @@ void main() {
             else a.psDiff = {-1, 0, 0};
             a.diffPrev = true;
         }
+        if (resolveAhead_)
+            for (DrawJob& j : b)
+                if (j.kind == DrawJob::kDraw && j.out->ok) resolveAhead(*j.out);
         {
             std::lock_guard lock(analysesMutex_);
             for (DrawJob& j : b) j.out->ready = true;
@@ -4751,8 +4939,8 @@ void main() {
             const float t[4] = {2.0f / float(width), 2.0f / float(height), -1.0f, -1.0f};
             std::memcpy(&vs.data[gcn::data::kPosTransform], t, sizeof(t));
         }
-        bindResources(vs, 0, VK_SHADER_STAGE_VERTEX_BIT, writes, bufs, imgs);
-        if (psm) bindResources(ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT, writes, bufs, imgs);
+        bindResources(vs, 0, VK_SHADER_STAGE_VERTEX_BIT, writes, bufs, imgs, aheadFor(a, vs));
+        if (psm) bindResources(ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT, writes, bufs, imgs, aheadFor(a, ps));
         linkWrites(writes, bufs, imgs);
 
         // Index buffer.
@@ -5041,7 +5229,8 @@ void main() {
             for (uint32_t i = 0; moved; ++i, moved >>= 1)
                 if (moved & 1)
                     if (VkDescriptorBufferInfo* b = bufferAt(base + 1 + i)) {
-                        *b = bindBuffer(p, p.buffers[i], true);
+                        const std::vector<BufRes>* pre = aheadFor(a, p);
+                        *b = bindBuffer(p, p.buffers[i], true, pre ? &(*pre)[i] : nullptr);
                         std::memcpy(bound.buffers[i].sharp, p.buffers[i].sharp, sizeof p.buffers[i].sharp);
                     }
             const VkDeviceSize bytes = p.data.size() * 4;
@@ -5158,7 +5347,8 @@ void main() {
         auto rebind = [&](gcn::Program& p, gcn::Program& bound, uint32_t moved, uint32_t base) {
             for (uint32_t i = 0; moved; ++i, moved >>= 1)
                 if (moved & 1) {
-                    bufs.push_back(bindBuffer(p, p.buffers[i], true));
+                    const std::vector<BufRes>* pre = aheadFor(a, p);
+                    bufs.push_back(bindBuffer(p, p.buffers[i], true, pre ? &(*pre)[i] : nullptr));
                     writes.push_back(kBufferWrite);
                     writes.back().dstBinding = base + 1 + i;
                     // Also in the fast state, which switchDraw binds again unchanged but for moved buffers.
