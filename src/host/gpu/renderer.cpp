@@ -1712,11 +1712,20 @@ private:
     bool guestBuffer(uint64_t addr, uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) {
         if (!addr || addr >= (1ull << 40) || !size) return false;
         const uint64_t end = addr + size;
+        // The import that last covered this granule: a map walk per buffer was a cache miss per
+        // level, at 8,000 draws a frame.
+        const Import*& hit = importHits_[(addr / kImportGranule) % kImportHits];
+        if (hit && hit->start <= addr && hit->end >= end) {
+            buffer = hit->buffer;
+            offset = addr - hit->start;
+            return true;
+        }
         // The import starting closest below `addr` usually covers it (imports are aligned granules);
         // a scan of all of them is the fallback.
         if (auto it = imports_.upper_bound(addr); it != imports_.begin()) {
             --it;
             if (it->second.end >= end) {
+                hit = &it->second;
                 buffer = it->second.buffer;
                 offset = addr - it->first;
                 return true;
@@ -3602,6 +3611,12 @@ void main() {
     static constexpr size_t kVramEntries = 1500; // each is a memory allocation of its own
     const bool vramOn_ = getenv("LPN_NO_VRAM_BUFFERS") == nullptr;
     std::unordered_map<std::pair<uint64_t, uint64_t>, std::unique_ptr<VramBuffer>, PairHash> vram_;
+    struct VramHit {
+        uint64_t base = 0, size = 0;
+        VramBuffer* v = nullptr;
+    };
+    static constexpr size_t kVramHits = 512;
+    std::array<VramHit, kVramHits> vramHits_{}; // cleared when a copy is freed
     std::multimap<uint64_t, VramBuffer*> vramByBase_; // for overlap queries
     std::map<uint64_t, uint64_t> gpuWrittenRanges_;  // [start, end), merged
     uint64_t vramBytes_ = 0, vramCount_ = 0;
@@ -3653,16 +3668,24 @@ void main() {
     // inPass: only a copy already checked this frame, as nothing can be recorded (fastDraw).
     bool vramBuffer(uint64_t base, uint64_t size, VkBuffer& out, VkDeviceSize& off, bool inPass = false) {
         if (!vramOn_ || size < kVramMin || size > kVramMax || base % 4 || size % 4) return false;
-        auto found = vram_.find({base, size});
+        // The copy last found for this buffer, checked before the hash map (a miss per lookup).
+        VramHit& hit = vramHits_[(base / 64 ^ size * 0x9E3779B97F4A7C15ull >> 40) % kVramHits];
+        VramBuffer* vp = nullptr;
+        if (hit.v && hit.base == base && hit.size == size) {
+            vp = hit.v;
+        } else if (auto found = vram_.find({base, size}); found != vram_.end()) {
+            vp = found->second.get();
+            hit = {base, size, vp};
+        }
         if (inPass) {
-            if (found == vram_.end()) return false;
-            const VramBuffer& v = *found->second;
+            if (!vp) return false;
+            const VramBuffer& v = *vp;
             if (!v.size || !v.buf || v.gpuWritten || frame_ < v.hostUntil || v.checkedFrame != frame_ || v.dirty) return false;
             out = v.buf;
             off = 0;
             return true;
         }
-        if (found == vram_.end()) {
+        if (!vp) {
             // Only a buffer used again in a later frame gets a copy: per-frame data in rings sits at
             // a new address each frame, and copying it would cost more than it saves.
             if (gpuWritten(base, size)) return false;
@@ -3673,15 +3696,15 @@ void main() {
             VkDeviceSize at;
             if (!guestBuffer(base, size, imported, at)) return false; // mapped (importedSample reads it directly)
             if (vram_.size() >= kVramEntries) evictVram();
-            found = vram_.emplace(std::make_pair(base, size), std::make_unique<VramBuffer>()).first;
+            vp = vram_.emplace(std::make_pair(base, size), std::make_unique<VramBuffer>()).first->second.get();
+            hit = {base, size, vp};
         }
-        auto& slot = found->second;
-        if (!slot->size) {
-            slot->base = base, slot->size = size, slot->phase = uint32_t(vramCount_++ % 8);
-            slot->gpuWritten = gpuWritten(base, size);
-            vramByBase_.emplace(base, slot.get());
+        VramBuffer& v = *vp;
+        if (!v.size) {
+            v.base = base, v.size = size, v.phase = uint32_t(vramCount_++ % 8);
+            v.gpuWritten = gpuWritten(base, size);
+            vramByBase_.emplace(base, vp);
         }
-        VramBuffer& v = *slot;
         if (v.gpuWritten || frame_ < v.hostUntil) return false;
         v.lastUse = frame_;
         if (v.checkedFrame != frame_ || v.dirty) {
@@ -3769,6 +3792,7 @@ void main() {
             }
             vram_.erase(it);
         }
+        vramHits_.fill({});
     }
 
     void bindResources(gcn::Program& p, uint32_t base, VkShaderStageFlags, std::vector<VkWriteDescriptorSet>& writes,
@@ -4914,7 +4938,6 @@ void main() {
         }
         ProfScope pb(prof_, kProfBind);
         std::vector<VkWriteDescriptorSet>& writes = drawWrites_;
-        std::vector<VkDescriptorBufferInfo>& bufs = drawBufs_;
         std::vector<VkDescriptorImageInfo>& imgs = drawImgs_;
         // Other textures go into the slot's descriptors first (rebindImages also queues writes of its
         // own for fastDraw, dropped here: all of the slot's are pushed).
@@ -4924,15 +4947,15 @@ void main() {
         // The buffers that moved and the draw data, bound again in the slot's descriptors (bufs is in
         // write order); the rest stay as the slot has them. Rebinding every buffer (15-20 a draw
         // outside the city gate) was most of the recorder's bind time.
-        std::array<int16_t, 256> bufIndex;
-        bufIndex.fill(-1);
-        for (size_t k = 0, n = 0; k < f.writes.size(); ++k)
-            if (f.writes[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-                if (f.writes[k].dstBinding < bufIndex.size()) bufIndex[f.writes[k].dstBinding] = int16_t(n);
-                ++n;
-            }
+        // A scan of the slot's writes per buffer: a binding table filled for every draw cost more
+        // than the few buffers that move.
         auto bufferAt = [&](uint32_t binding) -> VkDescriptorBufferInfo* {
-            return binding < bufIndex.size() && bufIndex[binding] >= 0 ? &f.bufs[bufIndex[binding]] : nullptr;
+            for (size_t k = 0, n = 0; k < f.writes.size(); ++k)
+                if (f.writes[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                    if (f.writes[k].dstBinding == binding) return &f.bufs[n];
+                    ++n;
+                }
+            return nullptr;
         };
         auto bind = [&](gcn::Program& p, gcn::Program& bound, uint32_t moved, uint32_t base) {
             for (uint32_t i = 0; moved; ++i, moved >>= 1)
@@ -4949,14 +4972,11 @@ void main() {
         };
         bind(a.vs, slot->prev.vs, moved, 0);
         if (a.psm) bind(a.ps, slot->prev.ps, psMoved, kPsBindingBase);
-        writes = f.writes;
-        bufs = f.bufs;
-        imgs = f.imgs;
         if (bound_.pipeline != f.pipe) {
             rec([c = cmd_, pipe = f.pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); });
             bound_.pipeline = f.pipe;
         }
-        pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, f.layout, writes, bufs, imgs);
+        pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, f.layout, f.writes, f.bufs, f.imgs);
         setViewportScissor(r, f.width, f.height, f.jitter);
         if (!bound_.state || std::memcmp(bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
             std::memcpy(bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
@@ -5308,7 +5328,9 @@ void main() {
     double worstFrameMs_ = 0;
     uint64_t frameNs_[kProfCount] = {}, frameAnalyses_ = 0, framePipelines_ = 0;
 
-    std::map<uint64_t, Import> imports_;
+    std::map<uint64_t, Import> imports_; // never erased while rendering: importHits_ points into it
+    static constexpr size_t kImportHits = 64;
+    std::array<const Import*, kImportHits> importHits_{};
     std::unordered_map<uint64_t, Surface> colors_, depths_;
     std::unordered_map<uint64_t, Metadata> metadata_; // by HTILE/CMASK address
     std::unordered_map<std::array<uint32_t, 6>, GuestTexture, WordsHash> textures_;
