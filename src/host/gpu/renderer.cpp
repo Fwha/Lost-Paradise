@@ -3196,8 +3196,8 @@ private:
     // then a blend that writes the scene colour back. With DLSS on, the first two are skipped and
     // the blend becomes DLSS, given the scene colour, its depth and motion vectors this renderer
     // makes from the depth and the camera (so only the camera's motion: moving characters rely on
-    // DLSS's own handling). Scene draws (into that depth buffer, depth tested, not full-screen
-    // rectangles) are jittered by moving the viewport a sub-pixel amount each frame.
+    // DLSS's own handling). Scene draws (with that depth buffer bound, before SMAA) are jittered
+    // by moving the viewport a sub-pixel amount each frame.
 
     // The SMAA pixel shaders, by a hash of their first 256 bytes of code.
     static uint8_t smaaRole(uint64_t codeHash) {
@@ -3378,6 +3378,7 @@ void main() {
     // blend replaced by DLSS).
     bool dlssSmaa(const GpuRegs& r, uint8_t role) {
         if (!dlss::usable()) return false;
+        smaaSeen_ = true; // later draws are post-processing: not jittered
         if (role != 3) return true; // edges and weights: DLSS needs neither
         const uint32_t* cb = &r.ctx[reg::kCbColorBase];
         const uint32_t info = cb[::gpu::ctx::kCbColorInfo];
@@ -3483,6 +3484,7 @@ void main() {
     void dlssFrameEnd() {
         prevCam_ = cam_;
         cam_.valid = false;
+        smaaSeen_ = false;
         camTries_ = 0;
         dlssRanLast_ = dlssRan_;
         dlssRan_ = false;
@@ -3492,7 +3494,7 @@ void main() {
         if (jitterOn_) dlss::jitter(++jitterIndex_, 1, 1, &jitterX_, &jitterY_);
     }
 
-    bool dlssOn_ = false, dlssRan_ = false, dlssRanLast_ = false, jitterOn_ = false, camWarned_ = false;
+    bool dlssOn_ = false, smaaSeen_ = false, dlssRan_ = false, dlssRanLast_ = false, jitterOn_ = false, camWarned_ = false;
     uint64_t sceneDepth_ = 0, jitterIndex_ = 0;
     uint32_t camTries_ = 0, dlssStats_[4] = {};
     float jitterX_ = 0, jitterY_ = 0;
@@ -4495,10 +4497,14 @@ void main() {
             }
         }
         if (!colorCount && !hasDepth) return;
-        // A scene draw (see dlssSmaa): jittered, and where the camera is read.
-        const bool scene = dlssOn_ && hasDepth && (uint64_t(r.ctx[reg::kDbZReadBase]) << 8) == sceneDepth_ &&
-                           ((depthControl >> 1) & 1) && prim != 17 && (r.ctx[reg::kPaClVteCntl] & 0xF);
-        if (scene && !cam_.valid && ((depthControl >> 2) & 1)) captureCamera(vs, r);
+        // A scene draw (see dlssSmaa): every draw with the scene's depth buffer bound before SMAA,
+        // full-screen passes too. Jittered alike, the lighting passes rebuild positions where the
+        // depth was rendered: shadows flickered when only the geometry moved. 3D draws that write
+        // depth are where the camera is read.
+        const bool scene = dlssOn_ && !smaaSeen_ && hasDepth && (uint64_t(r.ctx[reg::kDbZReadBase]) << 8) == sceneDepth_;
+        if (scene && !cam_.valid && ((depthControl >> 2) & 1) && ((depthControl >> 1) & 1) && prim != 17 &&
+            (r.ctx[reg::kPaClVteCntl] & 0xF))
+            captureCamera(vs, r);
         const bool jitter = scene && jitterOn_;
         // A draw writing only depth into the open pass's depth buffer joins that pass, its color
         // targets attached but not written. Outside the city gate the game interleaves depth-only
