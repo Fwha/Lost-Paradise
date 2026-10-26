@@ -95,3 +95,20 @@ is not emulated, and `ds_swizzle_b32` only in its quad mode.
 ## Next
 
 2D-tiled detiling, a swapchain, and batching draws per render pass.
+
+## DLSS (DLAA)
+
+`scripts/fetch-dlss.sh` puts NVIDIA's DLSS SDK in `third_party/dlss`; cmake then links NGX and
+copies the DLSS runtime beside `lpn-host`. PC Settings > DLSS (Off/DLAA, `dlss` in
+lpn-display.ini) replaces the game's SMAA (three full-screen draws, found by a hash of their
+pixel shaders' code) with DLAA (`gpu/dlss.cpp`, `dlssSmaa` in the renderer):
+
+- Depth: the depth buffer bound to the SMAA blend (the scene's).
+- Motion vectors: a compute pass reprojects that depth with this and last frame's camera. The
+  scene vertex shaders read it from the constant buffer whose V# s[12:13] points at: projection
+  rows at 0x0, view rotation rows at 0x40/0x50/0x60, camera position at 0x220 (positions are
+  camera-relative). Only camera motion: moving characters rely on DLSS.
+- Jitter: every draw with the scene depth bound before SMAA (full-screen lighting passes too, or
+  shadows flicker) gets a Halton sub-pixel viewport offset, passed to DLSS as is.
+- `[dlss] last 300 frames` lines count history resets; `LPN_DLSS_NO_JITTER=1`,
+  `LPN_DLSS_JITTER_SIGN=x,y` for debugging. Upscaling (render the scene smaller) is not done.
