@@ -3448,7 +3448,8 @@ void main() {
         });
         barrier();
 
-        // DLSS: the jitter is the sample's offset from the pixel centre, the viewport's opposite.
+        // DLSS: the jitter is how far the scene was moved on screen (as engines that jitter the
+        // projection pass it; y down).
         dlss::Frame f;
         f.color = {dlssColor_.image, view(dlssColor_, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), vf, VK_IMAGE_ASPECT_COLOR_BIT, w, h};
         f.depth = {depth->img.image, depthView, df, VK_IMAGE_ASPECT_DEPTH_BIT, w, h};
@@ -3456,9 +3457,16 @@ void main() {
         f.output = {out->img.image, view(out->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), vf, VK_IMAGE_ASPECT_COLOR_BIT, w, h};
         f.renderW = f.outW = w;
         f.renderH = f.outH = h;
-        f.jitterX = jitterOn_ ? -jitterX_ * jitterSign_[0] : 0;
-        f.jitterY = jitterOn_ ? -jitterY_ * jitterSign_[1] : 0;
+        f.jitterX = jitterOn_ ? jitterX_ * jitterSign_[0] : 0;
+        f.jitterY = jitterOn_ ? jitterY_ * jitterSign_[1] : 0;
         f.reset = !moved;
+        // Every 300 frames: how often the history was dropped, to tell a camera problem.
+        ++dlssStats_[0], dlssStats_[1] += f.reset, dlssStats_[2] += cam_.valid, dlssStats_[3] += jitterOn_;
+        if (dlssStats_[0] == 300) {
+            std::fprintf(stderr, "[dlss] last 300 frames: history reset %u, camera read %u, jittered %u\n", dlssStats_[1],
+                         dlssStats_[2], dlssStats_[3]);
+            std::memset(dlssStats_, 0, sizeof dlssStats_);
+        }
         f.mode = 1; // DLAA for now: the render size stays the game's
         rec([c = cmd_, dev = vk_.device, f] { dlss::evaluate(c, dev, f); });
         fullBarrier();
@@ -3486,7 +3494,7 @@ void main() {
 
     bool dlssOn_ = false, dlssRan_ = false, dlssRanLast_ = false, jitterOn_ = false, camWarned_ = false;
     uint64_t sceneDepth_ = 0, jitterIndex_ = 0;
-    uint32_t camTries_ = 0;
+    uint32_t camTries_ = 0, dlssStats_[4] = {};
     float jitterX_ = 0, jitterY_ = 0;
     // LPN_DLSS_JITTER_SIGN=<x>,<y> (each 1 or -1): flips the jitter DLSS is told (debugging).
     float jitterSign_[2] = {1, 1};
