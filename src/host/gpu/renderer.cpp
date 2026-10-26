@@ -457,7 +457,10 @@ struct Surface {
     uint64_t writtenFrame = 0; // last frame the GPU rendered into it
     uint64_t memSample = 0;    // sampleHash of its memory, while the GPU leaves it alone
     bool cpuOwned = false;     // its memory changed meanwhile: the CPU's contents win
+    bool writtenBack = false;  // the GPU copies it to memory (writeBack): sampled lazily instead
     uint64_t checkedFrame = ~0ull;
+    uint64_t addr = 0, memBytes = 0; // the memory memSample covers
+    uint64_t loggedFrame = ~0ull;    // writtenFrame of the last "[gpu] stale target" line
 };
 
 // A texture's full hash, computed off the recorder (see Renderer::guestTexture).
@@ -1868,6 +1871,8 @@ private:
             return nullptr;
         }
         std::fprintf(stderr, "[gpu] render target 0x%" PRIx64 " %ux%u format %d\n", addr, w, h, int(format));
+        s.addr = addr;
+        s.memBytes = uint64_t(w) * h * bytes;
         return &(colors_[addr] = std::move(s));
     }
 
@@ -3095,8 +3100,13 @@ private:
     };
 
     void gpuWrote(Surface& s) {
+        // The memory is sampled when the GPU renders into it, not when the target is next sampled
+        // as a texture: by then the game may have loaded a texture there (a special move's banner,
+        // in memory a render target had used), which became the baseline, so the old render
+        // target was bound in its place. Once a frame per target.
+        if (s.writtenFrame != frame_ || !s.memSample)
+            s.memSample = s.writtenBack || !s.memBytes ? 0 : sampleHash(s.addr, s.memBytes);
         s.writtenFrame = frame_;
-        s.memSample = 0;
         if (s.cpuOwned) ++imageGen_; // sampled as a render target again, not from memory
         s.cpuOwned = false;
     }
@@ -3110,9 +3120,21 @@ private:
         if (s.cpuOwned) return true;
         if (frame_ < s.writtenFrame + 2 || s.checkedFrame == frame_) return false; // once a frame
         s.checkedFrame = frame_;
-        const uint64_t sample = sampleHash(t.base(), size_t(t.pitch()) * t.height() * s.elementBytes);
+        const uint64_t sample = s.writtenBack || !s.memBytes
+                                    ? sampleHash(t.base(), size_t(t.pitch()) * t.height() * s.elementBytes)
+                                    : sampleHash(s.addr, s.memBytes);
         if (!s.memSample) s.memSample = sample;
         else if (sample && sample != s.memSample) s.cpuOwned = true, ++imageGen_;
+        // A texture bound to a render target the GPU left alone for a while: what to look for
+        // when a texture shows something else (once per target and write).
+        if (!s.cpuOwned && frame_ > s.writtenFrame + 30 && s.loggedFrame != s.writtenFrame) {
+            s.loggedFrame = s.writtenFrame;
+            std::fprintf(stderr, "[gpu] texture 0x%" PRIx64 " %ux%u fmt %u/%u sampled from render target %ux%u drawn %" PRIu64
+                                 " frames ago\n", t.base(), t.width(), t.height(), t.dataFormat(), t.numFormat(),
+                         s.img.width, s.img.height, frame_ - s.writtenFrame);
+        }
+        if (s.cpuOwned)
+            std::fprintf(stderr, "[gpu] render target 0x%" PRIx64 " rewritten in memory: sampled from memory\n", s.addr);
         return s.cpuOwned;
     }
 
@@ -4433,6 +4455,7 @@ void main() {
         if (it == colors_.end()) return;
         if (raceCheck_) noteWrite(t.base(), uint64_t(std::max(t.pitch(), t.width())) * t.height() * it->second.elementBytes);
         Surface& s = it->second;
+        s.writtenBack = true;
         gpuWrote(s); // its memory changes now, from the GPU
         const uint32_t w = std::min(t.width(), s.img.width), h = std::min(t.height(), s.img.height);
         const uint32_t pitch = std::max(t.pitch(), w);
