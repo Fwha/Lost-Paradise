@@ -38,7 +38,6 @@ struct Image {
 
 struct Frame {
     Image color, depth, motion, output; // motion: RG16F, pixels to the previous frame (render size)
-    Image bias; // optional, R8: 1 where DLSS should keep to this frame's colour (effects)
     uint32_t renderW = 0, renderH = 0, outW = 0, outH = 0;
     float jitterX = 0, jitterY = 0; // the sample's offset from the pixel centre, in render pixels
     bool reset = false;             // no usable history (first frame, camera cut)

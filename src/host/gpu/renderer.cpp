@@ -3379,9 +3379,6 @@ private:
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D depthTex;
 layout(set = 0, binding = 1, rg16f) uniform writeonly image2D motion;
-layout(set = 0, binding = 2) uniform sampler2D opaqueTex; // the scene before its effects
-layout(set = 0, binding = 3) uniform sampler2D colorTex;  // and after
-layout(set = 0, binding = 4, r8) uniform writeonly image2D bias;
 layout(push_constant) uniform P {
     mat4 reproject; // current NDC (x, y, depth, 1) to the previous clip position
     vec4 vp;        // viewport offset x, y and scale x, y: pixel = ndc * scale + offset
@@ -3396,9 +3393,6 @@ void main() {
     vec4 prev = p.reproject * vec4((pix - p.vp.xy) / p.vp.zw, (d - p.z.x) / p.z.y, 1.0);
     vec2 was = prev.xy / prev.w * p.vp.zw + p.vp.xy;
     imageStore(motion, c, vec4(prev.w > 0.0 ? was - pix : vec2(0.0), 0.0, 0.0));
-    // Where effects drew (no depth, no motion of their own): DLSS keeps to this frame's colour.
-    vec3 e = abs(texelFetch(colorTex, c, 0).rgb - texelFetch(opaqueTex, c, 0).rgb);
-    imageStore(bias, c, vec4(clamp((max(e.r, max(e.g, e.b)) - 2.0 / 255.0) * 16.0, 0.0, 1.0)));
 }
 )";
     struct MotionPush {
@@ -3415,13 +3409,12 @@ void main() {
         sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
         sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         VK_CHECK(vkCreateSampler(vk_.device, &sci, nullptr, &mvSampler_));
-        VkDescriptorSetLayoutBinding b[5]{};
-        for (uint32_t i = 0; i < 5; ++i)
-            b[i] = {i, i == 1 || i == 4 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
-                    VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutBinding b[2]{};
+        b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-        dl.bindingCount = 5;
+        dl.bindingCount = 2;
         dl.pBindings = b;
         VK_CHECK(vkCreateDescriptorSetLayout(vk_.device, &dl, nullptr, &mvSetLayout_));
         const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MotionPush)};
@@ -3472,7 +3465,6 @@ void main() {
         Surface* depth = depthSurface(depthAddr, ((size & 0x7FF) + 1) * 8, (((size >> 11) & 0x7FF) + 1) * 8, df);
         if (!out || !depth) return false;
         sceneDepth_ = depthAddr;
-        sceneColor_ = uint64_t(cb[0]) << 8;
         // The scene's size: the blend's full-screen viewport.
         const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
         const uint32_t w = std::min(uint32_t(std::lround(std::fabs(v[0]) * 2)), std::min(out->img.width, depth->img.width));
@@ -3481,8 +3473,7 @@ void main() {
         if (!ringFits(1 << 16)) flush();
         begin();
         if (!dlssImage(dlssColor_, vf, out->img.width, out->img.height) ||
-            !dlssImage(dlssMotion_, VK_FORMAT_R16G16_SFLOAT, w, h) || !dlssImage(dlssBias_, VK_FORMAT_R8_UNORM, w, h) ||
-            !motionPipeline())
+            !dlssImage(dlssMotion_, VK_FORMAT_R16G16_SFLOAT, w, h) || !motionPipeline())
             return false;
         fullBarrier();
 
@@ -3491,7 +3482,6 @@ void main() {
         rec([c = cmd_, src = out->img.image, dst = dlssColor_.image, copy] {
             vkCmdCopyImage(c, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
         });
-        barrier(); // the motion pass reads it
 
         // Motion vectors from the camera, or none without both frames' cameras or across a cut.
         MotionPush mp{};
@@ -3510,28 +3500,19 @@ void main() {
         mp.size[0] = int32_t(w), mp.size[1] = int32_t(h);
         const VkImageView depthView = view(depth->img, df, VK_IMAGE_VIEW_TYPE_2D, kIdentity, VK_IMAGE_ASPECT_DEPTH_BIT);
         const VkImageView mvView = view(dlssMotion_, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
-        const VkImageView colorView = view(dlssColor_, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
-        // Without a snapshot this frame (no effects drawn) the colour stands in: no bias anywhere.
-        const VkImageView opaqueView = opaqueTaken_ && dlssOpaque_.format == vf && dlssOpaque_.width >= w && dlssOpaque_.height >= h
-                                           ? view(dlssOpaque_, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity)
-                                           : colorView;
-        const VkImageView biasView = view(dlssBias_, VK_FORMAT_R8_UNORM, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
-        rec([this, c = cmd_, mp, depthView, mvView, opaqueView, colorView, biasView] {
-            const VkDescriptorImageInfo di[5] = {{mvSampler_, depthView, VK_IMAGE_LAYOUT_GENERAL},
-                                                 {VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL},
-                                                 {mvSampler_, opaqueView, VK_IMAGE_LAYOUT_GENERAL},
-                                                 {mvSampler_, colorView, VK_IMAGE_LAYOUT_GENERAL},
-                                                 {VK_NULL_HANDLE, biasView, VK_IMAGE_LAYOUT_GENERAL}};
-            VkWriteDescriptorSet wr[5]{};
-            for (uint32_t i = 0; i < 5; ++i) {
+        rec([this, c = cmd_, mp, depthView, mvView] {
+            const VkDescriptorImageInfo di[2] = {{mvSampler_, depthView, VK_IMAGE_LAYOUT_GENERAL},
+                                                 {VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL}};
+            VkWriteDescriptorSet wr[2]{};
+            for (uint32_t i = 0; i < 2; ++i) {
                 wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 wr[i].dstBinding = i;
                 wr[i].descriptorCount = 1;
-                wr[i].descriptorType = i == 1 || i == 4 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                wr[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                 wr[i].pImageInfo = &di[i];
             }
             vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, mvPipe_);
-            vk_.cmdPushDescriptorSet(c, VK_PIPELINE_BIND_POINT_COMPUTE, mvLayout_, 0, 5, wr);
+            vk_.cmdPushDescriptorSet(c, VK_PIPELINE_BIND_POINT_COMPUTE, mvLayout_, 0, 2, wr);
             vkCmdPushConstants(c, mvLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof mp, &mp);
             vkCmdDispatch(c, (uint32_t(mp.size[0]) + 7) / 8, (uint32_t(mp.size[1]) + 7) / 8, 1);
         });
@@ -3543,7 +3524,6 @@ void main() {
         f.color = {dlssColor_.image, view(dlssColor_, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), vf, VK_IMAGE_ASPECT_COLOR_BIT, w, h};
         f.depth = {depth->img.image, depthView, df, VK_IMAGE_ASPECT_DEPTH_BIT, w, h};
         f.motion = {dlssMotion_.image, mvView, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, w, h};
-        f.bias = {dlssBias_.image, biasView, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, w, h};
         f.output = {out->img.image, view(out->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), vf, VK_IMAGE_ASPECT_COLOR_BIT, w, h};
         f.renderW = f.outW = w;
         f.renderH = f.outH = h;
@@ -3569,35 +3549,11 @@ void main() {
         return true;
     }
 
-    // Before the scene's first blended draw that leaves depth alone (particles, auras, glows): the
-    // scene colour as it is, so dlssSmaa can mark where such effects drew. They have no depth or
-    // motion of their own, and DLSS blending them with its history made Ken's blue aura flicker;
-    // there it is told to keep to the current frame.
-    void takeOpaque() {
-        opaqueTaken_ = true;
-        auto it = colors_.find(sceneColor_);
-        if (it == colors_.end()) return;
-        Image& src = it->second.img;
-        if (!ringFits(1 << 16)) flush();
-        begin();
-        if (!dlssImage(dlssOpaque_, src.format, src.width, src.height)) return;
-        fullBarrier();
-        const VkImageCopy copy{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
-                               {src.width, src.height, 1}};
-        rec([c = cmd_, s = src.image, d = dlssOpaque_.image, copy] {
-            vkCmdCopyImage(c, s, VK_IMAGE_LAYOUT_GENERAL, d, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
-        });
-        fullBarrier();
-        fast_.valid = false;
-        ++fastEpoch_;
-    }
-
     // Each frame: whether DLSS runs, the cameras and the next jitter.
     void dlssFrameEnd() {
         prevCam_ = cam_;
         cam_.valid = false;
         smaaSeen_ = false;
-        opaqueTaken_ = false;
         camTries_ = 0;
         dlssRanLast_ = dlssRan_;
         dlssRan_ = false;
@@ -3607,14 +3563,14 @@ void main() {
         if (jitterOn_) dlss::jitter(++jitterIndex_, 1, 1, &jitterX_, &jitterY_);
     }
 
-    bool dlssOn_ = false, smaaSeen_ = false, opaqueTaken_ = false, dlssRan_ = false, dlssRanLast_ = false, jitterOn_ = false, camWarned_ = false;
-    uint64_t sceneDepth_ = 0, sceneColor_ = 0, jitterIndex_ = 0;
+    bool dlssOn_ = false, smaaSeen_ = false, dlssRan_ = false, dlssRanLast_ = false, jitterOn_ = false, camWarned_ = false;
+    uint64_t sceneDepth_ = 0, jitterIndex_ = 0;
     uint32_t camTries_ = 0, dlssStats_[4] = {};
     float jitterX_ = 0, jitterY_ = 0;
     // LPN_DLSS_JITTER_SIGN=<x>,<y> (each 1 or -1): flips the jitter DLSS is told (debugging).
     float jitterSign_[2] = {1, 1};
     Camera cam_, prevCam_;
-    Image dlssColor_, dlssMotion_, dlssBias_, dlssOpaque_;
+    Image dlssColor_, dlssMotion_;
     VkPipeline mvPipe_ = VK_NULL_HANDLE;
     VkPipelineLayout mvLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout mvSetLayout_ = VK_NULL_HANDLE;
@@ -4619,9 +4575,6 @@ void main() {
             (r.ctx[reg::kPaClVteCntl] & 0xF))
             captureCamera(vs, r);
         const bool jitter = scene && jitterOn_;
-        if (scene && !opaqueTaken_ && colorCount && (uint64_t(r.ctx[reg::kCbColorBase]) << 8) == sceneColor_ &&
-            ((r.ctx[reg::kCbBlendControl] >> 30) & 1) && !((depthControl >> 2) & 1))
-            takeOpaque();
         // A draw writing only depth into the open pass's depth buffer joins that pass, its color
         // targets attached but not written. Outside the city gate the game interleaves depth-only
         // draws with color ones on the same depth buffer: each switch was a new pass and barrier,

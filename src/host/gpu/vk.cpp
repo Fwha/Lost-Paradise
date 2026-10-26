@@ -146,8 +146,6 @@ bool Vk::init(std::string* error) {
     f.vertexPipelineStoresAndAtomics = h.vertexPipelineStoresAndAtomics;
     f.shaderStorageImageWriteWithoutFormat = h.shaderStorageImageWriteWithoutFormat;
     f.shaderStorageImageReadWithoutFormat = h.shaderStorageImageReadWithoutFormat;
-    // r8, rg16f storage images (the DLSS motion pass).
-    f.shaderStorageImageExtendedFormats = h.shaderStorageImageExtendedFormats;
     f.shaderInt64 = h.shaderInt64;
     f.depthClamp = h.depthClamp;
     f.fillModeNonSolid = h.fillModeNonSolid;

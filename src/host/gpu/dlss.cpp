@@ -213,8 +213,6 @@ bool evaluate(VkCommandBuffer cmd, VkDevice device, const Frame& f) {
     e.Feature.pInOutput = &output;
     e.pInDepth = &depth;
     e.pInMotionVectors = &motion;
-    NVSDK_NGX_Resource_VK bias = resource(f.bias, false);
-    if (f.bias.image) e.pInBiasCurrentColorMask = &bias;
     e.InJitterOffsetX = f.jitterX;
     e.InJitterOffsetY = f.jitterY;
     e.InRenderSubrectDimensions = {f.renderW, f.renderH};
