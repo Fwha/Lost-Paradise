@@ -4197,6 +4197,7 @@ void main() {
         struct Diff {
             int why = 0;
             uint32_t moved = 0, images = 0;
+            int8_t data = -1; // 1: its draw data is the previous draw's but for resource words, 0: it is not
         } vsDiff, psDiff;
         bool diffPrev = false;
         // Its buffers' bindings, resolved on the worker (resolveAhead) at bufferEpoch_ resEpoch.
@@ -4306,8 +4307,13 @@ void main() {
                 a.psm != p.psm)
                 continue;
             a.vsDiff.why = compareResources(a.vs, p.vs, a.vsDiff.moved, &a.vsDiff.images);
-            if (a.psm) a.psDiff.why = compareResources(a.ps, p.ps, a.psDiff.moved, &a.psDiff.images);
-            else a.psDiff = {-1, 0, 0};
+            a.vsDiff.data = a.vsDiff.why < 0 ? int8_t(dataAlike(a.vs, p.vs)) : -1;
+            if (a.psm) {
+                a.psDiff.why = compareResources(a.ps, p.ps, a.psDiff.moved, &a.psDiff.images);
+                a.psDiff.data = a.psDiff.why < 0 ? int8_t(dataAlike(a.ps, p.ps)) : -1;
+            } else {
+                a.psDiff = {-1, 0, 0, 1};
+            }
             a.diffPrev = true;
         }
         if (resolveAhead_)
@@ -5368,8 +5374,10 @@ void main() {
         }
         uint32_t vsMoved = 0, psMoved = 0, vsImages = 0, psImages = 0;
         int why;
+        int vsAlike = -1, psAlike = -1; // see DrawAnalysis::Diff::data
         if (a.diffPrev && prevSeq_ + 1 == a.seq) { // prevDraw_'s resources are the previous draw's
             ++prof_.diffsTaken;
+            vsAlike = a.vsDiff.data, psAlike = a.psDiff.data;
             why = a.vsDiff.why;
             if (why < 0 && a.psm) why = a.psDiff.why;
             if (why < 0) {
@@ -5435,9 +5443,10 @@ void main() {
         if (a.psm) rebind(a.ps, prevDraw_->ps, psMoved, kPsBindingBase);
         rebindImages(a.vs, prevDraw_->vs, vsImages, vsImg, 0, fast_);
         if (a.psm) rebindImages(a.ps, prevDraw_->ps, psImages, psImg, kPsBindingBase, fast_);
-        auto data = [&](const gcn::Program& p, gcn::Program& bound, uint32_t base) {
+        auto data = [&](const gcn::Program& p, gcn::Program& bound, uint32_t base, int alike, bool rebound) {
             const VkDeviceSize bytes = p.data.size() * 4;
-            if (!std::memcmp(p.data.data(), bound.data.data(), bytes)) return;
+            if (alike == 1 && !rebound) return; // the worker found it the same
+            if (alike != 0 && !std::memcmp(p.data.data(), bound.data.data(), bytes)) return;
             const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
             std::memcpy(static_cast<uint8_t*>(ringPtr_) + at, p.data.data(), bytes);
             bufs.push_back({ring_, at, bytes});
@@ -5445,8 +5454,8 @@ void main() {
             writes.back().dstBinding = base;
             std::memcpy(bound.data.data(), p.data.data(), bytes);
         };
-        data(a.vs, prevDraw_->vs, 0);
-        if (a.psm) data(a.ps, prevDraw_->ps, kPsBindingBase);
+        data(a.vs, prevDraw_->vs, 0, vsAlike, vsMoved || vsImages);
+        if (a.psm) data(a.ps, prevDraw_->ps, kPsBindingBase, psAlike, psMoved || psImages);
         if (!writes.empty()) pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, f.layout, writes, bufs, imgs);
         if (d.kind == DrawCall::kIndexed) {
             const VkIndexType it = r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
@@ -5535,6 +5544,24 @@ void main() {
             }
         }
         return -1;
+    }
+    // Whether cur's draw data is prev's (both as analysed, same layout) but for the words resolution
+    // fills in: then, filled from prev, it is what prev bound (fastDraw need not compare them). On a
+    // worker: comparing on the recorder was ~6% of it, the data written on another core.
+    static bool dataAlike(const gcn::Program& cur, const gcn::Program& prev) {
+        const size_t n = cur.data.size();
+        if (n != prev.data.size() || n < gcn::data::kSmrd) return false;
+        thread_local std::vector<uint8_t> skip;
+        skip.assign(n, 0);
+        std::fill_n(&skip[gcn::data::kPosTransform], 4, 1);
+        for (const auto& b : cur.buffers)
+            if (b.data + 4 <= n) std::fill_n(&skip[b.data], 4, 1);
+        for (const auto& im : cur.images)
+            if (im.data + 2 <= n) std::fill_n(&skip[im.data], 2, 1);
+        const uint32_t *x = cur.data.data(), *y = prev.data.data();
+        for (size_t i = 0; i < n; ++i)
+            if (x[i] != y[i] && !skip[i]) return false;
+        return true;
     }
     // sameButUserData's fill: the words resolution put in prev's data, for the resources that stay.
     static void fillFromPrev(gcn::Program& cur, const gcn::Program& prev, uint32_t moved, uint32_t images) {
