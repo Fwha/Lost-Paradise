@@ -247,6 +247,31 @@ int main() {
         ++failures;
     }
 
+    // A pixel shader with a loop (a backward branch on a vector compare) and an early exit out
+    // of it: blocks in address order with a `for` around the loop, no loop over a switch.
+    const std::vector<uint32_t> loop = {
+        0x7e000280, // v_mov_b32 v0, 0
+        0x060000f2, // v_add_f32 v0, 1.0, v0
+        0x7c0800f6, // v_cmp_gt_f32 vcc, 4.0, v0
+        0xbf860002, // s_cbranch_vccz 0x18 (out, past the loop)
+        0xbf87fffc, // s_cbranch_vccnz 0x4 (back to the add)
+        0xbf810000, // s_endpgm
+        0x7e000280, // v_mov_b32 v0, 0
+        0xbf810000, // s_endpgm
+    };
+    gcn::LaunchState loopL = l;
+    auto readLoop = [&](uint64_t addr, void* dst, size_t size) {
+        if (addr < loopL.entry || addr + size > loopL.entry + loop.size() * 4) return false;
+        std::memcpy(dst, reinterpret_cast<const char*>(loop.data()) + (addr - loopL.entry), size);
+        return true;
+    };
+    const gcn::Translation lt = gcn::translate(gcn::analyze(loopL, readLoop), 0);
+    if (lt.glsl.find("switch (pc)") != std::string::npos || lt.glsl.find("continue;") == std::string::npos ||
+        gcn::compileGlsl(lt.glsl, gcn::GlslStage::Fragment, &error).empty()) {
+        std::fprintf(stderr, "structured loop:\n%s\n%s\n", error.c_str(), lt.glsl.c_str());
+        ++failures;
+    }
+
     if (failures) std::fprintf(stderr, "%d failure(s)\n", failures);
     return failures ? 1 : 0;
 }
