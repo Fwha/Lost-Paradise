@@ -34,6 +34,13 @@ void dlssChoose(int i) {
     saveDisplaySettings();
 }
 
+std::vector<std::string> shadowChoices() { return {"Every Frame", "Every Other Frame"}; }
+int shadowValue() { return displaySettings().halfRateShadows ? 1 : 0; }
+void shadowChoose(int i) {
+    displaySettings().halfRateShadows = i == 1;
+    saveDisplaySettings();
+}
+
 } // namespace
 
 const std::vector<PcSetting>& pcSettings() {
@@ -46,6 +53,10 @@ const std::vector<PcSetting>& pcSettings() {
         {"DLSS",
          "NVIDIA DLAA: DLSS anti-aliasing in place of the game's. Needs an RTX card; Off on other GPUs.",
          &dlssChoices, &dlssValue, &dlssChoose},
+        {"Distant Shadows",
+         "How often the large shadow maps for far scenery are redrawn. Every other frame saves CPU time in "
+         "busy areas; distant shadows can trail a frame behind when the camera moves.",
+         &shadowChoices, &shadowValue, &shadowChoose},
         display<4>("Exit Game", "Close the game. Progress since your last save is lost."),
     };
     return settings;

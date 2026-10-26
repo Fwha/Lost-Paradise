@@ -22,6 +22,9 @@ struct DisplaySettings {
     int fps = 30;
     bool fpsCounter = false; // frames shown a second, in the top right corner
     DlssMode dlss = DlssMode::Off;
+    // Large shadow maps (hundreds of draws, used once a frame) are drawn every other frame and
+    // kept in between (gpu/renderer.cpp, throttleShadows).
+    bool halfRateShadows = false;
 };
 
 DisplaySettings& displaySettings();

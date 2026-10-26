@@ -541,7 +541,7 @@ struct Profiler {
     uint64_t switchMiss[6] = {}; // other shaders not switched to: no slot, slot stale, state, sampled, resources, index
     uint64_t depthJoins = 0, depthOnly = 0; // depth-only draws that joined the open pass, of all depth-only ones
     std::unordered_map<uint32_t, uint64_t> fastCtx; // the context registers that differed
-    uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0;
+    uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0, shadowSkips = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -745,6 +745,8 @@ public:
         a->vsm = a->psm = nullptr;
         a->vsc = a->psc = nullptr;
         a->diffPrev = false;
+        a->throttleDepth = 0;
+        a->skip = false;
         a->seq = ++analysisSeq_;
         // Most draws keep the last one's context registers: a compare here, a hash only on a change.
         if (std::memcmp(r.ctx, lastCtx_, sizeof lastCtx_) != 0) {
@@ -756,11 +758,65 @@ public:
         DrawJob& j = pending_.back();
         j.out = a;
         j.kind = DrawJob::kNone;
-        if (d.kind == DrawCall::kDispatch) prepareDispatch(r, j);
+        if (d.kind != DrawCall::kDispatch) throttleShadows(r, a->throttleDepth, a->skip);
+        if (a->skip) {} // nothing to analyse
+        else if (d.kind == DrawCall::kDispatch) prepareDispatch(r, j);
         else if (!computeOnly_ && (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed)) prepareDraw(r, j);
         if (pending_.size() >= kAnalysisBatch) submitBatch();
     }
     void onAnalyzeFlush() override { submitBatch(); }
+
+    // "Distant Shadows: Every Other Frame" (displaySettings().halfRateShadows). A depth buffer
+    // only ever drawn without color targets, in one run of 300 draws or more a frame, three
+    // frames in a row (the far shadow maps: 1,600 of the 9,800 draws overlooking the city) is
+    // skipped on odd frames: its draws are neither analysed nor recorded, and the game's fast
+    // clear of it before them is dropped (deferredClear_), so the frame samples the previous
+    // frame's map. A second run into it in a frame is drawn as usual and stops the skipping.
+    struct ShadowUse {
+        uint32_t draws = 0, runs = 0, stable = 0;
+        bool scene = false; // also drawn with color targets this frame
+    };
+    std::unordered_map<uint64_t, ShadowUse> shadowUses_; // the analysis thread's
+    uint64_t runDepth_ = 0, shadowFrame_ = 0;
+    ShadowUse* run_ = nullptr;
+    bool runSkip_ = false;
+    void throttleShadows(const GpuRegs& r, uint64_t& throttleDepth, bool& skip) {
+        uint64_t depth = 0;
+        if ((r.ctx[reg::kDbZInfo] & 3) && ((r.ctx[reg::kCbColorControl] >> 4) & 7) <= 1) {
+            depth = uint64_t(r.ctx[reg::kDbZReadBase]) << 8;
+            const uint32_t targetMask = r.ctx[reg::kCbTargetMask] & r.ctx[reg::kCbShaderMask];
+            for (uint32_t i = 0; i < 8; ++i) {
+                const uint32_t info = r.ctx[reg::kCbColorBase + i * reg::kCbColorStride + ::gpu::ctx::kCbColorInfo];
+                if (((info >> 2) & 0x1F) && ((targetMask >> (i * 4)) & 0xF)) { // draws color too: a scene's depth
+                    shadowUses_[depth].scene = true;
+                    depth = 0;
+                    break;
+                }
+            }
+            if (depth && !((r.ctx[reg::kDbDepthControl] >> 2) & 1)) depth = 0; // writes no depth
+        }
+        if (depth != runDepth_) { // a run of draws into another depth buffer, or none
+            runDepth_ = depth;
+            run_ = depth ? &shadowUses_[depth] : nullptr;
+            // Tagged (throttleDepth) a frame before the first skip, so the recorder defers its clear.
+            runSkip_ = run_ && displaySettings().halfRateShadows && run_->stable >= 3 && run_->runs == 0 && (shadowFrame_ & 1);
+            if (run_) ++run_->runs;
+        }
+        if (!run_) return;
+        ++run_->draws;
+        if (run_->stable >= 2) throttleDepth = depth;
+        skip = runSkip_;
+    }
+    void endShadowFrame() {
+        for (auto it = shadowUses_.begin(); it != shadowUses_.end();) {
+            ShadowUse& u = it->second;
+            u.stable = u.runs == 1 && u.draws >= 300 && !u.scene ? u.stable + 1 : 0;
+            if (!u.runs && !u.scene) it = shadowUses_.erase(it);
+            else u.draws = u.runs = 0, u.scene = false, ++it;
+        }
+        runDepth_ = 0, run_ = nullptr, runSkip_ = false;
+        ++shadowFrame_;
+    }
     uint64_t analysisSeq_ = 0, lastCtxHash_ = 0; // the analysis thread's
     uint32_t lastCtx_[::gpu::kContextRegs] = {};
 
@@ -796,6 +852,7 @@ public:
         ++submit_;
     }
     void onAnalyzeFrameEnd() override {
+        endShadowFrame();
         analysisBarrier();
         ++submit_;
         for (auto& c : actx_) {
@@ -874,6 +931,15 @@ public:
         } recycle{*this, a};
         std::lock_guard lock(m_);
         ProfScope ps(prof_, kProfRenderer);
+        if (deferredClear_) { // dropped when the draws it clears for are skipped
+            const uint64_t meta = std::exchange(deferredClear_, 0);
+            if (!(a.skip && a.throttleDepth == metadata_[meta].surface)) clearSurface(metadata_[meta]);
+        }
+        if (a.throttleDepth) throttled_.insert(a.throttleDepth);
+        if (a.skip) {
+            ++prof_.shadowSkips;
+            return;
+        }
         ++prof_.calls;
         ++drawIndex_;
         trace_ = frame_ == traceFrame_;
@@ -983,6 +1049,7 @@ public:
 
     void onFrameEnd() override {
         std::lock_guard lock(m_);
+        if (deferredClear_) clearSurface(metadata_[std::exchange(deferredClear_, 0)]);
         {
             ProfScope ps(prof_, kProfRenderer);
             flush();
@@ -1139,8 +1206,8 @@ public:
         std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / n, prof_.dmas / n,
                      prof_.dmaBytes / n / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
-        std::fprintf(stderr, " (ms/frame); %.0f draws (%.0f fast), %.0f analysis hits (%.0f repeats), %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " blended draws skipped for one; VRAM buffers %.0f MB, %.1f copies (%.2f MB) per frame\n",
-                     prof_.calls / n, prof_.fastDraws / n, prof_.analysisHits / n, prof_.repeats / n, prof_.analyses / n, prof_.texChecks / n, prof_.texUploads / n, prof_.texBytes / n / 1e6, prof_.flushes / n, prof_.passes / n,
+        std::fprintf(stderr, " (ms/frame); %.0f draws (%.0f fast, %.0f shadow draws skipped), %.0f analysis hits (%.0f repeats), %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " blended draws skipped for one; VRAM buffers %.0f MB, %.1f copies (%.2f MB) per frame\n",
+                     prof_.calls / n, prof_.fastDraws / n, prof_.shadowSkips / n, prof_.analysisHits / n, prof_.repeats / n, prof_.analyses / n, prof_.texChecks / n, prof_.texUploads / n, prof_.texBytes / n / 1e6, prof_.flushes / n, prof_.passes / n,
                      prof_.barriers / n, prof_.pipelinesMade, prof_.pipelineWaits, vramBytes_ / 1e6, prof_.vramCopies / n,
                      prof_.vramCopyBytes / n / 1e6);
         std::fprintf(stderr, "[prof] t=%.1f launches not repeating the last: other shader %.0f, new submission %.0f, user data %.0f, other %.0f per frame; user data words differing:",
@@ -3921,6 +3988,10 @@ void main() {
             uint32_t moved = 0, images = 0;
         } vsDiff, psDiff;
         bool diffPrev = false;
+        // throttleShadows: the depth buffer of a large shadow map this draws into, and whether
+        // this frame skips it (kept from the frame before).
+        uint64_t throttleDepth = 0;
+        bool skip = false;
     };
     // A draw's launches as the registers give them, for a worker to analyse.
     struct DrawJob {
@@ -4347,7 +4418,16 @@ void main() {
         // the last fill wrote, as nothing else writes metadata here.
         uint32_t word = 0;
         if (readGuest(meta, &word, 4) && (word & 0xF)) return;
-        const Metadata& m = it->second;
+        if (it->second.depth && throttled_.count(it->second.surface)) { // see throttleShadows
+            if (deferredClear_) clearSurface(metadata_[deferredClear_]);
+            deferredClear_ = meta;
+            return;
+        }
+        clearSurface(it->second);
+    }
+    uint64_t deferredClear_ = 0;             // the metadata of a large shadow map's fast clear, until the next draw
+    std::unordered_set<uint64_t> throttled_; // large shadow maps' depth buffers (throttleShadows)
+    void clearSurface(const Metadata& m) {
         auto& surfaces = m.depth ? depths_ : colors_;
         auto s = surfaces.find(m.surface);
         if (s == surfaces.end()) return;

@@ -62,6 +62,8 @@ void loadDisplaySettings() {
             else if (fps >= 10 && fps <= 240) gSettings.fps = fps;
         } else if (!std::strcmp(key, "fps_counter")) {
             gSettings.fpsCounter = !std::strcmp(value, "on");
+        } else if (!std::strcmp(key, "distant_shadows")) {
+            gSettings.halfRateShadows = !std::strcmp(value, "half");
         } else if (!std::strcmp(key, "dlss")) {
             for (int i = 0; i < kDlssModes; ++i)
                 if (!std::strcmp(value, kDlssKeys[i])) gSettings.dlss = DlssMode(i);
@@ -83,6 +85,7 @@ void saveDisplaySettings() {
     else std::fprintf(f, "fps = uncapped\n");
     std::fprintf(f, "fps_counter = %s\n", gSettings.fpsCounter ? "on" : "off");
     std::fprintf(f, "dlss = %s\n", kDlssKeys[int(gSettings.dlss)]);
+    std::fprintf(f, "distant_shadows = %s\n", gSettings.halfRateShadows ? "half" : "full");
     std::fclose(f);
 }
 
