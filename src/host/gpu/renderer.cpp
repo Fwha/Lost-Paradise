@@ -854,7 +854,8 @@ public:
         for (size_t o = 0; o < std::min<size_t>(bytes, 1024); o += 64) __builtin_prefetch(c + o);
     }
     // Only the lines a draw reads: prefetching whole analyses and draw data (~400 lines a draw)
-    // filled the core's miss buffers and stalled on the prefetches themselves.
+    // filled the core's miss buffers and stalled on the prefetches themselves. Buffers resolved
+    // ahead (resolveAhead) need no lookups here.
     void prefetchAhead() {
         const size_t n = taken_.size();
         if (takenNext_ + 6 < n) // the programs' resource list headers
@@ -862,26 +863,20 @@ public:
                 __builtin_prefetch(&p->buffers);
                 __builtin_prefetch(&p->images);
             }
-        if (takenNext_ + 3 < n) // the resource lists themselves
-            for (const gcn::Program* p : {&taken_[takenNext_ + 3]->vs, &taken_[takenNext_ + 3]->ps}) {
+        if (takenNext_ + 3 < n) { // the resource lists themselves, and their bindings resolved ahead
+            const DrawAnalysis& x = *taken_[takenNext_ + 3];
+            for (const gcn::Program* p : {&x.vs, &x.ps}) {
                 prefetchRange(p->buffers.data(), p->buffers.size() * sizeof(gcn::BufferResource));
                 prefetchRange(p->images.data(), p->images.size() * sizeof(gcn::ImageResource));
             }
-        if (takenNext_ + 2 < n) // the VRAM hit slots for its buffers
-            for (const gcn::Program* p : {&taken_[takenNext_ + 2]->vs, &taken_[takenNext_ + 2]->ps})
-                for (const gcn::BufferResource& b : p->buffers)
-                    if (b.known) __builtin_prefetch(&vramHits_[vramHitIndex(b.base(), bindSize(b))]);
-        if (takenNext_ + 1 < n) // the entries those slots and the image memo point at
-            for (const gcn::Program* p : {&taken_[takenNext_ + 1]->vs, &taken_[takenNext_ + 1]->ps}) {
-                for (const gcn::BufferResource& b : p->buffers) {
-                    if (!b.known) continue;
-                    const uint64_t base = b.base(), size = bindSize(b);
-                    const VramHit& h = vramHits_[vramHitIndex(base, size)];
-                    if (h.v && h.base == base && h.size == size) prefetchRange(h.v, sizeof(VramBuffer));
-                    if (const Import* im = importHits_[(base / kImportGranule) % kImportHits]) __builtin_prefetch(im);
-                }
+            prefetchRange(x.vsRes.data(), x.vsRes.size() * sizeof(BufRes));
+            prefetchRange(x.psRes.data(), x.psRes.size() * sizeof(BufRes));
+        }
+        if (takenNext_ + 1 < n) { // the image memo entries for its images
+            const DrawAnalysis& x = *taken_[takenNext_ + 1];
+            for (const gcn::Program* p : {&x.vs, &x.ps})
                 for (const gcn::ImageResource& t : p->images) prefetchRange(&imageMemos_[imageMemoSet(t)], 2 * sizeof(ImageMemo));
-            }
+        }
     }
 
     void onDraw(const DrawCall& d, const GpuRegs& r) override {
