@@ -51,23 +51,35 @@ public:
         const Stage stage = p_.launch.stage;
         exec_ = p_.writesExec;
         prologue();
-        if (p_.controlFlow) {
-            out("for (uint guard = 0u; guard < 100000u; ++guard) {\nswitch (pc) {\n");
-        }
+        linear_ = p_.controlFlow && structured();
+        if (linear_) out("{\n");
+        else if (p_.controlFlow) out("for (uint guard = 0u; guard < 100000u; ++guard) {\nswitch (pc) {\n");
         uint64_t expect = p_.launch.entry;
         bool first = true;
         for (const auto& [pc, in] : p_.code) {
-            if (!first && pc != expect) out("return;\n");
+            if (!first && pc != expect && !jumped_) out("return;\n");
             first = false;
-            if (p_.controlFlow && p_.labels.count(pc)) out("case " + label(pc) + ":\n");
+            if (linear_ && (jumped_ || p_.labels.count(pc))) { // a new block, reached with pc set to it
+                if (!jumped_) out("pc = " + label(pc) + ";\n");
+                out("}\n");
+                for (auto l = loops_.lower_bound({pc, ~0ull}); l != loops_.end() && l->first == pc; ++l) // outermost first
+                    out(fmt("for (uint guard%u = 0u; guard%u < 100000u; ++guard%u) {\n", loopVars_, loopVars_, loopVars_)), ++loopVars_;
+                out("if (pc == " + label(pc) + ") {\n");
+                jumped_ = false;
+            } else if (p_.controlFlow && !linear_ && p_.labels.count(pc)) {
+                out("case " + label(pc) + ":\n");
+            }
             pc_ = pc;
             next_ = pc + in.size;
             probe(pc);
             instruction(in);
             expect = next_;
+            for (const auto& [head, end] : loops_) // the loop's last block: back to its head, or out
+                if (end == pc) out("}\nif (pc == " + label(head) + ") continue;\nbreak;\n}\n{\n");
         }
         out("return;\n");
-        if (p_.controlFlow) out("default: return;\n}\n}\n");
+        if (linear_) out("}\n");
+        else if (p_.controlFlow) out("default: return;\n}\n}\n");
 
         // Assemble the module.
         std::string g = "#version 450\n";
@@ -405,8 +417,34 @@ vec3 cubeDir(vec3 c) {
             return hex(uint32_t(a)).substr(0, 10) + "u"; // outside them all: as is
         return hex(uint32_t(best << 24 | (a - regions_[best]))).substr(0, 10) + "u";
     }
+    // Programs without calls whose backward branches nest (most pixel shaders) run without the
+    // loop over a switch: each block is an `if (pc == <block>)` in address order, a branch sets
+    // pc to its target or the next block, and each backward branch closes a `for` around the
+    // blocks from its target to it. Drivers optimise that far better (a 49-tap blur took 2.6 ms
+    // at 1440p). LPN_SHADER_LOOP=1 keeps every program in the loop over a switch.
+    bool structured() {
+        static const bool off = std::getenv("LPN_SHADER_LOOP") && std::atoi(std::getenv("LPN_SHADER_LOOP"));
+        if (off || !p_.calls.empty()) return false;
+        loops_.clear();
+        for (const auto& [pc, in] : p_.code) {
+            if (in.format == Format::SOP1 && (in.op == 32 || in.op == 33)) return false; // s_setpc, s_swappc
+            if (in.format != Format::SOPP || !(in.op == 2 || (in.op >= 4 && in.op <= 9))) continue;
+            const uint64_t target = pc + 4 + int64_t(int16_t(in.words[0] & 0xFFFF)) * 4;
+            if (target <= pc && p_.labels.count(target)) loops_.insert({target, pc});
+        }
+        for (auto a = loops_.begin(); a != loops_.end(); ++a) // each pair nested or apart
+            for (auto b = std::next(a); b != loops_.end(); ++b)
+                if (b->first <= a->second && b->second > a->second) return false;
+        return true;
+    }
+
     void jump(const std::string& cond, uint64_t target) {
         if (!p_.labels.count(target)) return; // the analysis proved this branch is never taken
+        if (linear_) {
+            out("pc = " + (cond.empty() ? label(target) : "(" + cond + ") ? " + label(target) + " : " + label(next_)) + ";\n");
+            jumped_ = true;
+            return;
+        }
         if (cond.empty()) out("pc = " + label(target) + "; break;\n");
         else out("if (" + cond + ") { pc = " + label(target) + "; break; }\n");
     }
@@ -1304,6 +1342,14 @@ vec3 cubeDir(vec3 c) {
     uint64_t pc_ = 0, next_ = 0;
     uint32_t literal_ = 0;
     bool exec_ = false;
+    bool linear_ = false, jumped_ = false; // see structured
+    struct LoopOrder { // by head, then outermost first
+        bool operator()(const std::pair<uint64_t, uint64_t>& a, const std::pair<uint64_t, uint64_t>& b) const {
+            return a.first != b.first ? a.first < b.first : a.second > b.second;
+        }
+    };
+    std::set<std::pair<uint64_t, uint64_t>, LoopOrder> loops_; // (head, its backward branch)
+    uint32_t loopVars_ = 0;
     bool needLane_ = false, need64_ = false, needQuad_ = false, depthDeclared_ = false;
 };
 

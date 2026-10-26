@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <type_traits>
 
 namespace gcn {
 
@@ -695,6 +696,103 @@ std::string Program::key() const {
         put(shape, sizeof(shape));
     }
     return k;
+}
+
+
+namespace {
+constexpr uint32_t kSerialVersion = 1;
+template <class T> void putPod(std::string& s, const T& v) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    s.append(reinterpret_cast<const char*>(&v), sizeof v);
+}
+struct Reader {
+    const std::string& s;
+    size_t at = 0;
+    template <class T> bool get(T& v) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        if (s.size() - at < sizeof v) return false;
+        std::memcpy(&v, s.data() + at, sizeof v);
+        at += sizeof v;
+        return true;
+    }
+    bool count(uint32_t& n) { return get(n) && n <= (s.size() - at); } // each element is at least a byte
+};
+} // namespace
+
+std::string serialize(const Program& p) {
+    std::string s;
+    const uint32_t sizes[] = {kSerialVersion, uint32_t(sizeof(LaunchState)), uint32_t(sizeof(Instruction)),
+                              uint32_t(sizeof(BufferResource)), uint32_t(sizeof(ImageResource))};
+    putPod(s, sizes);
+    putPod(s, p.launch);
+    putPod(s, uint8_t(p.controlFlow | p.writesExec << 1));
+    putPod(s, uint32_t(p.code.size()));
+    for (const auto& [pc, in] : p.code) putPod(s, pc), putPod(s, in);
+    putPod(s, uint32_t(p.labels.size()));
+    for (uint64_t l : p.labels) putPod(s, l);
+    putPod(s, uint32_t(p.calls.size()));
+    for (const auto& [site, callee] : p.calls) putPod(s, site), putPod(s, callee);
+    putPod(s, uint32_t(p.smrd.size()));
+    for (const auto& [pc, slot] : p.smrd) putPod(s, pc), putPod(s, slot);
+    putPod(s, uint32_t(p.data.size()));
+    for (uint32_t d : p.data) putPod(s, d);
+    putPod(s, uint32_t(p.buffers.size()));
+    for (const auto& b : p.buffers) putPod(s, b);
+    putPod(s, uint32_t(p.images.size()));
+    for (const auto& i : p.images) putPod(s, i);
+    return s;
+}
+
+bool deserialize(const std::string& bytes, Program& p) {
+    p = Program{};
+    Reader r{bytes};
+    uint32_t sizes[5];
+    if (!r.get(sizes) || sizes[0] != kSerialVersion || sizes[1] != sizeof(LaunchState) || sizes[2] != sizeof(Instruction) ||
+        sizes[3] != sizeof(BufferResource) || sizes[4] != sizeof(ImageResource))
+        return false;
+    uint8_t flags;
+    uint32_t n;
+    if (!r.get(p.launch) || !r.get(flags)) return false;
+    p.controlFlow = flags & 1, p.writesExec = flags & 2;
+    if (!r.count(n)) return false;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint64_t pc;
+        Instruction in;
+        if (!r.get(pc) || !r.get(in)) return false;
+        p.code.emplace(pc, in);
+    }
+    if (!r.count(n)) return false;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint64_t l;
+        if (!r.get(l)) return false;
+        p.labels.insert(l);
+    }
+    if (!r.count(n)) return false;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint64_t site, callee;
+        if (!r.get(site) || !r.get(callee)) return false;
+        p.calls.emplace(site, callee);
+    }
+    if (!r.count(n)) return false;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint64_t pc;
+        uint32_t slot;
+        if (!r.get(pc) || !r.get(slot)) return false;
+        p.smrd.emplace(pc, slot);
+    }
+    if (!r.count(n)) return false;
+    p.data.resize(n);
+    for (auto& d : p.data)
+        if (!r.get(d)) return false;
+    if (!r.count(n)) return false;
+    p.buffers.resize(n);
+    for (auto& b : p.buffers)
+        if (!r.get(b)) return false;
+    if (!r.count(n)) return false;
+    p.images.resize(n);
+    for (auto& i : p.images)
+        if (!r.get(i)) return false;
+    return r.at == bytes.size();
 }
 
 } // namespace gcn

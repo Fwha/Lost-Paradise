@@ -1910,8 +1910,10 @@ private:
         // Debugging: LPN_DBG_PS=<entry>[,<entry>...] rewrites those pixel shaders' color output to
         // LPN_DBG_OUT (a GLSL vec4 argument list). dbgT<n> holds image n's last sample, and
         // LPN_DBG_CAP="<line text>|<expr>" stores vec4(expr) in dbgC after the first matching line.
+        bool rewritten = false; // by a debugging option below: not kept for later runs
         if (const char* dp = getenv("LPN_DBG_PS"); dp && *dp && getenv("LPN_DBG_OUT") && stage == gcn::GlslStage::Fragment &&
                                                    std::strstr(dp, hex(p.launch.entry).c_str())) {
+            rewritten = true;
             std::string& g = m->translation.glsl;
             for (int i = 15; i >= 0; --i) {
                 const std::string pat = "vec4 t_ = vec4(texture(img" + std::to_string(i) + ",";
@@ -1937,6 +1939,7 @@ private:
         }
         m->module = module(m->translation.glsl, stage);
         m->name = spirvName(m->translation.glsl, stage);
+        if (m->module && !rewritten) saveSource(m->name, p, bindingBase);
         if (stage == gcn::GlslStage::Fragment) {
             uint8_t code[256];
             if (readGuest(p.launch.entry, code, sizeof code)) m->smaa = smaaRole(fnv(code, sizeof code));
@@ -2093,14 +2096,70 @@ private:
         return words;
     }
     static void saveSpirv(const std::string& path, const std::vector<uint32_t>& words) {
+        saveFile(path, words.data(), words.size() * 4);
+    }
+    static void saveFile(const std::string& path, const void* data, size_t size) {
         if (path.empty()) return;
-        const std::string tmp = path + ".tmp" + std::to_string(getpid());
+        const std::string tmp = path + ".tmp" + std::to_string(getpid()) + "-" +
+                                std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
         FILE* f = std::fopen(tmp.c_str(), "wb");
         if (!f) return;
-        const bool ok = std::fwrite(words.data(), 4, words.size(), f) == words.size();
+        const bool ok = std::fwrite(data, 1, size, f) == size;
         if (std::fclose(f) == 0 && ok) std::rename(tmp.c_str(), path.c_str()); // never a partial file
         else std::remove(tmp.c_str());
     }
+    static std::string loadFile(const std::string& path) {
+        std::string bytes;
+        FILE* f = path.empty() ? nullptr : std::fopen(path.c_str(), "rb");
+        if (!f) return bytes;
+        char buf[65536];
+        for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) bytes.append(buf, n);
+        std::fclose(f);
+        return bytes;
+    }
+
+    // Beside each <name>.spv, <name>.gcn holds the program it was translated from (the binding
+    // base, then gcn::serialize), so the startup builds can translate it again once the
+    // translator has changed and the old SPIR-V names no longer match (see currentShader).
+    void saveSource(const std::string& name, const gcn::Program& p, uint32_t bindingBase) {
+        if (spirvDir_ == "-") return;
+        const std::string path = spirvDir_ + "/" + name + ".gcn";
+        if (access(path.c_str(), F_OK) == 0) return;
+        std::string bytes(reinterpret_cast<const char*>(&bindingBase), 4);
+        bytes += gcn::serialize(p);
+        saveFile(path, bytes.data(), bytes.size());
+    }
+
+    // The name the shader recorded as `name` has with today's translator: translated again from
+    // its .gcn (and its SPIR-V compiled if new), or `name` itself without one. Prebuild thread only.
+    std::unordered_map<std::string, std::string> currentNames_;
+    std::string currentShader(const std::string& name) {
+        if (name.empty() || spirvDir_ == "-") return name;
+        if (auto it = currentNames_.find(name); it != currentNames_.end()) return it->second;
+        std::string& out = currentNames_[name] = name;
+        const std::string bytes = loadFile(spirvDir_ + "/" + name + ".gcn");
+        gcn::Program p;
+        uint32_t bindingBase;
+        if (bytes.size() < 4 || !gcn::deserialize(bytes.substr(4), p)) return out;
+        std::memcpy(&bindingBase, bytes.data(), 4);
+        const gcn::Translation t = gcn::translate(p, bindingBase);
+        const gcn::GlslStage stage = p.launch.stage == gcn::Stage::Pixel     ? gcn::GlslStage::Fragment
+                                     : p.launch.stage == gcn::Stage::Compute ? gcn::GlslStage::Compute
+                                                                             : gcn::GlslStage::Vertex;
+        const std::string now = spirvName(t.glsl, stage);
+        if (now == name) return out;
+        const std::string path = spirvCachePath(t.glsl, stage);
+        if (loadSpirv(path).empty()) {
+            std::string error;
+            const std::vector<uint32_t> spirv = gcn::compileGlsl(t.glsl, stage, &error);
+            if (spirv.empty()) return out;
+            saveSpirv(path, spirv);
+        }
+        if (access((spirvDir_ + "/" + now + ".gcn").c_str(), F_OK) != 0) saveFile(spirvDir_ + "/" + now + ".gcn", bytes.data(), bytes.size());
+        ++retranslated_;
+        return out = now;
+    }
+    size_t retranslated_ = 0;
 
     static std::string hex(uint64_t v) {
         char b[24];
@@ -2533,12 +2592,20 @@ private:
             std::fclose(f);
         }
         std::unordered_set<std::string> seen;
-        size_t queued = 0;
+        size_t queued = 0, renamed = 0;
         for (auto r = records.rbegin(); r != records.rend(); ++r) {
-            if (!seen.insert(*r).second) continue;
             GraphicsState s;
             std::string vsName, psName;
             std::vector<VkDescriptorSetLayoutBinding> bindings;
+            if (parseRecord(*r, s, vsName, psName, bindings)) { // its shaders as translated today
+                const std::string vsNow = currentShader(vsName), psNow = currentShader(psName);
+                if (vsNow != vsName || psNow != psName) {
+                    vsName = vsNow, psName = psNow;
+                    *r = pipelineRecord(s, vsName, psName, bindings);
+                    ++renamed;
+                }
+            }
+            if (!seen.insert(*r).second) continue;
             if (!parseRecord(*r, s, vsName, psName, bindings)) continue;
             notePipeline(s, vsName, psName, false);
             PipelineJob j;
@@ -2566,9 +2633,11 @@ private:
             queueJob(std::move(j), false);
             ++queued;
         }
-        std::fprintf(stderr, "[gpu] building %zu pipelines from earlier runs\n", queued);
-        // Keep the list from growing without bound: rewrite it without duplicates.
-        if (records.size() > seen.size() + 1024) {
+        std::fprintf(stderr, "[gpu] building %zu pipelines from earlier runs (%zu shaders translated again)\n", queued,
+                     retranslated_);
+        // Keep the list from growing without bound, and its shader names current: rewrite it
+        // without duplicates, with today's names.
+        if (records.size() > seen.size() + 1024 || renamed) {
             std::lock_guard lock(listMutex_);
             const std::string tmp = pipelineListPath_ + ".tmp" + std::to_string(getpid());
             if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
