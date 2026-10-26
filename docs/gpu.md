@@ -110,5 +110,8 @@ pixel shaders' code) with DLAA (`gpu/dlss.cpp`, `dlssSmaa` in the renderer):
   camera-relative). Only camera motion: moving characters rely on DLSS.
 - Jitter: every draw with the scene depth bound before SMAA (full-screen lighting passes too, or
   shadows flicker) gets a Halton sub-pixel viewport offset, passed to DLSS as is.
+- Effects: before the scene's first blended draw that writes no depth (particles, auras), the
+  scene colour is copied; where the final colour differs from it, a bias mask tells DLSS to keep
+  to the current frame (Ken's blue aura flickered without it).
 - `[dlss] last 300 frames` lines count history resets; `LPN_DLSS_NO_JITTER=1`,
   `LPN_DLSS_JITTER_SIGN=x,y` for debugging. Upscaling (render the scene smaller) is not done.
