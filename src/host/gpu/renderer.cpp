@@ -858,11 +858,15 @@ public:
     // ahead (resolveAhead) need no lookups here.
     void prefetchAhead() {
         const size_t n = taken_.size();
-        if (takenNext_ + 6 < n) // the programs' resource list headers
-            for (const gcn::Program* p : {&taken_[takenNext_ + 6]->vs, &taken_[takenNext_ + 6]->ps}) {
+        if (takenNext_ + 6 < n) { // the resource list headers
+            const DrawAnalysis& x = *taken_[takenNext_ + 6];
+            for (const gcn::Program* p : {&x.vs, &x.ps}) {
                 __builtin_prefetch(&p->buffers);
                 __builtin_prefetch(&p->images);
             }
+            __builtin_prefetch(&x.vsRes);
+            __builtin_prefetch(&x.psRes);
+        }
         if (takenNext_ + 3 < n) { // the resource lists themselves, and their bindings resolved ahead
             const DrawAnalysis& x = *taken_[takenNext_ + 3];
             for (const gcn::Program* p : {&x.vs, &x.ps}) {
