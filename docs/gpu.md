@@ -109,6 +109,8 @@ pixel shaders' code) with DLAA (`gpu/dlss.cpp`, `dlssSmaa` in the renderer):
   rows at 0x0, view rotation rows at 0x40/0x50/0x60, camera position at 0x220 (positions are
   camera-relative). Only camera motion: moving characters rely on DLSS.
 - Jitter: every draw with the scene depth bound before SMAA (full-screen lighting passes too, or
-  shadows flicker) gets a Halton sub-pixel viewport offset, passed to DLSS as is.
+  shadows flicker) gets a Halton sub-pixel viewport offset, passed to DLSS as is. So do 3D draws
+  after SMAA that depth-test against it (Ken's aura redraws his body additively; unjittered it
+  passed or failed its depth test by frame and flickered).
 - `[dlss] last 300 frames` lines count history resets; `LPN_DLSS_NO_JITTER=1`,
   `LPN_DLSS_JITTER_SIGN=x,y` for debugging. Upscaling (render the scene smaller) is not done.
