@@ -736,9 +736,9 @@ public:
                 analyses_.push_back(std::move(spareAnalyses_.back()));
                 spareAnalyses_.pop_back();
             } else {
-                analyses_.emplace_back();
+                analyses_.push_back(std::make_unique<DrawAnalysis>());
             }
-            a = &analyses_.back(); // stays put while later ones are added (a deque)
+            a = analyses_.back().get();
             a->ready = false;
         }
         a->ok = a->repeat = false;
@@ -847,19 +847,22 @@ public:
                 warnOnce("a draw arrived without its analysis");
                 return;
             }
-            if (!analyses_.front().ready) {
+            if (!analyses_.front()->ready) {
                 ProfScope pw(prof_, kProfAnalysisWait);
-                analysesCv_.wait(lock, [&] { return analyses_.front().ready; });
+                analysesCv_.wait(lock, [&] { return analyses_.front()->ready; });
             }
             do {
                 taken_.push_back(std::move(analyses_.front()));
                 analyses_.pop_front();
-            } while (taken_.size() < kTakeRun && !analyses_.empty() && analyses_.front().ready);
+            } while (taken_.size() < kTakeRun && !analyses_.empty() && analyses_.front()->ready);
         }
-        DrawAnalysis& a = taken_[takenNext_++];
+        // Analyses move by pointer: moved by value (two Programs each), handing them along was
+        // ~10% of the recorder at 8,000 draws a frame.
+        std::unique_ptr<DrawAnalysis>& held = taken_[takenNext_++];
+        DrawAnalysis& a = *held;
         struct Recycle { // hands `a` back to the analysis thread however the draw ends
             Renderer& r;
-            DrawAnalysis& a;
+            std::unique_ptr<DrawAnalysis>& a;
             ~Recycle() {
                 r.returned_.push_back(std::move(a));
                 if (r.returned_.size() < kTakeRun) return;
@@ -867,11 +870,11 @@ public:
                 // As many as can be in flight: analysis runs up to a frame ahead, and at ~6,000
                 // draws a frame a smaller pool left most draws allocating a fresh one (12% of the
                 // analysis thread in malloc) and the recorder freeing it (6% in ~Program).
-                for (DrawAnalysis& x : r.returned_)
+                for (auto& x : r.returned_)
                     if (r.spareAnalyses_.size() < 16384) r.spareAnalyses_.push_back(std::move(x));
                 r.returned_.clear();
             }
-        } recycle{*this, a};
+        } recycle{*this, held};
         std::lock_guard lock(m_);
         ProfScope ps(prof_, kProfRenderer);
         ++prof_.calls;
@@ -891,7 +894,7 @@ public:
         prevSeq_ = keepDraw_ || recordedSeq_ == a.seq ? a.seq : 0;
         if (keepDraw_) { // the next draw may repeat this one (see fastDraw)
             keepDraw_ = false;
-            std::swap(a, prevDraw_);
+            std::swap(held, prevDraw_);
         }
         if (frame_ == timingFrame_ && timing_ && recording_ && timingMeta_.size() + 1 < kTimingQueries) {
             rec([c = cmd_, q = timing_, i = uint32_t(timingMeta_.size() + 1)] {
@@ -3719,6 +3722,10 @@ void main() {
         }
         if (v.gpuWritten || frame_ < v.hostUntil) return false;
         v.lastUse = frame_;
+        // Unchanged for 10 s: fingerprinted every 4th frame only (as textures are on every other
+        // use). The fingerprints' reads of host memory were ~10% of the recorder in the city.
+        if (v.checkedFrame != frame_ && !v.dirty && v.buf && frame_ - v.changedFrame >= 600 && (frame_ + v.phase) % 4 != 0)
+            v.checkedFrame = frame_;
         if (v.checkedFrame != frame_ || v.dirty) {
             v.checkedFrame = frame_;
             const uint64_t smp = importedSample(base, size);
@@ -3748,6 +3755,7 @@ void main() {
                 VkDeviceSize soff;
                 if (!guestBuffer(base, size, src, soff)) return false;
                 if (!v.buf && !allocVram(v)) return false;
+                if (!changed) v.changedFrame = frame_; // the first copy
                 v.hash = hasher_.hash(base, size); // what the copy holds (the game does not write memory the GPU is about to read)
                 if (v.check) v.check->state.store(0, std::memory_order_relaxed); // a result in flight is about the old contents
                 fullBarrier();
@@ -4884,7 +4892,7 @@ void main() {
     // their last draws.
     struct FastSlot {
         FastDraw f;
-        DrawAnalysis prev;
+        std::unique_ptr<DrawAnalysis> prev = std::make_unique<DrawAnalysis>();
         uint64_t used = 0;
     };
     // 16: the city gate switches between more shaders in a pass than the steps (4 were enough there).
@@ -4936,8 +4944,8 @@ void main() {
         uint32_t moved, vsImages = 0, psImages = 0;
         ImageBinding vsImg[32], psImg[32];
         uint32_t psMoved = 0;
-        if (sameButUserData(a.vs, slot->prev.vs, moved, noFastTextures_ ? nullptr : &vsImages) >= 0 ||
-            (a.psm && sameButUserData(a.ps, slot->prev.ps, psMoved, noFastTextures_ ? nullptr : &psImages) >= 0) ||
+        if (sameButUserData(a.vs, slot->prev->vs, moved, noFastTextures_ ? nullptr : &vsImages) >= 0 ||
+            (a.psm && sameButUserData(a.ps, slot->prev->ps, psMoved, noFastTextures_ ? nullptr : &psImages) >= 0) ||
             !peekImages(a.vs, vsImages, vsImg) || !peekImages(a.ps, psImages, psImg))
             return miss(4);
         VkBuffer indexBuffer = VK_NULL_HANDLE;
@@ -4954,8 +4962,8 @@ void main() {
         // Other textures go into the slot's descriptors first (rebindImages also queues writes of its
         // own for fastDraw, dropped here: all of the slot's are pushed).
         writes.clear(), imgs.clear();
-        rebindImages(a.vs, slot->prev.vs, vsImages, vsImg, 0, f);
-        if (a.psm) rebindImages(a.ps, slot->prev.ps, psImages, psImg, kPsBindingBase, f);
+        rebindImages(a.vs, slot->prev->vs, vsImages, vsImg, 0, f);
+        if (a.psm) rebindImages(a.ps, slot->prev->ps, psImages, psImg, kPsBindingBase, f);
         // The buffers that moved and the draw data, bound again in the slot's descriptors (bufs is in
         // write order); the rest stay as the slot has them. Rebinding every buffer (15-20 a draw
         // outside the city gate) was most of the recorder's bind time.
@@ -4982,8 +4990,8 @@ void main() {
             if (VkDescriptorBufferInfo* b = bufferAt(base)) *b = {ring_, at, bytes};
             std::memcpy(bound.data.data(), p.data.data(), bytes);
         };
-        bind(a.vs, slot->prev.vs, moved, 0);
-        if (a.psm) bind(a.ps, slot->prev.ps, psMoved, kPsBindingBase);
+        bind(a.vs, slot->prev->vs, moved, 0);
+        if (a.psm) bind(a.ps, slot->prev->ps, psMoved, kPsBindingBase);
         if (bound_.pipeline != f.pipe) {
             rec([c = cmd_, pipe = f.pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); });
             bound_.pipeline = f.pipe;
@@ -5053,14 +5061,14 @@ void main() {
                 if (noFastTextures_ && (vsImages || psImages)) why = 2;
             }
             if (why < 0) {
-                fillFromPrev(a.vs, prevDraw_.vs, vsMoved, vsImages);
-                if (a.psm) fillFromPrev(a.ps, prevDraw_.ps, psMoved, psImages);
+                fillFromPrev(a.vs, prevDraw_->vs, vsMoved, vsImages);
+                if (a.psm) fillFromPrev(a.ps, prevDraw_->ps, psMoved, psImages);
             }
         } else {
             uint32_t* const vi = noFastTextures_ ? nullptr : &vsImages;
             uint32_t* const pi = noFastTextures_ ? nullptr : &psImages;
-            why = sameButUserData(a.vs, prevDraw_.vs, vsMoved, vi);
-            if (why < 0 && a.psm) why = sameButUserData(a.ps, prevDraw_.ps, psMoved, pi);
+            why = sameButUserData(a.vs, prevDraw_->vs, vsMoved, vi);
+            if (why < 0 && a.psm) why = sameButUserData(a.ps, prevDraw_->ps, psMoved, pi);
         }
         // Other textures (another material on the same shaders): only ones already resolved this frame.
         ImageBinding vsImg[32], psImg[32];
@@ -5105,10 +5113,10 @@ void main() {
         };
         if (vsMoved || psMoved) ++prof_.fastMoved;
         if (vsImages || psImages) ++prof_.fastImages;
-        rebind(a.vs, prevDraw_.vs, vsMoved, 0);
-        if (a.psm) rebind(a.ps, prevDraw_.ps, psMoved, kPsBindingBase);
-        rebindImages(a.vs, prevDraw_.vs, vsImages, vsImg, 0, fast_);
-        if (a.psm) rebindImages(a.ps, prevDraw_.ps, psImages, psImg, kPsBindingBase, fast_);
+        rebind(a.vs, prevDraw_->vs, vsMoved, 0);
+        if (a.psm) rebind(a.ps, prevDraw_->ps, psMoved, kPsBindingBase);
+        rebindImages(a.vs, prevDraw_->vs, vsImages, vsImg, 0, fast_);
+        if (a.psm) rebindImages(a.ps, prevDraw_->ps, psImages, psImg, kPsBindingBase, fast_);
         auto data = [&](const gcn::Program& p, gcn::Program& bound, uint32_t base) {
             const VkDeviceSize bytes = p.data.size() * 4;
             if (!std::memcmp(p.data.data(), bound.data.data(), bytes)) return;
@@ -5119,8 +5127,8 @@ void main() {
             writes.back().dstBinding = base;
             std::memcpy(bound.data.data(), p.data.data(), bytes);
         };
-        data(a.vs, prevDraw_.vs, 0);
-        if (a.psm) data(a.ps, prevDraw_.ps, kPsBindingBase);
+        data(a.vs, prevDraw_->vs, 0);
+        if (a.psm) data(a.ps, prevDraw_->ps, kPsBindingBase);
         if (!writes.empty()) pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, f.layout, writes, bufs, imgs);
         if (d.kind == DrawCall::kIndexed) {
             const VkIndexType it = r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
@@ -5382,7 +5390,7 @@ private:
     uint64_t overlayIds_ = 0;
     uint64_t recCount_ = 0; // calls rec()'d (see fastDraw)
     FastDraw fast_;
-    DrawAnalysis prevDraw_; // the last draw recorded in full, if fast_.valid
+    std::unique_ptr<DrawAnalysis> prevDraw_ = std::make_unique<DrawAnalysis>(); // the last draw recorded in full, if fast_.valid
     bool keepDraw_ = false; // onDraw keeps the draw as prevDraw_
     uint64_t prevSeq_ = 0, recordedSeq_ = 0; // DrawAnalysis::seq of prevDraw_'s draw / the last fast one
     const bool noFastDraws_ = getenv("LPN_NO_FAST_DRAWS") != nullptr;
@@ -5390,10 +5398,10 @@ private:
     Profiler aprof_; // the analysis thread's slots and counts, merged into prof_'s reports
     std::mutex analysesMutex_;
     std::condition_variable analysesCv_; // a DrawAnalysis is ready
-    std::deque<DrawAnalysis> analyses_; // one per draw or dispatch, for the recorder
-    std::vector<DrawAnalysis> spareAnalyses_; // used ones, back from the recorder
+    std::deque<std::unique_ptr<DrawAnalysis>> analyses_; // one per draw or dispatch, for the recorder
+    std::vector<std::unique_ptr<DrawAnalysis>> spareAnalyses_; // used ones, back from the recorder
     static constexpr size_t kTakeRun = 64;
-    std::vector<DrawAnalysis> taken_, returned_; // the recorder's: ready ones taken, used ones to hand back
+    std::vector<std::unique_ptr<DrawAnalysis>> taken_, returned_; // the recorder's: ready ones taken, used ones to hand back
     size_t takenNext_ = 0;
     std::deque<uint64_t> dmaOverlays_, writeOverlays_; // the analysis thread's overlay of each DMA / WRITE_DATA
     std::vector<std::unique_ptr<AnalysisCtx>> actx_; // one per worker (one without workers)
