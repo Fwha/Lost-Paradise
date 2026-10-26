@@ -476,6 +476,11 @@ struct GuestTexture {
     uint64_t sample = 0;       // sampleHash at the last full check
     uint32_t uses = 0;         // frames it was used in while unchanged
     uint32_t phase = 0;        // which of every 8 uses gets the full check (spread across textures)
+    // Unchanged for 60 frames and checked by the sweep once a frame (see sweepVram), so image
+    // bindings of it stay good from frame to frame. What the sweep reads: base, span, tiled.
+    bool settled = false, swept = false, sweptChanged = false;
+    uint64_t base = 0;
+    size_t span = 0, tiled = 0;
 };
 
 struct Import {
@@ -1047,6 +1052,7 @@ public:
         dlssFrameEnd();
         sweepVram();
         ++frame_;
+        frameNow_.store(frame_, std::memory_order_relaxed);
         if (!pendingCapture_.empty()) { // F12: trace this frame into the capture folder
             traceDir_ = pendingCapture_ + "/";
             captured_.clear();
@@ -2987,6 +2993,29 @@ private:
     }
 
     // Uploads a texture from guest memory (linear layouts only for now).
+    // A texture just checked and found unchanged: settled once unchanged for a while.
+    GuestTexture* settleTexture(GuestTexture& tex, uint64_t base, size_t span, size_t tiled) {
+        if (resolveAhead_ && !tex.settled && frame_ - tex.changedFrame >= kSettleFrames) {
+            tex.settled = true;
+            tex.base = base, tex.span = span, tex.tiled = tiled;
+            if (!tex.swept) {
+                tex.swept = true;
+                sweptTextures_.push_back(&tex);
+            }
+        }
+        lastTexture_ = &tex;
+        return &tex;
+    }
+    // Found changed (by the sweep): checked in full at its next use, which every image binding
+    // remembered from earlier frames is dropped for.
+    void unsettleTexture(GuestTexture& t) {
+        t.settled = false;
+        t.sweptChanged = true;
+        ++imageGen_, ++prof_.imageGens;
+    }
+    std::vector<GuestTexture*> sweptTextures_; // settled ones (and some no longer), for the sweep
+    GuestTexture* lastTexture_ = nullptr;      // the one resolveImageUncached bound, if any
+
     GuestTexture* guestTexture(const gcn::ImageResource& t, VkFormat format) {
         const uint32_t df = t.dataFormat();
         const bool bc = isBlockCompressed(df);
@@ -2999,7 +3028,10 @@ private:
         const uint32_t layers = t.type() == 11 ? 6 : (t.type() == 13 || t.type() == 10) ? t.lastArray() + 1 : 1;
         const uint32_t slices = t.type() == 10 ? t.depth() : layers;
         GuestTexture& tex = textures_[{t.t[0], t.t[1], t.t[2], t.t[3] & ~0xFFFu, t.t[4], t.t[5]}];
-        if (tex.img.image && tex.checkedFrame == frame_) return &tex;
+        if (tex.img.image && tex.checkedFrame == frame_) {
+            lastTexture_ = &tex;
+            return &tex;
+        }
         // Re-reading every sampled texture each frame cost ~8 ms in fights and ~15 ms in crowded
         // areas, though most never change. One unchanged for 60 frames is fully hashed on every
         // 8th frame it is used and fingerprinted on the others, which catches whole rewrites at
@@ -3011,8 +3043,8 @@ private:
         const size_t span = size_t(ew) * eh * bpe * slices;
         // A full hash finished on a hasher thread is taken at the very next use, due or not: a
         // partial rewrite (new glyphs in a font atlas) then shows one use late, not eight.
-        bool asyncChanged = false;
-        if (tex.check && tex.check->state.load(std::memory_order_acquire) == 2) {
+        bool asyncChanged = std::exchange(tex.sweptChanged, false);
+        if (!asyncChanged && tex.check && tex.check->state.load(std::memory_order_acquire) == 2) {
             tex.check->state.store(0, std::memory_order_relaxed);
             asyncChanged = tex.check->result != tex.hash;
         }
@@ -3045,11 +3077,11 @@ private:
                 const int st = c.state.load(std::memory_order_acquire);
                 if (st == 2) {
                     c.state.store(0, std::memory_order_relaxed);
-                    if (c.result == tex.hash) return &tex;
+                    if (c.result == tex.hash) return settleTexture(tex, t.base(), span, tiled);
                     // changed (or unreadable): checked again in line below
                 } else {
                     if (st == 0) queueTexHash(tex.check, t.base(), tiled);
-                    return &tex;
+                    return settleTexture(tex, t.base(), span, tiled);
                 }
             }
         }
@@ -3065,8 +3097,8 @@ private:
         }
         tex.checkedFrame = frame_;
         tex.sample = sampleHash(t.base(), span);
-        if (!tex.img.image || tex.hash != h64) tex.changedFrame = frame_;
-        if (tex.img.image && tex.hash == h64) return &tex;
+        if (!tex.img.image || tex.hash != h64) tex.changedFrame = frame_, tex.settled = false;
+        if (tex.img.image && tex.hash == h64) return settleTexture(tex, t.base(), span, tiled);
         ProfScope pu(prof_, kProfTexUpload);
         scratch_.resize(tiled);
         if (!readGuest(t.base(), scratch_.data(), tiled)) return nullptr;
@@ -3173,6 +3205,7 @@ private:
     struct ImageMemo {
         uint32_t t[8], s[4];
         bool compare;
+        bool persist = false; // a settled texture's: good in later frames too, while gen holds
         uint64_t frame = ~0ull, gen = 0;
         ImageBinding b;
         VkImage sampled; // the render target it samples, if any (for feedback checks)
@@ -3193,12 +3226,13 @@ private:
         if (memoHit(b, t)) return b;
         if (memoHit(a, t)) return a;
         // A miss replaces a stale way first, else the older one (the way not hit last moves to b).
-        const bool aLive = a.frame == frame_ && a.gen == imageGen_;
+        const bool aLive = memoLive(a);
         if (aLive) std::swap(a, b);
         return a;
     }
+    bool memoLive(const ImageMemo& m) const { return (m.frame == frame_ || m.persist) && m.gen == imageGen_; }
     bool memoHit(const ImageMemo& m, const gcn::ImageResource& t) const {
-        return m.frame == frame_ && m.gen == imageGen_ && m.compare == t.compare && std::equal(t.t, t.t + 8, m.t) &&
+        return memoLive(m) && m.compare == t.compare && std::equal(t.t, t.t + 8, m.t) &&
                std::equal(t.s, t.s + 4, m.s);
     }
     // An image already resolved this frame that samples no render target: what fastDraw may bind
@@ -3219,6 +3253,7 @@ private:
         }
         const size_t before = sampledSurfaces_.size();
         ++prof_.imageMisses;
+        lastTexture_ = nullptr;
         const ImageBinding b = resolveImageUncached(t);
         std::copy(t.t, t.t + 8, m.t);
         std::copy(t.s, t.s + 4, m.s);
@@ -3227,6 +3262,8 @@ private:
         m.gen = imageGen_;
         m.b = b;
         m.sampled = sampledSurfaces_.size() > before ? sampledSurfaces_.back() : VK_NULL_HANDLE;
+        // A settled texture's binding holds until the sweep finds it changed (which moves imageGen_).
+        m.persist = !m.sampled && lastTexture_ && lastTexture_->settled;
         return b;
     }
     ImageBinding resolveImageUncached(const gcn::ImageResource& t) {
@@ -3672,6 +3709,7 @@ void main() {
         // Unchanged for a while and checked once a frame by the sweep (see sweepVram) instead of
         // at its first use: analysis workers may then resolve it ahead (see resolveAhead).
         std::atomic<bool> settled{false};
+        std::atomic<uint64_t> aheadUse{0}; // the frame a worker last resolved a draw to it in (for evictVram)
     };
     // A buffer binding resolved ahead on an analysis worker, valid while bufferEpoch_ is the
     // one it was resolved at. info.buffer null: resolved by the recorder as before.
@@ -3683,6 +3721,7 @@ void main() {
     // Bumped (by the recorder, under cacheMutex_ when a lookup structure changes) whenever a
     // resolution done ahead may have gone stale: a VRAM copy made, freed, written or found changed.
     std::atomic<uint64_t> bufferEpoch_{1};
+    std::atomic<uint64_t> frameNow_{0}; // frame_, for the workers
     std::shared_mutex cacheMutex_; // vram_, imports_ and VRAM copies' buffers, for the workers' reads
     const bool resolveAhead_ = getenv("LPN_NO_RESOLVE_AHEAD") == nullptr && getenv("LPN_RACE_CHECK") == nullptr;
     void unsettle(VramBuffer& v) {
@@ -3857,24 +3896,30 @@ void main() {
     }
     static constexpr uint64_t kSettleFrames = 60;
 
-    // Once a frame, the settled copies' fingerprints are taken on a thread of their own, as their
-    // first use in a frame took them before; one that changed is copied again at its next use.
-    // Their full hashes run on the hasher threads every 8th frame, as on every 8th use before.
+    // Once a frame, the settled copies' and textures' fingerprints are taken on a thread of their
+    // own, as their first use in a frame took them before; a copy that changed is copied again at
+    // its next use, a texture uploaded again. Their full hashes run on the hasher threads every
+    // 8th frame, as on every 8th use before.
     struct SweepItem {
         uint64_t base, size, sample;
         bool changed;
+        GuestTexture* tex; // a texture's (sampleHash) rather than a VRAM copy's (importedSample)
     };
     std::mutex sweepMutex_;
     std::condition_variable sweepCv_;
     std::vector<SweepItem> sweep_;
     bool sweepQueued_ = false, sweepDone_ = true, sweepStarted_ = false;
     void sweepVram() {
-        if (!resolveAhead_ || !vramOn_) return;
+        if (!resolveAhead_) return;
         {
             std::lock_guard lock(sweepMutex_);
             if (!sweepDone_) return; // the last one is still running: next frame
             for (const SweepItem& it : sweep_) {
                 if (!it.changed) continue;
+                if (it.tex) {
+                    if (it.tex->settled && it.tex->sample == it.sample) unsettleTexture(*it.tex);
+                    continue;
+                }
                 auto f = vram_.find({it.base, it.size});
                 if (f == vram_.end() || f->second->sample != it.sample) continue; // gone, or checked since
                 f->second->dirty = true;
@@ -3896,8 +3941,25 @@ void main() {
                 } else if (st == 0 && (frame_ + v.phase) % 8 == 0) {
                     queueTexHash(v.check, v.base, v.size);
                 }
-                sweep_.push_back({v.base, v.size, v.sample, false});
+                sweep_.push_back({v.base, v.size, v.sample, false, nullptr});
             }
+            auto drop = [](GuestTexture* t) { return !(t->swept = false); }; // out of the list
+            std::erase_if(sweptTextures_, [&](GuestTexture* t) {
+                if (!t->settled) return drop(t);
+                if (!t->check) t->check = std::make_shared<AsyncHash>();
+                const int st = t->check->state.load(std::memory_order_acquire);
+                if (st == 2) {
+                    t->check->state.store(0, std::memory_order_relaxed);
+                    if (t->check->result != t->hash) {
+                        unsettleTexture(*t);
+                        return drop(t);
+                    }
+                } else if (st == 0 && (frame_ + t->phase) % 8 == 0) {
+                    queueTexHash(t->check, t->base, t->tiled);
+                }
+                sweep_.push_back({t->base, t->span, t->sample, false, t});
+                return false;
+            });
             if (sweep_.empty()) return;
             sweepDone_ = false;
             sweepQueued_ = true;
@@ -3918,7 +3980,8 @@ void main() {
                 sweepQueued_ = false;
                 items.swap(sweep_);
             }
-            for (SweepItem& it : items) it.changed = importedSample(it.base, it.size) != it.sample;
+            for (SweepItem& it : items)
+                it.changed = (it.tex ? sampleHash(it.base, it.size) : importedSample(it.base, it.size)) != it.sample;
             {
                 std::lock_guard lock(sweepMutex_);
                 items.swap(sweep_);
@@ -3952,7 +4015,8 @@ void main() {
         bufferEpoch_.fetch_add(1, std::memory_order_release); // resolutions ahead may name a freed copy
         std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> byUse;
         for (auto& [k, v] : vram_)
-            if (v->lastUse + 2 < frame_) byUse.push_back({v->lastUse, k});
+            if (std::max(v->lastUse, v->aheadUse.load(std::memory_order_relaxed)) + 2 < frame_)
+                byUse.push_back({std::max(v->lastUse, v->aheadUse.load(std::memory_order_relaxed)), k});
         std::sort(byUse.begin(), byUse.end());
         for (size_t i = 0; i < std::max<size_t>(byUse.size() / 4, std::min<size_t>(byUse.size(), 16)); ++i) {
             auto it = vram_.find(byUse[i].second);
@@ -4015,7 +4079,6 @@ void main() {
     VkDescriptorBufferInfo bindBuffer(gcn::Program& p, const gcn::BufferResource& b, bool inPass = false, const BufRes* pre = nullptr) {
         if (pre && pre->info.buffer) {
             std::memcpy(&p.data[b.data], pre->words, sizeof pre->words);
-            if (pre->v) pre->v->lastUse = frame_;
             ++prof_.resolvedAhead;
             return pre->info;
         }
@@ -4201,6 +4264,9 @@ void main() {
                 if (!v->settled.load(std::memory_order_acquire) || !v->buf) continue;
                 buf = v->buf;
                 r.v = v;
+                // Kept from eviction here: the recorder storing it per draw took a miss each.
+                const uint64_t now = frameNow_.load(std::memory_order_relaxed);
+                if (v->aheadUse.load(std::memory_order_relaxed) != now) v->aheadUse.store(now, std::memory_order_relaxed);
             } else if (!importFor(base, size, buf, off)) {
                 continue;
             }
