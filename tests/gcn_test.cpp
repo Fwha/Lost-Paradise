@@ -272,6 +272,16 @@ int main() {
         ++failures;
     }
 
+    // A program saved and loaded again (for the startup pipeline builds) translates the same.
+    const gcn::Program saved = gcn::analyze(loopL, readLoop);
+    gcn::Program loaded;
+    const std::string bytes = gcn::serialize(saved);
+    if (!gcn::deserialize(bytes, loaded) || gcn::translate(loaded, 3).glsl != gcn::translate(saved, 3).glsl ||
+        gcn::deserialize(bytes.substr(0, bytes.size() - 1), loaded)) {
+        std::fprintf(stderr, "a saved program loaded differently\n");
+        ++failures;
+    }
+
     if (failures) std::fprintf(stderr, "%d failure(s)\n", failures);
     return failures ? 1 : 0;
 }

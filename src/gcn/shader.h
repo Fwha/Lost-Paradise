@@ -119,6 +119,12 @@ struct Program {
     std::string key() const;
 };
 
+// A program as translate() needs it (no trace or warnings), for re-translating it in a later run
+// without the game's memory: the startup pipeline builds keep these beside their SPIR-V.
+std::string serialize(const Program& program);
+// False when `bytes` is damaged or from a build whose structures differ.
+bool deserialize(const std::string& bytes, Program& program);
+
 // `readCode` fetches instructions, `readData` scalar loads.
 Program analyze(const LaunchState& launch, const ReadMemory& readCode, const ReadMemory& readData);
 inline Program analyze(const LaunchState& launch, const ReadMemory& read) { return analyze(launch, read, read); }
