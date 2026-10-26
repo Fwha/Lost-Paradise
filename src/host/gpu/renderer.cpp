@@ -4945,24 +4945,34 @@ void main() {
         uint64_t used = 0;
     };
     // 16: the city gate switches between more shaders in a pass than the steps (4 were enough there).
-    static constexpr size_t kFastSlots = 16;
+    // 64: at the rooftop ~840 draws a frame found no slot for their shaders with 16. Lookups go
+    // through slotKeys_ (one cache line per 4 slots) instead of each slot's own state.
+    static constexpr size_t kFastSlots = 64;
     // LPN_NO_FAST_TEXTURES=1: a draw sampling other textures than the last is recorded in full.
     const bool noFastTextures_ = getenv("LPN_NO_FAST_TEXTURES") != nullptr;
     std::array<FastSlot, kFastSlots> fastSlots_;
+    struct SlotKey {
+        const ShaderModule *vsm = nullptr, *psm = nullptr;
+    };
+    std::array<SlotKey, kFastSlots> slotKeys_{}; // fastSlots_[i].f's shaders
+    std::array<uint64_t, kFastSlots> slotUsed_{}; // fastSlots_[i].used, for the LRU scan
     uint64_t passSerial_ = 0, fastEpoch_ = 0, fastUse_ = 0;
 
     // The bound fast state, before a full draw replaces it: kept in a slot (its shaders' one, or
     // the least recently used) while its pass lasts.
     void stashFast() {
         if (fast_.valid && fast_.pass == passSerial_ && pass_.open && fast_.epoch == fastEpoch_ && fast_.frame == frame_) {
-            FastSlot* slot = &fastSlots_[0];
-            for (FastSlot& sl : fastSlots_) {
-                if (sl.f.vsm == fast_.vsm && sl.f.psm == fast_.psm) {
-                    slot = &sl;
+            size_t i = 0;
+            for (size_t k = 0; k < kFastSlots; ++k) {
+                if (slotKeys_[k].vsm == fast_.vsm && slotKeys_[k].psm == fast_.psm) {
+                    i = k;
                     break;
                 }
-                if (sl.used < slot->used) slot = &sl;
+                if (slotUsed_[k] < slotUsed_[i]) i = k;
             }
+            FastSlot* slot = &fastSlots_[i];
+            slotKeys_[i] = {fast_.vsm, fast_.psm};
+            slotUsed_[i] = fastUse_ + 1;
             std::swap(slot->f, fast_);
             std::swap(slot->prev, prevDraw_);
             slot->used = ++fastUse_;
@@ -4980,8 +4990,9 @@ void main() {
             return false;
         };
         FastSlot* slot = nullptr;
-        for (FastSlot& sl : fastSlots_)
-            if (sl.f.valid && sl.f.vsm == a.vsm && sl.f.psm == a.psm) slot = &sl;
+        size_t si = 0;
+        for (size_t k = 0; k < kFastSlots; ++k)
+            if (slotKeys_[k].vsm == a.vsm && slotKeys_[k].psm == a.psm && fastSlots_[k].f.valid) slot = &fastSlots_[si = k];
         if (!slot) return miss(0);
         FastDraw& f = slot->f;
         if (f.pass != passSerial_ || f.epoch != fastEpoch_ || f.frame != frame_ || f.imageGen != imageGen_) return miss(1);
@@ -5071,6 +5082,8 @@ void main() {
         std::swap(slot->prev, prevDraw_);
         slot->f.valid = keepOld;
         slot->used = ++fastUse_;
+        slotKeys_[si] = {slot->f.vsm, slot->f.psm};
+        slotUsed_[si] = slot->used;
         fast_.rec = recCount_;
         recordedSeq_ = a.seq;
         ++stats_.draws;
