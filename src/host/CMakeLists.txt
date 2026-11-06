@@ -24,6 +24,7 @@ add_executable(lpn-host
     pc_settings.cpp
     pause_menu.cpp
     hooks.cpp
+    draw_sites.cpp
     gpu/frame_dump.cpp
     gpu/dlss.cpp
     gpu/formats.cpp

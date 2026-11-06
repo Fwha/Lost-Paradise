@@ -544,10 +544,15 @@ struct Profiler {
     uint64_t fastImages = 0; // fast draws that bound other textures
     uint64_t diffsTaken = 0; // fastDraw checks an analysis worker had done
     uint64_t fastSwitches = 0; // fast draws that switched shaders (switchDraw)
+    // Fast draws that differ from the draw before only in draw data (same buffers, textures and
+    // index buffer), so one multi-draw could take both; and how many runs of them there were.
+    uint64_t mergeable = 0, mergeRuns = 0;
     uint64_t switchMiss[6] = {}; // other shaders not switched to: no slot, slot stale, state, sampled, resources, index
     uint64_t depthJoins = 0, depthOnly = 0; // depth-only draws that joined the open pass, of all depth-only ones
     std::unordered_map<uint32_t, uint64_t> fastCtx; // the context registers that differed
     uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0, imageMisses = 0, imageGens = 0, resolvedAhead = 0;
+    // VRAM copies: allocations, evictions run, copies they freed, and evictions that found nothing to free.
+    uint64_t vramAllocs = 0, vramEvicts = 0, vramFreed = 0, vramEvictsEmpty = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -647,7 +652,8 @@ private:
         Block& b = blocks_[block_];
         std::byte* at = b.mem.get() + used_;
         used_ += n;
-        for (const size_t to = std::min(used_ + kAhead, b.size); ahead_ < to; ahead_ += 64) __builtin_prefetch(b.mem.get() + ahead_, 1);
+        if (prefetchWrites_)
+            for (const size_t to = std::min(used_ + kAhead, b.size); ahead_ < to; ahead_ += 64) __builtin_prefetch(b.mem.get() + ahead_, 1);
         Header* h = reinterpret_cast<Header*>(at);
         h->call = call;
         h->size = n;
@@ -660,6 +666,8 @@ private:
     };
     std::vector<Block> blocks_;
     size_t block_ = 0, used_ = 0, ahead_ = 0, calls_ = 0;
+    // LPN_NO_CHUNK_PREFETCH=1: perf at the overlook put 4% of the recorder on these prefetches.
+    static inline const bool prefetchWrites_ = getenv("LPN_NO_CHUNK_PREFETCH") == nullptr;
 };
 
 class Renderer final : public DrawListener {
@@ -730,7 +738,10 @@ public:
         prof_.on = aprof_.on = getenv("LPN_PROFILE") != nullptr;
         {
             const char* w = getenv("LPN_ANALYSIS_WORKERS");
-            analysisWorkers_ = w ? unsigned(std::atoi(w)) : std::thread::hardware_concurrency() >= 8 ? 3 : 1;
+            // 6 on 16+ threads: on an i7-12700K (20) 3 workers left mid-size scenes (~2,900 draws)
+            // waiting 8-10 ms a frame for analysis at 36-59 fps; 6 cut that to ~1 ms (90-140 fps).
+            const unsigned hw = std::thread::hardware_concurrency();
+            analysisWorkers_ = w ? unsigned(std::atoi(w)) : hw >= 16 ? 6 : hw >= 8 ? 3 : 1;
             analysisWorkers_ = std::min(analysisWorkers_, 16u);
             for (unsigned i = 0; i < std::max(analysisWorkers_, 1u); ++i) {
                 actx_.push_back(std::make_unique<AnalysisCtx>(overlays_));
@@ -748,7 +759,8 @@ public:
 
     // ---- the analysis thread (see pm4.h): shader analysis for each draw, ahead of recording ----
     // It reads each draw's launches from the registers and hands them, in batches of consecutive
-    // draws, to analysis workers (LPN_ANALYSIS_WORKERS, default 3; 0 analyses on this thread).
+    // draws, to analysis workers (LPN_ANALYSIS_WORKERS, default 6 on 16+ hardware threads, else 3 on 8+,
+    // else 1; 0 analyses on this thread).
     // One thread replaying every launch capped crowded views: looking up the steps after New
     // Game, ~6,350 draws kept it 94% busy at ~59 fps. Each worker keeps its own analyses, page
     // cache and memo (a cached program is re-targeted in place); shader modules, pipelines and
@@ -1241,6 +1253,7 @@ public:
         std::fprintf(stderr, " (kind %.0f, shaders %.0f, prim %.0f; resource counts %.0f, buffer %.0f, image %.0f); fast draws binding a buffer again %.0f, other textures %.0f, switching shaders %.0f",
                      prof_.fastKind[0] / n, prof_.fastKind[1] / n, prof_.fastKind[2] / n, prof_.fastRes[0] / n,
                      prof_.fastRes[1] / n, prof_.fastRes[2] / n, prof_.fastMoved / n, prof_.fastImages / n, prof_.fastSwitches / n);
+        std::fprintf(stderr, "; mergeable fast draws %.0f in %.0f runs", prof_.mergeable / n, prof_.mergeRuns / n);
         std::fprintf(stderr, " (not switched: no slot %.0f, slot stale %.0f, state %.0f, sampled %.0f, resources %.0f, index %.0f); checks done ahead %.0f",
                      prof_.switchMiss[0] / n, prof_.switchMiss[1] / n, prof_.switchMiss[2] / n, prof_.switchMiss[3] / n,
                      prof_.switchMiss[4] / n, prof_.switchMiss[5] / n, prof_.diffsTaken / n);
@@ -1253,6 +1266,13 @@ public:
                 std::fprintf(stderr, " 0x%x %.0f", 0xA000 + regs[i].second, regs[i].first / n);
         }
         std::fprintf(stderr, " per frame\n");
+        std::fprintf(stderr, "[prof] t=%.1f VRAM copies %zu: %.1f allocations, %.2f evictions (%.1f freed, %.2f found none) per frame\n",
+                     profile::seconds(), vram_.size(), prof_.vramAllocs / n, prof_.vramEvicts / n, prof_.vramFreed / n,
+                     prof_.vramEvictsEmpty / n);
+        if (const gcn::ReplayStats rs = gcn::takeReplayStats(); rs.planned)
+            std::fprintf(stderr, "[prof] t=%.1f fast replays %.0f per frame, %.0f%% of their trace steps run directly (%.0f of %.0f); %" PRIu64 " differed from a full replay, %" PRIu64 " changed memory\n",
+                         profile::seconds(), rs.planned / n, 100.0 * rs.kept / std::max<uint64_t>(rs.steps, 1), rs.kept / n,
+                         rs.steps / n, rs.mismatches, rs.races);
         windowFrames_ = slowFrames_ = 0;
         worstFrameMs_ = 0;
         const bool on = prof_.on;
@@ -3747,7 +3767,8 @@ void main() {
     struct VramBuffer {
         uint64_t base = 0, size = 0;
         VkBuffer buf = VK_NULL_HANDLE;
-        VkDeviceMemory mem = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE; // the arena block it is bound in
+        VkDeviceSize memOffset = 0, memSize = 0;
         uint64_t sample = 0, hash = 0;
         uint64_t checkedFrame = ~0ull, changedFrame = 0, lastUse = 0, hostUntil = 0;
         uint32_t uses = 0, phase = 0, changes = 0;
@@ -3777,8 +3798,78 @@ void main() {
     struct PairHash {
         size_t operator()(const std::pair<uint64_t, uint64_t>& k) const { return std::hash<uint64_t>()(k.first * 0x9E3779B97F4A7C15ull ^ k.second); }
     };
-    static constexpr uint64_t kVramMin = 64 << 10, kVramMax = 64ull << 20, kVramBudget = 1536ull << 20;
-    static constexpr size_t kVramEntries = 1500; // each is a memory allocation of its own
+    static constexpr uint64_t kVramMin = 64 << 10, kVramMax = 64ull << 20, kVramBudget = 4096ull << 20;
+    // Copies share 128 MB blocks of device memory (VramArena), so their count is not held to the
+    // driver's allocation limit. At 1,500 (one allocation each) the overlook's ~1,500 live copies
+    // churned: 10-65 evicted, allocated and copied again a frame, the worst frames at 37-40 fps.
+    static constexpr size_t kVramEntries = 6000;
+    // Sub-allocates VRAM copies from large blocks: first fit over each block's free ranges,
+    // merged again on free. Freed from the completion thread, hence the mutex.
+    class VramArena {
+    public:
+        static constexpr VkDeviceSize kBlock = 128ull << 20;
+        bool alloc(Vk& vk, const VkMemoryRequirements& req, VkDeviceMemory& mem, VkDeviceSize& off) {
+            std::lock_guard lock(m_);
+            for (int pass = 0; pass < 2; ++pass) {
+                for (Block& b : blocks_) {
+                    if (!((req.memoryTypeBits >> b.type) & 1)) continue;
+                    for (auto it = b.free.begin(); it != b.free.end(); ++it) {
+                        const VkDeviceSize start = (it->first + req.alignment - 1) / req.alignment * req.alignment;
+                        const VkDeviceSize end = it->first + it->second;
+                        if (start + req.size > end) continue;
+                        const VkDeviceSize lo = it->first;
+                        b.free.erase(it);
+                        if (start > lo) b.free.emplace(lo, start - lo);
+                        if (start + req.size < end) b.free.emplace(start + req.size, end - start - req.size);
+                        mem = b.mem, off = start;
+                        return true;
+                    }
+                }
+                if (pass) break;
+                VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                mai.allocationSize = std::max(kBlock, req.size);
+                mai.memoryTypeIndex = vk.memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                Block b;
+                if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(vk.device, &mai, nullptr, &b.mem) != VK_SUCCESS)
+                    return false;
+                b.type = mai.memoryTypeIndex;
+                b.free.emplace(0, mai.allocationSize);
+                blocks_.push_back(std::move(b));
+            }
+            return false;
+        }
+        void free(VkDeviceMemory mem, VkDeviceSize off, VkDeviceSize size) {
+            std::lock_guard lock(m_);
+            for (Block& b : blocks_) {
+                if (b.mem != mem) continue;
+                auto [it, ok] = b.free.emplace(off, size);
+                if (!ok) return;
+                if (auto next = std::next(it); next != b.free.end() && it->first + it->second == next->first) {
+                    it->second += next->second;
+                    b.free.erase(next);
+                }
+                if (it != b.free.begin()) {
+                    auto prev = std::prev(it);
+                    if (prev->first + prev->second == it->first) {
+                        prev->second += it->second;
+                        b.free.erase(it);
+                    }
+                }
+                return;
+            }
+        }
+
+    private:
+        struct Block {
+            VkDeviceMemory mem = VK_NULL_HANDLE;
+            uint32_t type = 0;
+            std::map<VkDeviceSize, VkDeviceSize> free; // offset -> size
+        };
+        std::mutex m_;
+        std::vector<Block> blocks_;
+    };
+    VramArena vramArena_;
+    uint64_t evictNothingFrame_ = ~0ull; // evictVram found no copy to free in this frame
     const bool vramOn_ = getenv("LPN_NO_VRAM_BUFFERS") == nullptr;
     std::unordered_map<std::pair<uint64_t, uint64_t>, std::unique_ptr<VramBuffer>, PairHash> vram_;
     struct VramHit {
@@ -4037,33 +4128,49 @@ void main() {
         }
     }
     bool allocVram(VramBuffer& v) { // cacheMutex_ held
-        if (vramBytes_ + v.size > kVramBudget) evictVram();
-        if (vramBytes_ + v.size > kVramBudget) return false;
+        // A quarter of the largest device-local heap, at most kVramBudget.
+        static const uint64_t budget = [&] {
+            VkDeviceSize heap = 0;
+            for (uint32_t i = 0; i < vk_.mem.memoryHeapCount; ++i)
+                if (vk_.mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) heap = std::max(heap, vk_.mem.memoryHeaps[i].size);
+            return std::min<uint64_t>(kVramBudget, heap / 4);
+        }();
+        if (vramBytes_ + v.size > budget) evictVram();
+        if (vramBytes_ + v.size > budget) return false;
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bci.size = v.size;
         bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         if (vkCreateBuffer(vk_.device, &bci, nullptr, &v.buf) != VK_SUCCESS) return v.buf = VK_NULL_HANDLE, false;
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(vk_.device, v.buf, &req);
-        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        mai.allocationSize = req.size;
-        mai.memoryTypeIndex = vk_.memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(vk_.device, &mai, nullptr, &v.mem) != VK_SUCCESS) {
+        if (!vramArena_.alloc(vk_, req, v.mem, v.memOffset)) {
             vkDestroyBuffer(vk_.device, v.buf, nullptr);
             v.buf = VK_NULL_HANDLE;
             return false;
         }
-        VK_CHECK(vkBindBufferMemory(vk_.device, v.buf, v.mem, 0));
+        v.memSize = req.size;
+        VK_CHECK(vkBindBufferMemory(vk_.device, v.buf, v.mem, v.memOffset));
         vramBytes_ += v.size;
+        ++prof_.vramAllocs;
         return true;
     }
     // Frees the copies used longest ago (a quarter of them), once the GPU is done with them.
     void evictVram() { // cacheMutex_ held
-        bufferEpoch_.fetch_add(1, std::memory_order_release); // resolutions ahead may name a freed copy
+        // Only copies unused for 2 frames go: when none were, none will be until the next frame,
+        // and scanning and sorting every copy again for each new one cost the recorder at the overlook.
+        if (evictNothingFrame_ == frame_) return;
+        ++prof_.vramEvicts;
         std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> byUse;
         for (auto& [k, v] : vram_)
             if (std::max(v->lastUse, v->aheadUse.load(std::memory_order_relaxed)) + 2 < frame_)
                 byUse.push_back({std::max(v->lastUse, v->aheadUse.load(std::memory_order_relaxed)), k});
+        if (byUse.empty()) {
+            evictNothingFrame_ = frame_;
+            ++prof_.vramEvictsEmpty;
+            return;
+        }
+        bufferEpoch_.fetch_add(1, std::memory_order_release); // resolutions ahead may name a freed copy
+        prof_.vramFreed += std::max<size_t>(byUse.size() / 4, std::min<size_t>(byUse.size(), 16));
         std::sort(byUse.begin(), byUse.end());
         for (size_t i = 0; i < std::max<size_t>(byUse.size() / 4, std::min<size_t>(byUse.size(), 16)); ++i) {
             auto it = vram_.find(byUse[i].second);
@@ -4075,9 +4182,9 @@ void main() {
                 }
             if (v->buf) {
                 vramBytes_ -= v->size;
-                afterFlush_.push_back([this, buf = v->buf, mem = v->mem] {
+                afterFlush_.push_back([this, buf = v->buf, mem = v->mem, off = v->memOffset, sz = v->memSize] {
                     vkDestroyBuffer(vk_.device, buf, nullptr);
-                    vkFreeMemory(vk_.device, mem, nullptr);
+                    vramArena_.free(mem, off, sz);
                 });
             }
             vram_.erase(it);
@@ -4876,7 +4983,9 @@ void main() {
 
         if (!a.ok) return;
         if (dlssOn_ && a.psm && a.psm->smaa && dlssSmaa(r, a.psm->smaa)) return;
-        if (fastDraw(d, r, a) || switchDraw(d, r, a)) return;
+        const bool wasMergeable = lastMergeable_;
+        lastMergeable_ = false;
+        if (fastDraw(d, r, a, wasMergeable) || switchDraw(d, r, a)) return;
         stashFast();
         gcn::Program& vs = a.vs;
 
@@ -5397,7 +5506,7 @@ void main() {
         ++prof_.fastSwitches;
         return true;
     }
-    bool fastDraw(const DrawCall& d, const GpuRegs& r, DrawAnalysis& a) {
+    bool fastDraw(const DrawCall& d, const GpuRegs& r, DrawAnalysis& a, bool prevMergeable) {
         const FastDraw& f = fast_;
         auto miss = [&](FastMiss why) {
             if (prof_.on) ++prof_.fastMiss[why];
@@ -5502,9 +5611,11 @@ void main() {
         data(a.vs, prevDraw_->vs, 0, vsAlike, vsMoved || vsImages);
         if (a.psm) data(a.ps, prevDraw_->ps, kPsBindingBase, psAlike, psMoved || psImages);
         if (!writes.empty()) pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, f.layout, writes, bufs, imgs);
+        bool sameIndex = true;
         if (d.kind == DrawCall::kIndexed) {
             const VkIndexType it = r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
             if (bound_.index != indexBuffer || bound_.indexOffset != indexOffset || bound_.indexType != it) {
+                sameIndex = false;
                 rec([c = cmd_, indexBuffer, indexOffset, it] { vkCmdBindIndexBuffer(c, indexBuffer, indexOffset, it); });
                 bound_.index = indexBuffer, bound_.indexOffset = indexOffset, bound_.indexType = it;
             }
@@ -5518,6 +5629,11 @@ void main() {
         recordedSeq_ = a.seq;
         ++stats_.draws;
         ++prof_.fastDraws;
+        lastMergeable_ = sameIndex && !(vsMoved | psMoved | vsImages | psImages);
+        if (lastMergeable_) {
+            ++prof_.mergeable;
+            if (!prevMergeable) ++prof_.mergeRuns;
+        }
         return true;
     }
     bool peekImages(const gcn::Program& p, uint32_t mask, ImageBinding* out) {
@@ -5780,6 +5896,7 @@ private:
     Overlays overlays_;
     uint64_t overlayIds_ = 0;
     uint64_t recCount_ = 0; // calls rec()'d (see fastDraw)
+    bool lastMergeable_ = false; // the last draw was a fast draw that only changed draw data
     FastDraw fast_;
     std::unique_ptr<DrawAnalysis> prevDraw_ = std::make_unique<DrawAnalysis>(); // the last draw recorded in full, if fast_.valid
     bool keepDraw_ = false; // onDraw keeps the draw as prevDraw_
