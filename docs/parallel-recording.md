@@ -75,3 +75,10 @@ largest 1,000 (the 1,000-draw flush cuts them). So runs are cut by count, not by
 
 `LPN_PROFILE=1` adds a `[prof] ... recorder threads` line: segments, the threads' recording time
 summed, waits for them (drains) and waits to let them catch up, per frame.
+
+### Drains (2026-11-06)
+
+With fast draws sharing m_ the overlook reached 58 fps (from ~55 single-threaded), but the main
+recorder still waited ~12 ms a frame in 20 drains. GPU-made DMA copies no longer drain: the copy is
+queued after the segments before it (same GPU order) and nothing those segments read on the CPU
+changes; CPU-made copies still drain. The profile line now splits drains by cause.

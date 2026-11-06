@@ -568,6 +568,7 @@ struct Profiler {
     uint64_t passBySize[4] = {}, drawsBySize[4] = {}, largestPass = 0;
     // Recorder threads: segments recorded, waits for them (and their ns), their recording time summed.
     uint64_t segments = 0, drains = 0, drainNs = 0, workerNs = 0, aheadNs = 0; // aheadNs: waits for the threads to catch up
+    uint64_t drainWhy[4] = {}; // drains by cause: a sequential draw, a memory write, a CPU-copied DMA, frame end
     uint64_t locks = 0, lockWaits = 0, lockNs = 0; // recorder threads taking m_, finding it held, waiting for it
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
@@ -975,7 +976,7 @@ public:
                 addToSegment(d, r, held);
                 return;
             }
-            drainSegments(); // recorded here, in order with everything before it
+            drainSegments(0); // recorded here, in order with everything before it
         }
         DrawAnalysis& a = *held;
         Recycle recycle{*this, held};
@@ -1060,7 +1061,7 @@ public:
     // The command processor copies descriptors and constants between draws (DMA_DATA): draws
     // after it must not see the page cache's older copy.
     void onMemoryWrite(uint64_t addr, uint64_t size) override {
-        if (recordThreads_) drainSegments();
+        if (recordThreads_) drainSegments(1);
         std::lock_guard lock(m_);
         R().fast_.valid = false;
         ++fastEpoch_;
@@ -1078,8 +1079,11 @@ public:
         overlays_.drop(id);
     }
 
+    // With recorder threads, a copy the GPU makes is queued after the segments before it without
+    // waiting for them (their draws run first on the GPU, and nothing they read on the CPU changes);
+    // one the CPU makes waits for them, as it changes memory they may still read.
     bool onDmaCopy(uint64_t dst, uint64_t src, uint64_t bytes, bool fill, uint32_t value) override {
-        if (recordThreads_) drainSegments();
+        if (recordThreads_) dispatchSegment();
         R().fast_.valid = false; // memory changes (recorder thread, like fastDraw)
         ++fastEpoch_;
         uint64_t id = 0; // the analysis thread's overlay for this copy
@@ -1091,13 +1095,18 @@ public:
             }
         }
         // Copied by the CPU right after a false return: the overlay can go at once.
+        std::unique_lock lock(m_, std::defer_lock);
         auto cpu = [&] {
+            if (recordThreads_) {
+                if (lock.owns_lock()) lock.unlock();
+                drainSegments(2);
+            }
             if (id) overlays_.drop(id);
             return false;
         };
         static const bool cpuDma = getenv("LPN_CPU_DMA") != nullptr; // the old way, for comparison
         if (cpuDma) return cpu();
-        std::lock_guard lock(m_);
+        lock.lock();
         VkBuffer db, sb = VK_NULL_HANDLE;
         VkDeviceSize doff, soff = 0;
         if (!guestBuffer(dst, bytes, db, doff)) return cpu();
@@ -1144,7 +1153,7 @@ public:
         R().passDraws_ = 0;
     }
     void onFrameEnd() override {
-        if (recordThreads_) drainSegments();
+        if (recordThreads_) drainSegments(3);
         std::lock_guard lock(m_);
         if (recordThreads_ && R().prof_.on) mergeRecorderProfiles();
         if (R().prof_.on) {
@@ -1342,8 +1351,9 @@ public:
                      R().prof_.drawsBySize[3] / n, R().prof_.largestPass);
         if (recordThreads_)
             std::fprintf(stderr, "[prof] t=%.1f recorder threads %u: %.0f segments, threads recording %.2f ms (summed), "
-                                 "%.0f waits for them %.2f ms, ahead-waits %.2f ms; m_ taken %.0f, held by another %.0f, waited %.2f ms (summed) per frame\n",
+                                 "%.0f waits for them (draw %.0f, write %.0f, dma %.0f, frame %.0f) %.2f ms, ahead-waits %.2f ms; m_ taken %.0f, held by another %.0f, waited %.2f ms (summed) per frame\n",
                          profile::seconds(), recordThreads_, R().prof_.segments / n, R().prof_.workerNs / 1e6 / n, R().prof_.drains / n,
+                         R().prof_.drainWhy[0] / n, R().prof_.drainWhy[1] / n, R().prof_.drainWhy[2] / n, R().prof_.drainWhy[3] / n,
                          R().prof_.drainNs / 1e6 / n, R().prof_.aheadNs / 1e6 / n, R().prof_.locks / n, R().prof_.lockWaits / n,
                          R().prof_.lockNs / 1e6 / n);
         std::fprintf(stderr, "[prof] t=%.1f VRAM copies %zu: %.1f allocations, %.2f evictions (%.1f freed, %.2f found none) per frame\n",
@@ -5512,7 +5522,7 @@ void main() {
     struct SlotKey {
         const ShaderModule *vsm = nullptr, *psm = nullptr;
     };
-    uint64_t fastEpoch_ = 0;
+    std::atomic<uint64_t> fastEpoch_ = 0; // read by recorder threads
 
     // The bound fast state, before a full draw replaces it: kept in a slot (its shaders' one, or
     // the least recently used) while its pass lasts.
@@ -6397,7 +6407,7 @@ private:
         segFree_.push_back(&g);
     }
     // Waits until every segment so far is recorded: what comes next is recorded in order here.
-    void drainSegments() {
+    void drainSegments(int why) {
         dispatchSegment();
         std::unique_lock lock(segMutex_);
         if (!outstanding_) return;
@@ -6405,6 +6415,7 @@ private:
         segDoneCv_.wait(lock, [&] { return outstanding_ == 0; });
         R().prof_.drainNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
         ++R().prof_.drains;
+        ++R().prof_.drainWhy[why];
     }
     // Recorder threads' counters into the main ones (all threads idle: after drainSegments).
     void mergeRecorderProfiles() {
@@ -6427,7 +6438,7 @@ private:
         };
         add(a.ns, b.ns), add(a.passWhy, b.passWhy), add(a.feedbackOn, b.feedbackOn), add(a.missWhy, b.missWhy);
         add(a.missUser, b.missUser), add(a.fastMiss, b.fastMiss), add(a.fastKind, b.fastKind), add(a.fastRes, b.fastRes);
-        add(a.switchMiss, b.switchMiss), add(a.passBySize, b.passBySize), add(a.drawsBySize, b.drawsBySize);
+        add(a.switchMiss, b.switchMiss), add(a.drainWhy, b.drainWhy), add(a.passBySize, b.passBySize), add(a.drawsBySize, b.drawsBySize);
         for (uint64_t Profiler::*f : {&Profiler::fastMoved, &Profiler::fastImages, &Profiler::diffsTaken, &Profiler::fastSwitches,
                                       &Profiler::mergeable, &Profiler::mergeRuns, &Profiler::depthJoins, &Profiler::depthOnly,
                                       &Profiler::barriers, &Profiler::calls, &Profiler::fastDraws, &Profiler::analysisHits,
