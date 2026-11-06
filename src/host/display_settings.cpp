@@ -120,6 +120,27 @@ bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height) {
         text[s.at + 3] = uint8_t(v);
         text[s.at + 4] = uint8_t(v >> 8);
     }
+    // The base PS4's video memory setup (0xe7bd30) still caps the display buffers at 1920x1080
+    // (the 1080p frame was then scaled back up to the window). Above 1080p it now keeps the output
+    // size and reserves the extra 100 MB for the buffers, as its PS4 Pro branch does for 4K.
+    if (bigger) {
+        struct Bytes {
+            uint32_t at;
+            std::vector<uint8_t> was, now;
+        };
+        static const Bytes kDisplay[] = {
+            // movq $0x2500000, (%rsi): the display pool's size -> 0x8900000
+            {0xe7beb2, {0x48, 0xC7, 0x06, 0x00, 0x00, 0x50, 0x02}, {0x48, 0xC7, 0x06, 0x00, 0x00, 0x90, 0x08}},
+            // jb past the clamp to 1920x1080 -> jmp
+            {0xe7beb9, {0x72, 0x13}, {0xEB, 0x13}},
+        };
+        bool match = true;
+        for (const Bytes& c : kDisplay) match = match && std::equal(c.was.begin(), c.was.end(), text + c.at);
+        if (match)
+            for (const Bytes& c : kDisplay) std::copy(c.now.begin(), c.now.end(), text + c.at);
+        else
+            std::fprintf(stderr, "[display] unexpected eboot code at 0xe7beb2: display buffers stay 1920x1080\n");
+    }
     gActiveW = width, gActiveH = height;
     std::fprintf(stderr, "[display] rendering at %ux%u (output %ux%u)\n", width, height, bigger ? width : 1920,
                  bigger ? height : 1080);
