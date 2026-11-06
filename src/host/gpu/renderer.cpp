@@ -1258,9 +1258,9 @@ public:
         }
         std::fprintf(stderr, " per frame\n");
         if (const gcn::ReplayStats rs = gcn::takeReplayStats(); rs.planned)
-            std::fprintf(stderr, "[prof] t=%.1f fast replays %.0f per frame, stepping %.0f%% of their trace steps (%.0f of %.0f); %" PRIu64 " differed from a full replay\n",
+            std::fprintf(stderr, "[prof] t=%.1f fast replays %.0f per frame, %.0f%% of their trace steps run directly (%.0f of %.0f); %" PRIu64 " differed from a full replay, %" PRIu64 " changed memory\n",
                          profile::seconds(), rs.planned / n, 100.0 * rs.kept / std::max<uint64_t>(rs.steps, 1), rs.kept / n,
-                         rs.steps / n, rs.mismatches);
+                         rs.steps / n, rs.mismatches, rs.races);
         windowFrames_ = slowFrames_ = 0;
         worstFrameMs_ = 0;
         const bool on = prof_.on;

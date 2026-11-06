@@ -154,13 +154,13 @@ inline Program analyze(const LaunchState& launch, const ReadMemory& read) { retu
 // other user data or memory by replaying its trace. False when a branch would go another way;
 // otherwise `out` holds the launch's data and resources (and no code).
 bool replay(const Program& program, const LaunchState& launch, const ReadMemory& readData, Program& out);
-// Fast replays (LPN_FAST_REPLAY=1, or =check to also run the full replay and compare): a plan
-// keeps only the trace steps whose effect a later step can see, dropping the vector compares
-// and lane reads that only mark SGPRs unknown when nothing reads those SGPRs again. Counts since
-// the last call: replays run from a plan, trace steps they would have stepped and did step, and
-// check-mode mismatches.
+// Fast replays (LPN_FAST_REPLAY=1, or =check to also run the full replay and compare): each
+// trace is pre-decoded once into ops, and scalar loads, moves and SGPR kills run straight from
+// them. Counts since the last call: replays run from a plan, their trace steps and how many ran
+// directly, check-mode mismatches, and differences that two full replays showed as well (memory
+// changing while it was read).
 struct ReplayStats {
-    uint64_t planned = 0, steps = 0, kept = 0, mismatches = 0;
+    uint64_t planned = 0, steps = 0, kept = 0, mismatches = 0, races = 0;
 };
 ReplayStats takeReplayStats();
 

@@ -4,7 +4,6 @@
 
 #include <cstdio>
 #include <algorithm>
-#include <bitset>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -120,31 +119,31 @@ public:
         }
         return work.empty();
     }
-    bool replaySteps(const std::vector<uint32_t>& keep) {
-        const Program& prior = *prior_;
-        p_.data.assign(prior.data.size(), 0);
-        p_.buffers = prior.buffers;
-        p_.images = prior.images;
-        seenBuffers_.assign(p_.buffers.size(), false);
-        seenImages_.assign(p_.images.size(), false);
-        WorkQueue work{Work{p_.launch.entry, start()}};
-        State st;
-        for (uint32_t i : keep) {
-            const Program::TraceStep& t = prior.trace[i];
-            if (t.start) {
-                if (work.empty() || work.front().pc != t.pc) return false;
-                st = std::move(work.front().st);
-                work.pop_front();
-            } else if ((slot_ = t.slot, step(t.in, t.pc, st, t.pc + t.in.size, work) != t.result) || diverged_) {
-                return false;
-            }
-        }
-        return work.empty();
-    }
+    bool replayOps(const ReplayPlan& plan);
 
     Program& program() { return p_; }
 
-    // The SGPRs (0-127) a step only marks unknown, when it does nothing else a replay keeps.
+    // Where a scalar operand comes from, worked out once (see src()): an SGPR-like register,
+    // a value fixed by the instruction, or neither (unknown to a replay, or not handled here).
+    struct Operand {
+        enum Kind : uint8_t { kReg, kValue, kOther } kind = kOther;
+        uint32_t code = 0, value = 0, hi = 0; // hi: the upper word src64 gives a fixed value
+    };
+    static Operand operand(uint32_t code, const Instruction& in) {
+        Operand o;
+        o.code = code;
+        if (code < 104 || code == kVcc || code == kVcc + 1 || code == kM0) o.kind = Operand::kReg;
+        else if (code >= 128 && code <= 192) o.kind = Operand::kValue, o.value = code - 128;
+        else if (code >= 193 && code <= 208) o.kind = Operand::kValue, o.value = uint32_t(192 - int32_t(code)), o.hi = ~0u;
+        else if (code >= 240 && code <= 247) {
+            static const float c[] = {0.5f, -0.5f, 1.0f, -1.0f, 2.0f, -2.0f, 4.0f, -4.0f};
+            o.kind = Operand::kValue;
+            std::memcpy(&o.value, &c[code - 240], 4);
+        } else if (code == 255) o.kind = Operand::kValue, o.value = in.literal;
+        return o;
+    }
+
+    // The SGPRs (0-127 and vcc) a step only marks unknown, when it does nothing else a replay keeps.
     static bool onlyUnknowns(const Instruction& in, uint32_t& d, unsigned& n) {
         const uint32_t w = in.words[0];
         switch (in.format) {
@@ -159,30 +158,6 @@ public:
             if (in.op >= 37 && in.op <= 42) return d = kVcc, n = 2, true;
             return false;
         default: return false;
-        }
-    }
-    // Every SGPR a kept step may read (a superset).
-    static void reads(const Instruction& in, std::bitset<128>& live) {
-        const uint32_t w = in.words[0], w1 = in.words[1];
-        auto add = [&](uint32_t code, unsigned n) {
-            for (unsigned i = 0; i < n; ++i)
-                if (code + i < 128) live.set(code + i);
-        };
-        switch (in.format) {
-        case Format::SOP2: add(w & 0xFF, 2), add((w >> 8) & 0xFF, 2), add((w >> 16) & 0x7F, 2); break;
-        case Format::SOPC: add(w & 0xFF, 2), add((w >> 8) & 0xFF, 2); break;
-        case Format::SOP1: add(w & 0xFF, 2), add((w >> 16) & 0x7F, 2); break;
-        case Format::SOPK: add((w >> 16) & 0x7F, 2); break;
-        case Format::SMRD:
-            add(((w >> 9) & 0x3F) * 2, 4);
-            if (!((w >> 8) & 1)) add(w & 0xFF, 1);
-            break;
-        case Format::MUBUF:
-        case Format::MTBUF: add(((w1 >> 16) & 0x1F) * 4, 4), add((w1 >> 24) & 0xFF, 1); break;
-        case Format::MIMG: add(((w1 >> 16) & 0x1F) * 4, 8), add(((w1 >> 21) & 0x1F) * 4, 4); break;
-        case Format::SOPP: case Format::VOP1: case Format::VOP2: case Format::VOP3: case Format::VOPC:
-        case Format::EXP: case Format::VINTRP: case Format::DS: break;
-        default: live.set(); break; // unknown to the plan: keep everything before it
         }
     }
 
@@ -680,30 +655,69 @@ private:
 
 } // namespace
 
+// A trace pre-decoded: one op per step, with the fields a replay of the step needs worked out.
+// Scalar loads, moves and the vector steps that only mark SGPRs unknown run straight from their
+// op; anything else steps its instruction as the full replay does.
+struct ReplayOp {
+    enum Kind : uint8_t { kStart, kStep, kLoad, kMov, kMov64, kUnknown } kind = kStep;
+    uint8_t n = 0;     // kLoad: dwords; kUnknown: SGPRs
+    bool buf = false;  // kLoad: s_buffer_load (its address is a V#)
+    uint8_t d = 0;     // destination SGPR
+    uint8_t base = 0;  // kLoad: first SGPR of the address
+    uint32_t slot = 0; // kLoad: offset of its result in the draw data
+    uint32_t trace = 0; // index into the trace
+    Analyzer::Operand src; // kLoad: the offset; kMov/kMov64: the source
+};
+
 struct ReplayPlan {
-    std::vector<uint32_t> keep; // indices into the trace
+    std::vector<ReplayOp> ops;
+    uint32_t direct = 0; // ops run without stepping
 };
 
 namespace {
 
 std::shared_ptr<const ReplayPlan> makePlan(const std::vector<Program::TraceStep>& trace) {
     auto plan = std::make_shared<ReplayPlan>();
-    std::bitset<128> live;
-    std::vector<uint32_t> keep;
-    for (size_t i = trace.size(); i-- > 0;) {
+    plan->ops.reserve(trace.size());
+    static const unsigned kCount[] = {1, 2, 4, 8, 16};
+    for (size_t i = 0; i < trace.size(); ++i) {
         const Program::TraceStep& t = trace[i];
+        ReplayOp o;
+        o.trace = uint32_t(i);
+        const uint32_t w = t.in.words[0];
         uint32_t d = 0;
         unsigned n = 0;
-        if (!t.start && t.result && Analyzer::onlyUnknowns(t.in, d, n)) {
-            bool read = false;
-            for (unsigned k = 0; k < n; ++k) read |= d + k < 128 && live.test(d + k);
-            if (!read) continue;
+        if (t.start) {
+            o.kind = ReplayOp::kStart;
+        } else if (t.in.format == Format::SMRD && t.in.op < 29 && (t.in.op & 7) <= 4 && t.slot != ~0u && t.result) {
+            o.kind = ReplayOp::kLoad;
+            o.n = uint8_t(kCount[t.in.op & 7]);
+            o.buf = t.in.op >= 8;
+            o.d = uint8_t((w >> 15) & 0x7F);
+            o.base = uint8_t(((w >> 9) & 0x3F) * 2);
+            o.slot = t.slot;
+            if ((w >> 8) & 1) o.src.kind = Analyzer::Operand::kValue, o.src.value = (w & 0xFF) * 4;
+            else if ((w & 0xFF) == 255) o.src.kind = Analyzer::Operand::kValue, o.src.value = t.in.literal * 4;
+            else o.src = Analyzer::operand(w & 0xFF, t.in);
+            // Address registers src() reads as plain SGPRs (the buffer form also reads base + 2).
+            if (o.src.kind == Analyzer::Operand::kOther || o.base + 3 >= 104) o.kind = ReplayOp::kStep;
+        } else if (t.in.format == Format::SOP1 && (t.in.op == 3 || t.in.op == 4) && t.result) {
+            o.kind = t.in.op == 3 ? ReplayOp::kMov : ReplayOp::kMov64;
+            o.d = uint8_t((w >> 16) & 0x7F);
+            o.src = Analyzer::operand(w & 0xFF, t.in);
+            if (o.src.kind == Analyzer::Operand::kOther) o.kind = ReplayOp::kStep;
+            // src64 reads these as one register (high word 0): left to the full step.
+            if (o.kind == ReplayOp::kMov64 && o.src.kind == Analyzer::Operand::kReg &&
+                (o.src.code == kVcc + 1 || o.src.code == kM0))
+                o.kind = ReplayOp::kStep;
+        } else if (t.result && Analyzer::onlyUnknowns(t.in, d, n) && d + n <= 128) {
+            o.kind = ReplayOp::kUnknown;
+            o.d = uint8_t(d);
+            o.n = uint8_t(n);
         }
-        if (!t.start) Analyzer::reads(t.in, live);
-        keep.push_back(uint32_t(i));
+        if (o.kind != ReplayOp::kStep && o.kind != ReplayOp::kStart) ++plan->direct;
+        plan->ops.push_back(o);
     }
-    std::reverse(keep.begin(), keep.end());
-    plan->keep = std::move(keep);
     return plan;
 }
 
@@ -716,7 +730,7 @@ int fastReplayMode() { // 0 off, 1 on, 2 check
     return mode;
 }
 
-std::atomic<uint64_t> gPlanned{0}, gSteps{0}, gKept{0}, gMismatches{0};
+std::atomic<uint64_t> gPlanned{0}, gSteps{0}, gKept{0}, gMismatches{0}, gRaces{0};
 
 bool sameReplay(const Program& a, const Program& b) {
     if (a.data != b.data || a.buffers.size() != b.buffers.size() || a.images.size() != b.images.size()) return false;
@@ -737,7 +751,95 @@ bool sameReplay(const Program& a, const Program& b) {
 
 } // namespace
 
-bool Analyzer::replay(const ReplayPlan* plan) { return plan ? replaySteps(plan->keep) : replayAll(); }
+bool Analyzer::replay(const ReplayPlan* plan) { return plan ? replayOps(*plan) : replayAll(); }
+
+// replayAll() over the plan's ops: the same state changes, without decoding or dispatching on
+// the instruction for the ops that run directly.
+bool Analyzer::replayOps(const ReplayPlan& plan) {
+    const Program& prior = *prior_;
+    p_.data.assign(prior.data.size(), 0);
+    p_.buffers = prior.buffers;
+    p_.images = prior.images;
+    seenBuffers_.assign(p_.buffers.size(), false);
+    seenImages_.assign(p_.images.size(), false);
+    WorkQueue work{Work{p_.launch.entry, start()}};
+    State st;
+    auto value = [&](const Operand& o, uint32_t& v) {
+        if (o.kind == Operand::kValue) return v = o.value, true;
+        v = st.s[o.code];
+        return st.known[o.code];
+    };
+    for (const ReplayOp& o : plan.ops) {
+        const Program::TraceStep& t = prior.trace[o.trace];
+        switch (o.kind) {
+        case ReplayOp::kStart:
+            if (work.empty() || work.front().pc != t.pc) return false;
+            st = std::move(work.front().st);
+            work.pop_front();
+            break;
+        case ReplayOp::kUnknown: unknown(st, o.d, o.n); break;
+        case ReplayOp::kMov: {
+            uint32_t v;
+            if (value(o.src, v)) set(st, o.d, v);
+            else unknown(st, o.d);
+            break;
+        }
+        case ReplayOp::kMov64: {
+            uint32_t lo, hi = o.src.hi;
+            bool k = value(o.src, lo);
+            if (o.src.kind == Operand::kReg) {
+                hi = st.s[o.src.code + 1];
+                k &= st.known[o.src.code + 1];
+            }
+            if (k) set64(st, o.d, lo | (uint64_t(hi) << 32));
+            else unknown(st, o.d, 2);
+            break;
+        }
+        case ReplayOp::kLoad: {
+            const unsigned n = o.n;
+            const uint32_t at = o.slot;
+            if (at + n > p_.data.size()) return false;
+            uint32_t off = 0;
+            bool known = value(o.src, off);
+            const uint32_t lo = st.s[o.base], hi = st.s[o.base + 1];
+            known &= st.known[o.base] & st.known[o.base + 1];
+            if (!known) {
+                unknown(st, o.d, n);
+                break;
+            }
+            uint64_t addr;
+            uint32_t limit = ~0u;
+            if (o.buf) {
+                const uint32_t sharp2 = st.s[o.base + 2];
+                addr = lo | (uint64_t(hi & 0xFFF) << 32);
+                const uint32_t stride = (hi >> 16) & 0x3FFF;
+                limit = stride ? uint32_t(std::min<uint64_t>(uint64_t(stride) * sharp2, ~0u)) : sharp2;
+            } else {
+                addr = (lo | (uint64_t(hi & 0xFFFF) << 32)) & ~3ull;
+            }
+            uint32_t vals[16] = {};
+            unsigned inside = n;
+            if (o.buf) inside = off >= limit ? 0 : std::min<unsigned>(n, (limit - off) / 4);
+            if (inside && !readData_(addr + off, vals, inside * 4)) {
+                std::memset(vals, 0, sizeof vals);
+                for (unsigned i = 0; i < inside; ++i)
+                    if (!readData_(addr + off + i * 4, &vals[i], 4)) break;
+            }
+            uint32_t* out = &p_.data[at];
+            for (unsigned i = 0; i < n; ++i) {
+                out[i] = vals[i];
+                set(st, o.d + i, vals[i]);
+            }
+            break;
+        }
+        case ReplayOp::kStep:
+            slot_ = t.slot;
+            if (step(t.in, t.pc, st, t.pc + t.in.size, work) != t.result || diverged_) return false;
+            break;
+        }
+    }
+    return work.empty();
+}
 
 ReplayStats takeReplayStats() {
     ReplayStats s;
@@ -745,6 +847,7 @@ ReplayStats takeReplayStats() {
     s.steps = gSteps.exchange(0, std::memory_order_relaxed);
     s.kept = gKept.exchange(0, std::memory_order_relaxed);
     s.mismatches = gMismatches.exchange(0, std::memory_order_relaxed);
+    s.races = gRaces.exchange(0, std::memory_order_relaxed);
     return s;
 }
 
@@ -764,7 +867,7 @@ bool replay(const Program& p, const LaunchState& launch, const ReadMemory& readD
         }
         gPlanned.fetch_add(1, std::memory_order_relaxed);
         gSteps.fetch_add(p.trace.size(), std::memory_order_relaxed);
-        gKept.fetch_add(plan->keep.size(), std::memory_order_relaxed);
+        gKept.fetch_add(plan->direct, std::memory_order_relaxed);
     }
     Analyzer a(launch, readData, readData, &p);
     // A replay runs for every launch: it fills out's vectors, keeping their storage.
@@ -777,12 +880,17 @@ bool replay(const Program& p, const LaunchState& launch, const ReadMemory& readD
         Analyzer full(launch, readData, readData, &p);
         const bool fullOk = full.replay();
         if (fullOk != ok || (ok && !sameReplay(q, full.program()))) {
+            // Memory the game rewrites while we read it makes two full replays differ too:
+            // that is not the plan's doing.
+            Analyzer again(launch, readData, readData, &p);
+            const bool againOk = again.replay();
+            const bool race = againOk != fullOk || (fullOk && !sameReplay(full.program(), again.program()));
             static std::atomic<int> logged{0};
-            if (logged.fetch_add(1) < 20)
-                std::fprintf(stderr, "[replay] plan differs from full replay for shader 0x%llx (%s): %zu of %zu steps kept\n",
-                             (unsigned long long)launch.entry, ok != fullOk ? "result" : "output", plan->keep.size(),
+            if (!race && logged.fetch_add(1) < 20)
+                std::fprintf(stderr, "[replay] fast replay differs from full replay for shader 0x%llx (%s): %u of %zu steps direct\n",
+                             (unsigned long long)launch.entry, ok != fullOk ? "result" : "output", plan->direct,
                              p.trace.size());
-            gMismatches.fetch_add(1, std::memory_order_relaxed);
+            (race ? gRaces : gMismatches).fetch_add(1, std::memory_order_relaxed);
             q = std::move(full.program()); // the full replay's answer stands
             ok = fullOk;
         }
