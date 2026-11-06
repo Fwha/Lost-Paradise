@@ -3311,7 +3311,7 @@ private:
         // minified textures (hair, skin detail, fences) shimmered and broke into pixels.
         // LPN_NO_MIPS=1: level 0 only, as before.
         uint32_t levels = 1;
-        if (!noMips_ && t.type() != 10) {
+        if (!noMips_ && slices == 1) { // cube maps and arrays: level 0 only (their mip layout is not verified)
             uint32_t full = 1;
             while ((std::max(w, h) >> full) != 0) ++full;
             levels = std::clamp(t.lastLevel() + 1, 1u, std::min(full, kMaxMips));
@@ -3376,6 +3376,23 @@ private:
                 std::fwrite(scratch_.data(), 1, tiled, f);
                 std::fclose(f);
             }
+        // Debugging: LPN_DUMP_MIPS=<n> writes the first n mipmapped 2D textures up to 2048x2048 (LPN_DUMP_MIPS_MIN=<size>: at least that wide or tall) as
+        // they sit in memory (twice level 0's size, enough for any layout of the other levels).
+        if (static std::atomic<int> dumpMips = getenv("LPN_DUMP_MIPS") ? std::atoi(getenv("LPN_DUMP_MIPS")) : 0;
+            levels > 1 && slices == 1 && t.type() == 9 && w <= 2048 && h <= 2048 &&
+            std::max(w, h) >= (getenv("LPN_DUMP_MIPS_MIN") ? uint32_t(std::atoi(getenv("LPN_DUMP_MIPS_MIN"))) : 0u) &&
+            dumpMips.load() > 0 &&
+            dumpMips.fetch_sub(1) > 0) {
+            std::vector<uint8_t> raw(mips[0].sliceBytes * 2);
+            if (readGuest(t.base(), raw.data(), raw.size()))
+                if (FILE* f = std::fopen(("mips-" + hex(t.base()) + "-" + std::to_string(w) + "x" + std::to_string(h) +
+                                          "-df" + std::to_string(t.dataFormat()) + "-mode" + std::to_string(mode) + "-p" +
+                                          std::to_string(t.pitch()) + "-last" + std::to_string(t.lastLevel()) + "-pow2" +
+                                          std::to_string(t.pow2Pad()) + ".bin").c_str(), "wb")) {
+                    std::fwrite(raw.data(), 1, raw.size(), f);
+                    std::fclose(f);
+                }
+        }
         ++R().prof_.texUploads;
         R().prof_.texBytes += bytes;
         Prologue pg(*this); // on a recorder thread: ahead of the segments
