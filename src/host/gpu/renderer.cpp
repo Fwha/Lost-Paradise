@@ -1257,6 +1257,10 @@ public:
                 std::fprintf(stderr, " 0x%x %.0f", 0xA000 + regs[i].second, regs[i].first / n);
         }
         std::fprintf(stderr, " per frame\n");
+        if (const gcn::ReplayStats rs = gcn::takeReplayStats(); rs.planned)
+            std::fprintf(stderr, "[prof] t=%.1f fast replays %.0f per frame, stepping %.0f%% of their trace steps (%.0f of %.0f); %" PRIu64 " differed from a full replay\n",
+                         profile::seconds(), rs.planned / n, 100.0 * rs.kept / std::max<uint64_t>(rs.steps, 1), rs.kept / n,
+                         rs.steps / n, rs.mismatches);
         windowFrames_ = slowFrames_ = 0;
         worstFrameMs_ = 0;
         const bool on = prof_.on;
