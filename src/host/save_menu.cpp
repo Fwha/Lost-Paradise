@@ -301,6 +301,25 @@ std::string firstLine(const std::string& s) {
     return n == std::string::npos ? s : s.substr(0, n);
 }
 
+// The game's detail line packs everything into one, e.g. "Total Play Time: 3:14:51/Total Cash:
+// 11,500/Level: 12/Skills Unlocked - Mind: 10/...". The list shows only the play time and level;
+// a detail without either is shown as it is.
+std::string detailSummary(const std::string& detail, const std::string& sep) {
+    auto field = [&](const std::string& key) {
+        const size_t k = detail.find(key);
+        if (k == std::string::npos) return std::string();
+        size_t b = k + key.size();
+        while (b < detail.size() && detail[b] == ' ') ++b;
+        return detail.substr(b, detail.find('/', b) - b);
+    };
+    const std::string time = field("Total Play Time:"), level = field("Level:");
+    if (time.empty() && level.empty()) return firstLine(detail);
+    std::string out;
+    if (!time.empty()) out = "Play time " + time;
+    if (!level.empty()) out += (out.empty() ? "" : sep) + "Level " + level;
+    return out;
+}
+
 // Save icons by file, made into textures on the window thread; reloaded when the file changes.
 struct Icon {
     SDL_Texture* tex = nullptr;
@@ -537,7 +556,8 @@ void drawSaveMenu(SDL_Renderer* ren) {
         }
         // The chapter and place are what tell saves apart, so they lead; the game's name, the same
         // on every save, only stands in when nothing else was given.
-        std::string head = firstLine(r.subTitle), second = firstLine(r.detail);
+        const std::string sep = menufont::available() ? "   \xC2\xB7   " : "   ";
+        std::string head = firstLine(r.subTitle), second = detailSummary(r.detail, sep);
         if (head.empty()) head = firstLine(r.title);
         else if (second.empty()) second = firstLine(r.title);
         if (head.empty()) head = "Save " + r.slot.dir;
@@ -554,7 +574,6 @@ void drawSaveMenu(SDL_Renderer* ren) {
         }
         color(ren, 186, 182, 172);
         text(ren, cx, ry + U(42), U(17), fitText(second, U(17), cw));
-        const std::string sep = menufont::available() ? "   \xC2\xB7   " : "   ";
         const std::string when = dateText(r.mtime) + sep + sizeText(r.bytes);
         const std::string ago = agoText(r.mtime);
         color(ren, 214, 182, 98);
