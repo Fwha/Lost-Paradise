@@ -114,3 +114,22 @@ recorder waits 8-10 ms a frame for the analysis workers (analyze ~28 ms summed o
 So there the replay is the limit after all, and the state-block hook (milestone 3) targets it.
 Merging is not worth it: only 1-9 fast draws a frame change draw data alone (~600 rebind a
 buffer, ~700 switch shaders).
+
+## Slot setters (0xe583a0, 0xe584d0/0xe58680, 0xe58830)
+
+Gnmx-style input-usage mapping. Per stage, `*(ctx+0x78+stage*0x40)` points at the bound shader's
+slot table: +0x1c constant buffers, +0x9c, +0xbc samplers, +0xdc resources, one u16 per slot:
+- 0xffff: the shader doesn't use the slot (nothing written).
+- bit 15 set: a user SGPR (`& 0x3fff`); written straight into the PM4 as SET_SH_REG.
+- otherwise: a dword offset into the stage's flat table at `*(ctx+0x68) + stage*0x1800`, which
+  is copied to GPU memory and its address passed in a user SGPR (the per-draw s2/s12 pointers).
+Each setter also marks the stage dirty in `ctx+0x23c`.
+
+So the descriptor for every resource a shader reads sits either in user data or at a fixed
+offset in that table, and the offset only depends on the shader. That gives two designs:
+1. Per shader, learn once (from the first full analysis) which table offset or user SGPR each
+   resource comes from; later draws read those descriptors directly instead of replaying.
+   Needs no hook, only that the trace's control flow doesn't depend on the data.
+2. Hook 0xeabdb0 and capture the flat tables as the engine writes them (dirty stages only).
+A perf capture at an analysis-bound spot decides: if replay time is the interpreter, (1) wins;
+if it is the memory reads (PageCache), (2) does.
