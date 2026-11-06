@@ -3798,7 +3798,7 @@ void main() {
     struct PairHash {
         size_t operator()(const std::pair<uint64_t, uint64_t>& k) const { return std::hash<uint64_t>()(k.first * 0x9E3779B97F4A7C15ull ^ k.second); }
     };
-    static constexpr uint64_t kVramMin = 64 << 10, kVramMax = 64ull << 20, kVramBudget = 3072ull << 20;
+    static constexpr uint64_t kVramMin = 64 << 10, kVramMax = 64ull << 20, kVramBudget = 4096ull << 20;
     // Copies share 128 MB blocks of device memory (VramArena), so their count is not held to the
     // driver's allocation limit. At 1,500 (one allocation each) the overlook's ~1,500 live copies
     // churned: 10-65 evicted, allocated and copied again a frame, the worst frames at 37-40 fps.
