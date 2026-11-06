@@ -24,7 +24,7 @@ Optional, for NVIDIA DLSS: run `scripts/fetch-dlss.sh`, then the two build comma
 
 ## Run
 
-Put the decrypted dump (the folder with `eboot.bin` and `sce_module/`) somewhere, then:
+Put the dump (the folder with `eboot.bin` and `sce_module/`) somewhere, then:
 
 ```sh
 build/src/host/lpn-host /path/to/CUSA12776 --nids aerolib.csv
