@@ -5322,6 +5322,10 @@ void main() {
             }
             if (raceCheck_) noteRead(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, 'i');
         }
+        // Everything below is this thread's own (its pass, bindings and command buffer): at the
+        // overlook, holding m_ to the end of each full draw left the threads waiting for it half
+        // their time.
+        wl.unlock();
 
         // Consecutive draws into the same targets share a render pass. A new pass starts behind a
         // full barrier, as before every draw, so earlier passes, copies and dispatches are visible.
