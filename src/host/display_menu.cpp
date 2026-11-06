@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <mutex>
@@ -26,21 +27,35 @@ bool displayMenuOpen() { return gOpen; }
 #ifdef LPN_HAVE_SDL2
 namespace {
 
+// The save menu's drawing (save_menu.h), so both menus look alike.
+void text(SDL_Renderer* ren, int x, int y, int size, const std::string& s, bool bold = false) {
+    menuText(ren, x, y, size, s, bold);
+}
+int textW(const std::string& s, int size, bool bold = false) { return menuTextW(s, size, bold); }
+std::string fitText(const std::string& s, int size, int maxW) { return menuFitText(s, size, maxW); }
+void fill(SDL_Renderer* ren, int x, int y, int w, int h, Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255) {
+    menuFill(ren, x, y, w, h, r, g, b, a);
+}
+void outline(SDL_Renderer* ren, int x, int y, int w, int h, int t, Uint8 r, Uint8 g, Uint8 b) {
+    menuOutline(ren, x, y, w, h, t, r, g, b);
+}
+void color(SDL_Renderer* ren, Uint8 r, Uint8 g, Uint8 b) { SDL_SetRenderDrawColor(ren, r, g, b, 255); }
+
 std::mutex gM;
 int gRow = 0;         // 0 window mode, 1 resolution, 2 fps, 3 fps counter, 4 exit game
 bool gList = false;   // a drop-down is open under gRow
 int gItem = 0;        // highlighted drop-down entry
 
-const char* const kModes[] = {"WINDOWED", "BORDERLESS FULLSCREEN", "FULLSCREEN"};
+const char* const kModes[] = {"Windowed", "Borderless Fullscreen", "Fullscreen"};
 struct Res {
     uint32_t w, h;
     const char* label;
 };
 const Res kResolutions[] = {
-    {1280, 720, "1280X720"},
-    {0, 0, "1600X896 (PS4)"},
-    {1920, 1080, "1920X1080 (PS4 PRO)"},
-    {2560, 1440, "2560X1440"},
+    {1280, 720, "1280x720"},
+    {0, 0, "1600x896 (PS4)"},
+    {1920, 1080, "1920x1080 (PS4 Pro)"},
+    {2560, 1440, "2560x1440"},
 };
 constexpr int kResCount = int(sizeof kResolutions / sizeof kResolutions[0]);
 // The game runs at 60 and drops itself to 30 in cutscenes and 20 on loading screens. Above 60
@@ -59,7 +74,7 @@ int resIndex(uint32_t w, uint32_t h) {
 
 std::string resLabel(uint32_t w, uint32_t h) {
     const int i = resIndex(w, h);
-    return i >= 0 ? kResolutions[i].label : std::to_string(w) + "X" + std::to_string(h);
+    return i >= 0 ? kResolutions[i].label : std::to_string(w) + "x" + std::to_string(h);
 }
 
 int fpsIndex(int fps) {
@@ -68,7 +83,7 @@ int fpsIndex(int fps) {
     return -1;
 }
 
-std::string fpsLabel(int fps) { return fps ? std::to_string(fps) : "UNCAPPED"; }
+std::string fpsLabel(int fps) { return fps ? std::to_string(fps) : "Uncapped"; }
 
 int itemCount() { return gRow == 0 ? 3 : gRow == 1 ? kResCount : kFpsCount; }
 
@@ -202,6 +217,19 @@ bool displayMenuEvent(const SDL_Event& e, SDL_Window* win) {
     return false;
 }
 
+namespace {
+// A small down-pointing triangle, the drop-down's arrow.
+void arrow(SDL_Renderer* ren, int cx, int cy, int s, SDL_Color c, bool up) {
+    const float h = s * 0.55f, d = up ? -1.0f : 1.0f;
+    const SDL_Vertex v[3] = {{{cx - s / 2.0f, cy - d * h / 2}, c, {0, 0}},
+                             {{cx + s / 2.0f, cy - d * h / 2}, c, {0, 0}},
+                             {{float(cx), cy + d * h / 2}, c, {0, 0}}};
+    SDL_RenderGeometry(ren, nullptr, v, 3, nullptr, 0);
+}
+} // namespace
+
+// Laid out as the save menu is (save_menu.cpp): a dark panel with a header, one row per setting
+// with its value on the right, the drop-down under its row, then the controls along the bottom.
 void drawDisplayMenu(SDL_Renderer* ren) {
     if (!gOpen) return;
     std::lock_guard lock(gM);
@@ -212,68 +240,118 @@ void drawDisplayMenu(SDL_Renderer* ren) {
 
     int w = 0, h = 0;
     SDL_GetRendererOutputSize(ren, &w, &h);
-    const int px = std::max(1, h / 240);
-    const int line = 12 * px;
-    const std::string values[4] = {kModes[int(s.window)], resLabel(s.width, s.height), fpsLabel(s.fps),
-                                   s.fpsCounter ? "ON" : "OFF"};
-    const char* const labels[4] = {"WINDOW MODE", "RESOLUTION", "FPS", "FPS COUNTER"};
-    const int listRows = gList ? itemCount() : 0;
-    const int panelW = std::min(w - 4 * px, 230 * px), panelH = (9 + listRows + (restart ? 1 : 0)) * line;
-    const int x0 = (w - panelW) / 2, y0 = (h - panelH) / 2;
-    const int xv = x0 + 6 * px + menuTextWidth("FPS COUNTER  ", px);
-
+    const float u = std::max(0.5f, h / 720.0f); // 1 at 720p
+    auto U = [u](float v) { return std::max(1, int(std::lround(v * u))); };
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
-    SDL_Rect panel{x0, y0, panelW, panelH};
-    SDL_SetRenderDrawColor(ren, 20, 20, 28, 235);
-    SDL_RenderFillRect(ren, &panel);
-    SDL_SetRenderDrawColor(ren, 200, 170, 90, 255);
-    SDL_RenderDrawRect(ren, &panel);
-    drawMenuText(ren, x0 + 6 * px, y0 + 4 * px, px, "DISPLAY");
+    fill(ren, 0, 0, w, h, 0, 0, 0, 150);
 
-    int y = y0 + 2 * line;
-    for (int r = 0; r < 4; ++r, y += line) {
-        if (r == gRow) {
-            SDL_Rect hl{x0 + 3 * px, y - 2 * px, panelW - 6 * px, line - px};
-            SDL_SetRenderDrawColor(ren, 90, 70, 30, 255);
-            SDL_RenderFillRect(ren, &hl);
+    const std::string values[4] = {kModes[int(s.window)], resLabel(s.width, s.height), fpsLabel(s.fps),
+                                   s.fpsCounter ? "On" : "Off"};
+    const char* const labels[kRows] = {"Window Mode", "Resolution", "Frame Rate Cap", "FPS Counter", "Exit Game"};
+    const int listRows = gList ? itemCount() : 0;
+    const int headH = U(64), rowH = U(52), gap = U(6), itemH = U(40), noteH = restart ? U(32) : 0, hintH = U(34),
+              pad = U(20);
+    const int panelW = std::min(w - U(32), U(640));
+    const int listH = kRows * (rowH + gap) - gap + (listRows ? listRows * itemH + gap : 0);
+    const int panelH = headH + pad + listH + pad + noteH + hintH;
+    const int x0 = (w - panelW) / 2, y0 = (h - panelH) / 2;
+
+    // Panel and header.
+    fill(ren, x0, y0, panelW, panelH, 16, 16, 22, 242);
+    fill(ren, x0, y0, panelW, headH, 26, 24, 30, 255);
+    fill(ren, x0, y0 + headH - U(2), panelW, U(2), 200, 170, 90);
+    color(ren, 245, 240, 228);
+    text(ren, x0 + pad, y0 + (headH - U(30)) / 2, U(30), "Display Settings", true);
+    const std::string active = "Rendering at " + resLabel(activeW, activeH);
+    color(ren, 150, 146, 138);
+    text(ren, x0 + panelW - pad - textW(active, U(16)), y0 + (headH - U(16)) / 2, U(16), active);
+
+    // Rows: the setting's name on the left, its value in a box on the right.
+    const int rx = x0 + pad, rw = panelW - 2 * pad;
+    const int boxW = std::min(U(300), rw / 2), boxX = rx + rw - U(10) - boxW;
+    const int ls = U(20), vs = U(19);
+    int y = y0 + headH + pad;
+    for (int r = 0; r < kRows; ++r) {
+        const bool sel = r == gRow;
+        if (sel) {
+            fill(ren, rx, y, rw, rowH, 58, 47, 24);
+            outline(ren, rx, y, rw, rowH, U(2), 214, 182, 98);
+        } else {
+            fill(ren, rx, y, rw, rowH, 30, 30, 38);
         }
-        SDL_SetRenderDrawColor(ren, 235, 235, 225, 255);
-        drawMenuText(ren, x0 + 6 * px, y, px, labels[r]);
-        drawMenuText(ren, xv, y, px, values[r] + (r == gRow && !gList && r != 3 ? "  >" : ""));
-        if (r != gRow || !gList) continue;
-        // The drop-down, under its row.
+        if (r == 4) color(ren, sel ? 255 : 230, sel ? 150 : 128, sel ? 130 : 110);
+        else color(ren, 245, 240, 228);
+        text(ren, rx + U(16), y + (rowH - ls) / 2, ls, labels[r], true);
+
+        if (r == 3) {
+            // On or off: a switch.
+            const int tw = U(48), th = U(24), tx = rx + rw - U(16) - tw, ty = y + (rowH - th) / 2;
+            if (s.fpsCounter) fill(ren, tx, ty, tw, th, 200, 170, 90);
+            else fill(ren, tx, ty, tw, th, 58, 58, 66);
+            const int k = th - U(6);
+            fill(ren, s.fpsCounter ? tx + tw - U(3) - k : tx + U(3), ty + U(3), k, k, 245, 240, 228);
+            color(ren, s.fpsCounter ? 214 : 150, s.fpsCounter ? 182 : 146, s.fpsCounter ? 98 : 138);
+            text(ren, tx - U(12) - textW(values[3], vs), y + (rowH - vs) / 2, vs, values[3]);
+        } else if (r < 3) {
+            const int bh = rowH - U(14), by = y + (rowH - bh) / 2;
+            fill(ren, boxX, by, boxW, bh, 12, 12, 18);
+            outline(ren, boxX, by, boxW, bh, U(1), sel ? 214 : 80, sel ? 182 : 78, sel ? 98 : 88);
+            color(ren, 214, 182, 98);
+            const int as = U(12);
+            text(ren, boxX + U(12), y + (rowH - vs) / 2, vs, fitText(values[r], vs, boxW - U(36) - as));
+            arrow(ren, boxX + boxW - U(12) - as / 2, y + rowH / 2, as,
+                  sel ? SDL_Color{214, 182, 98, 255} : SDL_Color{150, 146, 138, 255}, sel && gList);
+        }
+        y += rowH + gap;
+        if (!sel || !gList) continue;
+
+        // The drop-down, under its row, lined up with the value box.
+        const int cur = r == 0 ? int(s.window) : r == 1 ? resIndex(s.width, s.height) : fpsIndex(s.fps);
+        fill(ren, boxX, y - gap, boxW, listRows * itemH + U(2), 12, 12, 18);
+        outline(ren, boxX, y - gap, boxW, listRows * itemH + U(2), U(1), 214, 182, 98);
         for (int i = 0; i < listRows; ++i) {
-            y += line;
-            const std::string item = itemLabel(i);
-            SDL_Rect box{xv - 3 * px, y - 2 * px, panelW - (xv - x0) - 3 * px, line};
-            SDL_SetRenderDrawColor(ren, 45, 45, 55, 255);
-            SDL_RenderFillRect(ren, &box);
+            const int iy = y - gap + U(1) + i * itemH;
             if (i == gItem) {
-                SDL_SetRenderDrawColor(ren, 200, 170, 90, 255);
-                SDL_RenderFillRect(ren, &box);
-                SDL_SetRenderDrawColor(ren, 20, 20, 28, 255);
+                fill(ren, boxX + U(1), iy, boxW - U(2), itemH, 200, 170, 90);
+                color(ren, 24, 20, 12);
+            } else if (i == cur) {
+                color(ren, 214, 182, 98);
             } else {
-                SDL_SetRenderDrawColor(ren, 235, 235, 225, 255);
+                color(ren, 225, 220, 208);
             }
-            drawMenuText(ren, xv, y, px, item);
+            text(ren, boxX + U(12), iy + (itemH - vs) / 2, vs, fitText(itemLabel(i), vs, boxW - U(24)), i == cur);
         }
+        y += listRows * itemH + gap;
     }
-    if (gRow == 4) {
-        SDL_Rect hl{x0 + 3 * px, y - 2 * px, panelW - 6 * px, line - px};
-        SDL_SetRenderDrawColor(ren, 90, 70, 30, 255);
-        SDL_RenderFillRect(ren, &hl);
-    }
-    SDL_SetRenderDrawColor(ren, 235, 235, 225, 255);
-    drawMenuText(ren, x0 + 6 * px, y, px, "EXIT GAME");
-    y += line;
+
     if (restart) {
-        SDL_SetRenderDrawColor(ren, 230, 150, 90, 255);
-        drawMenuText(ren, x0 + 6 * px, y + line / 2, px, "RESOLUTION CHANGES AFTER A RESTART");
-        y += line;
+        color(ren, 230, 150, 90);
+        text(ren, x0 + pad, y0 + panelH - hintH - noteH - U(4), U(17), "The new resolution takes effect after a restart");
     }
-    SDL_SetRenderDrawColor(ren, 150, 150, 150, 255);
-    const int hpx = std::max(1, px * 2 / 3);
-    drawMenuText(ren, x0 + 6 * px, y0 + panelH - line + px, hpx, "ENTER SELECT   BACKSPACE BACK   F11 CLOSE");
+
+    // Controls, as the save menu shows them.
+    fill(ren, x0, y0 + panelH - hintH, panelW, hintH, 10, 10, 14, 255);
+    const int hs = U(15), hy = y0 + panelH - hintH + (hintH - hs) / 2;
+    int hx = x0 + pad;
+    const bool usePad = menuControllerAttached();
+    const std::pair<MenuPad, const char*> hints[] = {{MenuPad::Cross, "Select"}, {MenuPad::Circle, "Back"}};
+    const char* keys[] = {"Enter", "Backspace"};
+    for (size_t i = 0; i < 3; ++i) {
+        const char* key = i < 2 ? keys[i] : "F11";
+        const char* what = i < 2 ? hints[i].second : "Close";
+        if (usePad && i < 2) {
+            const int is = U(24);
+            menuPadIcon(ren, hx, y0 + panelH - hintH + (hintH - is) / 2, is, hints[i].first);
+            hx += is + U(7);
+        } else {
+            color(ren, 200, 196, 186);
+            text(ren, hx, hy, hs, key, true);
+            hx += textW(key, hs, true) + U(7);
+        }
+        color(ren, 140, 136, 128);
+        text(ren, hx, hy, hs, what);
+        hx += textW(what, hs) + U(26);
+    }
     SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
 }
 
@@ -294,23 +372,22 @@ void drawFpsCounter(SDL_Renderer* ren) {
     }
     int w = 0, h = 0;
     SDL_GetRendererOutputSize(ren, &w, &h);
-    const int px = std::max(1, h / 360);
-    const std::string text = std::to_string(fps) + " FPS";
-    const int tw = menuTextWidth(text, px);
+    const float u = std::max(0.5f, h / 720.0f);
+    auto U = [u](float v) { return std::max(1, int(std::lround(v * u))); };
+    const std::string num = std::to_string(fps), unit = " FPS";
+    const int ns = U(20), us = U(14);
+    const int nw = textW(num, ns, true), uw = textW(unit, us, true);
+    const int bw = nw + uw + U(16), bh = ns + U(10), bx = w - bw - U(8), by = U(8);
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
-    SDL_Rect box{w - tw - 8 * px, 2 * px, tw + 6 * px, 11 * px};
-    SDL_SetRenderDrawColor(ren, 0, 0, 0, 160);
-    SDL_RenderFillRect(ren, &box);
-    SDL_SetRenderDrawColor(ren, 235, 235, 225, 255);
-    drawMenuText(ren, w - tw - 5 * px, 4 * px, px, text);
+    fill(ren, bx, by, bw, bh, 0, 0, 0, 170);
+    color(ren, 245, 240, 228);
+    text(ren, bx + U(8), by + U(5), ns, num, true);
+    color(ren, 214, 182, 98);
+    text(ren, bx + U(8) + nw, by + U(5) + ns - us - U(1), us, unit, true);
     SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
 }
 
 namespace {
-// The game's PC SETTINGS screen names choices as the game's own settings do.
-const char* const kModeNames[] = {"Windowed", "Borderless Fullscreen", "Fullscreen"};
-const char* const kResNames[] = {"1280x720", "1600x896 (PS4)", "1920x1080 (PS4 Pro)", "2560x1440"};
-static_assert(sizeof kResNames / sizeof kResNames[0] == kResCount);
 std::vector<std::pair<int, int>> gQueued; // setDisplayOption's (row, choice), under gM
 
 int valueOf(int row) {
@@ -343,8 +420,8 @@ std::string displayOptionName(int row, int i) {
     std::lock_guard lock(gM);
     const DisplaySettings& s = displaySettings();
     switch (row) {
-    case 0: return kModeNames[std::clamp(i, 0, 2)];
-    case 1: return i < kResCount ? kResNames[i] : std::to_string(s.width) + "x" + std::to_string(s.height);
+    case 0: return kModes[std::clamp(i, 0, 2)];
+    case 1: return i < kResCount ? kResolutions[i].label : std::to_string(s.width) + "x" + std::to_string(s.height);
     case 2: {
         const int fps = i < kFpsCount ? kFps[i] : s.fps;
         return fps ? std::to_string(fps) : "Uncapped";

@@ -34,9 +34,19 @@ void closeSaveMenu();
 // and drawing over the frame.
 bool saveMenuEvent(const SDL_Event& e);
 void drawSaveMenu(SDL_Renderer* ren);
-// The menus' blocky font (5x7 glyphs scaled by px; letters are drawn as capitals).
-void drawMenuText(SDL_Renderer* ren, int x, int y, int px, const std::string& s);
-int menuTextWidth(const std::string& s, int px);
+// The save menu's look, for the other menus drawn over the game (display_menu.cpp): text in
+// Arial (menu_font.h), or the blocky pixel font when no font file was found; size is the line
+// height in pixels.
+void menuText(SDL_Renderer* ren, int x, int y, int size, const std::string& s, bool bold = false);
+int menuTextW(const std::string& s, int size, bool bold = false);
+std::string menuFitText(const std::string& s, int size, int maxW, bool bold = false);
+void menuFill(SDL_Renderer* ren, int x, int y, int w, int h, Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255);
+void menuOutline(SDL_Renderer* ren, int x, int y, int w, int h, int t, Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255);
+// A PlayStation face button in a size x size box (the game's own icon when it can be read).
+enum class MenuPad { Cross, Circle, Square };
+void menuPadIcon(SDL_Renderer* ren, int x, int y, int size, MenuPad b);
+// True when the control hints should show pad buttons rather than keys (LPN_MENU_BUTTONS).
+bool menuControllerAttached();
 #endif
 
 } // namespace host

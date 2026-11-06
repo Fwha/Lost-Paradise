@@ -495,8 +495,17 @@ bool controllerAttached() {
 } // namespace
 
 #ifdef LPN_HAVE_SDL2
-void drawMenuText(SDL_Renderer* ren, int x, int y, int px, const std::string& s) { drawText(ren, x, y, px, s); }
-int menuTextWidth(const std::string& s, int px) { return textWidth(s, px); }
+void menuText(SDL_Renderer* ren, int x, int y, int size, const std::string& s, bool bold) { text(ren, x, y, size, s, bold); }
+int menuTextW(const std::string& s, int size, bool bold) { return textW(s, size, bold); }
+std::string menuFitText(const std::string& s, int size, int maxW, bool bold) { return fitText(s, size, maxW, bold); }
+void menuFill(SDL_Renderer* ren, int x, int y, int w, int h, Uint8 r, Uint8 g, Uint8 b, Uint8 a) { fill(ren, x, y, w, h, r, g, b, a); }
+void menuOutline(SDL_Renderer* ren, int x, int y, int w, int h, int t, Uint8 r, Uint8 g, Uint8 b, Uint8 a) {
+    outline(ren, x, y, w, h, t, r, g, b, a);
+}
+void menuPadIcon(SDL_Renderer* ren, int x, int y, int size, MenuPad b) {
+    padIcon(ren, x, y, size, b == MenuPad::Cross ? Pad::Cross : b == MenuPad::Circle ? Pad::Circle : Pad::Square);
+}
+bool menuControllerAttached() { return controllerAttached(); }
 #endif
 
 bool openSaveMenu(SaveMenuKind kind, std::vector<SaveSlot> slots, int focus, bool newItem) {
