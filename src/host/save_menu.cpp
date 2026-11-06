@@ -1,5 +1,6 @@
 #include "host/save_menu.h"
 
+#include "formats/par.h"
 #include "host/kernel.h"
 #include "host/menu_font.h"
 
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 
@@ -404,8 +406,59 @@ void segment(std::vector<SDL_Vertex>& v, float x0, float y0, float x1, float y1,
     vertex(v, x0 - nx, y0 - ny, c), vertex(v, x1 + nx, y1 + ny, c), vertex(v, x1 - nx, y1 - ny, c);
 }
 
-// Draws the icon in a size x size box at (x, y).
+// The game's own button sheet: data/2dpar/sprite_e.par holds 2d_mr_icon_button_ps4.dds, a 256x256
+// A8R8G8B8 sheet of 64x64 icons in a 4x4 grid; the top row is circle, cross, square, triangle.
+SDL_Texture* gButtons = nullptr;
+SDL_Renderer* gButtonsRen = nullptr;
+bool gButtonsTried = false;
+
+SDL_Texture* buttonSheet(SDL_Renderer* ren) {
+    if (ren != gButtonsRen) {
+        if (gButtons) SDL_DestroyTexture(gButtons);
+        gButtons = nullptr, gButtonsRen = ren, gButtonsTried = false;
+    }
+    if (gButtonsTried) return gButtons;
+    gButtonsTried = true;
+    const std::string path = process().gameDir + "/data/2dpar/sprite_e.par";
+    std::ifstream in(path, std::ios::binary);
+    std::vector<uint8_t> par(std::istreambuf_iterator<char>(in), {});
+    std::string err;
+    auto ar = formats::ParArchive::parse(par, &err);
+    if (!ar) {
+        std::fprintf(stderr, "[save menu] no button icons from %s: %s\n", path.c_str(), in ? err.c_str() : "not found");
+        return nullptr;
+    }
+    for (const auto& f : ar->files()) {
+        if (f.name != "2d_mr_icon_button_ps4.dds") continue;
+        std::vector<uint8_t> dds;
+        if (!ar->read(f, dds, &err) || dds.size() < 128 || std::memcmp(dds.data(), "DDS ", 4) != 0) break;
+        uint32_t h, w, flags, bits, rmask, amask;
+        std::memcpy(&h, &dds[12], 4), std::memcpy(&w, &dds[16], 4), std::memcpy(&flags, &dds[80], 4);
+        std::memcpy(&bits, &dds[88], 4), std::memcpy(&rmask, &dds[92], 4), std::memcpy(&amask, &dds[104], 4);
+        // Uncompressed 32-bit with red in bits 16-23: B, G, R, A bytes, which SDL calls ARGB8888.
+        if (!(flags & 0x40) || bits != 32 || rmask != 0x00FF0000u || amask != 0xFF000000u ||
+            dds.size() < 128 + size_t(w) * h * 4)
+            break;
+        gButtons = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, int(w), int(h));
+        if (gButtons) {
+            SDL_UpdateTexture(gButtons, nullptr, dds.data() + 128, int(w) * 4);
+            SDL_SetTextureBlendMode(gButtons, SDL_BLENDMODE_BLEND);
+            SDL_SetTextureScaleMode(gButtons, SDL_ScaleModeLinear);
+        }
+        return gButtons;
+    }
+    std::fprintf(stderr, "[save menu] no button icons in %s\n", path.c_str());
+    return nullptr;
+}
+
+// Draws the icon in a size x size box at (x, y): the game's own, or drawn shapes without it.
 void padIcon(SDL_Renderer* ren, int x, int y, int size, Pad b) {
+    if (SDL_Texture* sheet = buttonSheet(ren)) {
+        const int col = b == Pad::Circle ? 0 : b == Pad::Cross ? 1 : 2;
+        SDL_Rect src{col * 64, 0, 64, 64}, dst{x, y, size, size};
+        SDL_RenderCopy(ren, sheet, &src, &dst);
+        return;
+    }
     std::vector<SDL_Vertex> v;
     const float r = size / 2.0f, cx = x + r, cy = y + r, t = std::max(1.5f, size * 0.09f), k = r * 0.42f;
     disc(v, cx, cy, r, SDL_Color{58, 58, 66, 255});
@@ -706,7 +759,7 @@ void drawSaveMenu(SDL_Renderer* ren) {
     const char* keys[] = {"Enter", "Backspace", "Z"};
     for (size_t i = 0; i < 3; ++i) {
         if (usePad) {
-            const int is = U(20);
+            const int is = U(24);
             padIcon(ren, hx, y0 + panelH - hintH + (hintH - is) / 2, is, hints[i].first);
             hx += is + U(7);
         } else {
