@@ -3767,7 +3767,8 @@ void main() {
     struct VramBuffer {
         uint64_t base = 0, size = 0;
         VkBuffer buf = VK_NULL_HANDLE;
-        VkDeviceMemory mem = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE; // the arena block it is bound in
+        VkDeviceSize memOffset = 0, memSize = 0;
         uint64_t sample = 0, hash = 0;
         uint64_t checkedFrame = ~0ull, changedFrame = 0, lastUse = 0, hostUntil = 0;
         uint32_t uses = 0, phase = 0, changes = 0;
@@ -3797,8 +3798,77 @@ void main() {
     struct PairHash {
         size_t operator()(const std::pair<uint64_t, uint64_t>& k) const { return std::hash<uint64_t>()(k.first * 0x9E3779B97F4A7C15ull ^ k.second); }
     };
-    static constexpr uint64_t kVramMin = 64 << 10, kVramMax = 64ull << 20, kVramBudget = 1536ull << 20;
-    static constexpr size_t kVramEntries = 1500; // each is a memory allocation of its own
+    static constexpr uint64_t kVramMin = 64 << 10, kVramMax = 64ull << 20, kVramBudget = 3072ull << 20;
+    // Copies share 128 MB blocks of device memory (VramArena), so their count is not held to the
+    // driver's allocation limit. At 1,500 (one allocation each) the overlook's ~1,500 live copies
+    // churned: 10-65 evicted, allocated and copied again a frame, the worst frames at 37-40 fps.
+    static constexpr size_t kVramEntries = 6000;
+    // Sub-allocates VRAM copies from large blocks: first fit over each block's free ranges,
+    // merged again on free. Freed from the completion thread, hence the mutex.
+    class VramArena {
+    public:
+        static constexpr VkDeviceSize kBlock = 128ull << 20;
+        bool alloc(Vk& vk, const VkMemoryRequirements& req, VkDeviceMemory& mem, VkDeviceSize& off) {
+            std::lock_guard lock(m_);
+            for (int pass = 0; pass < 2; ++pass) {
+                for (Block& b : blocks_) {
+                    if (!((req.memoryTypeBits >> b.type) & 1)) continue;
+                    for (auto it = b.free.begin(); it != b.free.end(); ++it) {
+                        const VkDeviceSize start = (it->first + req.alignment - 1) / req.alignment * req.alignment;
+                        const VkDeviceSize end = it->first + it->second;
+                        if (start + req.size > end) continue;
+                        const VkDeviceSize lo = it->first;
+                        b.free.erase(it);
+                        if (start > lo) b.free.emplace(lo, start - lo);
+                        if (start + req.size < end) b.free.emplace(start + req.size, end - start - req.size);
+                        mem = b.mem, off = start;
+                        return true;
+                    }
+                }
+                if (pass) break;
+                VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                mai.allocationSize = std::max(kBlock, req.size);
+                mai.memoryTypeIndex = vk.memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                Block b;
+                if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(vk.device, &mai, nullptr, &b.mem) != VK_SUCCESS)
+                    return false;
+                b.type = mai.memoryTypeIndex;
+                b.free.emplace(0, mai.allocationSize);
+                blocks_.push_back(std::move(b));
+            }
+            return false;
+        }
+        void free(VkDeviceMemory mem, VkDeviceSize off, VkDeviceSize size) {
+            std::lock_guard lock(m_);
+            for (Block& b : blocks_) {
+                if (b.mem != mem) continue;
+                auto [it, ok] = b.free.emplace(off, size);
+                if (!ok) return;
+                if (auto next = std::next(it); next != b.free.end() && it->first + it->second == next->first) {
+                    it->second += next->second;
+                    b.free.erase(next);
+                }
+                if (it != b.free.begin()) {
+                    auto prev = std::prev(it);
+                    if (prev->first + prev->second == it->first) {
+                        prev->second += it->second;
+                        b.free.erase(it);
+                    }
+                }
+                return;
+            }
+        }
+
+    private:
+        struct Block {
+            VkDeviceMemory mem = VK_NULL_HANDLE;
+            uint32_t type = 0;
+            std::map<VkDeviceSize, VkDeviceSize> free; // offset -> size
+        };
+        std::mutex m_;
+        std::vector<Block> blocks_;
+    };
+    VramArena vramArena_;
     uint64_t evictNothingFrame_ = ~0ull; // evictVram found no copy to free in this frame
     const bool vramOn_ = getenv("LPN_NO_VRAM_BUFFERS") == nullptr;
     std::unordered_map<std::pair<uint64_t, uint64_t>, std::unique_ptr<VramBuffer>, PairHash> vram_;
@@ -4058,23 +4128,28 @@ void main() {
         }
     }
     bool allocVram(VramBuffer& v) { // cacheMutex_ held
-        if (vramBytes_ + v.size > kVramBudget) evictVram();
-        if (vramBytes_ + v.size > kVramBudget) return false;
+        // A quarter of the largest device-local heap, at most kVramBudget.
+        static const uint64_t budget = [&] {
+            VkDeviceSize heap = 0;
+            for (uint32_t i = 0; i < vk_.mem.memoryHeapCount; ++i)
+                if (vk_.mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) heap = std::max(heap, vk_.mem.memoryHeaps[i].size);
+            return std::min<uint64_t>(kVramBudget, heap / 4);
+        }();
+        if (vramBytes_ + v.size > budget) evictVram();
+        if (vramBytes_ + v.size > budget) return false;
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bci.size = v.size;
         bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         if (vkCreateBuffer(vk_.device, &bci, nullptr, &v.buf) != VK_SUCCESS) return v.buf = VK_NULL_HANDLE, false;
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(vk_.device, v.buf, &req);
-        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        mai.allocationSize = req.size;
-        mai.memoryTypeIndex = vk_.memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(vk_.device, &mai, nullptr, &v.mem) != VK_SUCCESS) {
+        if (!vramArena_.alloc(vk_, req, v.mem, v.memOffset)) {
             vkDestroyBuffer(vk_.device, v.buf, nullptr);
             v.buf = VK_NULL_HANDLE;
             return false;
         }
-        VK_CHECK(vkBindBufferMemory(vk_.device, v.buf, v.mem, 0));
+        v.memSize = req.size;
+        VK_CHECK(vkBindBufferMemory(vk_.device, v.buf, v.mem, v.memOffset));
         vramBytes_ += v.size;
         ++prof_.vramAllocs;
         return true;
@@ -4107,9 +4182,9 @@ void main() {
                 }
             if (v->buf) {
                 vramBytes_ -= v->size;
-                afterFlush_.push_back([this, buf = v->buf, mem = v->mem] {
+                afterFlush_.push_back([this, buf = v->buf, mem = v->mem, off = v->memOffset, sz = v->memSize] {
                     vkDestroyBuffer(vk_.device, buf, nullptr);
-                    vkFreeMemory(vk_.device, mem, nullptr);
+                    vramArena_.free(mem, off, sz);
                 });
             }
             vram_.erase(it);
