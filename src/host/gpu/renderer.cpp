@@ -3376,10 +3376,12 @@ private:
                 std::fwrite(scratch_.data(), 1, tiled, f);
                 std::fclose(f);
             }
-        // Debugging: LPN_DUMP_MIPS=<n> writes the first n mipmapped 2D textures up to 512x512 as
+        // Debugging: LPN_DUMP_MIPS=<n> writes the first n mipmapped 2D textures up to 2048x2048 (LPN_DUMP_MIPS_MIN=<size>: at least that wide or tall) as
         // they sit in memory (twice level 0's size, enough for any layout of the other levels).
         if (static std::atomic<int> dumpMips = getenv("LPN_DUMP_MIPS") ? std::atoi(getenv("LPN_DUMP_MIPS")) : 0;
-            levels > 1 && slices == 1 && t.type() == 9 && w <= 512 && h <= 512 && dumpMips.load() > 0 &&
+            levels > 1 && slices == 1 && t.type() == 9 && w <= 2048 && h <= 2048 &&
+            std::max(w, h) >= (getenv("LPN_DUMP_MIPS_MIN") ? uint32_t(std::atoi(getenv("LPN_DUMP_MIPS_MIN"))) : 0u) &&
+            dumpMips.load() > 0 &&
             dumpMips.fetch_sub(1) > 0) {
             std::vector<uint8_t> raw(mips[0].sliceBytes * 2);
             if (readGuest(t.base(), raw.data(), raw.size()))
