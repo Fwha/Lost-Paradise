@@ -551,6 +551,8 @@ struct Profiler {
     uint64_t depthJoins = 0, depthOnly = 0; // depth-only draws that joined the open pass, of all depth-only ones
     std::unordered_map<uint32_t, uint64_t> fastCtx; // the context registers that differed
     uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0, imageMisses = 0, imageGens = 0, resolvedAhead = 0;
+    // VRAM copies: allocations, evictions run, copies they freed, and evictions that found nothing to free.
+    uint64_t vramAllocs = 0, vramEvicts = 0, vramFreed = 0, vramEvictsEmpty = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -650,7 +652,8 @@ private:
         Block& b = blocks_[block_];
         std::byte* at = b.mem.get() + used_;
         used_ += n;
-        for (const size_t to = std::min(used_ + kAhead, b.size); ahead_ < to; ahead_ += 64) __builtin_prefetch(b.mem.get() + ahead_, 1);
+        if (prefetchWrites_)
+            for (const size_t to = std::min(used_ + kAhead, b.size); ahead_ < to; ahead_ += 64) __builtin_prefetch(b.mem.get() + ahead_, 1);
         Header* h = reinterpret_cast<Header*>(at);
         h->call = call;
         h->size = n;
@@ -663,6 +666,8 @@ private:
     };
     std::vector<Block> blocks_;
     size_t block_ = 0, used_ = 0, ahead_ = 0, calls_ = 0;
+    // LPN_NO_CHUNK_PREFETCH=1: perf at the overlook put 4% of the recorder on these prefetches.
+    static inline const bool prefetchWrites_ = getenv("LPN_NO_CHUNK_PREFETCH") == nullptr;
 };
 
 class Renderer final : public DrawListener {
@@ -1261,6 +1266,9 @@ public:
                 std::fprintf(stderr, " 0x%x %.0f", 0xA000 + regs[i].second, regs[i].first / n);
         }
         std::fprintf(stderr, " per frame\n");
+        std::fprintf(stderr, "[prof] t=%.1f VRAM copies %zu: %.1f allocations, %.2f evictions (%.1f freed, %.2f found none) per frame\n",
+                     profile::seconds(), vram_.size(), prof_.vramAllocs / n, prof_.vramEvicts / n, prof_.vramFreed / n,
+                     prof_.vramEvictsEmpty / n);
         if (const gcn::ReplayStats rs = gcn::takeReplayStats(); rs.planned)
             std::fprintf(stderr, "[prof] t=%.1f fast replays %.0f per frame, %.0f%% of their trace steps run directly (%.0f of %.0f); %" PRIu64 " differed from a full replay, %" PRIu64 " changed memory\n",
                          profile::seconds(), rs.planned / n, 100.0 * rs.kept / std::max<uint64_t>(rs.steps, 1), rs.kept / n,
@@ -3791,6 +3799,7 @@ void main() {
     };
     static constexpr uint64_t kVramMin = 64 << 10, kVramMax = 64ull << 20, kVramBudget = 1536ull << 20;
     static constexpr size_t kVramEntries = 1500; // each is a memory allocation of its own
+    uint64_t evictNothingFrame_ = ~0ull; // evictVram found no copy to free in this frame
     const bool vramOn_ = getenv("LPN_NO_VRAM_BUFFERS") == nullptr;
     std::unordered_map<std::pair<uint64_t, uint64_t>, std::unique_ptr<VramBuffer>, PairHash> vram_;
     struct VramHit {
@@ -4067,15 +4076,26 @@ void main() {
         }
         VK_CHECK(vkBindBufferMemory(vk_.device, v.buf, v.mem, 0));
         vramBytes_ += v.size;
+        ++prof_.vramAllocs;
         return true;
     }
     // Frees the copies used longest ago (a quarter of them), once the GPU is done with them.
     void evictVram() { // cacheMutex_ held
-        bufferEpoch_.fetch_add(1, std::memory_order_release); // resolutions ahead may name a freed copy
+        // Only copies unused for 2 frames go: when none were, none will be until the next frame,
+        // and scanning and sorting every copy again for each new one cost the recorder at the overlook.
+        if (evictNothingFrame_ == frame_) return;
+        ++prof_.vramEvicts;
         std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> byUse;
         for (auto& [k, v] : vram_)
             if (std::max(v->lastUse, v->aheadUse.load(std::memory_order_relaxed)) + 2 < frame_)
                 byUse.push_back({std::max(v->lastUse, v->aheadUse.load(std::memory_order_relaxed)), k});
+        if (byUse.empty()) {
+            evictNothingFrame_ = frame_;
+            ++prof_.vramEvictsEmpty;
+            return;
+        }
+        bufferEpoch_.fetch_add(1, std::memory_order_release); // resolutions ahead may name a freed copy
+        prof_.vramFreed += std::max<size_t>(byUse.size() / 4, std::min<size_t>(byUse.size(), 16));
         std::sort(byUse.begin(), byUse.end());
         for (size_t i = 0; i < std::max<size_t>(byUse.size() / 4, std::min<size_t>(byUse.size(), 16)); ++i) {
             auto it = vram_.find(byUse[i].second);
