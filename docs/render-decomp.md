@@ -141,3 +141,9 @@ reads again kept 98-100% of steps on the owner's run (~60 steps per replay, up t
 frame): every step in these traces is live. Check mode also logged 8 replays of shader
 0x53c3fd200 whose two back-to-back replays of the same trace gave different output, which
 points at guest memory changing while it is being read (the game writing ahead into its rings).
+
+## Worker count (2026-11-06)
+
+LPN_ANALYSIS_WORKERS=6 on the owner's i7-12700K: mid-size spots (1,500-3,700 draws) went from
+36-59 to 90-140 fps with analysis-wait ~1 ms; the default is now 6 on 16+ hardware threads. The
+~8,400-draw overlook stays ~56 fps with no analysis wait: the recorder (~16 ms) is its limit.
