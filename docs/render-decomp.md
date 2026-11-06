@@ -154,3 +154,12 @@ LPN_FAST_REPLAY=check past the overlook: 37-54% of trace steps run directly; 4 d
 ~85 s, all shader 0x53c3fd200, the same one that differed when the plan ran every step (so not
 the fast path; most likely its memory changing between the two reads). Left off by default:
 with 6 workers analysis no longer limits fps, so its gain is spare CPU.
+
+## Recorder after the VRAM arena (overlook, 2026-11-06)
+
+vramBuffer 22.5% -> 3.5% of lpn-record, bindBuffer 24% -> 6%, no driver time left. The rest is
+spread thin: onDraw self 21% (over half on prefetchAhead's prefetches, the rest a hash probe),
+draw self 12% and switchDraw self 6%, both stalling on the first load of fields the analysis
+workers wrote (cross-core misses), pushDescriptors 9% (CmdChunk::alloc 6%), compareResources 4%,
+switchDraw's 64-slot linear search ~2%. No single item left is worth more than a few percent;
+the next real step is recording on more than one thread.
