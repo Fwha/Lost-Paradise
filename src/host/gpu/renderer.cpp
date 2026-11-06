@@ -733,7 +733,10 @@ public:
         prof_.on = aprof_.on = getenv("LPN_PROFILE") != nullptr;
         {
             const char* w = getenv("LPN_ANALYSIS_WORKERS");
-            analysisWorkers_ = w ? unsigned(std::atoi(w)) : std::thread::hardware_concurrency() >= 8 ? 3 : 1;
+            // 6 on 16+ threads: on an i7-12700K (20) 3 workers left mid-size scenes (~2,900 draws)
+            // waiting 8-10 ms a frame for analysis at 36-59 fps; 6 cut that to ~1 ms (90-140 fps).
+            const unsigned hw = std::thread::hardware_concurrency();
+            analysisWorkers_ = w ? unsigned(std::atoi(w)) : hw >= 16 ? 6 : hw >= 8 ? 3 : 1;
             analysisWorkers_ = std::min(analysisWorkers_, 16u);
             for (unsigned i = 0; i < std::max(analysisWorkers_, 1u); ++i) {
                 actx_.push_back(std::make_unique<AnalysisCtx>(overlays_));
@@ -751,7 +754,8 @@ public:
 
     // ---- the analysis thread (see pm4.h): shader analysis for each draw, ahead of recording ----
     // It reads each draw's launches from the registers and hands them, in batches of consecutive
-    // draws, to analysis workers (LPN_ANALYSIS_WORKERS, default 3; 0 analyses on this thread).
+    // draws, to analysis workers (LPN_ANALYSIS_WORKERS, default 6 on 16+ hardware threads, else 3 on 8+,
+    // else 1; 0 analyses on this thread).
     // One thread replaying every launch capped crowded views: looking up the steps after New
     // Game, ~6,350 draws kept it 94% busy at ~59 fps. Each worker keeps its own analyses, page
     // cache and memo (a cached program is re-targeted in place); shader modules, pipelines and
