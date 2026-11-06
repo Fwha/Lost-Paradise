@@ -568,6 +568,7 @@ struct Profiler {
     uint64_t passBySize[4] = {}, drawsBySize[4] = {}, largestPass = 0;
     // Recorder threads: segments recorded, waits for them (and their ns), their recording time summed.
     uint64_t segments = 0, drains = 0, drainNs = 0, workerNs = 0, aheadNs = 0; // aheadNs: waits for the threads to catch up
+    uint64_t locks = 0, lockWaits = 0, lockNs = 0; // recorder threads taking m_, finding it held, waiting for it
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -1341,9 +1342,10 @@ public:
                      R().prof_.drawsBySize[3] / n, R().prof_.largestPass);
         if (recordThreads_)
             std::fprintf(stderr, "[prof] t=%.1f recorder threads %u: %.0f segments, threads recording %.2f ms (summed), "
-                                 "%.0f waits for them %.2f ms, ahead-waits %.2f ms per frame\n",
+                                 "%.0f waits for them %.2f ms, ahead-waits %.2f ms; m_ taken %.0f, held by another %.0f, waited %.2f ms (summed) per frame\n",
                          profile::seconds(), recordThreads_, R().prof_.segments / n, R().prof_.workerNs / 1e6 / n, R().prof_.drains / n,
-                         R().prof_.drainNs / 1e6 / n, R().prof_.aheadNs / 1e6 / n);
+                         R().prof_.drainNs / 1e6 / n, R().prof_.aheadNs / 1e6 / n, R().prof_.locks / n, R().prof_.lockWaits / n,
+                         R().prof_.lockNs / 1e6 / n);
         std::fprintf(stderr, "[prof] t=%.1f VRAM copies %zu: %.1f allocations, %.2f evictions (%.1f freed, %.2f found none) per frame\n",
                      profile::seconds(), vram_.size(), R().prof_.vramAllocs / n, R().prof_.vramEvicts / n, R().prof_.vramFreed / n,
                      R().prof_.vramEvictsEmpty / n);
@@ -6424,7 +6426,7 @@ private:
                                       &Profiler::dmaBytes, &Profiler::pipelinesMade, &Profiler::pipelineWaits, &Profiler::vramCopies,
                                       &Profiler::vramCopyBytes, &Profiler::imageMisses, &Profiler::imageGens, &Profiler::resolvedAhead,
                                       &Profiler::vramAllocs, &Profiler::vramEvicts, &Profiler::vramFreed, &Profiler::vramEvictsEmpty,
-                                      &Profiler::segments, &Profiler::drains, &Profiler::drainNs, &Profiler::workerNs, &Profiler::aheadNs})
+                                      &Profiler::segments, &Profiler::drains, &Profiler::drainNs, &Profiler::workerNs, &Profiler::aheadNs, &Profiler::locks, &Profiler::lockWaits, &Profiler::lockNs})
             a.*f += std::exchange(b.*f, 0);
         a.largestPass = std::max(a.largestPass, std::exchange(b.largestPass, 0));
         for (auto& [k, v] : b.fastCtx) a.fastCtx[k] += v;
@@ -6500,7 +6502,22 @@ private:
             Rec& x = r.R();
             if (!x.worker_ || x.locked_) return;
             m_ = &r.m_;
-            m_->lock();
+            // Held for microseconds at a time: spin first (a futex sleep and wake-up per handoff
+            // cost more than the work it guards), counting the wait with LPN_PROFILE.
+            ++x.prof_.locks;
+            if (!m_->try_lock()) {
+                const auto t0 = x.prof_.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                int spins = 0;
+                while (!m_->try_lock())
+                    if (++spins < 20000) __builtin_ia32_pause();
+                    else {
+                        m_->lock();
+                        break;
+                    }
+                ++x.prof_.lockWaits;
+                if (x.prof_.on)
+                    x.prof_.lockNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+            }
             x.locked_ = true;
             rec_ = &x;
         }
