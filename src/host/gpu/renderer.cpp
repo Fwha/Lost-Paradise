@@ -1964,7 +1964,7 @@ private:
         const uint64_t end = addr + size;
         // The import that last covered this granule: a map walk per buffer was a cache miss per
         // level, at 8,000 draws a frame.
-        const Import*& hit = importHits_[(addr / kImportGranule) % kImportHits];
+        const Import*& hit = R().importHits_[(addr / kImportGranule) % kImportHits];
         if (hit && hit->start <= addr && hit->end >= end) {
             buffer = hit->buffer;
             offset = addr - hit->start;
@@ -1989,6 +1989,7 @@ private:
                 return true;
             }
         }
+        if (R().lockShared_) return false; // a recorder thread's fast draw: the caller records it in full
         const uint64_t align = std::max<uint64_t>(vk_.hostPointerAlignment, 4096);
         Import im;
         const uint64_t gs = addr & ~(kImportGranule - 1), ge = (end + kImportGranule - 1) & ~(kImportGranule - 1);
@@ -3436,9 +3437,12 @@ private:
     // without recording anything (an upload) or affecting the pass.
     bool peekImage(const gcn::ImageResource& t, ImageBinding& b) {
         if (t.storage || trace_) return false;
-        const ImageMemo& m = imageMemo(t);
-        if (!memoHit(m, t) || m.sampled) return false;
-        b = m.b;
+        // Read only (recorder threads look up under a shared lock): no way swapped on a miss.
+        const size_t set = imageMemoSet(t);
+        const ImageMemo* m = &imageMemos_[set + 1];
+        if (!memoHit(*m, t)) m = &imageMemos_[set];
+        if (!memoHit(*m, t) || m->sampled) return false;
+        b = m->b;
         return true;
     }
     ImageBinding resolveImage(const gcn::ImageResource& t) {
@@ -4008,7 +4012,6 @@ void main() {
     };
     static constexpr size_t kVramHits = 512;
     static size_t vramHitIndex(uint64_t base, uint64_t size) { return (base / 64 ^ size * 0x9E3779B97F4A7C15ull >> 40) % kVramHits; }
-    std::array<VramHit, kVramHits> vramHits_{}; // cleared when a copy is freed
     std::multimap<uint64_t, VramBuffer*> vramByBase_; // for overlap queries
     std::map<uint64_t, uint64_t> gpuWrittenRanges_;  // [start, end), merged
     uint64_t vramBytes_ = 0, vramCount_ = 0;
@@ -4068,7 +4071,7 @@ void main() {
     bool vramBuffer(uint64_t base, uint64_t size, VkBuffer& out, VkDeviceSize& off, bool inPass = false) {
         if (!vramOn_ || size < kVramMin || size > kVramMax || base % 4 || size % 4) return false;
         // The copy last found for this buffer, checked before the hash map (a miss per lookup).
-        VramHit& hit = vramHits_[vramHitIndex(base, size)];
+        VramHit& hit = R().vramHits_[vramHitIndex(base, size)];
         VramBuffer* vp = nullptr;
         if (hit.v && hit.base == base && hit.size == size) {
             vp = hit.v;
@@ -4323,7 +4326,9 @@ void main() {
             }
             vram_.erase(it);
         }
-        vramHits_.fill({});
+        rec0_.vramHits_.fill({}); // every thread's (m_ held exclusively: none is looking)
+        pro_.vramHits_.fill({});
+        for (auto& w : workerRecs_) w->vramHits_.fill({});
     }
 
     void bindResources(gcn::Program& p, uint32_t base, VkShaderStageFlags, std::vector<VkWriteDescriptorSet>& writes,
@@ -5558,7 +5563,7 @@ void main() {
         if (sameButUserData(a.vs, slot->prev->vs, moved, noFastTextures_ ? nullptr : &vsImages) >= 0 ||
             (a.psm && sameButUserData(a.ps, slot->prev->ps, psMoved, noFastTextures_ ? nullptr : &psImages) >= 0))
             return miss(4);
-        WLock wl(*this); // to the descriptors: the caches
+        WLock wl(*this, true); // to the descriptors: the caches, shared (read only)
         if (!peekImages(a.vs, vsImages, vsImg) || !peekImages(a.ps, psImages, psImg)) return miss(4);
         VkBuffer indexBuffer = VK_NULL_HANDLE;
         VkDeviceSize indexOffset = 0;
@@ -5689,7 +5694,7 @@ void main() {
         }
         // Other textures (another material on the same shaders): only ones already resolved this frame.
         ImageBinding vsImg[32], psImg[32];
-        WLock wl(*this); // from here to the descriptors: the caches
+        WLock wl(*this, true); // from here to the descriptors: the caches, shared (read only)
         if (why < 0 && !(peekImages(a.vs, vsImages, vsImg) && peekImages(a.ps, psImages, psImg))) why = 2;
         if (why >= 0) {
             if (R().prof_.on) ++R().prof_.fastRes[why];
@@ -5940,7 +5945,7 @@ void main() {
     }
 
     Vk vk_;
-    std::mutex m_;
+    std::shared_mutex m_; // the renderer; recorder threads' fast draws share it for their lookups
     VkCommandPool pool_ = VK_NULL_HANDLE;
     struct Batch {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -5987,7 +5992,6 @@ void main() {
 
     std::map<uint64_t, Import> imports_; // never erased while rendering: importHits_ points into it
     static constexpr size_t kImportHits = 64;
-    std::array<const Import*, kImportHits> importHits_{};
     std::unordered_map<uint64_t, Surface> colors_, depths_;
     std::unordered_map<uint64_t, Metadata> metadata_; // by HTILE/CMASK address
     std::unordered_map<std::array<uint32_t, 6>, GuestTexture, WordsHash> textures_;
@@ -6122,7 +6126,9 @@ private:
         // A recorder thread's (or the uploads ahead of them): Vulkan calls are made at once (not
         // queued for the command thread), into a secondary command buffer; it never flushes.
         bool immediate_ = false, worker_ = false;
-        bool locked_ = false; // holds m_ (see WLock)
+        bool locked_ = false, lockShared_ = false; // holds m_, shared (see WLock)
+        std::array<VramHit, kVramHits> vramHits_{}; // the copies last found (see vramBuffer); cleared when one is freed
+        std::array<const Import*, kImportHits> importHits_{}; // the imports last found (see guestBuffer)
     };
     Rec rec0_;
     static inline thread_local Rec* tRec_ = nullptr;
@@ -6502,20 +6508,21 @@ private:
     // On a recorder thread: holds m_ (the caches), unless already held.
     class WLock {
     public:
-        explicit WLock(Renderer& r) {
+        explicit WLock(Renderer& r, bool shared = false) : shared_(shared) {
             Rec& x = r.R();
             if (!x.worker_ || x.locked_) return;
             m_ = &r.m_;
             // Held for microseconds at a time: spin first (a futex sleep and wake-up per handoff
             // cost more than the work it guards), counting the wait with LPN_PROFILE.
             ++x.prof_.locks;
-            if (!m_->try_lock()) {
+            auto tryLock = [&] { return shared_ ? m_->try_lock_shared() : m_->try_lock(); };
+            if (!tryLock()) {
                 const auto t0 = x.prof_.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 int spins = 0;
-                while (!m_->try_lock())
+                while (!tryLock())
                     if (++spins < 20000) __builtin_ia32_pause();
                     else {
-                        m_->lock();
+                        shared_ ? m_->lock_shared() : m_->lock();
                         break;
                     }
                 ++x.prof_.lockWaits;
@@ -6523,18 +6530,20 @@ private:
                     x.prof_.lockNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
             }
             x.locked_ = true;
+            x.lockShared_ = shared_;
             rec_ = &x;
         }
         void unlock() {
             if (!rec_) return;
-            rec_->locked_ = false;
-            m_->unlock();
+            rec_->locked_ = rec_->lockShared_ = false;
+            shared_ ? m_->unlock_shared() : m_->unlock();
             rec_ = nullptr;
         }
         ~WLock() { unlock(); }
 
     private:
-        std::mutex* m_ = nullptr;
+        bool shared_;
+        std::shared_mutex* m_ = nullptr;
         Rec* rec_ = nullptr;
     };
 
