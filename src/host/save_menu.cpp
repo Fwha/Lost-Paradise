@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -370,6 +371,72 @@ void outline(SDL_Renderer* ren, int x, int y, int w, int h, int t, Uint8 r, Uint
     fill(ren, x + w - t, y, t, h, r, g, b, a);
 }
 void color(SDL_Renderer* ren, Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255) { SDL_SetRenderDrawColor(ren, r, g, b, a); }
+
+// PlayStation face-button icons, drawn as shapes: a dark disc with the cross, circle or square on it.
+enum class Pad { Cross, Circle, Square };
+const SDL_Color kIconFg{226, 226, 230, 255};
+
+void vertex(std::vector<SDL_Vertex>& v, float x, float y, SDL_Color c) { v.push_back({{x, y}, c, {0, 0}}); }
+void disc(std::vector<SDL_Vertex>& v, float cx, float cy, float r, SDL_Color c) {
+    constexpr int kSeg = 32;
+    for (int i = 0; i < kSeg; ++i) {
+        const float a0 = 6.2831853f * i / kSeg, a1 = 6.2831853f * (i + 1) / kSeg;
+        vertex(v, cx, cy, c);
+        vertex(v, cx + r * std::cos(a0), cy + r * std::sin(a0), c);
+        vertex(v, cx + r * std::cos(a1), cy + r * std::sin(a1), c);
+    }
+}
+void ring(std::vector<SDL_Vertex>& v, float cx, float cy, float r, float t, SDL_Color c) {
+    constexpr int kSeg = 32;
+    for (int i = 0; i < kSeg; ++i) {
+        const float a0 = 6.2831853f * i / kSeg, a1 = 6.2831853f * (i + 1) / kSeg;
+        const float ri = r - t;
+        const SDL_FPoint o0{cx + r * std::cos(a0), cy + r * std::sin(a0)}, o1{cx + r * std::cos(a1), cy + r * std::sin(a1)};
+        const SDL_FPoint i0{cx + ri * std::cos(a0), cy + ri * std::sin(a0)}, i1{cx + ri * std::cos(a1), cy + ri * std::sin(a1)};
+        vertex(v, o0.x, o0.y, c), vertex(v, o1.x, o1.y, c), vertex(v, i0.x, i0.y, c);
+        vertex(v, i0.x, i0.y, c), vertex(v, o1.x, o1.y, c), vertex(v, i1.x, i1.y, c);
+    }
+}
+void segment(std::vector<SDL_Vertex>& v, float x0, float y0, float x1, float y1, float t, SDL_Color c) {
+    const float dx = x1 - x0, dy = y1 - y0, len = std::max(0.001f, std::sqrt(dx * dx + dy * dy));
+    const float nx = -dy / len * t / 2, ny = dx / len * t / 2;
+    vertex(v, x0 + nx, y0 + ny, c), vertex(v, x1 + nx, y1 + ny, c), vertex(v, x0 - nx, y0 - ny, c);
+    vertex(v, x0 - nx, y0 - ny, c), vertex(v, x1 + nx, y1 + ny, c), vertex(v, x1 - nx, y1 - ny, c);
+}
+
+// Draws the icon in a size x size box at (x, y).
+void padIcon(SDL_Renderer* ren, int x, int y, int size, Pad b) {
+    std::vector<SDL_Vertex> v;
+    const float r = size / 2.0f, cx = x + r, cy = y + r, t = std::max(1.5f, size * 0.09f), k = r * 0.42f;
+    disc(v, cx, cy, r, SDL_Color{58, 58, 66, 255});
+    switch (b) {
+    case Pad::Cross:
+        segment(v, cx - k, cy - k, cx + k, cy + k, t, kIconFg);
+        segment(v, cx - k, cy + k, cx + k, cy - k, t, kIconFg);
+        break;
+    case Pad::Circle: ring(v, cx, cy, k + t / 2, t, kIconFg); break;
+    case Pad::Square: {
+        const float h = k * 0.85f;
+        segment(v, cx - h - t / 2, cy - h, cx + h + t / 2, cy - h, t, kIconFg);
+        segment(v, cx - h - t / 2, cy + h, cx + h + t / 2, cy + h, t, kIconFg);
+        segment(v, cx - h, cy - h, cx - h, cy + h, t, kIconFg);
+        segment(v, cx + h, cy - h, cx + h, cy + h, t, kIconFg);
+        break;
+    }
+    }
+    SDL_RenderGeometry(ren, nullptr, v.data(), int(v.size()), nullptr, 0);
+}
+
+// LPN_MENU_BUTTONS=pad or keys picks the hints; by default pad buttons show while a controller is in.
+bool controllerAttached() {
+    if (const char* e = std::getenv("LPN_MENU_BUTTONS")) {
+        if (!std::strcmp(e, "pad")) return true;
+        if (!std::strcmp(e, "keys")) return false;
+    }
+    for (int i = 0; i < SDL_NumJoysticks(); ++i)
+        if (SDL_IsGameController(i)) return true;
+    return false;
+}
 #endif
 
 } // namespace
@@ -630,9 +697,27 @@ void drawSaveMenu(SDL_Renderer* ren) {
 
     // Controls.
     fill(ren, x0, y0 + panelH - hintH, panelW, hintH, 10, 10, 14, 255);
-    color(ren, 140, 136, 128);
-    text(ren, x0 + pad, y0 + panelH - hintH + (hintH - U(15)) / 2, U(15),
-         "Enter / A: select      Backspace / B: back      Z / X: delete");
+    // With a controller plugged in: its buttons (cross, circle, square, as SDL's A, B and X are on
+    // a DualSense); otherwise the keys.
+    const int hs = U(15), hy = y0 + panelH - hintH + (hintH - hs) / 2;
+    int hx = x0 + pad;
+    const bool usePad = controllerAttached();
+    const std::pair<Pad, const char*> hints[] = {{Pad::Cross, "Select"}, {Pad::Circle, "Back"}, {Pad::Square, "Delete"}};
+    const char* keys[] = {"Enter", "Backspace", "Z"};
+    for (size_t i = 0; i < 3; ++i) {
+        if (usePad) {
+            const int is = U(20);
+            padIcon(ren, hx, y0 + panelH - hintH + (hintH - is) / 2, is, hints[i].first);
+            hx += is + U(7);
+        } else {
+            color(ren, 200, 196, 186);
+            text(ren, hx, hy, hs, keys[i], true);
+            hx += textW(keys[i], hs, true) + U(7);
+        }
+        color(ren, 140, 136, 128);
+        text(ren, hx, hy, hs, hints[i].second);
+        hx += textW(hints[i].second, hs) + U(26);
+    }
     SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
 }
 #endif
