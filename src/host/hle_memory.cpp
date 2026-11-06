@@ -21,6 +21,10 @@ namespace host {
 namespace {
 
 constexpr uint64_t kDirectMemorySize = 0x13C000000ull; // 5056 MiB, the base PS4's game budget
+// Past the budget the game is told about: taken only when an allocation no longer fits in it.
+// The game fills the whole budget, and above 1080p its display pool grows by 100 MB (see
+// patchRenderResolution), which the PS4 Pro branch it copies would find in the Pro's extra memory.
+constexpr uint64_t kOverflowSize = 0x10000000ull;
 constexpr uint64_t kPage = 0x4000;
 
 // PS4 protection bits: CPU read/write/exec, GPU read/write. The GPU is emulated on the CPU,
@@ -45,7 +49,7 @@ int hostProt(int32_t prot) {
 int directFd() {
     if (gDirectFd < 0) {
         gDirectFd = memfd_create("ps4-direct-memory", MFD_CLOEXEC);
-        if (gDirectFd < 0 || ftruncate(gDirectFd, kDirectMemorySize) != 0) {
+        if (gDirectFd < 0 || ftruncate(gDirectFd, kDirectMemorySize + kOverflowSize) != 0) {
             std::perror("[memory] cannot create direct memory backing");
             std::abort();
         }
@@ -64,12 +68,23 @@ int32_t sceKernelAllocateDirectMemory(int64_t searchStart, int64_t searchEnd, ui
     if (!physOut || len == 0 || (len & (kPage - 1))) return sceError(ps4errno::kEINVAL);
     if (align < kPage) align = kPage;
     std::lock_guard lock(gMutex);
-    uint64_t candidate = alignUp(uint64_t(searchStart), align);
-    for (const auto& [start, length] : gAllocated) {
-        if (candidate + len <= start) break;
-        if (start + length > candidate) candidate = alignUp(start + length, align);
-    }
+    auto find = [&](uint64_t from) {
+        uint64_t candidate = alignUp(from, align);
+        for (const auto& [start, length] : gAllocated) {
+            if (candidate + len <= start) break;
+            if (start + length > candidate) candidate = alignUp(start + length, align);
+        }
+        return candidate;
+    };
+    uint64_t candidate = find(uint64_t(searchStart));
     if (candidate + len > uint64_t(searchEnd) || candidate + len > kDirectMemorySize) {
+        candidate = find(kDirectMemorySize);
+        if (candidate + len <= kDirectMemorySize + kOverflowSize) {
+            std::fprintf(stderr, "[memory] 0x%lx bytes of direct memory placed past the budget\n", len);
+            gAllocated[candidate] = len;
+            *physOut = int64_t(candidate);
+            return 0;
+        }
         std::fprintf(stderr, "[memory] direct memory exhausted (0x%lx bytes requested)\n", len);
         return sceError(ps4errno::kEAGAIN);
     }

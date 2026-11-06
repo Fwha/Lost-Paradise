@@ -242,6 +242,7 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
                 uint32_t* file = op == kOpSetContextReg ? tRegs->ctx : op == kOpSetShReg ? tRegs->sh : tRegs->uconfig;
                 const uint32_t size = op == kOpSetContextReg ? kContextRegs : op == kOpSetShReg ? kShRegs : kUconfigRegs;
                 if (reg + count <= size) std::memcpy(&file[reg], b + 1, count * 4);
+                if (op == kOpSetContextReg) ++tRegs->ctxSerial;
                 break;
             }
             case kOpIndexBase: tRegs->indexBase = address(b[0], b[1]); break;

@@ -43,6 +43,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -110,6 +111,16 @@ bool readGuest(uint64_t addr, void* dst, size_t size) {
 }
 
 uint64_t shaderAddress(const GpuRegs& r, uint32_t lo) { return ((uint64_t(r.sh[lo + 1]) << 32) | r.sh[lo]) << 8; }
+
+// What recording a draw reads of the registers: the context registers (the live ones, or a copy
+// taken for a recorder thread) and the few others.
+struct DrawRegs {
+    const uint32_t* ctx = nullptr;
+    uint32_t prim = 0, indexType = 0, numInstances = 1;
+    static DrawRegs of(const GpuRegs& r, const uint32_t* ctx = nullptr) {
+        return {ctx ? ctx : r.ctx, r.uconfig[reg::kPrimitiveType], r.indexType, r.numInstances};
+    }
+};
 
 uint64_t hashBytes(const void* p, size_t n) {
     // FNV-1a over 8-byte words in four independent lanes (a single multiply chain is the
@@ -444,7 +455,7 @@ struct Image {
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0, layers = 1, levels = 1;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    std::map<std::array<uint32_t, 7>, VkImageView> views;
+    std::map<std::array<uint32_t, 8>, VkImageView> views;
 };
 
 // A render target or depth buffer at a guest address.
@@ -478,6 +489,11 @@ struct GuestTexture {
     uint64_t sample = 0;       // sampleHash at the last full check
     uint32_t uses = 0;         // frames it was used in while unchanged
     uint32_t phase = 0;        // which of every 8 uses gets the full check (spread across textures)
+    // Unchanged for 60 frames and checked by the sweep once a frame (see sweepVram), so image
+    // bindings of it stay good from frame to frame. What the sweep reads: base, span, tiled.
+    bool settled = false, swept = false, sweptChanged = false;
+    uint64_t base = 0;
+    size_t span = 0, tiled = 0;
 };
 
 struct Import {
@@ -541,10 +557,23 @@ struct Profiler {
     uint64_t fastImages = 0; // fast draws that bound other textures
     uint64_t diffsTaken = 0; // fastDraw checks an analysis worker had done
     uint64_t fastSwitches = 0; // fast draws that switched shaders (switchDraw)
+    // Fast draws that differ from the draw before only in draw data (same buffers, textures and
+    // index buffer), so one multi-draw could take both; and how many runs of them there were.
+    uint64_t mergeable = 0, mergeRuns = 0;
     uint64_t switchMiss[6] = {}; // other shaders not switched to: no slot, slot stale, state, sampled, resources, index
     uint64_t depthJoins = 0, depthOnly = 0; // depth-only draws that joined the open pass, of all depth-only ones
     std::unordered_map<uint32_t, uint64_t> fastCtx; // the context registers that differed
-    uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0;
+    uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0, imageMisses = 0, imageGens = 0, resolvedAhead = 0;
+    // VRAM copies: allocations, evictions run, copies they freed, and evictions that found nothing to free.
+    uint64_t vramAllocs = 0, vramEvicts = 0, vramFreed = 0, vramEvictsEmpty = 0;
+    // Render passes by how many draws they hold (1-15, 16-127, 128-1023, 1024+): passes, and the
+    // draws in them; and the largest pass's draws. Sizes how far recording can split by pass.
+    uint64_t passBySize[4] = {}, drawsBySize[4] = {}, largestPass = 0;
+    // Recorder threads: segments recorded, waits for them (and their ns), their recording time summed.
+    uint64_t segments = 0, drains = 0, drainNs = 0, workerNs = 0, aheadNs = 0; // aheadNs: waits for the threads to catch up
+    uint64_t sharedDraws = 0, sharedRetries = 0; // recorder threads' full draws looked up under a shared m_, and those that started over
+    uint64_t drainWhy[4] = {}; // drains by cause: a sequential draw, a memory write, a CPU-copied DMA, frame end
+    uint64_t locks = 0, lockWaits = 0, lockNs = 0; // recorder threads taking m_, finding it held, waiting for it
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -584,59 +613,87 @@ private:
 // the chunk. LPN_SYNC_RECORD=1 runs each call on the recorder as it is made.
 class CmdChunk {
 public:
+    // Calls and kept arrays go into one stream: a header (the call, or none for an array, and the
+    // record's size) and then its storage. Chunks come back from the command thread with their
+    // memory in that core's cache, so the recorder asks for the lines ahead of where it writes
+    // (a separate list of calls cost a cache miss every few calls).
     template <typename F> void push(F&& f) {
         using T = std::decay_t<F>;
-        void* p = alloc(sizeof(T), alignof(T));
+        static_assert(alignof(T) <= kAlign);
+        void* p = alloc(sizeof(T), [](void* o) {
+            T& t = *static_cast<T*>(o);
+            t();
+            t.~T();
+        });
         new (p) T(std::forward<F>(f));
-        ops_.push_back({[](void* o) {
-                            T& t = *static_cast<T*>(o);
-                            t();
-                            t.~T();
-                        },
-                        p});
     }
     template <typename T> T* keep(const T* src, size_t n) {
         if (!n) return nullptr;
-        T* d = static_cast<T*>(alloc(sizeof(T) * n, alignof(T)));
+        static_assert(alignof(T) <= kAlign);
+        T* d = static_cast<T*>(alloc(sizeof(T) * n, nullptr));
         std::memcpy(static_cast<void*>(d), src, sizeof(T) * n);
         return d;
     }
-    bool empty() const { return ops_.empty(); }
+    bool empty() const { return !calls_; }
     void run() {
-        for (const Op& o : ops_) o.call(o.obj);
-        ops_.clear();
+        for (size_t b = 0; b <= block_ && b < blocks_.size(); ++b) {
+            std::byte* base = blocks_[b].mem.get();
+            const size_t end = b == block_ ? used_ : blocks_[b].used;
+            for (size_t at = 0; at < end;) {
+                Header* h = reinterpret_cast<Header*>(base + at);
+                if (h->call) h->call(h + 1);
+                at += h->size;
+            }
+        }
+        calls_ = 0;
         block_ = 0;
         used_ = 0;
+        ahead_ = 0;
     }
 
 private:
-    static constexpr size_t kBlock = 256 << 10;
-    void* alloc(size_t size, size_t align) {
-        for (;;) {
+    static constexpr size_t kBlock = 256 << 10, kAlign = 16, kAhead = 512;
+    struct alignas(kAlign) Header {
+        void (*call)(void*);
+        size_t size; // of the record, header included
+    };
+    void* alloc(size_t size, void (*call)(void*)) {
+        const size_t n = (sizeof(Header) + size + kAlign - 1) & ~(kAlign - 1);
+        while (block_ >= blocks_.size() || used_ + n > blocks_[block_].size) {
             if (block_ < blocks_.size()) {
-                const size_t at = (used_ + align - 1) & ~(align - 1);
-                if (at + size <= blocks_[block_].second) {
-                    used_ = at + size;
-                    return blocks_[block_].first.get() + at;
-                }
+                blocks_[block_].used = used_;
                 ++block_;
                 used_ = 0;
+                ahead_ = 0;
                 continue;
             }
-            const size_t n = std::max(kBlock, size + align);
-            blocks_.emplace_back(std::make_unique<std::byte[]>(n), n);
+            const size_t sz = std::max(kBlock, n);
+            blocks_.push_back({std::make_unique<std::byte[]>(sz), sz, 0});
         }
+        Block& b = blocks_[block_];
+        std::byte* at = b.mem.get() + used_;
+        used_ += n;
+        if (prefetchWrites_)
+            for (const size_t to = std::min(used_ + kAhead, b.size); ahead_ < to; ahead_ += 64) __builtin_prefetch(b.mem.get() + ahead_, 1);
+        Header* h = reinterpret_cast<Header*>(at);
+        h->call = call;
+        h->size = n;
+        if (call) ++calls_;
+        return h + 1;
     }
-    struct Op {
-        void (*call)(void*);
-        void* obj;
+    struct Block {
+        std::unique_ptr<std::byte[]> mem;
+        size_t size, used;
     };
-    std::vector<Op> ops_;
-    std::vector<std::pair<std::unique_ptr<std::byte[]>, size_t>> blocks_;
-    size_t block_ = 0, used_ = 0;
+    std::vector<Block> blocks_;
+    size_t block_ = 0, used_ = 0, ahead_ = 0, calls_ = 0;
+    // LPN_NO_CHUNK_PREFETCH=1: perf at the overlook put 4% of the recorder on these prefetches.
+    static inline const bool prefetchWrites_ = getenv("LPN_NO_CHUNK_PREFETCH") == nullptr;
 };
 
 class Renderer final : public DrawListener {
+    struct DrawAnalysis; // declared further down
+
 public:
     bool init() {
         std::string error;
@@ -701,14 +758,17 @@ public:
                 }
             }
         }
-        prof_.on = aprof_.on = getenv("LPN_PROFILE") != nullptr;
+        R().prof_.on = aprof_.on = getenv("LPN_PROFILE") != nullptr;
         {
             const char* w = getenv("LPN_ANALYSIS_WORKERS");
-            analysisWorkers_ = w ? unsigned(std::atoi(w)) : std::thread::hardware_concurrency() >= 8 ? 3 : 1;
+            // 6 on 16+ threads: on an i7-12700K (20) 3 workers left mid-size scenes (~2,900 draws)
+            // waiting 8-10 ms a frame for analysis at 36-59 fps; 6 cut that to ~1 ms (90-140 fps).
+            const unsigned hw = std::thread::hardware_concurrency();
+            analysisWorkers_ = w ? unsigned(std::atoi(w)) : hw >= 16 ? 6 : hw >= 8 ? 3 : 1;
             analysisWorkers_ = std::min(analysisWorkers_, 16u);
             for (unsigned i = 0; i < std::max(analysisWorkers_, 1u); ++i) {
                 actx_.push_back(std::make_unique<AnalysisCtx>(overlays_));
-                actx_.back()->prof.on = prof_.on;
+                actx_.back()->prof.on = R().prof_.on;
             }
             for (unsigned i = 0; i < analysisWorkers_; ++i)
                 std::thread([this, c = actx_[i].get()] { analysisWorker(*c); }).detach();
@@ -717,12 +777,14 @@ public:
         openPipelineCache();
         startPipelineWorkers();
         dumpGlsl_ = getenv("LPN_GPU_GLSL") != nullptr;
+        startRecorderThreads();
         return true;
     }
 
     // ---- the analysis thread (see pm4.h): shader analysis for each draw, ahead of recording ----
     // It reads each draw's launches from the registers and hands them, in batches of consecutive
-    // draws, to analysis workers (LPN_ANALYSIS_WORKERS, default 3; 0 analyses on this thread).
+    // draws, to analysis workers (LPN_ANALYSIS_WORKERS, default 6 on 16+ hardware threads, else 3 on 8+,
+    // else 1; 0 analyses on this thread).
     // One thread replaying every launch capped crowded views: looking up the steps after New
     // Game, ~6,350 draws kept it 94% busy at ~59 fps. Each worker keeps its own analyses, page
     // cache and memo (a cached program is re-targeted in place); shader modules, pipelines and
@@ -739,15 +801,16 @@ public:
                 analyses_.push_back(std::move(spareAnalyses_.back()));
                 spareAnalyses_.pop_back();
             } else {
-                analyses_.emplace_back();
+                analyses_.push_back(std::make_unique<DrawAnalysis>());
             }
-            a = &analyses_.back(); // stays put while later ones are added (a deque)
+            a = analyses_.back().get();
             a->ready = false;
         }
         a->ok = a->repeat = false;
         a->vsm = a->psm = nullptr;
         a->vsc = a->psc = nullptr;
         a->diffPrev = false;
+        a->resEpoch = 0;
         a->seq = ++analysisSeq_;
         // Most draws keep the last one's context registers: a compare here, a hash only on a change.
         if (std::memcmp(r.ctx, lastCtx_, sizeof lastCtx_) != 0) {
@@ -839,6 +902,56 @@ public:
         std::unique_lock lock(batchMutex_);
         batchIdleCv_.wait(lock, [&] { return analysisBatches_.empty() && batchesBusy_ == 0; });
     }
+    // The recorder spends most of a draw waiting on memory: the analysis a worker wrote on
+    // another core, then the VRAM copy, import and image memo each resource looks up, one
+    // dependent miss after another. The draws after this one in the run are known, so their
+    // memory is requested ahead in three steps (each reading only what the step before
+    // fetched), and the waits overlap. LPN_NO_PREFETCH=1 turns it off.
+    const bool prefetch_ = getenv("LPN_NO_PREFETCH") == nullptr;
+    static void prefetchRange(const void* p, size_t bytes) {
+        const char* c = static_cast<const char*>(p);
+        for (size_t o = 0; o < std::min<size_t>(bytes, 1024); o += 64) __builtin_prefetch(c + o);
+    }
+    // Only the lines a draw reads: prefetching whole analyses and draw data (~400 lines a draw)
+    // filled the core's miss buffers and stalled on the prefetches themselves. Buffers resolved
+    // ahead (resolveAhead) need no lookups here.
+    void prefetchAhead() {
+        const size_t n = taken_.size();
+        if (takenNext_ + 6 < n) { // the resource list headers
+            const DrawAnalysis& x = *taken_[takenNext_ + 6];
+            for (const gcn::Program* p : {&x.vs, &x.ps}) {
+                __builtin_prefetch(&p->buffers);
+                __builtin_prefetch(&p->images);
+            }
+            __builtin_prefetch(&x.vsRes);
+            __builtin_prefetch(&x.psRes);
+        }
+        if (takenNext_ + 3 < n) { // the resource lists themselves, and their bindings resolved ahead
+            const DrawAnalysis& x = *taken_[takenNext_ + 3];
+            for (const gcn::Program* p : {&x.vs, &x.ps}) {
+                prefetchRange(p->buffers.data(), p->buffers.size() * sizeof(gcn::BufferResource));
+                prefetchRange(p->images.data(), p->images.size() * sizeof(gcn::ImageResource));
+            }
+            prefetchRange(x.vsRes.data(), x.vsRes.size() * sizeof(BufRes));
+            prefetchRange(x.psRes.data(), x.psRes.size() * sizeof(BufRes));
+        }
+        if (takenNext_ + 1 < n) { // the image memo entries for its images
+            const DrawAnalysis& x = *taken_[takenNext_ + 1];
+            for (const gcn::Program* p : {&x.vs, &x.ps})
+                for (const gcn::ImageResource& t : p->images) prefetchRange(&imageMemos_[imageMemoSet(t)], 2 * sizeof(ImageMemo));
+        }
+    }
+
+    template <typename Run> void spare(Run& run) { // DrawAnalysis is declared further down
+        std::lock_guard lock(analysesMutex_);
+        // As many as can be in flight: analysis runs up to a frame ahead, and at ~6,000
+        // draws a frame a smaller pool left most draws allocating a fresh one (12% of the
+        // analysis thread in malloc) and the recorder freeing it (6% in ~Program).
+        for (auto& x : run)
+            if (spareAnalyses_.size() < 16384) spareAnalyses_.push_back(std::move(x));
+        run.clear();
+    }
+
     void onDraw(const DrawCall& d, const GpuRegs& r) override {
         // Analyses are taken, and handed back, a run at a time: a lock per draw was 4% of the
         // recorder at 6,000 draws a frame.
@@ -850,34 +963,30 @@ public:
                 warnOnce("a draw arrived without its analysis");
                 return;
             }
-            if (!analyses_.front().ready) {
-                ProfScope pw(prof_, kProfAnalysisWait);
-                analysesCv_.wait(lock, [&] { return analyses_.front().ready; });
+            if (!analyses_.front()->ready) {
+                ProfScope pw(R().prof_, kProfAnalysisWait);
+                analysesCv_.wait(lock, [&] { return analyses_.front()->ready; });
             }
             do {
                 taken_.push_back(std::move(analyses_.front()));
                 analyses_.pop_front();
-            } while (taken_.size() < kTakeRun && !analyses_.empty() && analyses_.front().ready);
+            } while (taken_.size() < kTakeRun && !analyses_.empty() && analyses_.front()->ready);
         }
-        DrawAnalysis& a = taken_[takenNext_++];
-        struct Recycle { // hands `a` back to the analysis thread however the draw ends
-            Renderer& r;
-            DrawAnalysis& a;
-            ~Recycle() {
-                r.returned_.push_back(std::move(a));
-                if (r.returned_.size() < kTakeRun) return;
-                std::lock_guard lock(r.analysesMutex_);
-                // As many as can be in flight: analysis runs up to a frame ahead, and at ~6,000
-                // draws a frame a smaller pool left most draws allocating a fresh one (12% of the
-                // analysis thread in malloc) and the recorder freeing it (6% in ~Program).
-                for (DrawAnalysis& x : r.returned_)
-                    if (r.spareAnalyses_.size() < 16384) r.spareAnalyses_.push_back(std::move(x));
-                r.returned_.clear();
+        // Analyses move by pointer: moved by value (two Programs each), handing them along was
+        // ~10% of the recorder at 8,000 draws a frame.
+        std::unique_ptr<DrawAnalysis>& held = taken_[takenNext_++];
+        if (recordThreads_) {
+            if (segmentable(d, *held)) {
+                addToSegment(d, r, held);
+                return;
             }
-        } recycle{*this, a};
+            drainSegments(0); // recorded here, in order with everything before it
+        }
+        DrawAnalysis& a = *held;
+        Recycle recycle{*this, held};
         std::lock_guard lock(m_);
-        ProfScope ps(prof_, kProfRenderer);
-        ++prof_.calls;
+        ProfScope ps(R().prof_, kProfRenderer);
+        if (prefetch_) prefetchAhead();
         ++drawIndex_;
         trace_ = frame_ == traceFrame_;
         if (trace_)
@@ -885,36 +994,80 @@ public:
                          d.kind == DrawCall::kDispatch ? "dispatch" : "draw", shaderAddress(r, reg::kPgmLoVs),
                          shaderAddress(r, reg::kPgmLoPs), shaderAddress(r, reg::kPgmLoCs));
         if (raceCheck_) raceShader_ = shaderAddress(r, d.kind == DrawCall::kDispatch ? reg::kPgmLoCs : reg::kPgmLoPs);
-        const uint64_t passesBefore = prof_.passes;
-        if (d.kind == DrawCall::kDispatch) dispatch(d, r, a);
-        else if (computeOnly_) return;
-        else if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r, a);
-        else warnOnce("indirect draws and dispatches are not rendered yet");
-        // prevDraw_ holds this draw's resources if it was recorded (fast, or in full and kept).
-        prevSeq_ = keepDraw_ || recordedSeq_ == a.seq ? a.seq : 0;
-        if (keepDraw_) { // the next draw may repeat this one (see fastDraw)
-            keepDraw_ = false;
-            std::swap(a, prevDraw_);
+        const uint64_t passesBefore = R().prof_.passes;
+        if (d.kind == DrawCall::kDispatch) {
+            ++R().prof_.calls;
+            dispatch(d, r, a);
+            R().prevSeq_ = 0;
+        } else if (computeOnly_) {
+            return;
+        } else {
+            recordDraw(d, DrawRegs::of(r), held);
         }
-        if (frame_ == timingFrame_ && timing_ && recording_ && timingMeta_.size() + 1 < kTimingQueries) {
-            rec([c = cmd_, q = timing_, i = uint32_t(timingMeta_.size() + 1)] {
+        if (frame_ == timingFrame_ && timing_ && R().recording_ && timingMeta_.size() + 1 < kTimingQueries) {
+            rec([c = R().cmd_, q = timing_, i = uint32_t(timingMeta_.size() + 1)] {
                 vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q, i);
             });
             timingMeta_.push_back({drawIndex_, shaderAddress(r, d.kind == DrawCall::kDispatch ? reg::kPgmLoCs : reg::kPgmLoPs),
-                                   d.kind == DrawCall::kDispatch, prof_.passes != passesBefore, d.count});
+                                   d.kind == DrawCall::kDispatch, R().prof_.passes != passesBefore, d.count});
         }
-        if (++drawsSinceHandOff_ >= 32) handOff(); // the command thread trails by a few draws
-        // Every 1,000 draws: at 400, the 6,350 draws looking up the steps after New Game made 16
-        // batches a frame, and with kBatches in flight the recorder waited on the GPU (80 fps, 90 at 1,000).
-        static const uint32_t flushDraws = getenv("LPN_FLUSH_DRAWS") ? std::atoi(getenv("LPN_FLUSH_DRAWS")) : 1000;
-        if (flushDraws && recording_ && ++drawsSinceFlush_ >= flushDraws) flush();
+        if (++R().drawsSinceHandOff_ >= 32) handOff(); // the command thread trails by a few draws
+        if (flushDraws_ && R().recording_ && ++R().drawsSinceFlush_ >= flushDraws_) flush();
+    }
+    // Every 1,000 draws: at 400, the 6,350 draws looking up the steps after New Game made 16
+    // batches a frame, and with kBatches in flight the recorder waited on the GPU (80 fps, 90 at 1,000).
+    const uint32_t flushDraws_ = getenv("LPN_FLUSH_DRAWS") ? std::atoi(getenv("LPN_FLUSH_DRAWS")) : 1000;
+
+    // Hands `a` back to the analysis thread however the draw ends.
+    struct Recycle {
+        Renderer& r;
+        std::unique_ptr<DrawAnalysis>& a;
+        ~Recycle() {
+            if (!a) return;
+            r.R().returned_.push_back(std::move(a));
+            if (r.R().returned_.size() < kTakeRun) return;
+            if (r.syncRecord_ || !r.deferUploads_ || r.R().immediate_) {
+                r.spare(r.R().returned_);
+                return;
+            }
+            // After the command thread has copied their data (see uploadData).
+            std::lock_guard lock(r.m_);
+            // Not rec(): a call between draws would end fastDraw's run (see FastDraw::rec).
+            r.R().chunk_->push([&r = r, run = std::move(r.R().returned_)]() mutable { r.spare(run); });
+            r.R().returned_.clear(); // moved from
+            r.R().returned_.reserve(kTakeRun);
+        }
+    };
+
+    // A draw (not a dispatch), on whichever thread records it: the main recorder under m_, or a
+    // recorder thread (which takes m_ itself where the caches are touched, see WLock).
+    void recordDraw(const DrawCall& d, const DrawRegs& r, std::unique_ptr<DrawAnalysis>& held) {
+        DrawAnalysis& a = *held;
+        ++R().prof_.calls;
+        const uint64_t drawsBefore = R().stats_.draws;
+        if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r, a);
+        else warnOnce("indirect draws and dispatches are not rendered yet");
+        if (R().prof_.on && R().stats_.draws != drawsBefore) {
+            if (R().countedPass_ != R().passSerial_) {
+                notePassSize();
+                R().countedPass_ = R().passSerial_;
+            }
+            ++R().passDraws_;
+        }
+        // R().prevDraw_ holds this draw's resources if it was recorded (fast, or in full and kept).
+        R().prevSeq_ = R().keepDraw_ || R().recordedSeq_ == a.seq ? a.seq : 0;
+        if (R().keepDraw_) { // the next draw may repeat this one (see fastDraw)
+            R().keepDraw_ = false;
+            std::swap(held, R().prevDraw_);
+        }
     }
 
     // The command processor copies descriptors and constants between draws (DMA_DATA): draws
     // after it must not see the page cache's older copy.
     void onMemoryWrite(uint64_t addr, uint64_t size) override {
+        if (recordThreads_) drainSegments(1);
         std::lock_guard lock(m_);
-        fast_.valid = false;
+        R().fast_.valid = false;
         ++fastEpoch_;
         if (raceCheck_) noteWrite(addr, size);
         cpWrites(addr, size);
@@ -930,8 +1083,12 @@ public:
         overlays_.drop(id);
     }
 
+    // With recorder threads, a copy the GPU makes is queued after the segments before it without
+    // waiting for them (their draws run first on the GPU, and nothing they read on the CPU changes);
+    // one the CPU makes waits for them, as it changes memory they may still read.
     bool onDmaCopy(uint64_t dst, uint64_t src, uint64_t bytes, bool fill, uint32_t value) override {
-        fast_.valid = false; // memory changes (recorder thread, like fastDraw)
+        if (recordThreads_) dispatchSegment();
+        R().fast_.valid = false; // memory changes (recorder thread, like fastDraw)
         ++fastEpoch_;
         uint64_t id = 0; // the analysis thread's overlay for this copy
         {
@@ -942,13 +1099,18 @@ public:
             }
         }
         // Copied by the CPU right after a false return: the overlay can go at once.
+        std::unique_lock lock(m_, std::defer_lock);
         auto cpu = [&] {
+            if (recordThreads_) {
+                if (lock.owns_lock()) lock.unlock();
+                drainSegments(2);
+            }
             if (id) overlays_.drop(id);
             return false;
         };
         static const bool cpuDma = getenv("LPN_CPU_DMA") != nullptr; // the old way, for comparison
         if (cpuDma) return cpu();
-        std::lock_guard lock(m_);
+        lock.lock();
         VkBuffer db, sb = VK_NULL_HANDLE;
         VkDeviceSize doff, soff = 0;
         if (!guestBuffer(dst, bytes, db, doff)) return cpu();
@@ -961,33 +1123,49 @@ public:
         begin();
         fullBarrier();
         if (fill) {
-            rec([c = cmd_, db, doff, bytes, value] { vkCmdFillBuffer(c, db, doff, bytes, value); });
+            rec([c = R().cmd_, db, doff, bytes, value] { vkCmdFillBuffer(c, db, doff, bytes, value); });
         } else {
             const VkBufferCopy bc{soff, doff, bytes};
-            rec([c = cmd_, sb, db, bc] { vkCmdCopyBuffer(c, sb, db, 1, &bc); });
+            rec([c = R().cmd_, sb, db, bc] { vkCmdCopyBuffer(c, sb, db, 1, &bc); });
         }
         if (raceCheck_) noteWrite(dst, bytes);
         gpuWrites(dst, bytes);
-        ++prof_.dmas, prof_.dmaBytes += bytes;
-        if (id) pendingDone_.push_back([this, id] { overlays_.drop(id); }); // once the GPU has copied
+        ++R().prof_.dmas, R().prof_.dmaBytes += bytes;
+        if (id) R().pendingDone_.push_back([this, id] { overlays_.drop(id); }); // once the GPU has copied
         return true;
     }
 
     void onWait() override {
+        if (recordThreads_) dispatchSegment();
         std::lock_guard lock(m_);
         flush();
     }
 
     void onSubmitEnd() override {
+        if (recordThreads_) dispatchSegment();
         std::lock_guard lock(m_);
-        ProfScope ps(prof_, kProfRenderer);
+        ProfScope ps(R().prof_, kProfRenderer);
         flush();
     }
 
+    void notePassSize() {
+        if (!R().passDraws_) return;
+        const int b = R().passDraws_ < 16 ? 0 : R().passDraws_ < 128 ? 1 : R().passDraws_ < 1024 ? 2 : 3;
+        ++R().prof_.passBySize[b];
+        R().prof_.drawsBySize[b] += R().passDraws_;
+        R().prof_.largestPass = std::max(R().prof_.largestPass, R().passDraws_);
+        R().passDraws_ = 0;
+    }
     void onFrameEnd() override {
+        if (recordThreads_) drainSegments(3);
         std::lock_guard lock(m_);
+        if (recordThreads_ && R().prof_.on) mergeRecorderProfiles();
+        if (R().prof_.on) {
+            notePassSize();
+            R().countedPass_ = ~0ull;
+        }
         {
-            ProfScope ps(prof_, kProfRenderer);
+            ProfScope ps(R().prof_, kProfRenderer);
             flush();
         }
         if (frame_ == traceFrame_) {
@@ -998,10 +1176,13 @@ public:
                 std::fprintf(stderr, "[capture] saved %s\n", traceDir_.c_str());
             }
         }
-        if (prof_.on) reportSlowFrame();
+        if (R().prof_.on) reportSlowFrame();
         savePipelineCache();
         dlssFrameEnd();
+        sweepVram();
+        trace_ = false; // recorder threads read it (a traced frame is recorded here, in order)
         ++frame_;
+        frameNow_.store(frame_, std::memory_order_relaxed);
         if (!pendingCapture_.empty()) { // F12: trace this frame into the capture folder
             traceDir_ = pendingCapture_ + "/";
             captured_.clear();
@@ -1011,7 +1192,7 @@ public:
             traceOut_ = std::fopen((traceDir_ + "trace.txt").c_str(), "w");
             if (!traceOut_) traceOut_ = stderr;
         }
-        if (prof_.on && std::chrono::steady_clock::now() - prof_.windowStart >= std::chrono::seconds(1)) reportProfile();
+        if (R().prof_.on && std::chrono::steady_clock::now() - R().prof_.windowStart >= std::chrono::seconds(1)) reportProfile();
         if (frame_ % 300 == 0) std::erase_if(vramCandidates_, [&](const auto& c) { return c.second + 60 < frame_; });
         if (frame_ == timingFrame_ + 1) reportTiming();
         if (frame_ == timingFrame_) startTiming();
@@ -1025,14 +1206,14 @@ public:
         if (frame_ > 0) ++windowFrames_, worstFrameMs_ = std::max(worstFrameMs_, ms), slowFrames_ += ms > 17;
         if (ms > 50 && frame_ > 0) {
             std::fprintf(stderr, "[prof] slow frame %" PRIu64 ": %.1f ms;", frame_, ms);
-            for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.1f", kProfNames[i], (prof_.ns[i] - frameNs_[i]) / 1e6);
-            std::fprintf(stderr, "; %" PRIu64 " analyses, %" PRIu64 " pipelines made\n", prof_.analyses - frameAnalyses_,
-                         prof_.pipelinesMade - framePipelines_);
+            for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.1f", kProfNames[i], (R().prof_.ns[i] - frameNs_[i]) / 1e6);
+            std::fprintf(stderr, "; %" PRIu64 " analyses, %" PRIu64 " pipelines made\n", R().prof_.analyses - frameAnalyses_,
+                         R().prof_.pipelinesMade - framePipelines_);
         }
         lastFrameEnd_ = now;
-        std::copy(std::begin(prof_.ns), std::end(prof_.ns), frameNs_);
-        frameAnalyses_ = prof_.analyses;
-        framePipelines_ = prof_.pipelinesMade;
+        std::copy(std::begin(R().prof_.ns), std::end(R().prof_.ns), frameNs_);
+        frameAnalyses_ = R().prof_.analyses;
+        framePipelines_ = R().prof_.pipelinesMade;
     }
 
     // LPN_GPU_TIMING=<frame>, or the frame after an F12 capture: GPU time of every draw and
@@ -1057,7 +1238,7 @@ public:
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(vk_.phys, &props);
         gpuTickNs_ = props.limits.timestampPeriod;
-        rec([c = cmd_, q = timing_] {
+        rec([c = R().cmd_, q = timing_] {
             vkCmdResetQueryPool(c, q, 0, kTimingQueries);
             vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q, 0);
         });
@@ -1115,13 +1296,13 @@ public:
     // Analysis time sums the workers' (CPU time, not wall time, with several).
     void mergeAnalysisProfile() {
         auto merge = [&](Profiler& a) {
-            for (int i : {kProfAnalyze, kProfShaderLookup, kProfLaunch}) prof_.ns[i] += std::exchange(a.ns[i], 0);
-            prof_.analysisHits += std::exchange(a.analysisHits, 0);
-            prof_.repeats += std::exchange(a.repeats, 0);
-            for (int i = 0; i < 4; ++i) prof_.missWhy[i] += std::exchange(a.missWhy[i], 0);
-            for (int i = 0; i < 16; ++i) prof_.missUser[i] += std::exchange(a.missUser[i], 0);
-            prof_.analyses += std::exchange(a.analyses, 0);
-            prof_.pipelinesMade += std::exchange(a.pipelinesMade, 0);
+            for (int i : {kProfAnalyze, kProfShaderLookup, kProfLaunch}) R().prof_.ns[i] += std::exchange(a.ns[i], 0);
+            R().prof_.analysisHits += std::exchange(a.analysisHits, 0);
+            R().prof_.repeats += std::exchange(a.repeats, 0);
+            for (int i = 0; i < 4; ++i) R().prof_.missWhy[i] += std::exchange(a.missWhy[i], 0);
+            for (int i = 0; i < 16; ++i) R().prof_.missUser[i] += std::exchange(a.missUser[i], 0);
+            R().prof_.analyses += std::exchange(a.analyses, 0);
+            R().prof_.pipelinesMade += std::exchange(a.pipelinesMade, 0);
         };
         merge(aprof_);
         for (auto& c : actx_) merge(c->prof);
@@ -1130,51 +1311,70 @@ public:
     void reportProfile() {
         mergeAnalysisProfile();
         const auto now = std::chrono::steady_clock::now();
-        const double wall = std::chrono::duration<double>(now - prof_.windowStart).count();
+        const double wall = std::chrono::duration<double>(now - R().prof_.windowStart).count();
         const double n = double(std::max<uint64_t>(windowFrames_, 1));
         std::fprintf(stderr, "[prof] t=%.1f frames %" PRIu64 "-%" PRIu64 ": %.1f fps, %.1f ms/frame, worst %.1f ms, %" PRIu64 " over 17 ms;",
                      profile::seconds(), frame_ - windowFrames_, frame_, n / wall, wall * 1000 / n, worstFrameMs_, slowFrames_);
-        for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.2f", kProfNames[i], prof_.ns[i] / 1e6 / n);
+        for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.2f", kProfNames[i], R().prof_.ns[i] / 1e6 / n);
         std::fprintf(stderr, " passes for targets %.0f feedback %.0f (depth %.0f color %.0f) store %.0f other %.0f; depth-only draws %.0f (%.0f joined a pass);",
-                     prof_.passWhy[0] / n, prof_.passWhy[1] / n, prof_.feedbackOn[0] / n,
-                     prof_.feedbackOn[1] / n, prof_.passWhy[2] / n, prof_.passWhy[3] / n, prof_.depthOnly / n,
-                     prof_.depthJoins / n);
-        std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / n, prof_.dmas / n,
-                     prof_.dmaBytes / n / 1e6);
+                     R().prof_.passWhy[0] / n, R().prof_.passWhy[1] / n, R().prof_.feedbackOn[0] / n,
+                     R().prof_.feedbackOn[1] / n, R().prof_.passWhy[2] / n, R().prof_.passWhy[3] / n, R().prof_.depthOnly / n,
+                     R().prof_.depthJoins / n);
+        std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / n, R().prof_.dmas / n,
+                     R().prof_.dmaBytes / n / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
-        std::fprintf(stderr, " (ms/frame); %.0f draws (%.0f fast), %.0f analysis hits (%.0f repeats), %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " blended draws skipped for one; VRAM buffers %.0f MB, %.1f copies (%.2f MB) per frame\n",
-                     prof_.calls / n, prof_.fastDraws / n, prof_.analysisHits / n, prof_.repeats / n, prof_.analyses / n, prof_.texChecks / n, prof_.texUploads / n, prof_.texBytes / n / 1e6, prof_.flushes / n, prof_.passes / n,
-                     prof_.barriers / n, prof_.pipelinesMade, prof_.pipelineWaits, vramBytes_ / 1e6, prof_.vramCopies / n,
-                     prof_.vramCopyBytes / n / 1e6);
+        std::fprintf(stderr, " (ms/frame); %.0f draws (%.0f fast), %.0f analysis hits (%.0f repeats), %.0f analyses, %.0f tex checks, %.1f uploads (%.1f MB), %.1f flushes, %.0f render passes, %.0f barriers per frame, %" PRIu64 " pipelines made, %" PRIu64 " blended draws skipped for one; VRAM buffers %.0f MB, %.1f copies (%.2f MB) per frame; %.0f image lookups missed, %.1f image changes; %.0f buffers resolved ahead\n",
+                     R().prof_.calls / n, R().prof_.fastDraws / n, R().prof_.analysisHits / n, R().prof_.repeats / n, R().prof_.analyses / n, R().prof_.texChecks / n, R().prof_.texUploads / n, R().prof_.texBytes / n / 1e6, R().prof_.flushes / n, R().prof_.passes / n,
+                     R().prof_.barriers / n, R().prof_.pipelinesMade, R().prof_.pipelineWaits, vramBytes_ / 1e6, R().prof_.vramCopies / n,
+                     R().prof_.vramCopyBytes / n / 1e6, R().prof_.imageMisses / n, R().prof_.imageGens / n, R().prof_.resolvedAhead / n);
         std::fprintf(stderr, "[prof] t=%.1f launches not repeating the last: other shader %.0f, new submission %.0f, user data %.0f, other %.0f per frame; user data words differing:",
-                     profile::seconds(), prof_.missWhy[0] / n, prof_.missWhy[1] / n, prof_.missWhy[2] / n, prof_.missWhy[3] / n);
+                     profile::seconds(), R().prof_.missWhy[0] / n, R().prof_.missWhy[1] / n, R().prof_.missWhy[2] / n, R().prof_.missWhy[3] / n);
         for (int i = 0; i < 16; ++i)
-            if (prof_.missUser[i]) std::fprintf(stderr, " s%d %.0f", i, prof_.missUser[i] / n);
+            if (R().prof_.missUser[i]) std::fprintf(stderr, " s%d %.0f", i, R().prof_.missUser[i] / n);
         std::fprintf(stderr, "\n[prof] t=%.1f draws recorded in full:", profile::seconds());
-        for (int i = 0; i < kFastMissCount; ++i) std::fprintf(stderr, " %s %.0f", kFastMissNames[i], prof_.fastMiss[i] / n);
+        for (int i = 0; i < kFastMissCount; ++i) std::fprintf(stderr, " %s %.0f", kFastMissNames[i], R().prof_.fastMiss[i] / n);
         std::fprintf(stderr, " (kind %.0f, shaders %.0f, prim %.0f; resource counts %.0f, buffer %.0f, image %.0f); fast draws binding a buffer again %.0f, other textures %.0f, switching shaders %.0f",
-                     prof_.fastKind[0] / n, prof_.fastKind[1] / n, prof_.fastKind[2] / n, prof_.fastRes[0] / n,
-                     prof_.fastRes[1] / n, prof_.fastRes[2] / n, prof_.fastMoved / n, prof_.fastImages / n, prof_.fastSwitches / n);
+                     R().prof_.fastKind[0] / n, R().prof_.fastKind[1] / n, R().prof_.fastKind[2] / n, R().prof_.fastRes[0] / n,
+                     R().prof_.fastRes[1] / n, R().prof_.fastRes[2] / n, R().prof_.fastMoved / n, R().prof_.fastImages / n, R().prof_.fastSwitches / n);
+        std::fprintf(stderr, "; mergeable fast draws %.0f in %.0f runs", R().prof_.mergeable / n, R().prof_.mergeRuns / n);
         std::fprintf(stderr, " (not switched: no slot %.0f, slot stale %.0f, state %.0f, sampled %.0f, resources %.0f, index %.0f); checks done ahead %.0f",
-                     prof_.switchMiss[0] / n, prof_.switchMiss[1] / n, prof_.switchMiss[2] / n, prof_.switchMiss[3] / n,
-                     prof_.switchMiss[4] / n, prof_.switchMiss[5] / n, prof_.diffsTaken / n);
-        if (!prof_.fastCtx.empty()) {
+                     R().prof_.switchMiss[0] / n, R().prof_.switchMiss[1] / n, R().prof_.switchMiss[2] / n, R().prof_.switchMiss[3] / n,
+                     R().prof_.switchMiss[4] / n, R().prof_.switchMiss[5] / n, R().prof_.diffsTaken / n);
+        if (!R().prof_.fastCtx.empty()) {
             std::vector<std::pair<uint64_t, uint32_t>> regs;
-            for (auto [reg, count] : prof_.fastCtx) regs.push_back({count, reg});
+            for (auto [reg, count] : R().prof_.fastCtx) regs.push_back({count, reg});
             std::sort(regs.rbegin(), regs.rend());
             std::fprintf(stderr, "; context regs differing:");
             for (size_t i = 0; i < regs.size() && i < 8; ++i)
                 std::fprintf(stderr, " 0x%x %.0f", 0xA000 + regs[i].second, regs[i].first / n);
         }
         std::fprintf(stderr, " per frame\n");
+        std::fprintf(stderr, "[prof] t=%.1f passes by draws: 1-15 %.0f (%.0f draws), 16-127 %.0f (%.0f), 128-1023 %.0f (%.0f), 1024+ %.0f (%.0f) per frame; largest %" PRIu64 " draws\n",
+                     profile::seconds(), R().prof_.passBySize[0] / n, R().prof_.drawsBySize[0] / n, R().prof_.passBySize[1] / n,
+                     R().prof_.drawsBySize[1] / n, R().prof_.passBySize[2] / n, R().prof_.drawsBySize[2] / n, R().prof_.passBySize[3] / n,
+                     R().prof_.drawsBySize[3] / n, R().prof_.largestPass);
+        if (recordThreads_)
+            std::fprintf(stderr, "[prof] t=%.1f recorder threads %u: %.0f segments, threads recording %.2f ms (summed), "
+                                 "%.0f waits for them (draw %.0f, write %.0f, dma %.0f, frame %.0f) %.2f ms, ahead-waits %.2f ms; m_ taken %.0f, held by another %.0f, waited %.2f ms (summed); full draws shared %.0f, started over %.0f per frame\n",
+                         profile::seconds(), recordThreads_, R().prof_.segments / n, R().prof_.workerNs / 1e6 / n, R().prof_.drains / n,
+                         R().prof_.drainWhy[0] / n, R().prof_.drainWhy[1] / n, R().prof_.drainWhy[2] / n, R().prof_.drainWhy[3] / n,
+                         R().prof_.drainNs / 1e6 / n, R().prof_.aheadNs / 1e6 / n, R().prof_.locks / n, R().prof_.lockWaits / n,
+                         R().prof_.lockNs / 1e6 / n, R().prof_.sharedDraws / n, R().prof_.sharedRetries / n);
+        std::fprintf(stderr, "[prof] t=%.1f VRAM copies %zu: %.1f allocations, %.2f evictions (%.1f freed, %.2f found none) per frame\n",
+                     profile::seconds(), vram_.size(), R().prof_.vramAllocs / n, R().prof_.vramEvicts / n, R().prof_.vramFreed / n,
+                     R().prof_.vramEvictsEmpty / n);
+        if (const gcn::ReplayStats rs = gcn::takeReplayStats(); rs.planned)
+            std::fprintf(stderr, "[prof] t=%.1f fast replays %.0f per frame, %.0f%% of their trace steps run directly (%.0f of %.0f); %" PRIu64 " differed from a full replay, %" PRIu64 " changed memory\n",
+                         profile::seconds(), rs.planned / n, 100.0 * rs.kept / std::max<uint64_t>(rs.steps, 1), rs.kept / n,
+                         rs.steps / n, rs.mismatches, rs.races);
         windowFrames_ = slowFrames_ = 0;
         worstFrameMs_ = 0;
-        const bool on = prof_.on;
+        const bool on = R().prof_.on;
         std::fill(std::begin(frameNs_), std::end(frameNs_), 0);
         frameAnalyses_ = framePipelines_ = 0;
-        prof_ = Profiler{};
-        prof_.on = on;
-        prof_.windowStart = now;
+        R().prof_ = Profiler{};
+        R().prof_.on = on;
+        R().prof_.windowStart = now;
     }
 
     // Called from the display thread. Only recording the copy holds the renderer; waiting for
@@ -1205,13 +1405,13 @@ public:
         }
         // Mid-submission, the copy rides in the batch being recorded: flushing it here would split
         // the game's frame and leave the recorder waiting on its own first half.
-        const bool riding = recording_;
+        const bool riding = R().recording_;
         begin();
         fullBarrier();
         VkBufferImageCopy r{};
         r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         r.imageExtent = {c.w, c.h, 1};
-        rec([c = cmd_, im = s.img.image, buf = d.buf, r] { vkCmdCopyImageToBuffer(c, im, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r); });
+        rec([c = R().cmd_, im = s.img.image, buf = d.buf, r] { vkCmdCopyImageToBuffer(c, im, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &r); });
         if (!riding) flush();
         std::lock_guard dl(doneMutex_);
         c.seq = riding ? submitted_ + 1 : submitted_;
@@ -1222,7 +1422,7 @@ public:
     uint64_t gpuMark() {
         std::lock_guard lock(m_);
         std::lock_guard dl(doneMutex_);
-        return recording_ ? submitted_ + 1 : submitted_;
+        return R().recording_ ? submitted_ + 1 : submitted_;
     }
     bool gpuDone(uint64_t mark) {
         std::lock_guard dl(doneMutex_);
@@ -1364,8 +1564,8 @@ private:
         c.imageExtent = {w, h, 1};
         const VkDeviceSize at = ringAlloc(bytes, 16);
         c.bufferOffset = at;
-        rec([cb = cmd_, im = s.img.image, buf = ring_, c] { vkCmdCopyImageToBuffer(cb, im, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &c); });
-        const auto* src = static_cast<const uint8_t*>(ringPtr_) + at;
+        rec([cb = R().cmd_, im = s.img.image, buf = R().ring_, c] { vkCmdCopyImageToBuffer(cb, im, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &c); });
+        const auto* src = static_cast<const uint8_t*>(R().ringPtr_) + at;
         waitIdle();
         pixels.assign(size_t(width) * height, 0);
         for (uint32_t y = 0; y < h; ++y) std::memcpy(&pixels[size_t(y) * width], src + size_t(y) * w * 4, w * 4);
@@ -1382,26 +1582,26 @@ private:
     // Queues a Vulkan call (a closure over values, given the batch's command buffer) for the
     // command thread.
     template <typename F> void rec(F&& f) {
-        ++recCount_;
-        if (syncRecord_) f();
-        else chunk_->push(std::forward<F>(f));
+        ++R().recCount_;
+        if (syncRecord_ || R().immediate_) f();
+        else R().chunk_->push(std::forward<F>(f));
     }
     // Storage for an array a queued call points to, valid until the call has run.
-    template <typename T> const T* keep(const T* p, size_t n) { return syncRecord_ ? p : chunk_->keep(p, n); }
+    template <typename T> const T* keep(const T* p, size_t n) { return syncRecord_ || R().immediate_ ? p : R().chunk_->keep(p, n); }
     void handOff() {
-        drawsSinceHandOff_ = 0;
-        if (syncRecord_ || chunk_->empty()) return;
+        R().drawsSinceHandOff_ = 0;
+        if (syncRecord_ || R().chunk_->empty()) return;
         std::unique_ptr<CmdChunk> next;
         {
             std::lock_guard lock(chunkMutex_);
-            chunks_.push_back(std::move(chunk_));
+            chunks_.push_back(std::move(R().chunk_));
             if (!spareChunks_.empty()) {
                 next = std::move(spareChunks_.front());
                 spareChunks_.pop_front();
             }
         }
         chunkCv_.notify_one();
-        chunk_ = next ? std::move(next) : std::make_unique<CmdChunk>();
+        R().chunk_ = next ? std::move(next) : std::make_unique<CmdChunk>();
     }
     void commandThread() {
         profile::nameThread("lpn-vkcmd");
@@ -1420,9 +1620,9 @@ private:
     }
     void pushDescriptors(VkPipelineBindPoint point, VkPipelineLayout layout, std::vector<VkWriteDescriptorSet>& writes,
                          std::vector<VkDescriptorBufferInfo>& bufs, std::vector<VkDescriptorImageInfo>& imgs) {
-        if (syncRecord_) {
+        if (syncRecord_ || R().immediate_) {
             linkWrites(writes, bufs, imgs);
-            vk_.cmdPushDescriptorSet(cmd_, point, layout, 0, uint32_t(writes.size()), writes.data());
+            vk_.cmdPushDescriptorSet(R().cmd_, point, layout, 0, uint32_t(writes.size()), writes.data());
             return;
         }
         auto* w = const_cast<VkWriteDescriptorSet*>(keep(writes.data(), writes.size()));
@@ -1434,54 +1634,74 @@ private:
             else w[k].pImageInfo = &im[ni++];
         }
         const uint32_t n = uint32_t(writes.size());
-        rec([this, c = cmd_, point, layout, n, w] { vk_.cmdPushDescriptorSet(c, point, layout, 0, n, w); });
+        rec([this, c = R().cmd_, point, layout, n, w] { vk_.cmdPushDescriptorSet(c, point, layout, 0, n, w); });
     }
 
     void useBatch(uint32_t i) {
-        cur_ = i;
-        cmd_ = batches_[i].cmd;
-        ring_ = batches_[i].ring;
-        ringPtr_ = batches_[i].ringPtr;
-        ringUsed_ = 0;
+        R().cur_ = i;
+        R().cmd_ = batches_[i].cmd;
+        R().ring_ = batches_[i].ring;
+        R().ringPtr_ = batches_[i].ringPtr;
+        R().ringUsed_ = 0;
     }
 
     void begin() {
-        if (recording_) return;
-        Batch& b = batches_[cur_];
+        if (R().recording_) return;
+        if (R().worker_) { // the uploads ahead of the segments (a segment's own Rec records from its start)
+            if (&R() == &pro_) openPrologue();
+            return;
+        }
+        Batch& b = batches_[R().cur_];
         {
-            ProfScope ps(prof_, kProfGpuWait);
+            ProfScope ps(R().prof_, kProfGpuWait);
             std::unique_lock lock(doneMutex_);
+            if (b.busy && recordThreads_ && !tRec_) {
+                // m_ held: the batch may still execute segments whose threads need it.
+                lock.unlock();
+                m_.unlock();
+                lock.lock();
+                doneCv_.wait(lock, [&] { return !b.busy; });
+                lock.unlock();
+                m_.lock();
+                if (R().recording_ || &b != &batches_[R().cur_]) return begin(); // another thread began meanwhile
+                lock.lock();
+            }
             doneCv_.wait(lock, [&] { return !b.busy; });
         }
-        rec([this, c = cmd_, fence = b.fence] {
+        rec([this, c = R().cmd_, fence = b.fence] {
             VK_CHECK(vkResetFences(vk_.device, 1, &fence));
             VK_CHECK(vkResetCommandBuffer(c, 0));
             VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             VK_CHECK(vkBeginCommandBuffer(c, &bi));
         });
-        recording_ = true;
-        bound_ = Bound{};
-        needBarrier_ = true; // earlier batches' writes
+        R().recording_ = true;
+        R().bound_ = Bound{};
+        R().needBarrier_ = true; // earlier batches' writes
         if (frame_ == timingFrame_ && timing_ && timingMeta_.size() + 1 < kTimingQueries) {
-            rec([c = cmd_, q = timing_, i = uint32_t(timingMeta_.size() + 1)] {
+            rec([c = R().cmd_, q = timing_, i = uint32_t(timingMeta_.size() + 1)] {
                 vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, q, i);
             });
             timingMeta_.push_back({0, 0, false, false, 0, true});
         }
         if (timestamps_)
-            rec([c = cmd_, q = timestamps_, i = 2 * cur_] {
+            rec([c = R().cmd_, q = timestamps_, i = 2 * R().cur_] {
                 vkCmdResetQueryPool(c, q, i, 2);
                 vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, q, i);
             });
     }
 
     void flush() {
-        if (!recording_) {
-            if (!pendingDone_.empty()) {
+        if (R().worker_) {
+            if (&R() == &pro_) closePrologue(); // its ring is full: the next upload starts another
+            else warnOnce("a recorder thread's upload ring is full (draw data may be overwritten)");
+            return;
+        }
+        if (!R().recording_) {
+            if (!R().pendingDone_.empty()) {
                 // Nothing new to submit: due when the last submission finishes. Decided on the
                 // command thread, which has submitted everything queued before.
-                rec([this, fns = std::move(pendingDone_)]() mutable {
+                rec([this, fns = std::move(R().pendingDone_)]() mutable {
                     {
                         std::lock_guard lock(doneMutex_);
                         if (!inFlight_.empty()) {
@@ -1492,33 +1712,38 @@ private:
                     }
                     for (auto& f : fns) f();
                 });
-                pendingDone_.clear();
+                R().pendingDone_.clear();
                 handOff();
             }
             if (sync_) waitSubmitted();
             return;
         }
-        ++prof_.flushes;
+        ++R().prof_.flushes;
         endPass();
         if (raceCheck_ && !raceReads_.empty()) {
             auto reads = std::make_shared<std::unordered_map<uint64_t, RaceRead>>(std::move(raceReads_));
             raceReads_.clear();
-            afterFlush_.insert(afterFlush_.begin(), [this, reads] { checkReads(*reads); });
+            R().afterFlush_.insert(R().afterFlush_.begin(), [this, reads] { checkReads(*reads); });
         }
-        Batch& b = batches_[cur_];
+        Batch& b = batches_[R().cur_];
         if (timestamps_)
-            rec([c = cmd_, q = timestamps_, i = 2 * cur_ + 1] { vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q, i); });
-        std::vector<std::function<void()>> fns = std::move(afterFlush_);
-        for (auto& f : pendingDone_) fns.push_back(std::move(f));
-        afterFlush_.clear();
-        pendingDone_.clear();
+            rec([c = R().cmd_, q = timestamps_, i = 2 * R().cur_ + 1] { vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q, i); });
+        std::vector<std::function<void()>> fns = std::move(R().afterFlush_);
+        if (recordThreads_) { // what recorder threads freed: after every segment recorded by now
+            std::lock_guard lock(lateMutex_);
+            for (auto& f : lateFree_) fns.push_back(std::move(f));
+            lateFree_.clear();
+        }
+        for (auto& f : R().pendingDone_) fns.push_back(std::move(f));
+        R().afterFlush_.clear();
+        R().pendingDone_.clear();
         {
             std::lock_guard lock(doneMutex_);
             b.busy = true; // its ring and command buffer are not reused until the GPU is done
             ++submitted_;
         }
         // The completion thread learns of the batch once it is submitted (inFlight_).
-        rec([this, i = cur_, c = cmd_, fns = std::move(fns)]() mutable {
+        rec([this, i = R().cur_, c = R().cmd_, fns = std::move(fns)]() mutable {
             Batch& b = batches_[i];
             VK_CHECK(vkEndCommandBuffer(c));
             VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -1534,19 +1759,42 @@ private:
             doneCv_.notify_all();
         });
         handOff();
-        recording_ = false;
-        useBatch((cur_ + 1) % kBatches);
-        drawsSinceFlush_ = 0;
+        R().recording_ = false;
+        useBatch((R().cur_ + 1) % kBatches);
+        R().drawsSinceFlush_ = 0;
         if (sync_) waitSubmitted();
     }
 
     // Submits what is recorded and waits until the GPU (and the deferred work) is done.
-    void waitIdle() {
+    void waitIdle() { // m_ held
+        const bool paused = pauseSegments();
         flush();
         waitSubmitted();
+        if (paused) resumeSegments();
+    }
+    // Before waiting on the GPU with m_ held: no new segments, and the dispatched ones recorded
+    // (their threads need m_, and the batches waited for execute them). Releases m_ meanwhile.
+    bool pauseSegments() {
+        if (!recordThreads_ || tRec_) return false;
+        std::unique_lock lock(segMutex_);
+        ++paused_;
+        if (outstanding_) {
+            m_.unlock();
+            segDoneCv_.wait(lock, [&] { return outstanding_ == 0; });
+            lock.unlock();
+            m_.lock();
+        }
+        return true;
+    }
+    void resumeSegments() {
+        {
+            std::lock_guard lock(segMutex_);
+            --paused_;
+        }
+        segDoneCv_.notify_all();
     }
     void waitSubmitted() {
-        ProfScope ps(prof_, kProfGpuWait);
+        ProfScope ps(R().prof_, kProfGpuWait);
         std::unique_lock lock(doneMutex_);
         doneCv_.wait(lock, [&] { return completed_ >= submitted_ && !completing_; });
     }
@@ -1589,32 +1837,33 @@ private:
 
 public:
     bool afterGpuWork(std::function<void()>& fn) override {
+        if (recordThreads_) dispatchSegment(); // due after the draws before it too
         std::lock_guard lock(m_);
-        pendingDone_.push_back(std::move(fn));
+        R().pendingDone_.push_back(std::move(fn));
         return true;
     }
 
 private:
 
     // Before a copy, clear, dispatch or upload: everything before it is done and visible. What it
-    // writes is then made visible by the barrier the next draw's pass starts with (needBarrier_).
+    // writes is then made visible by the barrier the next draw's pass starts with (R().needBarrier_).
     void fullBarrier() {
         endPass();
         barrier();
-        needBarrier_ = true;
+        R().needBarrier_ = true;
     }
     void barrier() {
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        rec([c = cmd_, mb] {
+        rec([c = R().cmd_, mb] {
             vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0,
                                  nullptr);
         });
-        ++prof_.barriers;
-        needBarrier_ = false;
-        drawWritten_.clear();
-        drawSampled_.clear();
+        ++R().prof_.barriers;
+        R().needBarrier_ = false;
+        R().drawWritten_.clear();
+        R().drawSampled_.clear();
     }
     static bool overlaps(const std::vector<VkImage>& a, const std::vector<VkImage>& b) {
         for (VkImage x : a)
@@ -1627,17 +1876,36 @@ private:
 
     // Space in the upload ring; flushes first if the ring is full.
     VkDeviceSize ringAlloc(VkDeviceSize size, VkDeviceSize align) {
-        VkDeviceSize at = (ringUsed_ + align - 1) & ~(align - 1);
-        if (at + size > kRingSize) {
+        VkDeviceSize at = (R().ringUsed_ + align - 1) & ~(align - 1);
+        if (at + size > R().ringSize_) {
             flush();
             begin();
             at = 0;
         }
-        ringUsed_ = at + size;
+        R().ringUsed_ = at + size;
         return at;
     }
-    bool ringFits(VkDeviceSize size) const { return ringUsed_ + size + 4096 <= kRingSize; }
+    bool ringFits(VkDeviceSize size) const { return R().ringUsed_ + size + 4096 <= R().ringSize_; }
+    // A draw's data into the ring, copied by the command thread: the recorder's copies were 15% of
+    // its time at the city overlook, nearly all misses on data the analysis workers had just
+    // written. The data stays put until then: analyses go back to the workers through the command
+    // thread too (see onDraw's Recycle), and only the draw being recorded writes its own data.
+    VkDeviceSize uploadData(const std::vector<uint32_t>& data) {
+        const VkDeviceSize bytes = data.size() * 4;
+        const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
+        uint8_t* dst = static_cast<uint8_t*>(R().ringPtr_) + at;
+        if (syncRecord_ || !deferUploads_ || R().immediate_) std::memcpy(dst, data.data(), bytes);
+        else rec([dst, src = data.data(), bytes] { std::memcpy(dst, src, bytes); });
+        return at;
+    }
 
+    // Under the shared lock (a recorder thread's draw), a lookup that would change a shared cache
+    // flags the draw instead, which then starts over holding m_ exclusively. True when it did.
+    bool sharedMiss() {
+        if (!R().lockShared_) return false;
+        R().abort_ = true;
+        return true;
+    }
     void warnOnce(const std::string& w) {
         std::lock_guard lock(warnMutex_); // the analysis and recorder threads both warn
         if (warned_.insert(w).second) std::fprintf(stderr, "[gpu] %s\n", w.c_str());
@@ -1715,11 +1983,20 @@ private:
     bool guestBuffer(uint64_t addr, uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) {
         if (!addr || addr >= (1ull << 40) || !size) return false;
         const uint64_t end = addr + size;
+        // The import that last covered this granule: a map walk per buffer was a cache miss per
+        // level, at 8,000 draws a frame.
+        const Import*& hit = R().importHits_[(addr / kImportGranule) % kImportHits];
+        if (hit && hit->start <= addr && hit->end >= end) {
+            buffer = hit->buffer;
+            offset = addr - hit->start;
+            return true;
+        }
         // The import starting closest below `addr` usually covers it (imports are aligned granules);
         // a scan of all of them is the fallback.
         if (auto it = imports_.upper_bound(addr); it != imports_.begin()) {
             --it;
             if (it->second.end >= end) {
+                hit = &it->second;
                 buffer = it->second.buffer;
                 offset = addr - it->first;
                 return true;
@@ -1733,6 +2010,7 @@ private:
                 return true;
             }
         }
+        if (sharedMiss()) return false; // a recorder thread's draw: recorded again with m_ held
         const uint64_t align = std::max<uint64_t>(vk_.hostPointerAlignment, 4096);
         Import im;
         const uint64_t gs = addr & ~(kImportGranule - 1), ge = (end + kImportGranule - 1) & ~(kImportGranule - 1);
@@ -1741,7 +2019,10 @@ private:
             warnOnce("cannot import guest memory at 0x" + std::to_string(addr));
             return false;
         }
-        imports_[im.start] = im;
+        {
+            std::unique_lock lock(cacheMutex_);
+            imports_[im.start] = im;
+        }
         buffer = im.buffer;
         offset = addr - im.start;
         return true;
@@ -1750,20 +2031,21 @@ private:
     // ---- images --------------------------------------------------------------------------------
 
     bool createImage(Image& img, VkFormat format, uint32_t w, uint32_t h, VkImageUsageFlags usage, bool depth,
-                     VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D, uint32_t layers = 1) {
+                     VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D, uint32_t layers = 1, uint32_t levels = 1) {
         VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ici.flags = depth ? 0 : VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
         if (viewType == VK_IMAGE_VIEW_TYPE_CUBE) ici.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
         ici.imageType = viewType == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
         ici.format = format;
         ici.extent = {w, h, viewType == VK_IMAGE_VIEW_TYPE_3D ? layers : 1};
-        ici.mipLevels = 1;
+        ici.mipLevels = levels;
         ici.arrayLayers = viewType == VK_IMAGE_VIEW_TYPE_3D ? 1 : layers;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
         ici.usage = usage;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         ++imageGen_; // remembered image bindings may name an image this replaces
+        ++R().prof_.imageGens;
         if (vkCreateImage(vk_.device, &ici, nullptr, &img.image) != VK_SUCCESS) return false;
         VkMemoryRequirements req;
         vkGetImageMemoryRequirements(vk_.device, img.image, &req);
@@ -1777,10 +2059,12 @@ private:
         img.width = w;
         img.height = h;
         img.layers = layers;
+        img.levels = levels;
         img.aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
         if (format == VK_FORMAT_D32_SFLOAT_S8_UINT) img.aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
 
         // Everything stays in GENERAL; start it there.
+        Prologue pg(*this); // on a recorder thread: ahead of the segments
         begin();
         endPass();
         VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -1789,21 +2073,21 @@ private:
         ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         ib.image = img.image;
-        ib.subresourceRange = {img.aspect, 0, 1, 0, ici.arrayLayers};
-        rec([c = cmd_, ib] {
+        ib.subresourceRange = {img.aspect, 0, levels, 0, ici.arrayLayers};
+        rec([c = R().cmd_, ib] {
             vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
                                  &ib);
         });
         // Clear so never-written surfaces read as black rather than garbage.
-        const VkImageSubresourceRange range{img.aspect, 0, 1, 0, ici.arrayLayers};
+        const VkImageSubresourceRange range{img.aspect, 0, levels, 0, ici.arrayLayers};
         if (depth) {
             if (usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
-                rec([c = cmd_, im = img.image, range] {
+                rec([c = R().cmd_, im = img.image, range] {
                     const VkClearDepthStencilValue v{1.0f, 0};
                     vkCmdClearDepthStencilImage(c, im, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
                 });
         } else if ((usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
-            rec([c = cmd_, im = img.image, range] {
+            rec([c = R().cmd_, im = img.image, range] {
                 const VkClearColorValue v{};
                 vkCmdClearColorImage(c, im, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
             });
@@ -1815,7 +2099,7 @@ private:
         if (!img.image) return;
         // The command buffer may still reference it: release after the next flush.
         Image copy = img;
-        afterFlush_.push_back([this, copy] {
+        R().afterFlush_.push_back([this, copy] {
             for (auto& [k, v] : copy.views) vkDestroyImageView(vk_.device, v, nullptr);
             vkDestroyImage(vk_.device, copy.image, nullptr);
             vkFreeMemory(vk_.device, copy.memory, nullptr);
@@ -1823,20 +2107,24 @@ private:
         img = Image{};
     }
 
+    // A view of mip levels [baseLevel, baseLevel + levelCount) (all of the image's by default).
     VkImageView view(Image& img, VkFormat format, VkImageViewType type, VkComponentMapping swz,
-                     VkImageAspectFlags aspect = 0) {
+                     VkImageAspectFlags aspect = 0, uint32_t baseLevel = 0, uint32_t levelCount = 0) {
         if (!aspect) aspect = img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT;
         if (!aspect) aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-        const std::array<uint32_t, 7> k{uint32_t(format), uint32_t(type), uint32_t(swz.r), uint32_t(swz.g),
-                                        uint32_t(swz.b), uint32_t(swz.a), aspect};
+        baseLevel = std::min(baseLevel, img.levels - 1);
+        levelCount = levelCount ? std::min(levelCount, img.levels - baseLevel) : img.levels - baseLevel;
+        const std::array<uint32_t, 8> k{uint32_t(format), uint32_t(type), uint32_t(swz.r), uint32_t(swz.g),
+                                        uint32_t(swz.b), uint32_t(swz.a), aspect, baseLevel << 8 | levelCount};
         auto it = img.views.find(k);
         if (it != img.views.end()) return it->second;
+        if (sharedMiss()) return VK_NULL_HANDLE;
         VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vci.image = img.image;
         vci.viewType = type;
         vci.format = format;
         vci.components = swz;
-        vci.subresourceRange = {aspect, 0, 1, 0,
+        vci.subresourceRange = {aspect, baseLevel, levelCount, 0,
                                 type == VK_IMAGE_VIEW_TYPE_3D ? 1 : (type == VK_IMAGE_VIEW_TYPE_2D || type == VK_IMAGE_VIEW_TYPE_1D) ? 1 : img.layers};
         VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
         VkImageView v = VK_NULL_HANDLE;
@@ -1857,9 +2145,11 @@ private:
         if (it != colors_.end()) {
             Surface& s = it->second;
             if (s.img.width == w && s.img.height == h && s.elementBytes == bytes) return &s;
+            if (sharedMiss()) return nullptr;
             destroyImage(s.img);
             colors_.erase(it);
         }
+        if (sharedMiss()) return nullptr;
         Surface s;
         s.elementBytes = bytes;
         if (!createImage(s.img, format,
@@ -1881,9 +2171,11 @@ private:
         if (it != depths_.end()) {
             Surface& s = it->second;
             if (s.img.width == w && s.img.height == h && s.img.format == format) return &s;
+            if (sharedMiss()) return nullptr;
             destroyImage(s.img);
             depths_.erase(it);
         }
+        if (sharedMiss()) return nullptr;
         Surface s;
         s.depth = true;
         s.elementBytes = format == VK_FORMAT_D16_UNORM ? 2 : 4;
@@ -2401,6 +2693,7 @@ private:
         key.assign(reinterpret_cast<const char*>(&s), sizeof(s));
         auto it = pipelines_.find(key);
         if (it != pipelines_.end()) return it->second;
+        if (sharedMiss()) return VK_NULL_HANDLE;
         if (!vs->module || (ps && !ps->module)) return pipelines_[key] = VK_NULL_HANDLE;
         GraphicsState c = s;
         c.vs = c.ps = 0;
@@ -2414,8 +2707,8 @@ private:
             b = slot;
         }
         if (fresh) {
-            ++prof_.pipelinesMade;
-            notePipeline(c, vs->name, ps ? ps->name : std::string(), prof_.on);
+            ++R().prof_.pipelinesMade;
+            notePipeline(c, vs->name, ps ? ps->name : std::string(), R().prof_.on);
             PipelineJob j{c, vs->module, ps ? ps->module : VK_NULL_HANDLE, geometryFor(s), layout, b, std::move(record), false};
             if (syncPipelines_) runJob(j);
             else {
@@ -2426,10 +2719,10 @@ private:
         if (!b->ready.load(std::memory_order_acquire)) {
             if (!b->started.load()) hurry(b);
             if (skippable(c)) {
-                ++prof_.pipelineWaits;
+                ++R().prof_.pipelineWaits;
                 return VK_NULL_HANDLE; // still being built: the draw is skipped
             }
-            ProfScope pw(prof_, kProfGpuWait);
+            ProfScope pw(R().prof_, kProfGpuWait);
             b->ready.wait(false, std::memory_order_acquire);
         }
         return pipelines_[key] = b->pipeline;
@@ -2790,15 +3083,15 @@ private:
 
     void setDynamicState(const DynamicState& d, uint32_t depthControl) {
         // Scale is in 1/16ths of the slope; the offset is in the depth format's units, as Vulkan's.
-        if (!bound_.state || std::memcmp(bound_.polyOffset, d.polyOffset, sizeof d.polyOffset) != 0) {
-            std::memcpy(bound_.polyOffset, d.polyOffset, sizeof d.polyOffset);
-            rec([c = cmd_, k = std::bit_cast<float>(d.polyOffset[2]), cl = std::bit_cast<float>(d.polyOffset[0]),
+        if (!R().bound_.state || std::memcmp(R().bound_.polyOffset, d.polyOffset, sizeof d.polyOffset) != 0) {
+            std::memcpy(R().bound_.polyOffset, d.polyOffset, sizeof d.polyOffset);
+            rec([c = R().cmd_, k = std::bit_cast<float>(d.polyOffset[2]), cl = std::bit_cast<float>(d.polyOffset[0]),
                  sl = std::bit_cast<float>(d.polyOffset[1]) / 16.0f] { vkCmdSetDepthBias(c, k, cl, sl); });
         }
         const uint32_t back = (depthControl >> 7) & 1 ? d.stencilMasksBf : d.stencilMasks;
-        if (bound_.state && bound_.stencil[0] == d.stencilMasks && bound_.stencil[1] == back) return;
-        bound_.stencil[0] = d.stencilMasks, bound_.stencil[1] = back;
-        rec([c = cmd_, front = d.stencilMasks, back] {
+        if (R().bound_.state && R().bound_.stencil[0] == d.stencilMasks && R().bound_.stencil[1] == back) return;
+        R().bound_.stencil[0] = d.stencilMasks, R().bound_.stencil[1] = back;
+        rec([c = R().cmd_, front = d.stencilMasks, back] {
             for (auto [face, m] : {std::pair{VK_STENCIL_FACE_FRONT_BIT, front}, std::pair{VK_STENCIL_FACE_BACK_BIT, back}}) {
                 vkCmdSetStencilCompareMask(c, face, (m >> 8) & 0xFF);
                 vkCmdSetStencilWriteMask(c, face, (m >> 16) & 0xFF);
@@ -2817,7 +3110,7 @@ private:
         VkBuffer index = VK_NULL_HANDLE;
         VkDeviceSize indexOffset = 0;
         VkIndexType indexType = VK_INDEX_TYPE_UINT16;
-    } bound_;
+    };
 
     static bool isIntegerFormat(VkFormat f) {
         switch (f) {
@@ -2867,11 +3160,33 @@ private:
         ci.addressModeU = wrap(s[0] & 7);
         ci.addressModeV = wrap((s[0] >> 3) & 7);
         ci.addressModeW = wrap((s[0] >> 6) & 7);
-        ci.magFilter = ((s[2] >> 20) & 3) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-        ci.minFilter = ((s[2] >> 22) & 3) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-        ci.mipmapMode = ((s[2] >> 26) & 3) == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        // XY filters: 0 point, 1 bilinear, 2 anisotropic point, 3 anisotropic bilinear.
+        const uint32_t mag = (s[2] >> 20) & 3, min = (s[2] >> 22) & 3, mip = (s[2] >> 26) & 3;
+        ci.magFilter = (mag & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        ci.minFilter = (min & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        ci.mipmapMode = mip == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
         ci.minLod = float(s[1] & 0xFFF) / 256.0f;
         ci.maxLod = float((s[1] >> 12) & 0xFFF) / 256.0f;
+        if (mip == 0) ci.maxLod = std::min(ci.maxLod, 0.25f); // no mip filter: the base level only
+        ci.minLod = std::min(ci.minLod, ci.maxLod);
+        // LOD_BIAS: signed, 8 fraction bits.
+        const int32_t bias = int32_t(s[2] << 18) >> 18;
+        ci.mipLodBias = std::clamp(float(bias) / 256.0f, -vk_.props.limits.maxSamplerLodBias,
+                                   vk_.props.limits.maxSamplerLodBias);
+        // MAX_ANISO_RATIO 0-4: 1x to 16x, used when a filter is anisotropic. LPN_ANISO=N forces Nx
+        // on every filtered sampler (1 turns it off).
+        static const int forced = getenv("LPN_ANISO") ? std::atoi(getenv("LPN_ANISO")) : 0;
+        float aniso = (mag >= 2 || min >= 2) ? float(1u << std::min((s[0] >> 9) & 7, 4u)) : 1.0f;
+        if (forced > 0 && (min & 1) && !compare) aniso = float(forced);
+        static const bool canAniso = [this] { // the device enables it whenever it has it (vk.cpp)
+            VkPhysicalDeviceFeatures f{};
+            vkGetPhysicalDeviceFeatures(vk_.phys, &f);
+            return f.samplerAnisotropy == VK_TRUE;
+        }();
+        if (aniso > 1.0f && canAniso) {
+            ci.anisotropyEnable = VK_TRUE;
+            ci.maxAnisotropy = std::min(aniso, vk_.props.limits.maxSamplerAnisotropy);
+        }
         ci.compareEnable = compare;
         ci.compareOp = VkCompareOp((s[0] >> 12) & 7);
         ci.borderColor = compare ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
@@ -2931,6 +3246,28 @@ private:
     }
 
     // Uploads a texture from guest memory (linear layouts only for now).
+    // A texture just checked and found unchanged: settled once unchanged for a while.
+    GuestTexture* settleTexture(GuestTexture& tex, uint64_t base, size_t span, size_t tiled) {
+        if (resolveAhead_ && !tex.settled && frame_ - tex.changedFrame >= kSettleFrames) {
+            tex.settled = true;
+            tex.base = base, tex.span = span, tex.tiled = tiled;
+            if (!tex.swept) {
+                tex.swept = true;
+                sweptTextures_.push_back(&tex);
+            }
+        }
+        R().lastTexture_ = &tex;
+        return &tex;
+    }
+    // Found changed (by the sweep): checked in full at its next use, which every image binding
+    // remembered from earlier frames is dropped for.
+    void unsettleTexture(GuestTexture& t) {
+        t.settled = false;
+        t.sweptChanged = true;
+        ++imageGen_, ++R().prof_.imageGens;
+    }
+    std::vector<GuestTexture*> sweptTextures_; // settled ones (and some no longer), for the sweep
+
     GuestTexture* guestTexture(const gcn::ImageResource& t, VkFormat format) {
         const uint32_t df = t.dataFormat();
         const bool bc = isBlockCompressed(df);
@@ -2943,7 +3280,10 @@ private:
         const uint32_t layers = t.type() == 11 ? 6 : (t.type() == 13 || t.type() == 10) ? t.lastArray() + 1 : 1;
         const uint32_t slices = t.type() == 10 ? t.depth() : layers;
         GuestTexture& tex = textures_[{t.t[0], t.t[1], t.t[2], t.t[3] & ~0xFFFu, t.t[4], t.t[5]}];
-        if (tex.img.image && tex.checkedFrame == frame_) return &tex;
+        if (tex.img.image && tex.checkedFrame == frame_) {
+            R().lastTexture_ = &tex;
+            return &tex;
+        }
         // Re-reading every sampled texture each frame cost ~8 ms in fights and ~15 ms in crowded
         // areas, though most never change. One unchanged for 60 frames is fully hashed on every
         // 8th frame it is used and fingerprinted on the others, which catches whole rewrites at
@@ -2955,8 +3295,8 @@ private:
         const size_t span = size_t(ew) * eh * bpe * slices;
         // A full hash finished on a hasher thread is taken at the very next use, due or not: a
         // partial rewrite (new glyphs in a font atlas) then shows one use late, not eight.
-        bool asyncChanged = false;
-        if (tex.check && tex.check->state.load(std::memory_order_acquire) == 2) {
+        bool asyncChanged = std::exchange(tex.sweptChanged, false);
+        if (!asyncChanged && tex.check && tex.check->state.load(std::memory_order_acquire) == 2) {
             tex.check->state.store(0, std::memory_order_relaxed);
             asyncChanged = tex.check->result != tex.hash;
         }
@@ -2965,7 +3305,8 @@ private:
         // banner into the same memory, and an entry last used for an earlier move's banner (never
         // checked while idle, so "unchanged for 10 s") was bound unchecked or passed the
         // fingerprint, which mostly samples transparent texels. It flashed the earlier banner.
-        const bool idle = tex.img.image && frame_ - tex.checkedFrame > 2;
+        // Settled textures are left to the sweep, which checks them every frame, used or not.
+        const bool idle = tex.img.image && !tex.settled && frame_ - tex.checkedFrame > 2;
         if (!asyncChanged && !idle && !fullTexChecks_ && tex.img.image && frame_ - tex.changedFrame >= 60 &&
             (++tex.uses + tex.phase) % 8 != 0) {
             tex.checkedFrame = frame_;
@@ -2975,14 +3316,32 @@ private:
             if (sampleHash(t.base(), span) == tex.sample) return &tex;
         }
         uint32_t mode = t.tileMode();
-        size_t slice = tiledSliceSize(mode, ep, eh, bpe);
-        if (!slice) {
+        if (!tiledSliceSize(mode, ep, eh, bpe)) {
             warnOnce("texture tile mode " + std::to_string(mode) + " is read as linear");
             mode = 8;
-            slice = tiledSliceSize(mode, ep, eh, bpe);
         }
-        const size_t tiled = slice * slices;
-        const VkDeviceSize bytes = VkDeviceSize(ew) * eh * bpe * slices;
+        // The T#'s mip chain (levels 0 to LAST_LEVEL), uploaded whole: sampled with only level 0,
+        // minified textures (hair, skin detail, fences) shimmered and broke into pixels.
+        // LPN_NO_MIPS=1: level 0 only, as before.
+        uint32_t levels = 1;
+        if (!noMips_ && t.type() != 10) {
+            uint32_t full = 1;
+            while ((std::max(w, h) >> full) != 0) ++full;
+            levels = std::clamp(t.lastLevel() + 1, 1u, std::min(full, kMaxMips));
+        }
+        MipLevel mips[kMaxMips];
+        size_t tiled = mipLayout(mode, w, h, pitchPx, bc, bpe, slices, levels, t.pow2Pad(), mips);
+        if (levels == 1) { // as before: level 0 exactly as the T# describes it
+            mips[0] = {0, tiledSliceSize(mode, ep, eh, bpe), ep, ew, eh};
+            tiled = mips[0].sliceBytes * slices;
+        }
+        // Linear copies of the levels, each at a 16-byte boundary.
+        size_t linearAt[kMaxMips];
+        VkDeviceSize bytes = 0;
+        for (uint32_t m = 0; m < levels; ++m) {
+            linearAt[m] = bytes;
+            bytes += (VkDeviceSize(mips[m].width) * mips[m].height * bpe * slices + 15) & ~VkDeviceSize(15);
+        }
         if (!bytes || bytes > kRingSize / 2 || tiled > (256u << 20)) return nullptr;
         // The full check of a texture already uploaded runs on a hasher thread, its result taken
         // at the next use (~2.7 ms a frame off the recorder in crowds). The fingerprint is still
@@ -2996,18 +3355,18 @@ private:
                 const int st = c.state.load(std::memory_order_acquire);
                 if (st == 2) {
                     c.state.store(0, std::memory_order_relaxed);
-                    if (c.result == tex.hash) return &tex;
+                    if (c.result == tex.hash) return settleTexture(tex, t.base(), span, tiled);
                     // changed (or unreadable): checked again in line below
                 } else {
                     if (st == 0) queueTexHash(tex.check, t.base(), tiled);
-                    return &tex;
+                    return settleTexture(tex, t.base(), span, tiled);
                 }
             }
         }
         uint64_t h64;
         {
-            ProfScope ps(prof_, kProfTexRead);
-            ++prof_.texChecks;
+            ProfScope ps(R().prof_, kProfTexRead);
+            ++R().prof_.texChecks;
             h64 = hasher_.hash(t.base(), tiled);
             if (!h64) {
                 warnOnce("texture at 0x" + hex(t.base()) + " is not readable");
@@ -3016,9 +3375,9 @@ private:
         }
         tex.checkedFrame = frame_;
         tex.sample = sampleHash(t.base(), span);
-        if (!tex.img.image || tex.hash != h64) tex.changedFrame = frame_;
-        if (tex.img.image && tex.hash == h64) return &tex;
-        ProfScope pu(prof_, kProfTexUpload);
+        if (!tex.img.image || tex.hash != h64) tex.changedFrame = frame_, tex.settled = false;
+        if (tex.img.image && tex.hash == h64) return settleTexture(tex, t.base(), span, tiled);
+        ProfScope pu(R().prof_, kProfTexUpload);
         scratch_.resize(tiled);
         if (!readGuest(t.base(), scratch_.data(), tiled)) return nullptr;
         // Debugging: LPN_DUMP_TEX_BPE=<bytes per element> writes small textures of that element size
@@ -3030,31 +3389,43 @@ private:
                 std::fwrite(scratch_.data(), 1, tiled, f);
                 std::fclose(f);
             }
-        ++prof_.texUploads;
-        prof_.texBytes += bytes;
+        ++R().prof_.texUploads;
+        R().prof_.texBytes += bytes;
+        Prologue pg(*this); // on a recorder thread: ahead of the segments
         if (!ringFits(bytes)) {
             flush();
             begin();
         }
         const VkDeviceSize at = ringAlloc(bytes, 16);
-        uint8_t* dst = static_cast<uint8_t*>(ringPtr_) + at;
-        for (uint32_t s = 0; s < slices; ++s)
-            detile(mode, scratch_.data() + s * slice, dst + size_t(s) * ew * eh * bpe, ew, eh, ep, bpe);
+        uint8_t* dst = static_cast<uint8_t*>(R().ringPtr_) + at;
+        for (uint32_t m = 0; m < levels; ++m) {
+            const MipLevel& l = mips[m];
+            const size_t linSlice = size_t(l.width) * l.height * bpe;
+            for (uint32_t s = 0; s < slices; ++s)
+                detile(mode, scratch_.data() + l.offset + s * l.sliceBytes, dst + linearAt[m] + s * linSlice, l.width,
+                       l.height, l.pitch, bpe);
+        }
         if (!tex.img.image) {
             tex.phase = textureCount_++ % 8;
             const VkImageViewType vt = viewType(t.type());
             if (!createImage(tex.img, format, w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, false,
-                             vt, slices))
+                             vt, slices, levels))
                 return nullptr;
         }
         tex.hash = h64;
         fullBarrier();
-        VkBufferImageCopy c{};
-        c.bufferOffset = at;
-        c.bufferRowLength = bc ? ew * 4 : ew;
-        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, t.type() == 10 ? 1 : layers};
-        c.imageExtent = {w, h, t.type() == 10 ? t.depth() : 1};
-        rec([cb = cmd_, buf = ring_, im = tex.img.image, c] { vkCmdCopyBufferToImage(cb, buf, im, VK_IMAGE_LAYOUT_GENERAL, 1, &c); });
+        std::array<VkBufferImageCopy, kMaxMips> cs{};
+        for (uint32_t m = 0; m < levels; ++m) {
+            VkBufferImageCopy& c = cs[m];
+            c.bufferOffset = at + linearAt[m];
+            c.bufferRowLength = bc ? mips[m].width * 4 : mips[m].width;
+            c.bufferImageHeight = bc ? mips[m].height * 4 : mips[m].height;
+            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, t.type() == 10 ? 1 : layers};
+            c.imageExtent = {std::max(w >> m, 1u), std::max(h >> m, 1u), t.type() == 10 ? t.depth() : 1};
+        }
+        rec([cb = R().cmd_, buf = R().ring_, im = tex.img.image, cs, levels] {
+            vkCmdCopyBufferToImage(cb, buf, im, VK_IMAGE_LAYOUT_GENERAL, levels, cs.data());
+        });
         return &tex;
     }
 
@@ -3104,10 +3475,12 @@ private:
         // as a texture: by then the game may have loaded a texture there (a special move's banner,
         // in memory a render target had used), which became the baseline, so the old render
         // target was bound in its place. Once a frame per target.
-        if (s.writtenFrame != frame_ || !s.memSample)
-            s.memSample = s.writtenBack || !s.memBytes ? 0 : sampleHash(s.addr, s.memBytes);
+        const bool again = s.writtenFrame == frame_;
+        if (again && !s.cpuOwned && !(s.writtenBack && s.memSample)) return;
+        if (sharedMiss()) return;
+        if (!again || s.writtenBack) s.memSample = s.writtenBack || !s.memBytes ? 0 : sampleHash(s.addr, s.memBytes);
         s.writtenFrame = frame_;
-        if (s.cpuOwned) ++imageGen_; // sampled as a render target again, not from memory
+        if (s.cpuOwned) ++imageGen_, ++R().prof_.imageGens; // sampled as a render target again, not from memory
         s.cpuOwned = false;
     }
     // Whether a render target's memory has been rewritten (by the CPU) since the GPU last
@@ -3124,7 +3497,7 @@ private:
                                     ? sampleHash(t.base(), size_t(t.pitch()) * t.height() * s.elementBytes)
                                     : sampleHash(s.addr, s.memBytes);
         if (!s.memSample) s.memSample = sample;
-        else if (sample && sample != s.memSample) s.cpuOwned = true, ++imageGen_;
+        else if (sample && sample != s.memSample) s.cpuOwned = true, ++imageGen_, ++R().prof_.imageGens;
         // A texture bound to a render target the GPU left alone for a while: what to look for
         // when a texture shows something else (once per target and write).
         if (!s.cpuOwned && frame_ > s.writtenFrame + 30 && s.loggedFrame != s.writtenFrame) {
@@ -3144,38 +3517,67 @@ private:
     struct ImageMemo {
         uint32_t t[8], s[4];
         bool compare;
+        bool persist = false; // a settled texture's: good in later frames too, while gen holds
         uint64_t frame = ~0ull, gen = 0;
         ImageBinding b;
         VkImage sampled; // the render target it samples, if any (for feedback checks)
     };
-    static constexpr size_t kImageMemos = 1024;
-    ImageMemo& imageMemo(const gcn::ImageResource& t) {
+    // Two ways of 4,096 sets: a city view resolves thousands of pairs a frame, and with 1,024
+    // single entries they evicted each other.
+    static constexpr size_t kImageMemos = 8192;
+    static size_t imageMemoSet(const gcn::ImageResource& t) {
         uint64_t h = 0xcbf29ce484222325ull;
         for (uint32_t w : t.t) h = (h ^ w) * 0x100000001b3ull;
         for (uint32_t w : t.s) h = (h ^ w) * 0x100000001b3ull;
-        return imageMemos_[(h ^ (h >> 29) ^ t.compare) & (kImageMemos - 1)];
+        return ((h ^ (h >> 29) ^ t.compare) & (kImageMemos / 2 - 1)) * 2;
     }
+    ImageMemo& imageMemo(const gcn::ImageResource& t) {
+        const size_t set = imageMemoSet(t);
+        ImageMemo& a = imageMemos_[set];
+        ImageMemo& b = imageMemos_[set + 1];
+        if (memoHit(b, t)) return b;
+        if (memoHit(a, t)) return a;
+        // A miss replaces a stale way first, else the older one (the way not hit last moves to b).
+        const bool aLive = memoLive(a);
+        if (aLive) std::swap(a, b);
+        return a;
+    }
+    bool memoLive(const ImageMemo& m) const { return (m.frame == frame_ || m.persist) && m.gen == imageGen_; }
     bool memoHit(const ImageMemo& m, const gcn::ImageResource& t) const {
-        return m.frame == frame_ && m.gen == imageGen_ && m.compare == t.compare && std::equal(t.t, t.t + 8, m.t) &&
+        return memoLive(m) && m.compare == t.compare && std::equal(t.t, t.t + 8, m.t) &&
                std::equal(t.s, t.s + 4, m.s);
     }
     // An image already resolved this frame that samples no render target: what fastDraw may bind
     // without recording anything (an upload) or affecting the pass.
     bool peekImage(const gcn::ImageResource& t, ImageBinding& b) {
         if (t.storage || trace_) return false;
-        const ImageMemo& m = imageMemo(t);
-        if (!memoHit(m, t) || m.sampled) return false;
-        b = m.b;
+        // Read only (recorder threads look up under a shared lock): no way swapped on a miss.
+        const size_t set = imageMemoSet(t);
+        const ImageMemo* m = &imageMemos_[set + 1];
+        if (!memoHit(*m, t)) m = &imageMemos_[set];
+        if (!memoHit(*m, t) || m->sampled) return false;
+        b = m->b;
         return true;
     }
     ImageBinding resolveImage(const gcn::ImageResource& t) {
+        if (R().lockShared_) { // read only: a hit, or the draw starts over
+            if (t.storage || trace_) return sharedMiss(), ImageBinding{};
+            const size_t set = imageMemoSet(t);
+            const ImageMemo* m = &imageMemos_[set + 1];
+            if (!memoHit(*m, t)) m = &imageMemos_[set];
+            if (!memoHit(*m, t)) return sharedMiss(), ImageBinding{};
+            if (m->sampled) R().sampledSurfaces_.push_back(m->sampled);
+            return m->b;
+        }
         if (t.storage || trace_) return resolveImageUncached(t); // storage: marks the target written
         ImageMemo& m = imageMemo(t);
         if (memoHit(m, t)) {
-            if (m.sampled) sampledSurfaces_.push_back(m.sampled);
+            if (m.sampled) R().sampledSurfaces_.push_back(m.sampled);
             return m.b;
         }
-        const size_t before = sampledSurfaces_.size();
+        const size_t before = R().sampledSurfaces_.size();
+        ++R().prof_.imageMisses;
+        R().lastTexture_ = nullptr;
         const ImageBinding b = resolveImageUncached(t);
         std::copy(t.t, t.t + 8, m.t);
         std::copy(t.s, t.s + 4, m.s);
@@ -3183,7 +3585,9 @@ private:
         m.frame = frame_;
         m.gen = imageGen_;
         m.b = b;
-        m.sampled = sampledSurfaces_.size() > before ? sampledSurfaces_.back() : VK_NULL_HANDLE;
+        m.sampled = R().sampledSurfaces_.size() > before ? R().sampledSurfaces_.back() : VK_NULL_HANDLE;
+        // A settled texture's binding holds until the sweep finds it changed (which moves imageGen_).
+        m.persist = !m.sampled && R().lastTexture_ && R().lastTexture_->settled;
         return b;
     }
     ImageBinding resolveImageUncached(const gcn::ImageResource& t) {
@@ -3198,7 +3602,7 @@ private:
 
         if (auto it = depths_.find(addr); it != depths_.end()) {
             Image& img = it->second.img;
-            sampledSurfaces_.push_back(img.image);
+            R().sampledSurfaces_.push_back(img.image);
             b.view = view(img, img.format == VK_FORMAT_D32_SFLOAT_S8_UINT ? img.format : img.format, vt,
                           kIdentity, VK_IMAGE_ASPECT_DEPTH_BIT);
             b.scale[0] = float(t.width()) / float(img.width);
@@ -3216,7 +3620,7 @@ private:
                                           bytesPerElement(t.dataFormat()) == it->second.elementBytes &&
                                           !cpuWritten(it->second, t)) {
             Surface& s = it->second;
-            sampledSurfaces_.push_back(s.img.image);
+            R().sampledSurfaces_.push_back(s.img.image);
             b.view = view(s.img, format, vt == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
                           swz);
             b.scale[0] = float(t.width()) / float(s.img.width);
@@ -3236,7 +3640,7 @@ private:
         if (format == VK_FORMAT_UNDEFINED) {
             warnOnce("texture format " + std::to_string(t.dataFormat()) + "/" + std::to_string(nf) + " unsupported");
         } else if (GuestTexture* g = guestTexture(t, format)) {
-            b.view = view(g->img, format, vt, swz);
+            b.view = view(g->img, format, vt, swz, 0, t.baseLevel(), t.lastLevel() + 1 - std::min(t.baseLevel(), t.lastLevel()));
         }
         if (!b.view) b.view = dummyView(vt, kind, false);
         return b;
@@ -3297,8 +3701,8 @@ private:
     // then a blend that writes the scene colour back. With DLSS on, the first two are skipped and
     // the blend becomes DLSS, given the scene colour, its depth and motion vectors this renderer
     // makes from the depth and the camera (so only the camera's motion: moving characters rely on
-    // DLSS's own handling). Scene draws (with that depth buffer bound, before SMAA) are jittered
-    // by moving the viewport a sub-pixel amount each frame.
+    // DLSS's own handling). Scene draws (with that depth buffer bound before SMAA, and 3D draws
+    // tested against it after) are jittered by moving the viewport a sub-pixel amount each frame.
 
     // The SMAA pixel shaders, by a hash of their first 256 bytes of code.
     static uint8_t smaaRole(uint64_t codeHash) {
@@ -3324,7 +3728,8 @@ private:
         float xs = 0, xo = 0, ys = 0, yo = 0, zs = 1, zo = 0;
     };
 
-    void captureCamera(const gcn::Program& vs, const GpuRegs& r) {
+    void captureCamera(const gcn::Program& vs, const DrawRegs& r) {
+        if (sharedMiss()) return;
         if (++camTries_ > 8) return; // shaders of another layout: not this frame
         const uint64_t table = vs.launch.userData[12] | uint64_t(vs.launch.userData[13]) << 32;
         uint32_t sharp[4];
@@ -3477,7 +3882,7 @@ void main() {
 
     // A draw of one of the SMAA shaders with DLSS on: true when it was handled (skipped, or the
     // blend replaced by DLSS).
-    bool dlssSmaa(const GpuRegs& r, uint8_t role) {
+    bool dlssSmaa(const DrawRegs& r, uint8_t role) {
         if (!dlss::usable()) return false;
         smaaSeen_ = true; // later draws are post-processing: not jittered
         if (role != 3) return true; // edges and weights: DLSS needs neither
@@ -3511,7 +3916,7 @@ void main() {
 
         // The scene colour, before the blend: DLSS's input (it cannot write where it reads).
         const VkImageCopy copy{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
-        rec([c = cmd_, src = out->img.image, dst = dlssColor_.image, copy] {
+        rec([c = R().cmd_, src = out->img.image, dst = dlssColor_.image, copy] {
             vkCmdCopyImage(c, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
         });
 
@@ -3532,7 +3937,7 @@ void main() {
         mp.size[0] = int32_t(w), mp.size[1] = int32_t(h);
         const VkImageView depthView = view(depth->img, df, VK_IMAGE_VIEW_TYPE_2D, kIdentity, VK_IMAGE_ASPECT_DEPTH_BIT);
         const VkImageView mvView = view(dlssMotion_, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
-        rec([this, c = cmd_, mp, depthView, mvView] {
+        rec([this, c = R().cmd_, mp, depthView, mvView] {
             const VkDescriptorImageInfo di[2] = {{mvSampler_, depthView, VK_IMAGE_LAYOUT_GENERAL},
                                                  {VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL}};
             VkWriteDescriptorSet wr[2]{};
@@ -3570,11 +3975,11 @@ void main() {
             std::memset(dlssStats_, 0, sizeof dlssStats_);
         }
         f.mode = 1; // DLAA for now: the render size stays the game's
-        rec([c = cmd_, dev = vk_.device, f] { dlss::evaluate(c, dev, f); });
+        rec([c = R().cmd_, dev = vk_.device, f] { dlss::evaluate(c, dev, f); });
         fullBarrier();
         // DLSS bound pipelines and descriptors of its own: everything is set again.
-        bound_ = Bound{};
-        fast_.valid = false;
+        R().bound_ = Bound{};
+        R().fast_.valid = false;
         ++fastEpoch_;
         gpuWrote(*out);
         dlssRan_ = true;
@@ -3620,24 +4025,122 @@ void main() {
     struct VramBuffer {
         uint64_t base = 0, size = 0;
         VkBuffer buf = VK_NULL_HANDLE;
-        VkDeviceMemory mem = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE; // the arena block it is bound in
+        VkDeviceSize memOffset = 0, memSize = 0;
         uint64_t sample = 0, hash = 0;
         uint64_t checkedFrame = ~0ull, changedFrame = 0, lastUse = 0, hostUntil = 0;
         uint32_t uses = 0, phase = 0, changes = 0;
         bool gpuWritten = false, dirty = false;
         std::shared_ptr<AsyncHash> check;
+        // Unchanged for a while and checked once a frame by the sweep (see sweepVram) instead of
+        // at its first use: analysis workers may then resolve it ahead (see resolveAhead).
+        std::atomic<bool> settled{false};
+        std::atomic<uint64_t> aheadUse{0}; // the frame a worker last resolved a draw to it in (for evictVram)
     };
+    // A buffer binding resolved ahead on an analysis worker, valid while bufferEpoch_ is the
+    // one it was resolved at. info.buffer null: resolved by the recorder as before.
+    struct BufRes {
+        VkDescriptorBufferInfo info{};
+        uint32_t words[4] = {};
+        VramBuffer* v = nullptr;
+    };
+    // Bumped (by the recorder, under cacheMutex_ when a lookup structure changes) whenever a
+    // resolution done ahead may have gone stale: a VRAM copy made, freed, written or found changed.
+    std::atomic<uint64_t> bufferEpoch_{1};
+    std::atomic<uint64_t> frameNow_{0}; // frame_, for the workers
+    std::shared_mutex cacheMutex_; // vram_, imports_ and VRAM copies' buffers, for the workers' reads
+    const bool resolveAhead_ = getenv("LPN_NO_RESOLVE_AHEAD") == nullptr && getenv("LPN_RACE_CHECK") == nullptr;
+    void unsettle(VramBuffer& v) {
+        if (v.settled.exchange(false, std::memory_order_relaxed)) bufferEpoch_.fetch_add(1, std::memory_order_release);
+    }
     struct PairHash {
         size_t operator()(const std::pair<uint64_t, uint64_t>& k) const { return std::hash<uint64_t>()(k.first * 0x9E3779B97F4A7C15ull ^ k.second); }
     };
-    static constexpr uint64_t kVramMin = 64 << 10, kVramMax = 64ull << 20, kVramBudget = 1536ull << 20;
-    static constexpr size_t kVramEntries = 1500; // each is a memory allocation of its own
+    static constexpr uint64_t kVramMin = 64 << 10, kVramMax = 64ull << 20, kVramBudget = 4096ull << 20;
+    // Copies share 128 MB blocks of device memory (VramArena), so their count is not held to the
+    // driver's allocation limit. At 1,500 (one allocation each) the overlook's ~1,500 live copies
+    // churned: 10-65 evicted, allocated and copied again a frame, the worst frames at 37-40 fps.
+    static constexpr size_t kVramEntries = 6000;
+    // Sub-allocates VRAM copies from large blocks: first fit over each block's free ranges,
+    // merged again on free. Freed from the completion thread, hence the mutex.
+    class VramArena {
+    public:
+        static constexpr VkDeviceSize kBlock = 128ull << 20;
+        bool alloc(Vk& vk, const VkMemoryRequirements& req, VkDeviceMemory& mem, VkDeviceSize& off) {
+            std::lock_guard lock(m_);
+            for (int pass = 0; pass < 2; ++pass) {
+                for (Block& b : blocks_) {
+                    if (!((req.memoryTypeBits >> b.type) & 1)) continue;
+                    for (auto it = b.free.begin(); it != b.free.end(); ++it) {
+                        const VkDeviceSize start = (it->first + req.alignment - 1) / req.alignment * req.alignment;
+                        const VkDeviceSize end = it->first + it->second;
+                        if (start + req.size > end) continue;
+                        const VkDeviceSize lo = it->first;
+                        b.free.erase(it);
+                        if (start > lo) b.free.emplace(lo, start - lo);
+                        if (start + req.size < end) b.free.emplace(start + req.size, end - start - req.size);
+                        mem = b.mem, off = start;
+                        return true;
+                    }
+                }
+                if (pass) break;
+                VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                mai.allocationSize = std::max(kBlock, req.size);
+                mai.memoryTypeIndex = vk.memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                Block b;
+                if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(vk.device, &mai, nullptr, &b.mem) != VK_SUCCESS)
+                    return false;
+                b.type = mai.memoryTypeIndex;
+                b.free.emplace(0, mai.allocationSize);
+                blocks_.push_back(std::move(b));
+            }
+            return false;
+        }
+        void free(VkDeviceMemory mem, VkDeviceSize off, VkDeviceSize size) {
+            std::lock_guard lock(m_);
+            for (Block& b : blocks_) {
+                if (b.mem != mem) continue;
+                auto [it, ok] = b.free.emplace(off, size);
+                if (!ok) return;
+                if (auto next = std::next(it); next != b.free.end() && it->first + it->second == next->first) {
+                    it->second += next->second;
+                    b.free.erase(next);
+                }
+                if (it != b.free.begin()) {
+                    auto prev = std::prev(it);
+                    if (prev->first + prev->second == it->first) {
+                        prev->second += it->second;
+                        b.free.erase(it);
+                    }
+                }
+                return;
+            }
+        }
+
+    private:
+        struct Block {
+            VkDeviceMemory mem = VK_NULL_HANDLE;
+            uint32_t type = 0;
+            std::map<VkDeviceSize, VkDeviceSize> free; // offset -> size
+        };
+        std::mutex m_;
+        std::vector<Block> blocks_;
+    };
+    VramArena vramArena_;
+    uint64_t evictNothingFrame_ = ~0ull; // evictVram found no copy to free in this frame
     const bool vramOn_ = getenv("LPN_NO_VRAM_BUFFERS") == nullptr;
     std::unordered_map<std::pair<uint64_t, uint64_t>, std::unique_ptr<VramBuffer>, PairHash> vram_;
+    struct VramHit {
+        uint64_t base = 0, size = 0;
+        VramBuffer* v = nullptr;
+    };
+    static constexpr size_t kVramHits = 512;
+    static size_t vramHitIndex(uint64_t base, uint64_t size) { return (base / 64 ^ size * 0x9E3779B97F4A7C15ull >> 40) % kVramHits; }
     std::multimap<uint64_t, VramBuffer*> vramByBase_; // for overlap queries
     std::map<uint64_t, uint64_t> gpuWrittenRanges_;  // [start, end), merged
     uint64_t vramBytes_ = 0, vramCount_ = 0;
     std::unordered_map<std::pair<uint64_t, uint64_t>, uint64_t, PairHash> vramCandidates_; // first seen in frame
+    std::mutex candMutex_; // vramCandidates_ among recorder threads holding m_ shared
 
     // Each VRAM buffer overlapping [lo, hi), via fn.
     template <typename F> void forVramOverlapping(uint64_t lo, uint64_t hi, F&& fn) {
@@ -3650,6 +4153,7 @@ void main() {
         const uint64_t end = addr + size;
         auto it = gpuWrittenRanges_.upper_bound(addr);
         if (it != gpuWrittenRanges_.begin() && std::prev(it)->second >= end) return; // known
+        if (sharedMiss()) return;
         uint64_t lo = addr, hi = end;
         if (it != gpuWrittenRanges_.begin() && std::prev(it)->second >= lo) --it;
         while (it != gpuWrittenRanges_.end() && it->first <= hi) {
@@ -3658,14 +4162,21 @@ void main() {
             it = gpuWrittenRanges_.erase(it);
         }
         gpuWrittenRanges_[lo] = hi;
-        forVramOverlapping(addr, end, [](VramBuffer& v) { v.gpuWritten = true; });
+        forVramOverlapping(addr, end, [&](VramBuffer& v) {
+            v.gpuWritten = true;
+            unsettle(v);
+        });
     }
     bool gpuWritten(uint64_t addr, uint64_t size) const {
         auto it = gpuWrittenRanges_.upper_bound(addr + size - 1);
         return it != gpuWrittenRanges_.begin() && std::prev(it)->second > addr;
     }
     void cpWrites(uint64_t addr, uint64_t size) {
-        if (vramOn_) forVramOverlapping(addr, addr + size, [](VramBuffer& v) { v.dirty = true; });
+        if (vramOn_)
+            forVramOverlapping(addr, addr + size, [&](VramBuffer& v) {
+                v.dirty = true;
+                unsettle(v);
+            });
     }
 
     // A fingerprint of imported guest memory, read directly: 64 samples of 16 bytes. Memory the
@@ -3685,16 +4196,45 @@ void main() {
     // inPass: only a copy already checked this frame, as nothing can be recorded (fastDraw).
     bool vramBuffer(uint64_t base, uint64_t size, VkBuffer& out, VkDeviceSize& off, bool inPass = false) {
         if (!vramOn_ || size < kVramMin || size > kVramMax || base % 4 || size % 4) return false;
-        auto found = vram_.find({base, size});
-        if (inPass) {
-            if (found == vram_.end()) return false;
-            const VramBuffer& v = *found->second;
-            if (!v.size || !v.buf || v.gpuWritten || frame_ < v.hostUntil || v.checkedFrame != frame_ || v.dirty) return false;
+        // The copy last found for this buffer, checked before the hash map (a miss per lookup).
+        VramHit& hit = R().vramHits_[vramHitIndex(base, size)];
+        VramBuffer* vp = nullptr;
+        if (hit.v && hit.base == base && hit.size == size) {
+            vp = hit.v;
+        } else if (auto found = vram_.find({base, size}); found != vram_.end()) {
+            vp = found->second.get();
+            hit = {base, size, vp};
+        }
+        if (R().lockShared_ && !inPass) { // a full draw on a recorder thread: changes nothing shared
+            if (!vp) {
+                if (gpuWritten(base, size)) return false;
+                std::lock_guard lock(candMutex_);
+                auto [cand, fresh] = vramCandidates_.try_emplace({base, size}, frame_);
+                if (fresh || cand->second == frame_) return false;
+                return !sharedMiss(); // a copy to make
+            }
+            VramBuffer& v = *vp;
+            if (!v.size) return !sharedMiss();
+            if (v.gpuWritten || frame_ < v.hostUntil) return false;
+            const bool settled = v.settled.load(std::memory_order_relaxed);
+            const bool skip = frame_ - v.changedFrame >= 600 && (frame_ + v.phase) % 4 != 0; // as below
+            if (!v.buf || v.dirty || (v.checkedFrame != frame_ && !settled && !skip)) return !sharedMiss();
+            if (v.lastUse != frame_) std::atomic_ref(v.lastUse).store(frame_, std::memory_order_relaxed);
             out = v.buf;
             off = 0;
             return true;
         }
-        if (found == vram_.end()) {
+        if (inPass) {
+            if (!vp) return false;
+            const VramBuffer& v = *vp;
+            if (!v.size || !v.buf || v.gpuWritten || frame_ < v.hostUntil || v.dirty ||
+                (v.checkedFrame != frame_ && !v.settled.load(std::memory_order_relaxed)))
+                return false;
+            out = v.buf;
+            off = 0;
+            return true;
+        }
+        if (!vp) {
             // Only a buffer used again in a later frame gets a copy: per-frame data in rings sits at
             // a new address each frame, and copying it would cost more than it saves.
             if (gpuWritten(base, size)) return false;
@@ -3704,18 +4244,25 @@ void main() {
             VkBuffer imported;
             VkDeviceSize at;
             if (!guestBuffer(base, size, imported, at)) return false; // mapped (importedSample reads it directly)
+            std::unique_lock lock(cacheMutex_);
             if (vram_.size() >= kVramEntries) evictVram();
-            found = vram_.emplace(std::make_pair(base, size), std::make_unique<VramBuffer>()).first;
+            vp = vram_.emplace(std::make_pair(base, size), std::make_unique<VramBuffer>()).first->second.get();
+            hit = {base, size, vp};
         }
-        auto& slot = found->second;
-        if (!slot->size) {
-            slot->base = base, slot->size = size, slot->phase = uint32_t(vramCount_++ % 8);
-            slot->gpuWritten = gpuWritten(base, size);
-            vramByBase_.emplace(base, slot.get());
+        VramBuffer& v = *vp;
+        if (!v.size) {
+            v.base = base, v.size = size, v.phase = uint32_t(vramCount_++ % 8);
+            v.gpuWritten = gpuWritten(base, size);
+            vramByBase_.emplace(base, vp);
         }
-        VramBuffer& v = *slot;
         if (v.gpuWritten || frame_ < v.hostUntil) return false;
         v.lastUse = frame_;
+        // Settled: the sweep checks it (sweepVram). Otherwise, unchanged for 10 s: fingerprinted
+        // every 4th frame only (as textures are on every other use). The fingerprints' reads of
+        // host memory were ~10% of the recorder in the city.
+        if (v.settled.load(std::memory_order_relaxed) && !v.dirty) v.checkedFrame = frame_;
+        if (v.checkedFrame != frame_ && !v.dirty && v.buf && frame_ - v.changedFrame >= 600 && (frame_ + v.phase) % 4 != 0)
+            v.checkedFrame = frame_;
         if (v.checkedFrame != frame_ || v.dirty) {
             v.checkedFrame = frame_;
             const uint64_t smp = importedSample(base, size);
@@ -3744,45 +4291,176 @@ void main() {
                 VkBuffer src;
                 VkDeviceSize soff;
                 if (!guestBuffer(base, size, src, soff)) return false;
-                if (!v.buf && !allocVram(v)) return false;
+                if (!v.buf) {
+                    std::unique_lock lock(cacheMutex_);
+                    if (!allocVram(v)) return false;
+                }
+                if (!changed) v.changedFrame = frame_; // the first copy
                 v.hash = hasher_.hash(base, size); // what the copy holds (the game does not write memory the GPU is about to read)
                 if (v.check) v.check->state.store(0, std::memory_order_relaxed); // a result in flight is about the old contents
-                fullBarrier();
-                const VkBufferCopy bc{soff, 0, size};
-                rec([c = cmd_, src, dst = v.buf, bc] { vkCmdCopyBuffer(c, src, dst, 1, &bc); });
-                ++prof_.vramCopies, prof_.vramCopyBytes += size;
+                {
+                    Prologue pg(*this); // on a recorder thread: ahead of the segments
+                    begin();
+                    fullBarrier();
+                    const VkBufferCopy bc{soff, 0, size};
+                    rec([c = R().cmd_, src, dst = v.buf, bc] { vkCmdCopyBuffer(c, src, dst, 1, &bc); });
+                }
+                ++R().prof_.vramCopies, R().prof_.vramCopyBytes += size;
+            } else if (resolveAhead_ && frame_ - v.changedFrame >= kSettleFrames && !v.gpuWritten) {
+                v.settled.store(true, std::memory_order_release); // checked and unchanged for a while
             }
         }
         out = v.buf;
         off = 0;
         return true;
     }
-    bool allocVram(VramBuffer& v) {
-        if (vramBytes_ + v.size > kVramBudget) evictVram();
-        if (vramBytes_ + v.size > kVramBudget) return false;
+    static constexpr uint64_t kSettleFrames = 60;
+
+    // Once a frame, the settled copies' and textures' fingerprints are taken on a thread of their
+    // own, as their first use in a frame took them before; a copy that changed is copied again at
+    // its next use, a texture uploaded again. Their full hashes run on the hasher threads every
+    // 8th frame, as on every 8th use before.
+    struct SweepItem {
+        uint64_t base, size, sample;
+        bool changed;
+        GuestTexture* tex; // a texture's (sampleHash) rather than a VRAM copy's (importedSample)
+    };
+    std::mutex sweepMutex_;
+    std::condition_variable sweepCv_;
+    std::vector<SweepItem> sweep_;
+    bool sweepQueued_ = false, sweepDone_ = true, sweepStarted_ = false;
+    // A settled copy's or texture's full hash: every 8th frame, and every 32nd (LPN_HASH_FRAMES)
+    // once unchanged for 10 s. Every 8th frame hashed all of them (GBs at the overlook), which kept
+    // three hasher threads busy; the fingerprints taken every frame still catch a whole rewrite.
+    bool hashDue(uint64_t changedFrame, uint32_t phase, uint64_t base) const {
+        if (frame_ - changedFrame < 600) return (frame_ + phase) % 8 == 0;
+        static const uint64_t every = std::max(8, getenv("LPN_HASH_FRAMES") ? std::atoi(getenv("LPN_HASH_FRAMES")) : 32);
+        return (frame_ + (base >> 8) * 0x9E3779B1ull % every) % every == 0;
+    }
+    void sweepVram() {
+        if (!resolveAhead_) return;
+        {
+            std::lock_guard lock(sweepMutex_);
+            if (!sweepDone_) return; // the last one is still running: next frame
+            for (const SweepItem& it : sweep_) {
+                if (!it.changed) continue;
+                if (it.tex) {
+                    if (it.tex->settled && it.tex->sample == it.sample) unsettleTexture(*it.tex);
+                    continue;
+                }
+                auto f = vram_.find({it.base, it.size});
+                if (f == vram_.end() || f->second->sample != it.sample) continue; // gone, or checked since
+                f->second->dirty = true;
+                unsettle(*f->second);
+            }
+            sweep_.clear();
+            for (auto& [k, up] : vram_) {
+                VramBuffer& v = *up;
+                if (!v.settled.load(std::memory_order_relaxed)) continue;
+                if (!v.check) v.check = std::make_shared<AsyncHash>();
+                const int st = v.check->state.load(std::memory_order_acquire);
+                if (st == 2) {
+                    v.check->state.store(0, std::memory_order_relaxed);
+                    if (v.check->result != v.hash) {
+                        v.dirty = true;
+                        unsettle(v);
+                        continue;
+                    }
+                } else if (st == 0 && hashDue(v.changedFrame, v.phase, v.base)) {
+                    queueTexHash(v.check, v.base, v.size);
+                }
+                sweep_.push_back({v.base, v.size, v.sample, false, nullptr});
+            }
+            auto drop = [](GuestTexture* t) { return !(t->swept = false); }; // out of the list
+            std::erase_if(sweptTextures_, [&](GuestTexture* t) {
+                if (!t->settled) return drop(t);
+                if (!t->check) t->check = std::make_shared<AsyncHash>();
+                const int st = t->check->state.load(std::memory_order_acquire);
+                if (st == 2) {
+                    t->check->state.store(0, std::memory_order_relaxed);
+                    if (t->check->result != t->hash) {
+                        unsettleTexture(*t);
+                        return drop(t);
+                    }
+                } else if (st == 0 && hashDue(t->changedFrame, t->phase, t->base)) {
+                    queueTexHash(t->check, t->base, t->tiled);
+                }
+                sweep_.push_back({t->base, t->span, t->sample, false, t});
+                return false;
+            });
+            if (sweep_.empty()) return;
+            sweepDone_ = false;
+            sweepQueued_ = true;
+            if (!sweepStarted_) {
+                sweepStarted_ = true;
+                std::thread([this] { sweepThread(); }).detach();
+            }
+        }
+        sweepCv_.notify_one();
+    }
+    void sweepThread() {
+        profile::nameThread("lpn-sweep");
+        std::vector<SweepItem> items;
+        for (;;) {
+            {
+                std::unique_lock lock(sweepMutex_);
+                sweepCv_.wait(lock, [&] { return sweepQueued_; });
+                sweepQueued_ = false;
+                items.swap(sweep_);
+            }
+            for (SweepItem& it : items)
+                it.changed = (it.tex ? sampleHash(it.base, it.size) : importedSample(it.base, it.size)) != it.sample;
+            {
+                std::lock_guard lock(sweepMutex_);
+                items.swap(sweep_);
+                sweepDone_ = true;
+            }
+        }
+    }
+    bool allocVram(VramBuffer& v) { // cacheMutex_ held
+        // A quarter of the largest device-local heap, at most kVramBudget.
+        static const uint64_t budget = [&] {
+            VkDeviceSize heap = 0;
+            for (uint32_t i = 0; i < vk_.mem.memoryHeapCount; ++i)
+                if (vk_.mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) heap = std::max(heap, vk_.mem.memoryHeaps[i].size);
+            return std::min<uint64_t>(kVramBudget, heap / 4);
+        }();
+        if (vramBytes_ + v.size > budget) evictVram();
+        if (vramBytes_ + v.size > budget) return false;
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bci.size = v.size;
         bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         if (vkCreateBuffer(vk_.device, &bci, nullptr, &v.buf) != VK_SUCCESS) return v.buf = VK_NULL_HANDLE, false;
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(vk_.device, v.buf, &req);
-        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        mai.allocationSize = req.size;
-        mai.memoryTypeIndex = vk_.memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(vk_.device, &mai, nullptr, &v.mem) != VK_SUCCESS) {
+        if (!vramArena_.alloc(vk_, req, v.mem, v.memOffset)) {
             vkDestroyBuffer(vk_.device, v.buf, nullptr);
             v.buf = VK_NULL_HANDLE;
             return false;
         }
-        VK_CHECK(vkBindBufferMemory(vk_.device, v.buf, v.mem, 0));
+        v.memSize = req.size;
+        VK_CHECK(vkBindBufferMemory(vk_.device, v.buf, v.mem, v.memOffset));
         vramBytes_ += v.size;
+        ++R().prof_.vramAllocs;
         return true;
     }
     // Frees the copies used longest ago (a quarter of them), once the GPU is done with them.
-    void evictVram() {
+    void evictVram() { // cacheMutex_ held
+        // Only copies unused for 2 frames go: when none were, none will be until the next frame,
+        // and scanning and sorting every copy again for each new one cost the recorder at the overlook.
+        if (evictNothingFrame_ == frame_) return;
+        ++R().prof_.vramEvicts;
         std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> byUse;
         for (auto& [k, v] : vram_)
-            if (v->lastUse + 2 < frame_) byUse.push_back({v->lastUse, k});
+            if (std::max(v->lastUse, v->aheadUse.load(std::memory_order_relaxed)) + 2 < frame_)
+                byUse.push_back({std::max(v->lastUse, v->aheadUse.load(std::memory_order_relaxed)), k});
+        if (byUse.empty()) {
+            evictNothingFrame_ = frame_;
+            ++R().prof_.vramEvictsEmpty;
+            return;
+        }
+        bufferEpoch_.fetch_add(1, std::memory_order_release); // resolutions ahead may name a freed copy
+        R().prof_.vramFreed += std::max<size_t>(byUse.size() / 4, std::min<size_t>(byUse.size(), 16));
         std::sort(byUse.begin(), byUse.end());
         for (size_t i = 0; i < std::max<size_t>(byUse.size() / 4, std::min<size_t>(byUse.size(), 16)); ++i) {
             auto it = vram_.find(byUse[i].second);
@@ -3794,21 +4472,26 @@ void main() {
                 }
             if (v->buf) {
                 vramBytes_ -= v->size;
-                afterFlush_.push_back([this, buf = v->buf, mem = v->mem] {
+                R().afterFlush_.push_back([this, buf = v->buf, mem = v->mem, off = v->memOffset, sz = v->memSize] {
                     vkDestroyBuffer(vk_.device, buf, nullptr);
-                    vkFreeMemory(vk_.device, mem, nullptr);
+                    vramArena_.free(mem, off, sz);
                 });
             }
             vram_.erase(it);
         }
+        rec0_.vramHits_.fill({}); // every thread's (m_ held exclusively: none is looking)
+        pro_.vramHits_.fill({});
+        for (auto& w : workerRecs_) w->vramHits_.fill({});
     }
 
     void bindResources(gcn::Program& p, uint32_t base, VkShaderStageFlags, std::vector<VkWriteDescriptorSet>& writes,
-                       std::vector<VkDescriptorBufferInfo>& bufInfos, std::vector<VkDescriptorImageInfo>& imgInfos) {
-        ProfScope pb(prof_, kProfBind);
+                       std::vector<VkDescriptorBufferInfo>& bufInfos, std::vector<VkDescriptorImageInfo>& imgInfos,
+                       const std::vector<BufRes>* pre = nullptr) {
+        ProfScope pb(R().prof_, kProfBind);
         uint32_t n = base + 1;
-        for (auto& b : p.buffers) {
-            bufInfos.push_back(bindBuffer(p, b));
+        for (size_t i = 0; i < p.buffers.size(); ++i) {
+            const gcn::BufferResource& b = p.buffers[i];
+            bufInfos.push_back(bindBuffer(p, b, false, pre ? &(*pre)[i] : nullptr));
             writes.push_back(kBufferWrite); // copied from a constant: built on the stack it stalled on store forwarding
             writes.back().dstBinding = n++;
         }
@@ -3827,16 +4510,24 @@ void main() {
         }
         // Draw data last: resource resolution above fills parts of it.
         const VkDeviceSize bytes = p.data.size() * 4;
-        const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
-        std::memcpy(static_cast<uint8_t*>(ringPtr_) + at, p.data.data(), bytes);
-        bufInfos.push_back({ring_, at, bytes});
+        const VkDeviceSize at = uploadData(p.data);
+        bufInfos.push_back({R().ring_, at, bytes});
         writes.push_back(kBufferWrite);
         writes.back().dstBinding = base;
     }
     // Resolves buffer `b` of `p` and fills its words in the draw data. inPass: nothing may be recorded.
-    VkDescriptorBufferInfo bindBuffer(gcn::Program& p, const gcn::BufferResource& b, bool inPass = false) {
-        uint64_t size = b.stride() ? uint64_t(b.stride()) * b.numRecords() : b.numRecords();
-        size = std::min<uint64_t>(size ? size : 16, std::min<uint64_t>(vk_.props.limits.maxStorageBufferRange, 64ull << 20));
+    uint64_t bindSize(const gcn::BufferResource& b) const {
+        const uint64_t size = b.stride() ? uint64_t(b.stride()) * b.numRecords() : b.numRecords();
+        return std::min<uint64_t>(size ? size : 16, std::min<uint64_t>(vk_.props.limits.maxStorageBufferRange, 64ull << 20));
+    }
+    // pre: its resolution on a worker (resolveAhead), if still good.
+    VkDescriptorBufferInfo bindBuffer(gcn::Program& p, const gcn::BufferResource& b, bool inPass = false, const BufRes* pre = nullptr) {
+        if (pre && pre->info.buffer) {
+            std::memcpy(&p.data[b.data], pre->words, sizeof pre->words);
+            ++R().prof_.resolvedAhead;
+            return pre->info;
+        }
+        const uint64_t size = bindSize(b);
         BufferRange r;
         VkDeviceSize off = 0;
         if (b.store && b.known) gpuWrites(b.base(), size);
@@ -3951,8 +4642,12 @@ void main() {
         struct Diff {
             int why = 0;
             uint32_t moved = 0, images = 0;
+            int8_t data = -1; // 1: its draw data is the previous draw's but for resource words, 0: it is not
         } vsDiff, psDiff;
         bool diffPrev = false;
+        // Its buffers' bindings, resolved on the worker (resolveAhead) at bufferEpoch_ resEpoch.
+        std::vector<BufRes> vsRes, psRes;
+        uint64_t resEpoch = 0;
     };
     // A draw's launches as the registers give them, for a worker to analyse.
     struct DrawJob {
@@ -3986,6 +4681,69 @@ void main() {
             batchIdleCv_.notify_all();
         }
     }
+    // On a worker: the bindings bindBuffer would make for the draw's buffers, where they depend
+    // only on lookups that stay put while bufferEpoch_ does: a settled VRAM copy, or an import
+    // for a buffer too small for one. The recorder takes them if the epoch has not moved since.
+    // Those lookups (cache misses one after another) were the largest part of its time.
+    // LPN_NO_RESOLVE_AHEAD=1: all on the recorder as before.
+    void resolveAhead(DrawAnalysis& a) {
+        std::shared_lock lock(cacheMutex_);
+        a.resEpoch = bufferEpoch_.load(std::memory_order_acquire);
+        resolveBuffers(a.vs, a.vsRes);
+        if (a.psm) resolveBuffers(a.ps, a.psRes);
+        else a.psRes.clear();
+    }
+    void resolveBuffers(const gcn::Program& p, std::vector<BufRes>& out) {
+        out.resize(p.buffers.size());
+        for (size_t i = 0; i < p.buffers.size(); ++i) {
+            const gcn::BufferResource& b = p.buffers[i];
+            BufRes& r = out[i];
+            r = {};
+            if (!b.known || b.store) continue;
+            const uint64_t base = b.base(), size = bindSize(b);
+            VkBuffer buf = VK_NULL_HANDLE;
+            VkDeviceSize off = 0;
+            if (vramOn_ && size >= kVramMin && size <= kVramMax && base % 4 == 0 && size % 4 == 0) {
+                auto it = vram_.find({base, size});
+                if (it == vram_.end()) continue; // the recorder decides on a copy
+                VramBuffer* v = it->second.get();
+                if (!v->settled.load(std::memory_order_acquire) || !v->buf) continue;
+                buf = v->buf;
+                r.v = v;
+                // Kept from eviction here: the recorder storing it per draw took a miss each.
+                const uint64_t now = frameNow_.load(std::memory_order_relaxed);
+                if (v->aheadUse.load(std::memory_order_relaxed) != now) v->aheadUse.store(now, std::memory_order_relaxed);
+            } else if (!importFor(base, size, buf, off)) {
+                continue;
+            }
+            const VkDeviceSize offset = off & ~(storageAlign_ - 1);
+            const uint32_t byteOffset = uint32_t(off - offset);
+            const VkDeviceSize range = std::min<VkDeviceSize>(size + byteOffset, vk_.props.limits.maxStorageBufferRange);
+            r.info = {buf, offset, range};
+            r.words[0] = byteOffset;
+            r.words[1] = b.stride();
+            r.words[2] = b.numRecords();
+            r.words[3] = uint32_t(range);
+        }
+    }
+    // guestBuffer's lookup of an existing import, without making one (cacheMutex_ held shared).
+    bool importFor(uint64_t addr, uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) const {
+        if (!addr || addr >= (1ull << 40) || !size) return false;
+        auto it = imports_.upper_bound(addr);
+        if (it == imports_.begin()) return false;
+        --it;
+        if (it->second.end < addr + size) return false;
+        buffer = it->second.buffer;
+        offset = addr - it->first;
+        return true;
+    }
+    // A worker's resolution of `p`'s buffers, if still good (see resolveAhead).
+    const std::vector<BufRes>* aheadFor(const DrawAnalysis& a, const gcn::Program& p) const {
+        if (!a.resEpoch || a.resEpoch != bufferEpoch_.load(std::memory_order_relaxed)) return nullptr;
+        const std::vector<BufRes>& r = &p == &a.vs ? a.vsRes : a.psRes;
+        return r.size() == p.buffers.size() ? &r : nullptr;
+    }
+
     void runBatch(AnalysisCtx& c, std::vector<DrawJob>& b) {
         for (DrawJob& j : b) runJob(c, j);
         for (size_t i = 1; i < b.size(); ++i) {
@@ -3994,10 +4752,18 @@ void main() {
                 a.psm != p.psm)
                 continue;
             a.vsDiff.why = compareResources(a.vs, p.vs, a.vsDiff.moved, &a.vsDiff.images);
-            if (a.psm) a.psDiff.why = compareResources(a.ps, p.ps, a.psDiff.moved, &a.psDiff.images);
-            else a.psDiff = {-1, 0, 0};
+            a.vsDiff.data = a.vsDiff.why < 0 ? int8_t(dataAlike(a.vs, p.vs)) : -1;
+            if (a.psm) {
+                a.psDiff.why = compareResources(a.ps, p.ps, a.psDiff.moved, &a.psDiff.images);
+                a.psDiff.data = a.psDiff.why < 0 ? int8_t(dataAlike(a.ps, p.ps)) : -1;
+            } else {
+                a.psDiff = {-1, 0, 0, 1};
+            }
             a.diffPrev = true;
         }
+        if (resolveAhead_)
+            for (DrawJob& j : b)
+                if (j.kind == DrawJob::kDraw && j.out->ok) resolveAhead(*j.out);
         {
             std::lock_guard lock(analysesMutex_);
             for (DrawJob& j : b) j.out->ready = true;
@@ -4294,7 +5060,7 @@ void main() {
         bindResources(cs, 0, VK_SHADER_STAGE_COMPUTE_BIT, writes, bufs, imgs);
         linkWrites(writes, bufs, imgs);
         fullBarrier();
-        rec([c = cmd_, pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pipe); });
+        rec([c = R().cmd_, pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pipe); });
         pushDescriptors(VK_PIPELINE_BIND_POINT_COMPUTE, lay.pipeline, writes, bufs, imgs);
         if (trace_) captureProgram(cs, m, "cs");
         if (trace_)
@@ -4304,8 +5070,8 @@ void main() {
                 std::fprintf(traceOut_, "[trace]   buffer 0x%" PRIx64 " stride %u records %u first 0x%x%s\n", b.base(),
                              b.stride(), b.numRecords(), first, b.store ? " (written)" : "");
             }
-        rec([c = cmd_, x = d.groups[0], y = d.groups[1], z = d.groups[2]] { vkCmdDispatch(c, x, y, z); });
-        ++stats_.dispatches;
+        rec([c = R().cmd_, x = d.groups[0], y = d.groups[1], z = d.groups[2]] { vkCmdDispatch(c, x, y, z); });
+        ++R().stats_.dispatches;
         for (const auto& im : cs.images)
             if (im.storage && im.tileMode() == kTileLinearAligned) writeBack(im);
         for (const auto& b : cs.buffers)
@@ -4344,10 +5110,10 @@ void main() {
         VkDeviceSize offset;
         if (b.base() % 4 || !guestBuffer(b.base(), records * 16, buffer, offset)) return false;
         fullBarrier();
-        rec([c = cmd_, buffer, offset, bytes = records * 16, v = value[0]] { vkCmdFillBuffer(c, buffer, offset, bytes, v); });
+        rec([c = R().cmd_, buffer, offset, bytes = records * 16, v = value[0]] { vkCmdFillBuffer(c, buffer, offset, bytes, v); });
         if (raceCheck_) noteWrite(b.base(), records * 16);
         gpuWrites(b.base(), records * 16);
-        ++stats_.dispatches;
+        ++R().stats_.dispatches;
         fastClear(b.base());
         return true;
     }
@@ -4365,6 +5131,14 @@ void main() {
 
     void noteMetadata(uint64_t meta, uint64_t surface, bool depth, uint32_t c0, uint32_t c1) {
         if (!meta || meta == surface) return;
+        if (R().lockShared_) {
+            auto it = metadata_.find(meta);
+            if (it != metadata_.end() && it->second.surface == surface && it->second.depth == depth &&
+                it->second.clear[0] == c0 && it->second.clear[1] == c1)
+                return;
+            sharedMiss();
+            return;
+        }
         Metadata& m = metadata_[meta];
         m.surface = surface;
         m.depth = depth;
@@ -4388,14 +5162,14 @@ void main() {
         VkImageSubresourceRange range{img.aspect, 0, 1, 0, img.layers};
         if (m.depth) {
             const VkClearDepthStencilValue v{std::bit_cast<float>(m.clear[0]), m.clear[1] & 0xFF};
-            rec([c = cmd_, im = img.image, v, range] { vkCmdClearDepthStencilImage(c, im, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range); });
+            rec([c = R().cmd_, im = img.image, v, range] { vkCmdClearDepthStencilImage(c, im, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range); });
         } else {
             VkClearColorValue v;
             if (!clearColor(img.format, m.clear, v)) {
                 warnOnce("fast clear of a render target in format " + std::to_string(img.format));
                 return;
             }
-            rec([c = cmd_, im = img.image, v, range] { vkCmdClearColorImage(c, im, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range); });
+            rec([c = R().cmd_, im = img.image, v, range] { vkCmdClearColorImage(c, im, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range); });
         }
         if (trace_)
             std::fprintf(traceOut_, "[trace]   fast clear of %s 0x%" PRIx64 " to 0x%x 0x%x\n", m.depth ? "depth" : "target",
@@ -4474,12 +5248,12 @@ void main() {
         c.bufferRowLength = pitch;
         c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         c.imageExtent = {w, h, 1};
-        rec([cb = cmd_, im = s.img.image, buffer, c] { vkCmdCopyImageToBuffer(cb, im, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &c); });
+        rec([cb = R().cmd_, im = s.img.image, buffer, c] { vkCmdCopyImageToBuffer(cb, im, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &c); });
         if (trace_)
             std::fprintf(traceOut_, "[trace]   copied %ux%u back to 0x%" PRIx64 "\n", w, h, t.base());
     }
 
-    void draw(const DrawCall& d, const GpuRegs& r, DrawAnalysis& a) {
+    void draw(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
         const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
         const uint32_t dbRender = r.ctx[reg::kDbRenderControl];
         if (trace_)
@@ -4488,7 +5262,7 @@ void main() {
                          cbMode, dbRender, r.ctx[reg::kDbDepthControl], r.ctx[reg::kDbZInfo], r.ctx[reg::kDbStencilInfo],
                          r.ctx[reg::kDbStencilControl], r.ctx[reg::kDbStencilRefMask],
                          uint64_t(r.ctx[reg::kDbZReadBase]) << 8, uint64_t(r.ctx[reg::kDbHtileDataBase]) << 8,
-                         std::bit_cast<float>(r.ctx[reg::kDbDepthClear]), r.uconfig[reg::kPrimitiveType], d.count);
+                         std::bit_cast<float>(r.ctx[reg::kDbDepthClear]), r.prim, d.count);
         if (trace_ && (r.ctx[reg::kPaSuScModeCntl] & (3u << 11)))
             std::fprintf(traceOut_, "[trace]   polygon offset scale %g offset %g clamp %g (mode 0x%x)\n",
                          std::bit_cast<float>(r.ctx[reg::kPaSuPolyOffsetFrontScale]),
@@ -4502,7 +5276,7 @@ void main() {
         }
         if (cbMode > 1) return;           // fast-clear eliminate, resolve, decompress: nothing to do here
         if (dbRender & 0x1C) return;      // depth/stencil copy, resummarize
-        const uint32_t prim = r.uconfig[reg::kPrimitiveType];
+        const uint32_t prim = r.prim;
         if (prim == 0 || prim == 8 || prim == 13) {
             warnOnce("primitive type " + std::to_string(prim) + " not rendered");
             return;
@@ -4510,12 +5284,28 @@ void main() {
 
         if (!a.ok) return;
         if (dlssOn_ && a.psm && a.psm->smaa && dlssSmaa(r, a.psm->smaa)) return;
-        if (fastDraw(d, r, a) || switchDraw(d, r, a)) return;
+        const bool wasMergeable = R().lastMergeable_;
+        R().lastMergeable_ = false;
+        if (fastDraw(d, r, a, wasMergeable) || switchDraw(d, r, a)) return;
         stashFast();
+        // A recorder thread looks the caches up holding m_ shared first: almost every full draw
+        // only finds what it needs. One that would change a cache (sharedMiss) starts over here
+        // holding it exclusively. Everything up to wl.unlock() can run twice.
+        bool sharedTry = R().worker_;
+    retry:
+        R().abort_ = false;
+        WLock wl(*this, sharedTry);
+        auto again = [&] { // true: start over exclusively
+            if (!R().abort_) return false;
+            wl.unlock();
+            sharedTry = false;
+            ++R().prof_.sharedRetries;
+            return true;
+        };
         gcn::Program& vs = a.vs;
 
         // Render targets. The pass and vectors below are reused from draw to draw (no allocations).
-        Pass& pass = drawPass_;
+        Pass& pass = R().drawPass_;
         pass.open = false;
         pass.images.clear();
         pass.written.clear();
@@ -4598,13 +5388,19 @@ void main() {
                 gs.depthWriteOff = clearDepth;
             }
         }
-        if (!colorCount && !hasDepth) return;
+        if (!colorCount && !hasDepth) {
+            if (again()) goto retry;
+            return;
+        }
         // A scene draw (see dlssSmaa): every draw with the scene's depth buffer bound before SMAA,
         // full-screen passes too. Jittered alike, the lighting passes rebuild positions where the
-        // depth was rendered: shadows flickered when only the geometry moved. 3D draws that write
-        // depth are where the camera is read.
-        const bool scene = dlssOn_ && !smaaSeen_ && hasDepth && (uint64_t(r.ctx[reg::kDbZReadBase]) << 8) == sceneDepth_;
-        if (scene && !cam_.valid && ((depthControl >> 2) & 1) && ((depthControl >> 1) & 1) && prim != 17 &&
+        // depth was rendered: shadows flickered when only the geometry moved. After SMAA, 3D draws
+        // that depth-test against it are jittered too: Ken's aura draws his body again, additively,
+        // with an equal-or-nearer test, and unjittered it passed or failed by frame (it flickered).
+        // 3D draws that write depth are where the camera is read.
+        const bool sceneDepthBound = dlssOn_ && hasDepth && (uint64_t(r.ctx[reg::kDbZReadBase]) << 8) == sceneDepth_;
+        const bool scene = sceneDepthBound && (!smaaSeen_ || (prim != 17 && ((depthControl >> 1) & 1)));
+        if (scene && !smaaSeen_ && !cam_.valid && ((depthControl >> 2) & 1) && ((depthControl >> 1) & 1) && prim != 17 &&
             (r.ctx[reg::kPaClVteCntl] & 0xF))
             captureCamera(vs, r);
         const bool jitter = scene && jitterOn_;
@@ -4612,21 +5408,21 @@ void main() {
         // targets attached but not written. Outside the city gate the game interleaves depth-only
         // draws with color ones on the same depth buffer: each switch was a new pass and barrier,
         // ~430 a frame (60 fps).
-        if (!colorCount && hasDepth) ++prof_.depthOnly;
-        if (!colorCount && hasDepth && pass_.open && pass_.colorCount && pass_.depth == depth.imageView &&
-            pass_.stencil == gs.stencil && pass_.width <= width && pass_.height <= height && !noDepthJoin_) {
+        if (!colorCount && hasDepth) ++R().prof_.depthOnly;
+        if (!colorCount && hasDepth && R().pass_.open && R().pass_.colorCount && R().pass_.depth == depth.imageView &&
+            R().pass_.stencil == gs.stencil && R().pass_.width <= width && R().pass_.height <= height && !noDepthJoin_) {
             // The pass's area is the smaller of its targets' (the depth buffer is often taller).
-            ++prof_.depthJoins;
-            colorCount = pass_.colorCount;
-            width = pass_.width;
-            height = pass_.height;
+            ++R().prof_.depthJoins;
+            colorCount = R().pass_.colorCount;
+            width = R().pass_.width;
+            height = R().pass_.height;
             for (uint32_t i = 0; i < colorCount; ++i) {
                 colors[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-                colors[i].imageView = pass_.views[i];
+                colors[i].imageView = R().pass_.views[i];
                 colors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
                 colors[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
                 colors[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-                gs.colorFormats[i] = pass_.formats[i];
+                gs.colorFormats[i] = R().pass_.formats[i];
             }
         }
 
@@ -4643,27 +5439,30 @@ void main() {
             for (int i = 0; i < 3; ++i) dyn.polyOffset[i] = r.ctx[reg::kPaSuPolyOffsetClamp + i];
         gs.vsOutputs = vsm->translation.outputs;
 
-        std::vector<VkDescriptorSetLayoutBinding>& lb = drawBindings_;
+        std::vector<VkDescriptorSetLayoutBinding>& lb = R().drawBindings_;
         lb.clear();
         addBindings(lb, vs, 0, VK_SHADER_STAGE_VERTEX_BIT);
         if (psm) addBindings(lb, ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT);
         Layout* layp;
         VkPipeline pipe;
         {
-            ProfScope pp(prof_, kProfPipeline);
+            ProfScope pp(R().prof_, kProfPipeline);
             layp = &layout(lb);
             pipe = graphicsPipeline(gs, vsm, psm, layp->pipeline, lb);
         }
-        if (!pipe) return;
+        if (!pipe) {
+            if (again()) goto retry;
+            return;
+        }
         Layout& lay = *layp;
 
-        std::vector<VkWriteDescriptorSet>& writes = drawWrites_;
-        std::vector<VkDescriptorBufferInfo>& bufs = drawBufs_;
-        std::vector<VkDescriptorImageInfo>& imgs = drawImgs_;
+        std::vector<VkWriteDescriptorSet>& writes = R().drawWrites_;
+        std::vector<VkDescriptorBufferInfo>& bufs = R().drawBufs_;
+        std::vector<VkDescriptorImageInfo>& imgs = R().drawImgs_;
         writes.clear();
         bufs.clear();
         imgs.clear();
-        sampledSurfaces_.clear();
+        R().sampledSurfaces_.clear();
         if (trace_) {
             captureProgram(vs, vsm, "vs");
             if (psm) captureProgram(ps, psm, "ps");
@@ -4688,8 +5487,8 @@ void main() {
             const float t[4] = {2.0f / float(width), 2.0f / float(height), -1.0f, -1.0f};
             std::memcpy(&vs.data[gcn::data::kPosTransform], t, sizeof(t));
         }
-        bindResources(vs, 0, VK_SHADER_STAGE_VERTEX_BIT, writes, bufs, imgs);
-        if (psm) bindResources(ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT, writes, bufs, imgs);
+        bindResources(vs, 0, VK_SHADER_STAGE_VERTEX_BIT, writes, bufs, imgs, aheadFor(a, vs));
+        if (psm) bindResources(ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT, writes, bufs, imgs, aheadFor(a, ps));
         linkWrites(writes, bufs, imgs);
 
         // Index buffer.
@@ -4698,7 +5497,10 @@ void main() {
         if (d.kind == DrawCall::kIndexed) {
             const uint32_t isz = r.indexType ? 4 : 2;
             if (!vramBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset) &&
-                !guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset)) return;
+                !guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset)) {
+                if (again()) goto retry;
+                return;
+            }
             if (trace_ && !traceDir_.empty() && uint64_t(d.indexOffset + d.count) * isz <= (1u << 20)) { // captures: the indices
                 std::vector<uint8_t> idx(size_t(d.count) * isz);
                 if (readGuest(d.indexAddr + uint64_t(d.indexOffset) * isz, idx.data(), idx.size()))
@@ -4709,6 +5511,12 @@ void main() {
             }
             if (raceCheck_) noteRead(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, 'i');
         }
+        if (again()) goto retry;
+        if (wl.shared()) ++R().prof_.sharedDraws;
+        // Everything below is this thread's own (its pass, bindings and command buffer): at the
+        // overlook, holding m_ to the end of each full draw left the threads waiting for it half
+        // their time.
+        wl.unlock();
 
         // Consecutive draws into the same targets share a render pass. A new pass starts behind a
         // full barrier, as before every draw, so earlier passes, copies and dispatches are visible.
@@ -4724,20 +5532,20 @@ void main() {
         // pass has written it: decals and soft particles that read the depth buffer without
         // writing it then share one pass.
         bool feedback = false;
-        for (VkImage im : sampledSurfaces_)
-            if (std::find(drawWritten_.begin(), drawWritten_.end(), im) != drawWritten_.end()) {
+        for (VkImage im : R().sampledSurfaces_)
+            if (std::find(R().drawWritten_.begin(), R().drawWritten_.end(), im) != R().drawWritten_.end()) {
                 feedback = true;
-                if (prof_.on && pass_.open && pass_.sameTargets(pass)) ++prof_.feedbackOn[im == pass_.depthImage ? 0 : 1];
+                if (R().prof_.on && R().pass_.open && R().pass_.sameTargets(pass)) ++R().prof_.feedbackOn[im == R().pass_.depthImage ? 0 : 1];
             }
-        if (!pass_.open || feedback || !pass_.sameTargets(pass)) {
-            if (prof_.on) ++prof_.passWhy[!pass_.open ? passClosedBy_ : feedback ? kPassFeedback : kPassTargets];
-            if (pass_.open) { // to other targets: no barrier unless something since the last one needs it
-                rec([c = cmd_] { vkCmdEndRendering(c); });
-                pass_.open = false;
+        if (!R().pass_.open || feedback || !R().pass_.sameTargets(pass)) {
+            if (R().prof_.on) ++R().prof_.passWhy[!R().pass_.open ? R().passClosedBy_ : feedback ? kPassFeedback : kPassTargets];
+            if (R().pass_.open) { // to other targets: no barrier unless something since the last one needs it
+                rec([c = R().cmd_] { vkCmdEndRendering(c); });
+                R().pass_.open = false;
             }
             // Draws since the last barrier wrote and sampled only images; another pass needs the
             // barrier when it samples what they wrote, or renders into what they wrote or sampled.
-            if (needBarrier_ || feedback || overlaps(pass.images, drawWritten_) || overlaps(pass.images, drawSampled_))
+            if (R().needBarrier_ || feedback || overlaps(pass.images, R().drawWritten_) || overlaps(pass.images, R().drawSampled_))
                 barrier();
             VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
             ri.renderArea = {{0, 0}, {width, height}};
@@ -4748,24 +5556,24 @@ void main() {
                 ri.pDepthAttachment = keep(&depth, 1);
                 if (gs.stencil) ri.pStencilAttachment = ri.pDepthAttachment;
             }
-            rec([c = cmd_, ri] { vkCmdBeginRendering(c, &ri); });
-            std::swap(pass_, pass); // the old pass's storage is reused by the next draw
-            pass_.open = true;
-            ++passSerial_;
-            ++prof_.passes;
+            rec([c = R().cmd_, ri] { vkCmdBeginRendering(c, &ri); });
+            std::swap(R().pass_, pass); // the old pass's storage is reused by the next draw
+            R().pass_.open = true;
+            ++R().passSerial_;
+            ++R().prof_.passes;
         }
-        if (bound_.pipeline != pipe) {
-            rec([c = cmd_, pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); });
-            bound_.pipeline = pipe;
+        if (R().bound_.pipeline != pipe) {
+            rec([c = R().cmd_, pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); });
+            R().bound_.pipeline = pipe;
         }
         pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, lay.pipeline, writes, bufs, imgs);
         setViewportScissor(r, width, height, jitter);
-        if (!bound_.state || std::memcmp(bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
-            std::memcpy(bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
-            rec([c = cmd_, b = std::bit_cast<std::array<float, 4>>(bound_.blend)] { vkCmdSetBlendConstants(c, b.data()); });
+        if (!R().bound_.state || std::memcmp(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
+            std::memcpy(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
+            rec([c = R().cmd_, b = std::bit_cast<std::array<float, 4>>(R().bound_.blend)] { vkCmdSetBlendConstants(c, b.data()); });
         }
         setDynamicState(dyn, gs.depthControl);
-        bound_.state = true;
+        R().bound_.state = true;
         if (clearDepth) {
             VkClearAttachment ca{};
             ca.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -4774,19 +5582,19 @@ void main() {
             ca.clearValue.depthStencil = {z, r.ctx[reg::kDbStencilClear] & 0xFF};
             if (gs.stencil && (dbRender & 2)) ca.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
             VkClearRect cr{{{0, 0}, {width, height}}, 0, 1};
-            rec([c = cmd_, ca, cr] { vkCmdClearAttachments(c, 1, &ca, 1, &cr); });
+            rec([c = R().cmd_, ca, cr] { vkCmdClearAttachments(c, 1, &ca, 1, &cr); });
         }
         if (d.kind == DrawCall::kIndexed) {
             const VkIndexType it = r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
-            if (bound_.index != indexBuffer || bound_.indexOffset != indexOffset || bound_.indexType != it) {
-                rec([c = cmd_, indexBuffer, indexOffset, it] { vkCmdBindIndexBuffer(c, indexBuffer, indexOffset, it); });
-                bound_.index = indexBuffer, bound_.indexOffset = indexOffset, bound_.indexType = it;
+            if (R().bound_.index != indexBuffer || R().bound_.indexOffset != indexOffset || R().bound_.indexType != it) {
+                rec([c = R().cmd_, indexBuffer, indexOffset, it] { vkCmdBindIndexBuffer(c, indexBuffer, indexOffset, it); });
+                R().bound_.index = indexBuffer, R().bound_.indexOffset = indexOffset, R().bound_.indexType = it;
             }
-            rec([c = cmd_, n = d.count, inst = std::max(r.numInstances, 1u), first = d.indexOffset] {
+            rec([c = R().cmd_, n = d.count, inst = std::max(r.numInstances, 1u), first = d.indexOffset] {
                 vkCmdDrawIndexed(c, n, inst, first, 0, 0);
             });
         } else {
-            rec([c = cmd_, n = d.count, inst = std::max(r.numInstances, 1u)] { vkCmdDraw(c, n, inst, 0, 0); });
+            rec([c = R().cmd_, n = d.count, inst = std::max(r.numInstances, 1u)] { vkCmdDraw(c, n, inst, 0, 0); });
         }
         auto stores = [](const gcn::Program& p) {
             for (const auto& b : p.buffers)
@@ -4795,29 +5603,29 @@ void main() {
                 if (i.storage) return true;
             return false;
         };
-        for (VkImage im : pass_.images) // what this draw wrote
-            if ((im != pass_.depthImage || clearDepth || (((depthControl >> 2) & 1) && ((depthControl >> 1) & 1)) ||
+        for (VkImage im : R().pass_.images) // what this draw wrote
+            if ((im != R().pass_.depthImage || clearDepth || (((depthControl >> 2) & 1) && ((depthControl >> 1) & 1)) ||
                  (gs.stencil && (depthControl & 1) && ((r.ctx[reg::kDbStencilRefMask] >> 16) & 0xFF) &&
                   (r.ctx[reg::kDbStencilControl] & 0xFFFFFF))) &&
-                std::find(pass_.written.begin(), pass_.written.end(), im) == pass_.written.end()) {
-                pass_.written.push_back(im);
-                addOnce(drawWritten_, im);
+                std::find(R().pass_.written.begin(), R().pass_.written.end(), im) == R().pass_.written.end()) {
+                R().pass_.written.push_back(im);
+                addOnce(R().drawWritten_, im);
             }
-        for (VkImage im : sampledSurfaces_) addOnce(drawSampled_, im);
+        for (VkImage im : R().sampledSurfaces_) addOnce(R().drawSampled_, im);
         if (stores(vs) || (psm && stores(ps))) {
             endPass();
-            passClosedBy_ = kPassStore;
+            R().passClosedBy_ = kPassStore;
         }
-        ++stats_.draws;
+        ++R().stats_.draws;
         if (trace_ && snap_ && colorCount && snapWanted()) snapshot(uint64_t(r.ctx[reg::kCbColorBase]) << 8);
         // What a repeat of this draw can take as is (see fastDraw).
-        bool repeatable = pass_.open && !clearDepth && !trace_ && !raceCheck_ && !snap_;
-        for (VkImage im : sampledSurfaces_) // sampling what it renders to: a repeat needs a new pass
-            if (std::find(drawWritten_.begin(), drawWritten_.end(), im) != drawWritten_.end()) repeatable = false;
+        bool repeatable = R().pass_.open && !clearDepth && !trace_ && !raceCheck_ && !snap_;
+        for (VkImage im : R().sampledSurfaces_) // sampling what it renders to: a repeat needs a new pass
+            if (std::find(R().drawWritten_.begin(), R().drawWritten_.end(), im) != R().drawWritten_.end()) repeatable = false;
         if (repeatable && !noFastDraws_) {
-            FastDraw& f = fast_;
+            FastDraw& f = R().fast_;
             f.valid = true;
-            f.rec = recCount_;
+            f.rec = R().recCount_;
             f.frame = frame_;
             f.imageGen = imageGen_;
             f.kind = d.kind;
@@ -4825,7 +5633,7 @@ void main() {
             f.numInstances = r.numInstances;
             f.prim = prim;
             f.ctxHash = a.ctxHash;
-            if (prof_.on) f.ctx.assign(r.ctx, r.ctx + ::gpu::kContextRegs);
+            if (R().prof_.on) f.ctx.assign(r.ctx, r.ctx + ::gpu::kContextRegs);
             f.layout = lay.pipeline;
             f.vsm = vsm;
             f.psm = psm;
@@ -4835,13 +5643,13 @@ void main() {
             f.jitter = jitter;
             f.width = width;
             f.height = height;
-            f.pass = passSerial_;
+            f.pass = R().passSerial_;
             f.epoch = fastEpoch_;
-            f.sampled = sampledSurfaces_;
+            f.sampled = R().sampledSurfaces_;
             f.writes = writes;
             f.bufs = bufs;
             f.imgs = imgs;
-            keepDraw_ = true;
+            R().keepDraw_ = true;
         }
     }
 
@@ -4878,62 +5686,71 @@ void main() {
     // their last draws.
     struct FastSlot {
         FastDraw f;
-        DrawAnalysis prev;
+        std::unique_ptr<DrawAnalysis> prev = std::make_unique<DrawAnalysis>();
         uint64_t used = 0;
     };
     // 16: the city gate switches between more shaders in a pass than the steps (4 were enough there).
-    static constexpr size_t kFastSlots = 16;
+    // 64: at the rooftop ~840 draws a frame found no slot for their shaders with 16. Lookups go
+    // through R().slotKeys_ (one cache line per 4 slots) instead of each slot's own state.
+    static constexpr size_t kFastSlots = 64;
     // LPN_NO_FAST_TEXTURES=1: a draw sampling other textures than the last is recorded in full.
     const bool noFastTextures_ = getenv("LPN_NO_FAST_TEXTURES") != nullptr;
-    std::array<FastSlot, kFastSlots> fastSlots_;
-    uint64_t passSerial_ = 0, fastEpoch_ = 0, fastUse_ = 0;
+    struct SlotKey {
+        const ShaderModule *vsm = nullptr, *psm = nullptr;
+    };
+    std::atomic<uint64_t> fastEpoch_ = 0; // read by recorder threads
 
     // The bound fast state, before a full draw replaces it: kept in a slot (its shaders' one, or
     // the least recently used) while its pass lasts.
     void stashFast() {
-        if (fast_.valid && fast_.pass == passSerial_ && pass_.open && fast_.epoch == fastEpoch_ && fast_.frame == frame_) {
-            FastSlot* slot = &fastSlots_[0];
-            for (FastSlot& sl : fastSlots_) {
-                if (sl.f.vsm == fast_.vsm && sl.f.psm == fast_.psm) {
-                    slot = &sl;
+        if (R().fast_.valid && R().fast_.pass == R().passSerial_ && R().pass_.open && R().fast_.epoch == fastEpoch_ && R().fast_.frame == frame_) {
+            size_t i = 0;
+            for (size_t k = 0; k < kFastSlots; ++k) {
+                if (R().slotKeys_[k].vsm == R().fast_.vsm && R().slotKeys_[k].psm == R().fast_.psm) {
+                    i = k;
                     break;
                 }
-                if (sl.used < slot->used) slot = &sl;
+                if (R().slotUsed_[k] < R().slotUsed_[i]) i = k;
             }
-            std::swap(slot->f, fast_);
-            std::swap(slot->prev, prevDraw_);
-            slot->used = ++fastUse_;
+            FastSlot* slot = &R().fastSlots_[i];
+            R().slotKeys_[i] = {R().fast_.vsm, R().fast_.psm};
+            R().slotUsed_[i] = R().fastUse_ + 1;
+            std::swap(slot->f, R().fast_);
+            std::swap(slot->prev, R().prevDraw_);
+            slot->used = ++R().fastUse_;
         }
-        fast_.valid = false;
+        R().fast_.valid = false;
     }
 
     // A draw repeating one in a slot (see FastSlot) but for its user data, constants and buffer
     // placement, with only draws recorded since in the same pass: its pipeline, dynamic state and
     // descriptors are set again from the slot, and its state becomes the bound one.
-    bool switchDraw(const DrawCall& d, const GpuRegs& r, DrawAnalysis& a) {
-        if (!recording_ || !pass_.open || !ringFits(1 << 16)) return false;
+    bool switchDraw(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
+        if (!R().recording_ || !R().pass_.open || !ringFits(1 << 16)) return false;
         auto miss = [&](int why) {
-            if (prof_.on && (fast_.vsm != a.vsm || fast_.psm != a.psm)) ++prof_.switchMiss[why];
+            if (R().prof_.on && (R().fast_.vsm != a.vsm || R().fast_.psm != a.psm)) ++R().prof_.switchMiss[why];
             return false;
         };
         FastSlot* slot = nullptr;
-        for (FastSlot& sl : fastSlots_)
-            if (sl.f.valid && sl.f.vsm == a.vsm && sl.f.psm == a.psm) slot = &sl;
+        size_t si = 0;
+        for (size_t k = 0; k < kFastSlots; ++k)
+            if (R().slotKeys_[k].vsm == a.vsm && R().slotKeys_[k].psm == a.psm && R().fastSlots_[k].f.valid) slot = &R().fastSlots_[si = k];
         if (!slot) return miss(0);
         FastDraw& f = slot->f;
-        if (f.pass != passSerial_ || f.epoch != fastEpoch_ || f.frame != frame_ || f.imageGen != imageGen_) return miss(1);
+        if (f.pass != R().passSerial_ || f.epoch != fastEpoch_ || f.frame != frame_ || f.imageGen != imageGen_) return miss(1);
         if (d.kind != f.kind || r.indexType != f.indexType || r.numInstances != f.numInstances ||
-            r.uconfig[reg::kPrimitiveType] != f.prim || a.ctxHash != f.ctxHash)
+            r.prim != f.prim || a.ctxHash != f.ctxHash)
             return miss(2);
         for (VkImage im : f.sampled) // sampling what a draw since has rendered to needs a new pass
-            if (std::find(drawWritten_.begin(), drawWritten_.end(), im) != drawWritten_.end()) return miss(3);
+            if (std::find(R().drawWritten_.begin(), R().drawWritten_.end(), im) != R().drawWritten_.end()) return miss(3);
         uint32_t moved, vsImages = 0, psImages = 0;
         ImageBinding vsImg[32], psImg[32];
         uint32_t psMoved = 0;
-        if (sameButUserData(a.vs, slot->prev.vs, moved, noFastTextures_ ? nullptr : &vsImages) >= 0 ||
-            (a.psm && sameButUserData(a.ps, slot->prev.ps, psMoved, noFastTextures_ ? nullptr : &psImages) >= 0) ||
-            !peekImages(a.vs, vsImages, vsImg) || !peekImages(a.ps, psImages, psImg))
+        if (sameButUserData(a.vs, slot->prev->vs, moved, noFastTextures_ ? nullptr : &vsImages) >= 0 ||
+            (a.psm && sameButUserData(a.ps, slot->prev->ps, psMoved, noFastTextures_ ? nullptr : &psImages) >= 0))
             return miss(4);
+        WLock wl(*this, true); // to the descriptors: the caches, shared (read only)
+        if (!peekImages(a.vs, vsImages, vsImg) || !peekImages(a.ps, psImages, psImg)) return miss(4);
         VkBuffer indexBuffer = VK_NULL_HANDLE;
         VkDeviceSize indexOffset = 0;
         if (d.kind == DrawCall::kIndexed) {
@@ -4942,107 +5759,117 @@ void main() {
                 !guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset))
                 return miss(5);
         }
-        ProfScope pb(prof_, kProfBind);
-        std::vector<VkWriteDescriptorSet>& writes = drawWrites_;
-        std::vector<VkDescriptorBufferInfo>& bufs = drawBufs_;
-        std::vector<VkDescriptorImageInfo>& imgs = drawImgs_;
+        ProfScope pb(R().prof_, kProfBind);
+        std::vector<VkWriteDescriptorSet>& writes = R().drawWrites_;
+        std::vector<VkDescriptorImageInfo>& imgs = R().drawImgs_;
         // Other textures go into the slot's descriptors first (rebindImages also queues writes of its
         // own for fastDraw, dropped here: all of the slot's are pushed).
         writes.clear(), imgs.clear();
-        rebindImages(a.vs, slot->prev.vs, vsImages, vsImg, 0, f);
-        if (a.psm) rebindImages(a.ps, slot->prev.ps, psImages, psImg, kPsBindingBase, f);
+        rebindImages(a.vs, slot->prev->vs, vsImages, vsImg, 0, f);
+        if (a.psm) rebindImages(a.ps, slot->prev->ps, psImages, psImg, kPsBindingBase, f);
         // The buffers that moved and the draw data, bound again in the slot's descriptors (bufs is in
         // write order); the rest stay as the slot has them. Rebinding every buffer (15-20 a draw
         // outside the city gate) was most of the recorder's bind time.
-        std::array<int16_t, 256> bufIndex;
-        bufIndex.fill(-1);
-        for (size_t k = 0, n = 0; k < f.writes.size(); ++k)
-            if (f.writes[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-                if (f.writes[k].dstBinding < bufIndex.size()) bufIndex[f.writes[k].dstBinding] = int16_t(n);
-                ++n;
-            }
+        // A scan of the slot's writes per buffer: a binding table filled for every draw cost more
+        // than the few buffers that move.
         auto bufferAt = [&](uint32_t binding) -> VkDescriptorBufferInfo* {
-            return binding < bufIndex.size() && bufIndex[binding] >= 0 ? &f.bufs[bufIndex[binding]] : nullptr;
+            for (size_t k = 0, n = 0; k < f.writes.size(); ++k)
+                if (f.writes[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                    if (f.writes[k].dstBinding == binding) return &f.bufs[n];
+                    ++n;
+                }
+            return nullptr;
         };
         auto bind = [&](gcn::Program& p, gcn::Program& bound, uint32_t moved, uint32_t base) {
             for (uint32_t i = 0; moved; ++i, moved >>= 1)
                 if (moved & 1)
                     if (VkDescriptorBufferInfo* b = bufferAt(base + 1 + i)) {
-                        *b = bindBuffer(p, p.buffers[i], true);
+                        const std::vector<BufRes>* pre = aheadFor(a, p);
+                        *b = bindBuffer(p, p.buffers[i], true, pre ? &(*pre)[i] : nullptr);
                         std::memcpy(bound.buffers[i].sharp, p.buffers[i].sharp, sizeof p.buffers[i].sharp);
                     }
             const VkDeviceSize bytes = p.data.size() * 4;
-            const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
-            std::memcpy(static_cast<uint8_t*>(ringPtr_) + at, p.data.data(), bytes);
-            if (VkDescriptorBufferInfo* b = bufferAt(base)) *b = {ring_, at, bytes};
-            std::memcpy(bound.data.data(), p.data.data(), bytes);
+            const VkDeviceSize at = uploadData(p.data);
+            if (VkDescriptorBufferInfo* b = bufferAt(base)) *b = {R().ring_, at, bytes};
+            std::swap(bound.data, p.data); // as fastDraw: the analysis is handed back after this draw
         };
-        bind(a.vs, slot->prev.vs, moved, 0);
-        if (a.psm) bind(a.ps, slot->prev.ps, psMoved, kPsBindingBase);
-        writes = f.writes;
-        bufs = f.bufs;
-        imgs = f.imgs;
-        if (bound_.pipeline != f.pipe) {
-            rec([c = cmd_, pipe = f.pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); });
-            bound_.pipeline = f.pipe;
+        R().abort_ = false;
+        bind(a.vs, slot->prev->vs, moved, 0);
+        if (a.psm) bind(a.ps, slot->prev->ps, psMoved, kPsBindingBase);
+        wl.unlock();
+        if (R().abort_) { // a buffer needed a cache change: bound again holding m_
+            R().abort_ = false;
+            std::swap(slot->prev->vs.data, a.vs.data);
+            if (a.psm) std::swap(slot->prev->ps.data, a.ps.data);
+            WLock wx(*this);
+            bind(a.vs, slot->prev->vs, moved, 0);
+            if (a.psm) bind(a.ps, slot->prev->ps, psMoved, kPsBindingBase);
         }
-        pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, f.layout, writes, bufs, imgs);
+        if (R().bound_.pipeline != f.pipe) {
+            rec([c = R().cmd_, pipe = f.pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); });
+            R().bound_.pipeline = f.pipe;
+        }
+        pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, f.layout, f.writes, f.bufs, f.imgs);
         setViewportScissor(r, f.width, f.height, f.jitter);
-        if (!bound_.state || std::memcmp(bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
-            std::memcpy(bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
-            rec([c = cmd_, b = std::bit_cast<std::array<float, 4>>(bound_.blend)] { vkCmdSetBlendConstants(c, b.data()); });
+        if (!R().bound_.state || std::memcmp(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
+            std::memcpy(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
+            rec([c = R().cmd_, b = std::bit_cast<std::array<float, 4>>(R().bound_.blend)] { vkCmdSetBlendConstants(c, b.data()); });
         }
         setDynamicState(f.dyn, f.depthControl);
-        bound_.state = true;
+        R().bound_.state = true;
         if (d.kind == DrawCall::kIndexed) {
             const VkIndexType it = r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
-            if (bound_.index != indexBuffer || bound_.indexOffset != indexOffset || bound_.indexType != it) {
-                rec([c = cmd_, indexBuffer, indexOffset, it] { vkCmdBindIndexBuffer(c, indexBuffer, indexOffset, it); });
-                bound_.index = indexBuffer, bound_.indexOffset = indexOffset, bound_.indexType = it;
+            if (R().bound_.index != indexBuffer || R().bound_.indexOffset != indexOffset || R().bound_.indexType != it) {
+                rec([c = R().cmd_, indexBuffer, indexOffset, it] { vkCmdBindIndexBuffer(c, indexBuffer, indexOffset, it); });
+                R().bound_.index = indexBuffer, R().bound_.indexOffset = indexOffset, R().bound_.indexType = it;
             }
-            rec([c = cmd_, n = d.count, inst = std::max(r.numInstances, 1u), first = d.indexOffset] {
+            rec([c = R().cmd_, n = d.count, inst = std::max(r.numInstances, 1u), first = d.indexOffset] {
                 vkCmdDrawIndexed(c, n, inst, first, 0, 0);
             });
         } else {
-            rec([c = cmd_, n = d.count, inst = std::max(r.numInstances, 1u)] { vkCmdDraw(c, n, inst, 0, 0); });
+            rec([c = R().cmd_, n = d.count, inst = std::max(r.numInstances, 1u)] { vkCmdDraw(c, n, inst, 0, 0); });
         }
         // The slot's state is the bound one now; the one bound before takes its slot.
-        const bool keepOld = fast_.valid && fast_.pass == passSerial_ && fast_.epoch == fastEpoch_ && fast_.frame == frame_;
-        std::swap(slot->f, fast_);
-        std::swap(slot->prev, prevDraw_);
+        const bool keepOld = R().fast_.valid && R().fast_.pass == R().passSerial_ && R().fast_.epoch == fastEpoch_ && R().fast_.frame == frame_;
+        std::swap(slot->f, R().fast_);
+        std::swap(slot->prev, R().prevDraw_);
         slot->f.valid = keepOld;
-        slot->used = ++fastUse_;
-        fast_.rec = recCount_;
-        recordedSeq_ = a.seq;
-        ++stats_.draws;
-        ++prof_.fastDraws;
-        ++prof_.fastSwitches;
+        slot->used = ++R().fastUse_;
+        R().slotKeys_[si] = {slot->f.vsm, slot->f.psm};
+        R().slotUsed_[si] = slot->used;
+        R().fast_.rec = R().recCount_;
+        R().recordedSeq_ = a.seq;
+        ++R().stats_.draws;
+        ++R().prof_.fastDraws;
+        ++R().prof_.fastSwitches;
         return true;
     }
-    bool fastDraw(const DrawCall& d, const GpuRegs& r, DrawAnalysis& a) {
-        const FastDraw& f = fast_;
+    bool fastDraw(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a, bool prevMergeable) {
+        const FastDraw& f = R().fast_;
         auto miss = [&](FastMiss why) {
-            if (prof_.on) ++prof_.fastMiss[why];
+            if (R().prof_.on) ++R().prof_.fastMiss[why];
             return false;
         };
         if (!f.valid) return miss(kFastNotKept);
-        if (f.rec != recCount_) return miss(kFastBetween);
-        if (f.frame != frame_ || f.imageGen != imageGen_ || !recording_ || !pass_.open) return miss(kFastFrame);
+        if (f.rec != R().recCount_) return miss(kFastBetween);
+        if (f.frame != frame_ || f.imageGen != imageGen_ || !R().recording_ || !R().pass_.open) return miss(kFastFrame);
         if (d.kind != f.kind || a.vsm != f.vsm || a.psm != f.psm || r.indexType != f.indexType ||
-            r.numInstances != f.numInstances || r.uconfig[reg::kPrimitiveType] != f.prim || !ringFits(1 << 16)) {
-            if (prof_.on) ++prof_.fastKind[d.kind != f.kind ? 0 : a.vsm != f.vsm || a.psm != f.psm ? 1 : 2];
+            r.numInstances != f.numInstances || r.prim != f.prim || !ringFits(1 << 16)) {
+            if (R().prof_.on) ++R().prof_.fastKind[d.kind != f.kind ? 0 : a.vsm != f.vsm || a.psm != f.psm ? 1 : 2];
             return miss(kFastKind);
         }
         if (a.ctxHash != f.ctxHash) {
-            if (prof_.on && f.ctx.size() == ::gpu::kContextRegs)
+            if (R().prof_.on && f.ctx.size() == ::gpu::kContextRegs)
                 for (uint32_t i = 0; i < ::gpu::kContextRegs; ++i)
-                    if (r.ctx[i] != f.ctx[i]) ++prof_.fastCtx[i];
+                    if (r.ctx[i] != f.ctx[i]) ++R().prof_.fastCtx[i];
             return miss(kFastCtx);
         }
         uint32_t vsMoved = 0, psMoved = 0, vsImages = 0, psImages = 0;
         int why;
-        if (a.diffPrev && prevSeq_ + 1 == a.seq) { // prevDraw_'s resources are the previous draw's
-            ++prof_.diffsTaken;
+        int vsAlike = -1, psAlike = -1; // see DrawAnalysis::Diff::data
+        if (a.diffPrev && R().prevSeq_ + 1 == a.seq) { // R().prevDraw_'s resources are the previous draw's
+            ++R().prof_.diffsTaken;
+            vsAlike = a.vsDiff.data, psAlike = a.psDiff.data;
             why = a.vsDiff.why;
             if (why < 0 && a.psm) why = a.psDiff.why;
             if (why < 0) {
@@ -5051,20 +5878,21 @@ void main() {
                 if (noFastTextures_ && (vsImages || psImages)) why = 2;
             }
             if (why < 0) {
-                fillFromPrev(a.vs, prevDraw_.vs, vsMoved, vsImages);
-                if (a.psm) fillFromPrev(a.ps, prevDraw_.ps, psMoved, psImages);
+                fillFromPrev(a.vs, R().prevDraw_->vs, vsMoved, vsImages);
+                if (a.psm) fillFromPrev(a.ps, R().prevDraw_->ps, psMoved, psImages);
             }
         } else {
             uint32_t* const vi = noFastTextures_ ? nullptr : &vsImages;
             uint32_t* const pi = noFastTextures_ ? nullptr : &psImages;
-            why = sameButUserData(a.vs, prevDraw_.vs, vsMoved, vi);
-            if (why < 0 && a.psm) why = sameButUserData(a.ps, prevDraw_.ps, psMoved, pi);
+            why = sameButUserData(a.vs, R().prevDraw_->vs, vsMoved, vi);
+            if (why < 0 && a.psm) why = sameButUserData(a.ps, R().prevDraw_->ps, psMoved, pi);
         }
         // Other textures (another material on the same shaders): only ones already resolved this frame.
         ImageBinding vsImg[32], psImg[32];
+        WLock wl(*this, true); // from here to the descriptors: the caches, shared (read only)
         if (why < 0 && !(peekImages(a.vs, vsImages, vsImg) && peekImages(a.ps, psImages, psImg))) why = 2;
         if (why >= 0) {
-            if (prof_.on) ++prof_.fastRes[why];
+            if (R().prof_.on) ++R().prof_.fastRes[why];
             return miss(kFastResources);
         }
         VkBuffer indexBuffer = VK_NULL_HANDLE;
@@ -5075,25 +5903,26 @@ void main() {
                 !guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset))
                 return miss(kFastIndex);
         }
-        ProfScope pb(prof_, kProfBind);
-        std::vector<VkWriteDescriptorSet>& writes = drawWrites_;
-        std::vector<VkDescriptorBufferInfo>& bufs = drawBufs_;
-        std::vector<VkDescriptorImageInfo>& imgs = drawImgs_;
+        ProfScope pb(R().prof_, kProfBind);
+        std::vector<VkWriteDescriptorSet>& writes = R().drawWrites_;
+        std::vector<VkDescriptorBufferInfo>& bufs = R().drawBufs_;
+        std::vector<VkDescriptorImageInfo>& imgs = R().drawImgs_;
         writes.clear();
         bufs.clear();
         imgs.clear();
-        // Buffers that moved, then the draw data; prevDraw_ holds what is bound now.
+        // Buffers that moved, then the draw data; R().prevDraw_ holds what is bound now.
         auto rebind = [&](gcn::Program& p, gcn::Program& bound, uint32_t moved, uint32_t base) {
             for (uint32_t i = 0; moved; ++i, moved >>= 1)
                 if (moved & 1) {
-                    bufs.push_back(bindBuffer(p, p.buffers[i], true));
+                    const std::vector<BufRes>* pre = aheadFor(a, p);
+                    bufs.push_back(bindBuffer(p, p.buffers[i], true, pre ? &(*pre)[i] : nullptr));
                     writes.push_back(kBufferWrite);
                     writes.back().dstBinding = base + 1 + i;
                     // Also in the fast state, which switchDraw binds again unchanged but for moved buffers.
-                    for (size_t k = 0, n = 0; k < fast_.writes.size(); ++k)
-                        if (fast_.writes[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-                            if (fast_.writes[k].dstBinding == base + 1 + i) {
-                                fast_.bufs[n] = bufs.back();
+                    for (size_t k = 0, n = 0; k < R().fast_.writes.size(); ++k)
+                        if (R().fast_.writes[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                            if (R().fast_.writes[k].dstBinding == base + 1 + i) {
+                                R().fast_.bufs[n] = bufs.back();
                                 break;
                             }
                             ++n;
@@ -5101,41 +5930,61 @@ void main() {
                     std::memcpy(bound.buffers[i].sharp, p.buffers[i].sharp, sizeof p.buffers[i].sharp);
                 }
         };
-        if (vsMoved || psMoved) ++prof_.fastMoved;
-        if (vsImages || psImages) ++prof_.fastImages;
-        rebind(a.vs, prevDraw_.vs, vsMoved, 0);
-        if (a.psm) rebind(a.ps, prevDraw_.ps, psMoved, kPsBindingBase);
-        rebindImages(a.vs, prevDraw_.vs, vsImages, vsImg, 0, fast_);
-        if (a.psm) rebindImages(a.ps, prevDraw_.ps, psImages, psImg, kPsBindingBase, fast_);
-        auto data = [&](const gcn::Program& p, gcn::Program& bound, uint32_t base) {
+        if (vsMoved || psMoved) ++R().prof_.fastMoved;
+        if (vsImages || psImages) ++R().prof_.fastImages;
+        auto rebindAll = [&] {
+            rebind(a.vs, R().prevDraw_->vs, vsMoved, 0);
+            if (a.psm) rebind(a.ps, R().prevDraw_->ps, psMoved, kPsBindingBase);
+            rebindImages(a.vs, R().prevDraw_->vs, vsImages, vsImg, 0, R().fast_);
+            if (a.psm) rebindImages(a.ps, R().prevDraw_->ps, psImages, psImg, kPsBindingBase, R().fast_);
+        };
+        const size_t bufsBefore = bufs.size(), writesBefore = writes.size(), imgsBefore = imgs.size();
+        R().abort_ = false;
+        rebindAll();
+        wl.unlock();
+        if (R().abort_) { // a buffer needed a cache change: bound again holding m_
+            R().abort_ = false;
+            bufs.resize(bufsBefore), writes.resize(writesBefore), imgs.resize(imgsBefore);
+            WLock wx(*this);
+            rebindAll();
+        }
+        auto data = [&](gcn::Program& p, gcn::Program& bound, uint32_t base, int alike, bool rebound) {
             const VkDeviceSize bytes = p.data.size() * 4;
-            if (!std::memcmp(p.data.data(), bound.data.data(), bytes)) return;
-            const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
-            std::memcpy(static_cast<uint8_t*>(ringPtr_) + at, p.data.data(), bytes);
-            bufs.push_back({ring_, at, bytes});
+            if (alike == 1 && !rebound) return; // the worker found it the same
+            if (alike != 0 && !std::memcmp(p.data.data(), bound.data.data(), bytes)) return;
+            const VkDeviceSize at = uploadData(p.data);
+            bufs.push_back({R().ring_, at, bytes});
             writes.push_back(kBufferWrite);
             writes.back().dstBinding = base;
-            std::memcpy(bound.data.data(), p.data.data(), bytes);
+            // Now what is bound: swapped, not copied (the analysis is handed back after this draw).
+            std::swap(bound.data, p.data);
         };
-        data(a.vs, prevDraw_.vs, 0);
-        if (a.psm) data(a.ps, prevDraw_.ps, kPsBindingBase);
+        data(a.vs, R().prevDraw_->vs, 0, vsAlike, vsMoved || vsImages);
+        if (a.psm) data(a.ps, R().prevDraw_->ps, kPsBindingBase, psAlike, psMoved || psImages);
         if (!writes.empty()) pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, f.layout, writes, bufs, imgs);
+        bool sameIndex = true;
         if (d.kind == DrawCall::kIndexed) {
             const VkIndexType it = r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
-            if (bound_.index != indexBuffer || bound_.indexOffset != indexOffset || bound_.indexType != it) {
-                rec([c = cmd_, indexBuffer, indexOffset, it] { vkCmdBindIndexBuffer(c, indexBuffer, indexOffset, it); });
-                bound_.index = indexBuffer, bound_.indexOffset = indexOffset, bound_.indexType = it;
+            if (R().bound_.index != indexBuffer || R().bound_.indexOffset != indexOffset || R().bound_.indexType != it) {
+                sameIndex = false;
+                rec([c = R().cmd_, indexBuffer, indexOffset, it] { vkCmdBindIndexBuffer(c, indexBuffer, indexOffset, it); });
+                R().bound_.index = indexBuffer, R().bound_.indexOffset = indexOffset, R().bound_.indexType = it;
             }
-            rec([c = cmd_, n = d.count, inst = std::max(r.numInstances, 1u), first = d.indexOffset] {
+            rec([c = R().cmd_, n = d.count, inst = std::max(r.numInstances, 1u), first = d.indexOffset] {
                 vkCmdDrawIndexed(c, n, inst, first, 0, 0);
             });
         } else {
-            rec([c = cmd_, n = d.count, inst = std::max(r.numInstances, 1u)] { vkCmdDraw(c, n, inst, 0, 0); });
+            rec([c = R().cmd_, n = d.count, inst = std::max(r.numInstances, 1u)] { vkCmdDraw(c, n, inst, 0, 0); });
         }
-        fast_.rec = recCount_;
-        recordedSeq_ = a.seq;
-        ++stats_.draws;
-        ++prof_.fastDraws;
+        R().fast_.rec = R().recCount_;
+        R().recordedSeq_ = a.seq;
+        ++R().stats_.draws;
+        ++R().prof_.fastDraws;
+        R().lastMergeable_ = sameIndex && !(vsMoved | psMoved | vsImages | psImages);
+        if (R().lastMergeable_) {
+            ++R().prof_.mergeable;
+            if (!prevMergeable) ++R().prof_.mergeRuns;
+        }
         return true;
     }
     bool peekImages(const gcn::Program& p, uint32_t mask, ImageBinding* out) {
@@ -5153,9 +6002,9 @@ void main() {
             std::memcpy(&p.data[im.data], ib[i].scale, 8);
             const VkDescriptorImageInfo info{ib[i].sampler, ib[i].view, VK_IMAGE_LAYOUT_GENERAL};
             const uint32_t binding = base + 1 + uint32_t(p.buffers.size()) + i;
-            drawImgs_.push_back(info);
-            drawWrites_.push_back(kSampledImageWrite);
-            drawWrites_.back().dstBinding = binding;
+            R().drawImgs_.push_back(info);
+            R().drawWrites_.push_back(kSampledImageWrite);
+            R().drawWrites_.back().dstBinding = binding;
             size_t n = 0;
             for (const auto& w : f.writes)
                 if (w.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
@@ -5208,6 +6057,24 @@ void main() {
         }
         return -1;
     }
+    // Whether cur's draw data is prev's (both as analysed, same layout) but for the words resolution
+    // fills in: then, filled from prev, it is what prev bound (fastDraw need not compare them). On a
+    // worker: comparing on the recorder was ~6% of it, the data written on another core.
+    static bool dataAlike(const gcn::Program& cur, const gcn::Program& prev) {
+        const size_t n = cur.data.size();
+        if (n != prev.data.size() || n < gcn::data::kSmrd) return false;
+        thread_local std::vector<uint8_t> skip;
+        skip.assign(n, 0);
+        std::fill_n(&skip[gcn::data::kPosTransform], 4, 1);
+        for (const auto& b : cur.buffers)
+            if (b.data + 4 <= n) std::fill_n(&skip[b.data], 4, 1);
+        for (const auto& im : cur.images)
+            if (im.data + 2 <= n) std::fill_n(&skip[im.data], 2, 1);
+        const uint32_t *x = cur.data.data(), *y = prev.data.data();
+        for (size_t i = 0; i < n; ++i)
+            if (x[i] != y[i] && !skip[i]) return false;
+        return true;
+    }
     // sameButUserData's fill: the words resolution put in prev's data, for the resources that stay.
     static void fillFromPrev(gcn::Program& cur, const gcn::Program& prev, uint32_t moved, uint32_t images) {
         std::memcpy(&cur.data[gcn::data::kPosTransform], &prev.data[gcn::data::kPosTransform], 16);
@@ -5218,14 +6085,14 @@ void main() {
     }
 
     void endPass() {
-        needBarrier_ = true; // something other than a draw comes next
-        if (!pass_.open) return;
-        rec([c = cmd_] { vkCmdEndRendering(c); });
-        pass_.open = false;
-        passClosedBy_ = kPassOther;
+        R().needBarrier_ = true; // something other than a draw comes next
+        if (!R().pass_.open) return;
+        rec([c = R().cmd_] { vkCmdEndRendering(c); });
+        R().pass_.open = false;
+        R().passClosedBy_ = kPassOther;
     }
 
-    void setViewportScissor(const GpuRegs& r, uint32_t width, uint32_t height, bool jitter = false) {
+    void setViewportScissor(const DrawRegs& r, uint32_t width, uint32_t height, bool jitter = false) {
         const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
         float xs = v[0], xo = v[1], ys = v[2], yo = v[3], zs = v[4], zo = v[5];
         const uint32_t vte = r.ctx[reg::kPaClVteCntl];
@@ -5256,7 +6123,7 @@ void main() {
             vp.width = -vp.width;
         }
         if (jitter) vp.x += jitterX_, vp.y += jitterY_;
-        if (!bound_.state || std::memcmp(&bound_.viewport, &vp, sizeof vp) != 0) rec([c = cmd_, vp] { vkCmdSetViewport(c, 0, 1, &vp); }), bound_.viewport = vp;
+        if (!R().bound_.state || std::memcmp(&R().bound_.viewport, &vp, sizeof vp) != 0) rec([c = R().cmd_, vp] { vkCmdSetViewport(c, 0, 1, &vp); }), R().bound_.viewport = vp;
 
         int32_t x0 = 0, y0 = 0, x1 = int32_t(width), y1 = int32_t(height);
         auto clip = [&](uint32_t tl, uint32_t br) {
@@ -5280,11 +6147,11 @@ void main() {
             std::fprintf(traceOut_, "[trace]   viewport %.1f,%.1f %.1fx%.1f z %.2f..%.2f scissor %d,%d %ux%u vte 0x%x colfmt 0x%x\n",
                          vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth, sc.offset.x, sc.offset.y,
                          sc.extent.width, sc.extent.height, vte, r.ctx[reg::kSpiShaderColFormat]);
-        if (!bound_.state || std::memcmp(&bound_.scissor, &sc, sizeof sc) != 0) rec([c = cmd_, sc] { vkCmdSetScissor(c, 0, 1, &sc); }), bound_.scissor = sc;
+        if (!R().bound_.state || std::memcmp(&R().bound_.scissor, &sc, sizeof sc) != 0) rec([c = R().cmd_, sc] { vkCmdSetScissor(c, 0, 1, &sc); }), R().bound_.scissor = sc;
     }
 
     Vk vk_;
-    std::mutex m_;
+    std::shared_mutex m_; // the renderer; recorder threads' fast draws share it for their lookups
     VkCommandPool pool_ = VK_NULL_HANDLE;
     struct Batch {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -5296,9 +6163,6 @@ void main() {
         std::vector<std::function<void()>> done; // runs once it has finished
     };
     Batch batches_[kBatches];
-    uint32_t cur_ = 0;
-    uint32_t drawsSinceFlush_ = 0;
-    PassWhy passClosedBy_ = kPassOther;
     VkQueryPool timestamps_ = VK_NULL_HANDLE; // LPN_PROFILE: two per batch
     double gpuTickNs_ = 1;
     std::atomic<uint64_t> gpuBusyNs_{0};
@@ -5315,22 +6179,16 @@ void main() {
         VkDeviceSize size = 0;
     };
     DisplaySlot displays_[kDisplaySlots];
-    std::vector<std::function<void()>> pendingDone_; // due after the batch being recorded
     bool sync_ = false;
-    VkCommandBuffer cmd_ = VK_NULL_HANDLE; // the current batch's
     // The command thread's queue (see CmdChunk): chunks handed over in order, and spare ones.
     bool syncRecord_ = getenv("LPN_SYNC_RECORD") != nullptr;
-    std::unique_ptr<CmdChunk> chunk_ = std::make_unique<CmdChunk>(); // being filled
+    bool deferUploads_ = getenv("LPN_NO_DEFER_UPLOADS") == nullptr; // see uploadData
     std::mutex chunkMutex_;
     std::condition_variable chunkCv_;
     std::deque<std::unique_ptr<CmdChunk>> chunks_, spareChunks_;
-    uint32_t drawsSinceHandOff_ = 0;
-    bool recording_ = false;
-    VkBuffer ring_ = VK_NULL_HANDLE, dummyBuffer_ = VK_NULL_HANDLE;
+    VkBuffer dummyBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory dummyMemory_ = VK_NULL_HANDLE;
-    void* ringPtr_ = nullptr;
-    VkDeviceSize ringUsed_ = 0, storageAlign_ = 16;
-    std::vector<std::function<void()>> afterFlush_;
+    VkDeviceSize storageAlign_ = 16;
     std::vector<uint8_t> scratch_;
     GuestHasher hasher_;
     std::chrono::steady_clock::time_point lastFrameEnd_ = std::chrono::steady_clock::now();
@@ -5338,10 +6196,13 @@ void main() {
     double worstFrameMs_ = 0;
     uint64_t frameNs_[kProfCount] = {}, frameAnalyses_ = 0, framePipelines_ = 0;
 
-    std::map<uint64_t, Import> imports_;
+    std::map<uint64_t, Import> imports_; // never erased while rendering: importHits_ points into it
+    static constexpr size_t kImportHits = 64;
     std::unordered_map<uint64_t, Surface> colors_, depths_;
     std::unordered_map<uint64_t, Metadata> metadata_; // by HTILE/CMASK address
     std::unordered_map<std::array<uint32_t, 6>, GuestTexture, WordsHash> textures_;
+    static constexpr uint32_t kMaxMips = 15;
+    const bool noMips_ = getenv("LPN_NO_MIPS") != nullptr;
     std::map<std::array<uint32_t, 5>, VkSampler> samplers_;
     std::unordered_map<std::string, std::unique_ptr<ShaderModule>> shaders_;
     std::unordered_map<uint64_t, VkShaderModule> expanders_;
@@ -5370,26 +6231,17 @@ public:
     bool computeOnly_ = false;
 
 private:
-    struct {
-        uint64_t draws = 0, dispatches = 0;
-    } stats_;
-    Profiler prof_;
     Overlays overlays_;
     uint64_t overlayIds_ = 0;
-    uint64_t recCount_ = 0; // calls rec()'d (see fastDraw)
-    FastDraw fast_;
-    DrawAnalysis prevDraw_; // the last draw recorded in full, if fast_.valid
-    bool keepDraw_ = false; // onDraw keeps the draw as prevDraw_
-    uint64_t prevSeq_ = 0, recordedSeq_ = 0; // DrawAnalysis::seq of prevDraw_'s draw / the last fast one
     const bool noFastDraws_ = getenv("LPN_NO_FAST_DRAWS") != nullptr;
     const bool noDepthJoin_ = getenv("LPN_NO_DEPTH_JOIN") != nullptr; // depth-only draws get their own pass
-    Profiler aprof_; // the analysis thread's slots and counts, merged into prof_'s reports
+    Profiler aprof_; // the analysis thread's slots and counts, merged into R().prof_'s reports
     std::mutex analysesMutex_;
     std::condition_variable analysesCv_; // a DrawAnalysis is ready
-    std::deque<DrawAnalysis> analyses_; // one per draw or dispatch, for the recorder
-    std::vector<DrawAnalysis> spareAnalyses_; // used ones, back from the recorder
+    std::deque<std::unique_ptr<DrawAnalysis>> analyses_; // one per draw or dispatch, for the recorder
+    std::vector<std::unique_ptr<DrawAnalysis>> spareAnalyses_; // used ones, back from the recorder
     static constexpr size_t kTakeRun = 64;
-    std::vector<DrawAnalysis> taken_, returned_; // the recorder's: ready ones taken, used ones to hand back
+    std::vector<std::unique_ptr<DrawAnalysis>> taken_; // the recorder's: ready ones taken
     size_t takenNext_ = 0;
     std::deque<uint64_t> dmaOverlays_, writeOverlays_; // the analysis thread's overlay of each DMA / WRITE_DATA
     std::vector<std::unique_ptr<AnalysisCtx>> actx_; // one per worker (one without workers)
@@ -5416,18 +6268,9 @@ private:
             return colorCount == o.colorCount && depth == o.depth && stencil == o.stencil && width == o.width &&
                    height == o.height && std::equal(views, views + colorCount, o.views);
         }
-    } pass_, drawPass_; // the open pass; the draw being recorded's
-    std::vector<VkDescriptorSetLayoutBinding> drawBindings_;
-    std::vector<VkWriteDescriptorSet> drawWrites_;
-    std::vector<VkDescriptorBufferInfo> drawBufs_;
-    std::vector<VkDescriptorImageInfo> drawImgs_;
-    std::vector<VkImage> sampledSurfaces_;
+    };
     std::array<ImageMemo, kImageMemos> imageMemos_{};
     uint64_t imageGen_ = 1;
-    // Since the last barrier: images draws wrote and sampled, and whether anything else (a copy,
-    // dispatch, upload, clear, shader store or new batch) needs one before the next pass.
-    std::vector<VkImage> drawWritten_, drawSampled_;
-    bool needBarrier_ = true;
     std::string spirvDir_; // "-": no SPIR-V cache
     VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
     std::string pipelineCachePath_;
@@ -5442,6 +6285,503 @@ private:
     FILE* pipelineList_ = nullptr;
     std::chrono::steady_clock::time_point lastPipelineSave_{};
     std::atomic<bool> pipelineSaving_{false};
+
+    // What one thread recording draws keeps from draw to draw: its batch (command buffer, upload
+    // ring, command chunk), the open pass, what is bound, the fast-draw states and its counters.
+    // Each recorder thread has its own (see R()); the others use the main one.
+    struct Rec {
+        uint32_t cur_ = 0; // the batch
+        VkCommandBuffer cmd_ = VK_NULL_HANDLE; // the current batch's
+        VkBuffer ring_ = VK_NULL_HANDLE;
+        void* ringPtr_ = nullptr;
+        VkDeviceSize ringUsed_ = 0;
+        bool recording_ = false;
+        uint32_t drawsSinceFlush_ = 0, drawsSinceHandOff_ = 0;
+        std::unique_ptr<CmdChunk> chunk_ = std::make_unique<CmdChunk>(); // being filled
+        uint64_t recCount_ = 0; // calls rec()'d (see fastDraw)
+        std::vector<std::function<void()>> pendingDone_; // due after the batch being recorded
+        std::vector<std::function<void()>> afterFlush_;
+        Pass pass_, drawPass_; // the open pass; the draw being recorded's
+        PassWhy passClosedBy_ = kPassOther;
+        uint64_t passSerial_ = 0;
+        // Since the last barrier: images draws wrote and sampled, and whether anything else (a copy,
+        // dispatch, upload, clear, shader store or new batch) needs one before the next pass.
+        std::vector<VkImage> drawWritten_, drawSampled_;
+        bool needBarrier_ = true;
+        std::vector<VkImage> sampledSurfaces_;
+        Bound bound_;
+        std::vector<VkDescriptorSetLayoutBinding> drawBindings_;
+        std::vector<VkWriteDescriptorSet> drawWrites_;
+        std::vector<VkDescriptorBufferInfo> drawBufs_;
+        std::vector<VkDescriptorImageInfo> drawImgs_;
+        bool lastMergeable_ = false; // the last draw was a fast draw that only changed draw data
+        FastDraw fast_;
+        std::unique_ptr<DrawAnalysis> prevDraw_ = std::make_unique<DrawAnalysis>(); // the last draw recorded in full, if fast_.valid
+        bool keepDraw_ = false; // onDraw keeps the draw as prevDraw_
+        uint64_t prevSeq_ = 0, recordedSeq_ = 0; // DrawAnalysis::seq of prevDraw_'s draw / the last fast one
+        std::array<FastSlot, kFastSlots> fastSlots_;
+        std::array<SlotKey, kFastSlots> slotKeys_{}; // fastSlots_[i].f's shaders
+        std::array<uint64_t, kFastSlots> slotUsed_{}; // fastSlots_[i].used, for the LRU scan
+        uint64_t fastUse_ = 0;
+        GuestTexture* lastTexture_ = nullptr; // the one resolveImageUncached bound, if any
+        std::vector<std::unique_ptr<DrawAnalysis>> returned_; // used analyses to hand back
+        struct {
+            uint64_t draws = 0, dispatches = 0;
+        } stats_;
+        Profiler prof_;
+        uint64_t countedPass_ = ~0ull, passDraws_ = 0; // LPN_PROFILE: the pass being counted, and its draws so far
+        VkDeviceSize ringSize_ = kRingSize;
+        // A recorder thread's (or the uploads ahead of them): Vulkan calls are made at once (not
+        // queued for the command thread), into a secondary command buffer; it never flushes.
+        bool immediate_ = false, worker_ = false;
+        bool locked_ = false, lockShared_ = false; // holds m_, shared (see WLock)
+        bool abort_ = false; // a full draw under the shared lock met a cache it would change (see sharedMiss)
+        std::array<VramHit, kVramHits> vramHits_{}; // the copies last found (see vramBuffer); cleared when one is freed
+        std::array<const Import*, kImportHits> importHits_{}; // the imports last found (see guestBuffer)
+    };
+    Rec rec0_;
+    static inline thread_local Rec* tRec_ = nullptr;
+    Rec& R() {
+        Rec* r = tRec_;
+        return r ? *r : rec0_;
+    }
+    const Rec& R() const {
+        const Rec* r = tRec_;
+        return r ? *r : rec0_;
+    }
+
+    // ---- recorder threads (LPN_RECORD_THREADS) -------------------------------------------------
+
+    // At ~9,000 draws a frame (the city overlook) one recorder took ~15 ms a frame, most of it
+    // waiting on memory, and capped the frame rate at ~55 while the GPU needed ~11 ms. With
+    // LPN_RECORD_THREADS=N, runs of up to LPN_RECORD_SEGMENT draws (128) go to N threads, each
+    // recording its run into a secondary command buffer of its own from a fresh state (its own
+    // pass, bindings and fast-draw slots, starting behind a full barrier); the main recorder
+    // queues an execution of each in order in its batch, which the command thread makes once the
+    // run is recorded. Everything else (dispatches, DMA, memory writes, SMAA under DLSS, frame
+    // ends) waits for the runs recorded so far and is recorded in order as before.
+    // The caches are shared under m_: a thread holds it for a whole full draw and around a fast
+    // draw's lookups. Uploads and copies a thread records go into a command buffer of their own
+    // that runs before the next run is executed (none recorded earlier can miss them), and what
+    // a thread frees waits for every run recorded by then.
+    struct SegSlot {
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkBuffer ring = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        void* ptr = nullptr;
+        VkDeviceSize size = 0;
+    };
+    struct SegItem {
+        DrawCall d;
+        DrawRegs r;
+        std::unique_ptr<DrawAnalysis> a;
+    };
+    struct Segment {
+        SegSlot* slot = nullptr;
+        std::vector<SegItem> items;
+        std::vector<std::unique_ptr<uint32_t[]>> ctxs; // copies of the context registers the items read
+        size_t ctxUsed = 0;
+        bool done = false; // recorded (segMutex_)
+    };
+    static constexpr VkDeviceSize kSegRing = 4ull << 20, kProRing = 48ull << 20;
+
+    std::unique_ptr<SegSlot> makeSlot(VkDeviceSize ringSize) {
+        auto sl = std::make_unique<SegSlot>();
+        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        pci.queueFamilyIndex = vk_.family;
+        if (vkCreateCommandPool(vk_.device, &pci, nullptr, &sl->pool) != VK_SUCCESS) return nullptr;
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = sl->pool;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+        cai.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(vk_.device, &cai, &sl->cmd) != VK_SUCCESS) return nullptr;
+        sl->ring = createHostBuffer(ringSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &sl->mem, &sl->ptr);
+        if (!sl->ring) return nullptr;
+        sl->size = ringSize;
+        return sl;
+    }
+    void beginSecondary(SegSlot& sl) {
+        VK_CHECK(vkResetCommandPool(vk_.device, sl.pool, 0));
+        VkCommandBufferInheritanceInfo ii{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        bi.pInheritanceInfo = &ii;
+        VK_CHECK(vkBeginCommandBuffer(sl.cmd, &bi));
+    }
+    // A Rec starting on a slot's command buffer: nothing bound, no pass, no fast states.
+    static void startRec(Rec& rc, SegSlot& sl) {
+        rc.cmd_ = sl.cmd;
+        rc.ring_ = sl.ring;
+        rc.ringPtr_ = sl.ptr;
+        rc.ringUsed_ = 0;
+        rc.ringSize_ = sl.size;
+        rc.recording_ = true;
+        rc.bound_ = Bound{};
+        rc.needBarrier_ = true;
+        rc.drawWritten_.clear();
+        rc.drawSampled_.clear();
+        rc.pass_.open = false;
+        ++rc.passSerial_; // fast states from an earlier segment never match
+        rc.fast_.valid = false;
+        for (FastSlot& f : rc.fastSlots_) f.f.valid = false;
+        rc.lastMergeable_ = false;
+        rc.keepDraw_ = false;
+        rc.prevSeq_ = rc.recordedSeq_ = 0;
+    }
+
+    void startRecorderThreads() {
+        const char* n = getenv("LPN_RECORD_THREADS");
+        // 6 on 16+ hardware threads (=0 turns them off): the overlook went from ~55 to ~76 fps on
+        // an i7-12700K, where 4, 6 and 8 did alike before the lock was shared.
+        const unsigned want = n ? unsigned(std::atoi(n)) : std::thread::hardware_concurrency() >= 16 ? 6 : 0;
+        if (want < 1) return;
+        const char* why = syncRecord_ ? "LPN_SYNC_RECORD" : sync_ ? "LPN_GPU_SYNC" : traceFrame_ != ~0ull ? "LPN_GPU_TRACE" : snap_ ? "LPN_GPU_SNAP"
+                          : raceCheck_ ? "LPN_RACE_CHECK" : computeOnly_ ? "compute only" : !analysisWorkers_ ? "no analysis workers"
+                                                                                                           : nullptr;
+        if (why) {
+            if (n) std::fprintf(stderr, "[gpu] LPN_RECORD_THREADS ignored (%s)\n", why);
+            return;
+        }
+        if (const char* sz = getenv("LPN_RECORD_SEGMENT")) segDraws_ = std::max(8, std::atoi(sz));
+        recordThreads_ = std::min(want, 16u);
+        pro_.worker_ = pro_.immediate_ = true;
+        pro_.prof_.on = R().prof_.on;
+        for (unsigned i = 0; i < recordThreads_; ++i) {
+            workerRecs_.push_back(std::make_unique<Rec>());
+            Rec& rc = *workerRecs_.back();
+            rc.worker_ = rc.immediate_ = true;
+            rc.prof_.on = R().prof_.on;
+            std::thread([this, &rc] { recorderThread(rc); }).detach();
+        }
+        std::fprintf(stderr, "[gpu] %u recorder threads, runs of up to %u draws\n", recordThreads_, segDraws_);
+    }
+    void recorderThread(Rec& rc) {
+        profile::nameThread("lpn-record-w");
+        tRec_ = &rc;
+        for (;;) {
+            Segment* g;
+            {
+                std::unique_lock lock(segMutex_);
+                segCv_.wait(lock, [&] { return !segQueue_.empty(); });
+                g = segQueue_.front();
+                segQueue_.pop_front();
+            }
+            recordSegment(rc, *g);
+            {
+                std::lock_guard lock(segMutex_);
+                g->done = true;
+                --outstanding_;
+            }
+            segDoneCv_.notify_all();
+        }
+    }
+    void recordSegment(Rec& rc, Segment& g) {
+        SegSlot& sl = *g.slot;
+        startRec(rc, sl);
+        beginSecondary(sl);
+        {
+            ProfScope ps(rc.prof_, kProfRenderer);
+            for (SegItem& it : g.items) {
+                Recycle recycle{*this, it.a};
+                recordDraw(it.d, it.r, it.a);
+            }
+            endPass();
+        }
+        VK_CHECK(vkEndCommandBuffer(sl.cmd));
+        rc.recording_ = false;
+        ++rc.prof_.segments;
+        g.items.clear();
+        g.ctxUsed = 0;
+        if (!rc.returned_.empty()) spare(rc.returned_);
+        if (!rc.afterFlush_.empty() || !rc.pendingDone_.empty()) { // freed: once every segment recorded by now is done
+            std::lock_guard lock(lateMutex_);
+            for (auto& f : rc.afterFlush_) lateFree_.push_back(std::move(f));
+            for (auto& f : rc.pendingDone_) lateFree_.push_back(std::move(f));
+            rc.afterFlush_.clear();
+            rc.pendingDone_.clear();
+        }
+    }
+
+    bool segmentable(const DrawCall& d, const DrawAnalysis& a) const {
+        if (d.kind != DrawCall::kAuto && d.kind != DrawCall::kIndexed) return false;
+        if (computeOnly_ || frame_ == traceFrame_ || frame_ == timingFrame_) return false;
+        return !(dlssOn_ && a.psm && a.psm->smaa); // SMAA under DLSS changes what later draws do
+    }
+    void addToSegment(const DrawCall& d, const GpuRegs& r, std::unique_ptr<DrawAnalysis>& held) {
+        ProfScope ps(R().prof_, kProfRenderer);
+        if (!open_) {
+            std::lock_guard lock(segMutex_);
+            if (segFree_.empty()) {
+                segAll_.push_back(std::make_unique<Segment>());
+                segFree_.push_back(segAll_.back().get());
+            }
+            open_ = segFree_.back();
+            segFree_.pop_back();
+            openCtx_ = nullptr;
+        }
+        Segment& g = *open_;
+        if (!openCtx_ || r.ctxSerial != openCtxSerial_) { // a copy of the context registers, while they hold
+            if (g.ctxUsed == g.ctxs.size()) g.ctxs.push_back(std::make_unique<uint32_t[]>(::gpu::kContextRegs));
+            uint32_t* c = g.ctxs[g.ctxUsed++].get();
+            std::memcpy(c, r.ctx, sizeof r.ctx);
+            openCtx_ = c;
+            openCtxSerial_ = r.ctxSerial;
+        }
+        g.items.push_back({d, DrawRegs::of(r, openCtx_), std::move(held)});
+        ++drawIndex_;
+        if (g.items.size() >= segDraws_) dispatchSegment();
+    }
+    SegSlot* acquireSlot() {
+        std::unique_lock lock(segMutex_);
+        if (slotFree_.empty() && slotsAll_.size() < 256) {
+            lock.unlock();
+            auto sl = makeSlot(kSegRing);
+            lock.lock();
+            if (sl) {
+                slotsAll_.push_back(std::move(sl));
+                slotFree_.push_back(slotsAll_.back().get());
+            }
+        }
+        if (slotFree_.empty()) {
+            ProfScope pw(R().prof_, kProfGpuWait);
+            segFreeCv_.wait(lock, [&] { return !slotFree_.empty(); });
+        }
+        SegSlot* sl = slotFree_.back();
+        slotFree_.pop_back();
+        return sl;
+    }
+    // The open segment to a recorder thread, its execution queued in the batch in order.
+    void dispatchSegment() {
+        Segment* g = open_;
+        open_ = nullptr;
+        openCtx_ = nullptr;
+        if (!g) return;
+        if (g->items.empty()) {
+            std::lock_guard lock(segMutex_);
+            segFree_.push_back(g);
+            return;
+        }
+        g->slot = acquireSlot();
+        const size_t n = g->items.size();
+        {
+            // At most a few batches ahead of the threads: the main recorder waits for a batch two
+            // flushes back while holding m_ (begin), and that batch's segments must be recorded.
+            const unsigned ahead = std::max(2u, flushDraws_ ? (kBatches - 2) * flushDraws_ / segDraws_ : 16u);
+            std::unique_lock lock(segMutex_);
+            if (outstanding_ >= ahead || paused_) {
+                const auto t0 = std::chrono::steady_clock::now();
+                segDoneCv_.wait(lock, [&] { return outstanding_ < ahead && !paused_; });
+                R().prof_.aheadNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+            }
+            g->done = false;
+            ++outstanding_;
+            segQueue_.push_back(g);
+        }
+        segCv_.notify_one();
+        std::lock_guard lock(m_);
+        begin();
+        endPass(); // secondaries run outside a render pass
+        rec([this, c = R().cmd_, batch = R().cur_, g] { executeSegment(c, batch, *g); });
+        R().afterFlush_.push_back([this, sl = g->slot] {
+            {
+                std::lock_guard lock(segMutex_);
+                slotFree_.push_back(sl);
+            }
+            segFreeCv_.notify_one();
+        });
+        handOff();
+        R().drawsSinceFlush_ += uint32_t(n);
+        if (flushDraws_ && R().drawsSinceFlush_ >= flushDraws_) flush();
+    }
+    // On the command thread: once the segment is recorded, the uploads queued so far, then it.
+    void executeSegment(VkCommandBuffer c, uint32_t batch, Segment& g) {
+        {
+            std::unique_lock lock(segMutex_);
+            segDoneCv_.wait(lock, [&] { return g.done; });
+        }
+        executePrologues(c, batch);
+        vkCmdExecuteCommands(c, 1, &g.slot->cmd);
+        std::lock_guard lock(segMutex_);
+        g.slot = nullptr;
+        segFree_.push_back(&g);
+    }
+    // Waits until every segment so far is recorded: what comes next is recorded in order here.
+    void drainSegments(int why) {
+        dispatchSegment();
+        std::unique_lock lock(segMutex_);
+        if (!outstanding_) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        segDoneCv_.wait(lock, [&] { return outstanding_ == 0; });
+        R().prof_.drainNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        ++R().prof_.drains;
+        ++R().prof_.drainWhy[why];
+    }
+    // Recorder threads' counters into the main ones (all threads idle: after drainSegments).
+    void mergeRecorderProfiles() {
+        auto take = [&](Rec& w) {
+            Profiler& to = R().prof_;
+            Profiler& p = w.prof_;
+            to.workerNs += p.ns[kProfRenderer];
+            p.ns[kProfRenderer] = 0;
+            addProfile(to, p);
+            R().stats_.draws += std::exchange(w.stats_.draws, 0);
+            R().stats_.dispatches += std::exchange(w.stats_.dispatches, 0);
+        };
+        for (auto& w : workerRecs_) take(*w);
+        std::lock_guard lock(proMutex_);
+        take(pro_);
+    }
+    static void addProfile(Profiler& a, Profiler& b) {
+        auto add = [](auto& x, auto& y) {
+            for (size_t i = 0; i < std::size(x); ++i) x[i] += std::exchange(y[i], 0);
+        };
+        add(a.ns, b.ns), add(a.passWhy, b.passWhy), add(a.feedbackOn, b.feedbackOn), add(a.missWhy, b.missWhy);
+        add(a.missUser, b.missUser), add(a.fastMiss, b.fastMiss), add(a.fastKind, b.fastKind), add(a.fastRes, b.fastRes);
+        add(a.switchMiss, b.switchMiss), add(a.drainWhy, b.drainWhy), add(a.passBySize, b.passBySize), add(a.drawsBySize, b.drawsBySize);
+        for (uint64_t Profiler::*f : {&Profiler::fastMoved, &Profiler::fastImages, &Profiler::diffsTaken, &Profiler::fastSwitches,
+                                      &Profiler::mergeable, &Profiler::mergeRuns, &Profiler::depthJoins, &Profiler::depthOnly,
+                                      &Profiler::barriers, &Profiler::calls, &Profiler::fastDraws, &Profiler::analysisHits,
+                                      &Profiler::repeats, &Profiler::analyses, &Profiler::passes, &Profiler::texChecks,
+                                      &Profiler::texUploads, &Profiler::texBytes, &Profiler::flushes, &Profiler::dmas,
+                                      &Profiler::dmaBytes, &Profiler::pipelinesMade, &Profiler::pipelineWaits, &Profiler::vramCopies,
+                                      &Profiler::vramCopyBytes, &Profiler::imageMisses, &Profiler::imageGens, &Profiler::resolvedAhead,
+                                      &Profiler::vramAllocs, &Profiler::vramEvicts, &Profiler::vramFreed, &Profiler::vramEvictsEmpty,
+                                      &Profiler::segments, &Profiler::drains, &Profiler::drainNs, &Profiler::workerNs, &Profiler::aheadNs, &Profiler::sharedDraws, &Profiler::sharedRetries, &Profiler::locks, &Profiler::lockWaits, &Profiler::lockNs})
+            a.*f += std::exchange(b.*f, 0);
+        a.largestPass = std::max(a.largestPass, std::exchange(b.largestPass, 0));
+        for (auto& [k, v] : b.fastCtx) a.fastCtx[k] += v;
+        b.fastCtx.clear();
+    }
+
+    // Uploads and copies a recorder thread makes (texture uploads, VRAM copies, new images' first
+    // layout and clear) go into the next secondary of pro_, executed before the next segment.
+    void openPrologue() { // proMutex_ held
+        SegSlot* sl = nullptr;
+        if (!proFree_.empty()) {
+            sl = proFree_.back();
+            proFree_.pop_back();
+        } else {
+            auto made = makeSlot(kProRing);
+            if (!made) {
+                warnOnce("cannot create an upload command buffer for the recorder threads");
+                return;
+            }
+            sl = made.get();
+            proAll_.push_back(std::move(made));
+        }
+        proSlot_ = sl;
+        startRec(pro_, *sl);
+        beginSecondary(*sl);
+    }
+    void closePrologue() { // proMutex_ held
+        if (!pro_.recording_) return;
+        VK_CHECK(vkEndCommandBuffer(proSlot_->cmd));
+        pro_.recording_ = false;
+        proPending_.push_back(proSlot_);
+        proSlot_ = nullptr;
+    }
+    void executePrologues(VkCommandBuffer c, uint32_t batch) {
+        std::vector<SegSlot*> run;
+        {
+            std::lock_guard lock(proMutex_);
+            closePrologue();
+            run.swap(proPending_);
+        }
+        if (run.empty()) return;
+        for (SegSlot* sl : run) vkCmdExecuteCommands(c, 1, &sl->cmd);
+        std::lock_guard lock(doneMutex_);
+        batches_[batch].done.push_back([this, run] {
+            std::lock_guard lock(proMutex_);
+            for (SegSlot* sl : run) proFree_.push_back(sl);
+        });
+    }
+    // Around code that records an upload or copy: on a recorder thread, into pro_.
+    class Prologue {
+    public:
+        explicit Prologue(Renderer& r) : r_(r) {
+            Rec* t = tRec_;
+            if (!t || !t->worker_ || t == &r.pro_) return;
+            lock_ = std::unique_lock(r.proMutex_);
+            saved_ = t;
+            tRec_ = &r.pro_;
+            r.begin();
+        }
+        ~Prologue() {
+            if (saved_) tRec_ = saved_;
+        }
+
+    private:
+        Renderer& r_;
+        std::unique_lock<std::mutex> lock_;
+        Rec* saved_ = nullptr;
+    };
+    // On a recorder thread: holds m_ (the caches), unless already held.
+    class WLock {
+    public:
+        explicit WLock(Renderer& r, bool shared = false) : shared_(shared) {
+            Rec& x = r.R();
+            if (!x.worker_ || x.locked_) return;
+            m_ = &r.m_;
+            // Held for microseconds at a time: spin first (a futex sleep and wake-up per handoff
+            // cost more than the work it guards), counting the wait with LPN_PROFILE.
+            ++x.prof_.locks;
+            auto tryLock = [&] { return shared_ ? m_->try_lock_shared() : m_->try_lock(); };
+            if (!tryLock()) {
+                const auto t0 = x.prof_.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                int spins = 0;
+                while (!tryLock())
+                    if (++spins < 20000) __builtin_ia32_pause();
+                    else {
+                        shared_ ? m_->lock_shared() : m_->lock();
+                        break;
+                    }
+                ++x.prof_.lockWaits;
+                if (x.prof_.on)
+                    x.prof_.lockNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+            }
+            x.locked_ = true;
+            x.lockShared_ = shared_;
+            rec_ = &x;
+        }
+        void unlock() {
+            if (!rec_) return;
+            rec_->locked_ = rec_->lockShared_ = false;
+            shared_ ? m_->unlock_shared() : m_->unlock();
+            rec_ = nullptr;
+        }
+        ~WLock() { unlock(); }
+        bool shared() const { return rec_ && shared_; }
+
+    private:
+        bool shared_;
+        std::shared_mutex* m_ = nullptr;
+        Rec* rec_ = nullptr;
+    };
+
+    unsigned recordThreads_ = 0; // LPN_RECORD_THREADS
+    uint32_t segDraws_ = 128;
+    std::vector<std::unique_ptr<Rec>> workerRecs_;
+    std::mutex segMutex_; // the queue, free lists, outstanding_ and Segment::done
+    std::condition_variable segCv_, segDoneCv_, segFreeCv_;
+    std::deque<Segment*> segQueue_;
+    std::vector<std::unique_ptr<Segment>> segAll_;
+    std::vector<Segment*> segFree_;
+    std::vector<std::unique_ptr<SegSlot>> slotsAll_;
+    std::vector<SegSlot*> slotFree_;
+    unsigned outstanding_ = 0; // dispatched, not yet recorded
+    unsigned paused_ = 0;      // threads waiting on the GPU with m_ held (see pauseSegments)
+    Segment* open_ = nullptr;  // being filled (the main recorder's)
+    const uint32_t* openCtx_ = nullptr;
+    uint64_t openCtxSerial_ = 0;
+    Rec pro_;             // uploads ahead of the segments
+    std::mutex proMutex_; // pro_, proSlot_, proFree_, proPending_ (after m_)
+    SegSlot* proSlot_ = nullptr;
+    std::vector<SegSlot*> proFree_, proPending_;
+    std::vector<std::unique_ptr<SegSlot>> proAll_;
+    std::mutex lateMutex_;
+    std::vector<std::function<void()>> lateFree_; // freed by recorder threads: after the next flush
 };
 
 Renderer* gRenderer = nullptr;

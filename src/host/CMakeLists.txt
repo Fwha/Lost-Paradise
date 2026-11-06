@@ -24,6 +24,7 @@ add_executable(lpn-host
     pc_settings.cpp
     pause_menu.cpp
     hooks.cpp
+    draw_sites.cpp
     gpu/frame_dump.cpp
     gpu/dlss.cpp
     gpu/formats.cpp
@@ -32,6 +33,8 @@ add_executable(lpn-host
     gpu/vk.cpp
     window.cpp
     save_menu.cpp
+    menu_font.cpp
+    stb_impl.cpp
     display_menu.cpp
     display_settings.cpp
     tls.cpp
@@ -40,7 +43,9 @@ add_executable(lpn-host
 )
 find_package(ZLIB REQUIRED)
 find_package(Vulkan REQUIRED)
-target_link_libraries(lpn-host PRIVATE ps4elf gcn ZLIB::ZLIB Vulkan::Vulkan)
+target_link_libraries(lpn-host PRIVATE ps4elf gcn formats ZLIB::ZLIB Vulkan::Vulkan)
+# stb_truetype and stb_image (public domain, external/stb) for the menu font and save icons.
+target_include_directories(lpn-host SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/external/stb")
 # The guest TLS slot must sit at a fixed offset from %fs, which the initial-exec model gives.
 target_compile_options(lpn-host PRIVATE -ftls-model=initial-exec)
 # Vulkan structs are initialised as {sType} and the rest zeroed.

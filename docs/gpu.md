@@ -53,7 +53,10 @@ screen loop). Addresses are guest addresses and change between runs.
 - **Surfaces.** Render targets and depth buffers are Vulkan images keyed by guest address; a
   texture at the same address samples that image (scaled when the T# is smaller than the
   padded target, e.g. 1600x896 inside 1664x896). Other textures are uploaded from guest
-  memory, detiled if needed, and re-uploaded when their bytes change. Each texture is hashed
+  memory with their whole mip chain (levels 0 to the T#'s LAST_LEVEL, laid out as GCN does for
+  linear-aligned and 1D-thin modes), detiled if needed, and re-uploaded when their bytes change.
+  Samplers take the S#'s LOD bias and anisotropy. `LPN_NO_MIPS=1` uploads level 0 only;
+  `LPN_ANISO=N` forces Nx anisotropic filtering on filtered samplers. Each texture is hashed
   once per frame, in 128 KiB chunks on worker threads (~90 MB per gameplay frame).
 - **Draws.** RECTLIST and QUADLIST go through a generated geometry shader; GNM's
   decompress/eliminate passes are skipped; screen-space draws (viewport transform off) are
@@ -109,6 +112,8 @@ pixel shaders' code) with DLAA (`gpu/dlss.cpp`, `dlssSmaa` in the renderer):
   rows at 0x0, view rotation rows at 0x40/0x50/0x60, camera position at 0x220 (positions are
   camera-relative). Only camera motion: moving characters rely on DLSS.
 - Jitter: every draw with the scene depth bound before SMAA (full-screen lighting passes too, or
-  shadows flicker) gets a Halton sub-pixel viewport offset, passed to DLSS as is.
+  shadows flicker) gets a Halton sub-pixel viewport offset, passed to DLSS as is. So do 3D draws
+  after SMAA that depth-test against it (Ken's aura redraws his body additively; unjittered it
+  passed or failed its depth test by frame and flickered).
 - `[dlss] last 300 frames` lines count history resets; `LPN_DLSS_NO_JITTER=1`,
   `LPN_DLSS_JITTER_SIGN=x,y` for debugging. Upscaling (render the scene smaller) is not done.

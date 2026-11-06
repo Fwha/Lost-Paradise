@@ -1,5 +1,6 @@
 #include "host/gpu/tiling.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace host::render {
@@ -24,6 +25,40 @@ size_t tiledSliceSize(uint32_t mode, uint32_t pitch, uint32_t height, uint32_t b
     case k1dThin: return size_t(align(pitch, 8)) * align(height, 8) * bpe;
     default: return 0;
     }
+}
+
+size_t mipLayout(uint32_t mode, uint32_t width, uint32_t height, uint32_t pitch, bool bc, uint32_t bpe,
+                 uint32_t slices, uint32_t count, bool pow2Pad, MipLevel* out) {
+    if (mode != kLinearAligned && mode != k1dThin) return 0;
+    auto elems = [&](uint32_t px) { return std::max(bc ? (px + 3) / 4 : px, 1u); };
+    auto ceil2 = [](uint32_t v) { uint32_t p = 1; while (p < v) p <<= 1; return p; };
+    size_t total = 0;
+    for (uint32_t m = 0; m < count; ++m) {
+        MipLevel& l = out[m];
+        l.width = elems(std::max(width >> m, 1u));
+        l.height = elems(std::max(height >> m, 1u));
+        uint32_t w = m == 0 ? elems(pitch) : elems(std::max(pitch >> m, 1u)), h = l.height;
+        if (pow2Pad && m) w = ceil2(w);
+        if (pow2Pad) h = ceil2(h);
+        if (mode == kLinearAligned) {
+            if (m == 0) {
+                l.pitch = w;
+            } else {
+                const uint32_t pa = std::max(8u, 64u / bpe), sa = std::max(64u, 256u / bpe);
+                l.pitch = align(w, pa);
+                while ((size_t(l.pitch) * h) % sa) l.pitch += pa;
+            }
+            l.sliceBytes = size_t(l.pitch) * h * bpe;
+        } else {
+            l.pitch = align(w, 8);
+            const uint32_t ha = align(h, 8);
+            if (m) while ((size_t(l.pitch) * ha * bpe) % 256) l.pitch += 8;
+            l.sliceBytes = size_t(l.pitch) * ha * bpe;
+        }
+        l.offset = total;
+        total += l.sliceBytes * slices;
+    }
+    return total;
 }
 
 bool detile(uint32_t mode, const uint8_t* src, uint8_t* dst, uint32_t width, uint32_t height, uint32_t pitch,

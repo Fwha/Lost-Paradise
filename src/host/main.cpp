@@ -8,6 +8,7 @@
 #include "host/input_history.h"
 #include "host/pause_menu.h"
 #include "host/title_menu.h"
+#include "host/draw_sites.h"
 #include "host/gpu/frame_dump.h"
 #include "host/hle.h"
 #include "host/kernel.h"
@@ -65,6 +66,7 @@ void onGuestExit() { std::fprintf(stderr, "[host] guest exit handler called\n");
 } // namespace
 
 int main(int argc, char** argv) {
+    host::profile::avoidRecorderCore(); // inherited by every thread started from here
     host::profile::start();
     std::string gameDir, nidPath, dataDir = "lpn-data";
     bool listUnimplemented = false, headless = false, gpu = true, computeOnly = false;
@@ -145,6 +147,7 @@ int main(int argc, char** argv) {
     host::patchInputHistory(*modules[0]);
     if (host::patchTitleMenu(*modules[0])) host::patchPauseMenu(*modules[0]);
     host::patchRenderResolution(*modules[0], host::displaySettings().width, host::displaySettings().height);
+    host::patchDrawSites(*modules[0]);
 
     const int32_t fsOffset = host::guestThreadPointerFsOffset();
     for (auto* m : modules) {
