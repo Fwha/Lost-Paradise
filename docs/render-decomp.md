@@ -53,3 +53,21 @@ replacing that one binder covers almost every draw at the heavy spots.
 
 Analysis scripts (capstone over eboot.bin + analysis/functions.csv) live outside the repo;
 never commit game files.
+
+## Decompiling without full analysis
+
+Full Ghidra auto-analysis of 34 MB takes hours; for single functions it isn't needed.
+1. Flatten the eboot into a raw image (code at 0, relro at 0x2294000, data at 0x2398000).
+2. `analyzeHeadless <proj> lpn -import image.bin -loader BinaryLoader -processor x86:LE:64:default
+   -cspec gcc -noanalysis -scriptPath ghidra -postScript DecompileList.java <dir> e61ae0,eac430`
+   where `<dir>` holds `funcs.txt` (`<hex start> <size>` per line, from functions.csv),
+   `names.txt` (PLT stub names) and optionally `labels.txt` (our names). Output: `<dir>/out.c`.
+   Later runs with `-process image.bin` instead of `-import` reuse the project.
+
+## 0xe61ae0 first pass
+
+It is the engine's dirty-state flush before a draw: the first qword of its context is a dirty
+mask (bits 0x10 PS, 0x20 VS, 0x40, 0x100, 0x200, 0xc...); shaders come from tables at
+0x2698148 / 0x2698168 / 0x26981e8 indexed by 16-bit ids at ctx+0xe80/0xe82, and it writes into
+a Gnmx-like state block at `*(ctx+0x18)+800`. Because it only re-emits what changed, hooking it
+gives us exactly the per-draw deltas, which is what the renderer currently reconstructs.
