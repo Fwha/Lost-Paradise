@@ -133,3 +133,11 @@ offset in that table, and the offset only depends on the shader. That gives two 
 2. Hook 0xeabdb0 and capture the flat tables as the engine writes them (dirty stages only).
 A perf capture at an analysis-bound spot decides: if replay time is the interpreter, (1) wins;
 if it is the memory reads (PageCache), (2) does.
+
+## Tried: skipping dead replay steps (reverted)
+
+A per-shader plan that dropped trace steps whose only effect (marking SGPRs unknown) nothing
+reads again kept 98-100% of steps on the owner's run (~60 steps per replay, up to 6,200 replays a
+frame): every step in these traces is live. Check mode also logged 8 replays of shader
+0x53c3fd200 whose two back-to-back replays of the same trace gave different output, which
+points at guest memory changing while it is being read (the game writing ahead into its rings).
