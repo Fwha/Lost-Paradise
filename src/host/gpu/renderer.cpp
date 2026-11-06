@@ -4241,6 +4241,14 @@ void main() {
     std::condition_variable sweepCv_;
     std::vector<SweepItem> sweep_;
     bool sweepQueued_ = false, sweepDone_ = true, sweepStarted_ = false;
+    // A settled copy's or texture's full hash: every 8th frame, and every 32nd (LPN_HASH_FRAMES)
+    // once unchanged for 10 s. Every 8th frame hashed all of them (GBs at the overlook), which kept
+    // three hasher threads busy; the fingerprints taken every frame still catch a whole rewrite.
+    bool hashDue(uint64_t changedFrame, uint32_t phase, uint64_t base) const {
+        if (frame_ - changedFrame < 600) return (frame_ + phase) % 8 == 0;
+        static const uint64_t every = std::max(8, getenv("LPN_HASH_FRAMES") ? std::atoi(getenv("LPN_HASH_FRAMES")) : 32);
+        return (frame_ + (base >> 8) * 0x9E3779B1ull % every) % every == 0;
+    }
     void sweepVram() {
         if (!resolveAhead_) return;
         {
@@ -4270,7 +4278,7 @@ void main() {
                         unsettle(v);
                         continue;
                     }
-                } else if (st == 0 && (frame_ + v.phase) % 8 == 0) {
+                } else if (st == 0 && hashDue(v.changedFrame, v.phase, v.base)) {
                     queueTexHash(v.check, v.base, v.size);
                 }
                 sweep_.push_back({v.base, v.size, v.sample, false, nullptr});
@@ -4286,7 +4294,7 @@ void main() {
                         unsettleTexture(*t);
                         return drop(t);
                     }
-                } else if (st == 0 && (frame_ + t->phase) % 8 == 0) {
+                } else if (st == 0 && hashDue(t->changedFrame, t->phase, t->base)) {
                     queueTexHash(t->check, t->base, t->tiled);
                 }
                 sweep_.push_back({t->base, t->span, t->sample, false, t});
