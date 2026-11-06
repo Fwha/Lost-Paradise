@@ -94,3 +94,15 @@ milestone 3: hook 0xeac430 and the auto-index draw, snapshot the changed slots (
 tell us which) into a side record tagged with the draw's PM4 position, and have the renderer map
 slots to shader inputs with the shader binary's own input-usage table (static, once per shader)
 instead of replaying scalar code per draw.
+
+## Reassessment after reading the renderer (2026-11-06)
+
+Since PR #47 the per-draw analysis/replay runs on worker threads and is off the critical path;
+the limit at heavy spots is the single recorder thread (90-93% busy) and then GPU time. Most heavy
+draws already take `fastDraw`, whose per-draw cost is a data upload, a push-descriptor write and
+a vkCmdDrawIndexed. So the state-block hook would mostly save worker time, not frame time.
+
+The bigger lever is milestone 4: merge runs of fast draws that differ only in draw data into one
+multi-draw (vkCmdDrawIndexedIndirect, shaders indexing their draw data by gl_DrawID). The engine
+side supports this: ~60% of heavy draws come from one draw-command list through the same binder.
+`LPN_PROFILE=1` now reports `mergeable fast draws N in M runs` per frame to size it first.

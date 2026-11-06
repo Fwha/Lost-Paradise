@@ -544,6 +544,9 @@ struct Profiler {
     uint64_t fastImages = 0; // fast draws that bound other textures
     uint64_t diffsTaken = 0; // fastDraw checks an analysis worker had done
     uint64_t fastSwitches = 0; // fast draws that switched shaders (switchDraw)
+    // Fast draws that differ from the draw before only in draw data (same buffers, textures and
+    // index buffer), so one multi-draw could take both; and how many runs of them there were.
+    uint64_t mergeable = 0, mergeRuns = 0;
     uint64_t switchMiss[6] = {}; // other shaders not switched to: no slot, slot stale, state, sampled, resources, index
     uint64_t depthJoins = 0, depthOnly = 0; // depth-only draws that joined the open pass, of all depth-only ones
     std::unordered_map<uint32_t, uint64_t> fastCtx; // the context registers that differed
@@ -1241,6 +1244,7 @@ public:
         std::fprintf(stderr, " (kind %.0f, shaders %.0f, prim %.0f; resource counts %.0f, buffer %.0f, image %.0f); fast draws binding a buffer again %.0f, other textures %.0f, switching shaders %.0f",
                      prof_.fastKind[0] / n, prof_.fastKind[1] / n, prof_.fastKind[2] / n, prof_.fastRes[0] / n,
                      prof_.fastRes[1] / n, prof_.fastRes[2] / n, prof_.fastMoved / n, prof_.fastImages / n, prof_.fastSwitches / n);
+        std::fprintf(stderr, "; mergeable fast draws %.0f in %.0f runs", prof_.mergeable / n, prof_.mergeRuns / n);
         std::fprintf(stderr, " (not switched: no slot %.0f, slot stale %.0f, state %.0f, sampled %.0f, resources %.0f, index %.0f); checks done ahead %.0f",
                      prof_.switchMiss[0] / n, prof_.switchMiss[1] / n, prof_.switchMiss[2] / n, prof_.switchMiss[3] / n,
                      prof_.switchMiss[4] / n, prof_.switchMiss[5] / n, prof_.diffsTaken / n);
@@ -4876,7 +4880,9 @@ void main() {
 
         if (!a.ok) return;
         if (dlssOn_ && a.psm && a.psm->smaa && dlssSmaa(r, a.psm->smaa)) return;
-        if (fastDraw(d, r, a) || switchDraw(d, r, a)) return;
+        const bool wasMergeable = lastMergeable_;
+        lastMergeable_ = false;
+        if (fastDraw(d, r, a, wasMergeable) || switchDraw(d, r, a)) return;
         stashFast();
         gcn::Program& vs = a.vs;
 
@@ -5397,7 +5403,7 @@ void main() {
         ++prof_.fastSwitches;
         return true;
     }
-    bool fastDraw(const DrawCall& d, const GpuRegs& r, DrawAnalysis& a) {
+    bool fastDraw(const DrawCall& d, const GpuRegs& r, DrawAnalysis& a, bool prevMergeable) {
         const FastDraw& f = fast_;
         auto miss = [&](FastMiss why) {
             if (prof_.on) ++prof_.fastMiss[why];
@@ -5502,9 +5508,11 @@ void main() {
         data(a.vs, prevDraw_->vs, 0, vsAlike, vsMoved || vsImages);
         if (a.psm) data(a.ps, prevDraw_->ps, kPsBindingBase, psAlike, psMoved || psImages);
         if (!writes.empty()) pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, f.layout, writes, bufs, imgs);
+        bool sameIndex = true;
         if (d.kind == DrawCall::kIndexed) {
             const VkIndexType it = r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
             if (bound_.index != indexBuffer || bound_.indexOffset != indexOffset || bound_.indexType != it) {
+                sameIndex = false;
                 rec([c = cmd_, indexBuffer, indexOffset, it] { vkCmdBindIndexBuffer(c, indexBuffer, indexOffset, it); });
                 bound_.index = indexBuffer, bound_.indexOffset = indexOffset, bound_.indexType = it;
             }
@@ -5518,6 +5526,11 @@ void main() {
         recordedSeq_ = a.seq;
         ++stats_.draws;
         ++prof_.fastDraws;
+        lastMergeable_ = sameIndex && !(vsMoved | psMoved | vsImages | psImages);
+        if (lastMergeable_) {
+            ++prof_.mergeable;
+            if (!prevMergeable) ++prof_.mergeRuns;
+        }
         return true;
     }
     bool peekImages(const gcn::Program& p, uint32_t mask, ImageBinding* out) {
@@ -5780,6 +5793,7 @@ private:
     Overlays overlays_;
     uint64_t overlayIds_ = 0;
     uint64_t recCount_ = 0; // calls rec()'d (see fastDraw)
+    bool lastMergeable_ = false; // the last draw was a fast draw that only changed draw data
     FastDraw fast_;
     std::unique_ptr<DrawAnalysis> prevDraw_ = std::make_unique<DrawAnalysis>(); // the last draw recorded in full, if fast_.valid
     bool keepDraw_ = false; // onDraw keeps the draw as prevDraw_
