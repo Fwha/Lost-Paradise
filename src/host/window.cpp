@@ -176,6 +176,10 @@ void presenterThread() {
             if (!tex || texW != gFrame.width || texH != gFrame.height || texFormat != fmt) {
                 if (tex) SDL_DestroyTexture(tex);
                 tex = SDL_CreateTexture(ren, fmt, SDL_TEXTUREACCESS_STREAMING, int(gFrame.width), int(gFrame.height));
+                // The game's 1920x1080 frame is stretched to the window: SDL's default nearest
+                // scaling repeated every third row and column at 1440p, leaving stair-stepped edges
+                // and blocky shading. LPN_PRESENT_NEAREST=1: nearest, as before.
+                if (tex && !getenv("LPN_PRESENT_NEAREST")) SDL_SetTextureScaleMode(tex, SDL_ScaleModeLinear);
                 texW = gFrame.width, texH = gFrame.height, texFormat = fmt;
             }
             SDL_UpdateTexture(tex, nullptr, gPixels.data(), int(gFrame.width * 4));
