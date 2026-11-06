@@ -40,15 +40,20 @@ size_t mipLayout(uint32_t mode, uint32_t width, uint32_t height, uint32_t pitch,
         uint32_t w = m == 0 ? elems(pitch) : elems(std::max(pitch >> m, 1u)), h = l.height;
         if (pow2Pad && m) w = ceil2(w);
         if (pow2Pad) h = ceil2(h);
-        // Pitch alignment as in addrlib (EgBasedLib::ComputeSurfaceAlignments*): a row is a
-        // multiple of the 256-byte pipe interleave, at least 64 elements linear and 8 (one
-        // micro tile) 1D-thin. Level 0 keeps the T#'s pitch.
         if (mode == kLinearAligned) {
-            l.pitch = m == 0 ? w : align(w, std::max(64u, 256u / bpe));
+            if (m == 0) {
+                l.pitch = w;
+            } else {
+                const uint32_t pa = std::max(8u, 64u / bpe), sa = std::max(64u, 256u / bpe);
+                l.pitch = align(w, pa);
+                while ((size_t(l.pitch) * h) % sa) l.pitch += pa;
+            }
             l.sliceBytes = size_t(l.pitch) * h * bpe;
         } else {
-            l.pitch = m == 0 ? align(w, 8) : align(w, std::max(8u, 256u / bpe));
-            l.sliceBytes = size_t(l.pitch) * align(h, 8) * bpe;
+            l.pitch = align(w, 8);
+            const uint32_t ha = align(h, 8);
+            if (m) while ((size_t(l.pitch) * ha * bpe) % 256) l.pitch += 8;
+            l.sliceBytes = size_t(l.pitch) * ha * bpe;
         }
         l.offset = total;
         total += l.sliceBytes * slices;

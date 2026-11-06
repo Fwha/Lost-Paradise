@@ -3376,6 +3376,21 @@ private:
                 std::fwrite(scratch_.data(), 1, tiled, f);
                 std::fclose(f);
             }
+        // Debugging: LPN_DUMP_MIPS=<n> writes the first n mipmapped 2D textures up to 512x512 as
+        // they sit in memory (twice level 0's size, enough for any layout of the other levels).
+        if (static std::atomic<int> dumpMips = getenv("LPN_DUMP_MIPS") ? std::atoi(getenv("LPN_DUMP_MIPS")) : 0;
+            levels > 1 && slices == 1 && t.type() == 9 && w <= 512 && h <= 512 && dumpMips.load() > 0 &&
+            dumpMips.fetch_sub(1) > 0) {
+            std::vector<uint8_t> raw(mips[0].sliceBytes * 2);
+            if (readGuest(t.base(), raw.data(), raw.size()))
+                if (FILE* f = std::fopen(("mips-" + hex(t.base()) + "-" + std::to_string(w) + "x" + std::to_string(h) +
+                                          "-df" + std::to_string(t.dataFormat()) + "-mode" + std::to_string(mode) + "-p" +
+                                          std::to_string(t.pitch()) + "-last" + std::to_string(t.lastLevel()) + "-pow2" +
+                                          std::to_string(t.pow2Pad()) + ".bin").c_str(), "wb")) {
+                    std::fwrite(raw.data(), 1, raw.size(), f);
+                    std::fclose(f);
+                }
+        }
         ++R().prof_.texUploads;
         R().prof_.texBytes += bytes;
         Prologue pg(*this); // on a recorder thread: ahead of the segments
