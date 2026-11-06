@@ -568,6 +568,7 @@ struct Profiler {
     uint64_t passBySize[4] = {}, drawsBySize[4] = {}, largestPass = 0;
     // Recorder threads: segments recorded, waits for them (and their ns), their recording time summed.
     uint64_t segments = 0, drains = 0, drainNs = 0, workerNs = 0, aheadNs = 0; // aheadNs: waits for the threads to catch up
+    uint64_t sharedDraws = 0, sharedRetries = 0; // recorder threads' full draws looked up under a shared m_, and those that started over
     uint64_t drainWhy[4] = {}; // drains by cause: a sequential draw, a memory write, a CPU-copied DMA, frame end
     uint64_t locks = 0, lockWaits = 0, lockNs = 0; // recorder threads taking m_, finding it held, waiting for it
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
@@ -1351,11 +1352,11 @@ public:
                      R().prof_.drawsBySize[3] / n, R().prof_.largestPass);
         if (recordThreads_)
             std::fprintf(stderr, "[prof] t=%.1f recorder threads %u: %.0f segments, threads recording %.2f ms (summed), "
-                                 "%.0f waits for them (draw %.0f, write %.0f, dma %.0f, frame %.0f) %.2f ms, ahead-waits %.2f ms; m_ taken %.0f, held by another %.0f, waited %.2f ms (summed) per frame\n",
+                                 "%.0f waits for them (draw %.0f, write %.0f, dma %.0f, frame %.0f) %.2f ms, ahead-waits %.2f ms; m_ taken %.0f, held by another %.0f, waited %.2f ms (summed); full draws shared %.0f, started over %.0f per frame\n",
                          profile::seconds(), recordThreads_, R().prof_.segments / n, R().prof_.workerNs / 1e6 / n, R().prof_.drains / n,
                          R().prof_.drainWhy[0] / n, R().prof_.drainWhy[1] / n, R().prof_.drainWhy[2] / n, R().prof_.drainWhy[3] / n,
                          R().prof_.drainNs / 1e6 / n, R().prof_.aheadNs / 1e6 / n, R().prof_.locks / n, R().prof_.lockWaits / n,
-                         R().prof_.lockNs / 1e6 / n);
+                         R().prof_.lockNs / 1e6 / n, R().prof_.sharedDraws / n, R().prof_.sharedRetries / n);
         std::fprintf(stderr, "[prof] t=%.1f VRAM copies %zu: %.1f allocations, %.2f evictions (%.1f freed, %.2f found none) per frame\n",
                      profile::seconds(), vram_.size(), R().prof_.vramAllocs / n, R().prof_.vramEvicts / n, R().prof_.vramFreed / n,
                      R().prof_.vramEvictsEmpty / n);
@@ -1895,6 +1896,13 @@ private:
         return at;
     }
 
+    // Under the shared lock (a recorder thread's draw), a lookup that would change a shared cache
+    // flags the draw instead, which then starts over holding m_ exclusively. True when it did.
+    bool sharedMiss() {
+        if (!R().lockShared_) return false;
+        R().abort_ = true;
+        return true;
+    }
     void warnOnce(const std::string& w) {
         std::lock_guard lock(warnMutex_); // the analysis and recorder threads both warn
         if (warned_.insert(w).second) std::fprintf(stderr, "[gpu] %s\n", w.c_str());
@@ -1999,7 +2007,7 @@ private:
                 return true;
             }
         }
-        if (R().lockShared_) return false; // a recorder thread's fast draw: the caller records it in full
+        if (sharedMiss()) return false; // a recorder thread's draw: recorded again with m_ held
         const uint64_t align = std::max<uint64_t>(vk_.hostPointerAlignment, 4096);
         Import im;
         const uint64_t gs = addr & ~(kImportGranule - 1), ge = (end + kImportGranule - 1) & ~(kImportGranule - 1);
@@ -2103,6 +2111,7 @@ private:
                                         uint32_t(swz.b), uint32_t(swz.a), aspect};
         auto it = img.views.find(k);
         if (it != img.views.end()) return it->second;
+        if (sharedMiss()) return VK_NULL_HANDLE;
         VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vci.image = img.image;
         vci.viewType = type;
@@ -2129,9 +2138,11 @@ private:
         if (it != colors_.end()) {
             Surface& s = it->second;
             if (s.img.width == w && s.img.height == h && s.elementBytes == bytes) return &s;
+            if (sharedMiss()) return nullptr;
             destroyImage(s.img);
             colors_.erase(it);
         }
+        if (sharedMiss()) return nullptr;
         Surface s;
         s.elementBytes = bytes;
         if (!createImage(s.img, format,
@@ -2151,9 +2162,11 @@ private:
         if (it != depths_.end()) {
             Surface& s = it->second;
             if (s.img.width == w && s.img.height == h && s.img.format == format) return &s;
+            if (sharedMiss()) return nullptr;
             destroyImage(s.img);
             depths_.erase(it);
         }
+        if (sharedMiss()) return nullptr;
         Surface s;
         s.depth = true;
         s.elementBytes = format == VK_FORMAT_D16_UNORM ? 2 : 4;
@@ -2671,6 +2684,7 @@ private:
         key.assign(reinterpret_cast<const char*>(&s), sizeof(s));
         auto it = pipelines_.find(key);
         if (it != pipelines_.end()) return it->second;
+        if (sharedMiss()) return VK_NULL_HANDLE;
         if (!vs->module || (ps && !ps->module)) return pipelines_[key] = VK_NULL_HANDLE;
         GraphicsState c = s;
         c.vs = c.ps = 0;
@@ -3386,6 +3400,8 @@ private:
     };
 
     void gpuWrote(Surface& s) {
+        if (s.writtenFrame == frame_ && !s.memSample && !s.cpuOwned) return;
+        if (sharedMiss()) return;
         s.writtenFrame = frame_;
         s.memSample = 0;
         if (s.cpuOwned) ++imageGen_, ++R().prof_.imageGens; // sampled as a render target again, not from memory
@@ -3456,6 +3472,15 @@ private:
         return true;
     }
     ImageBinding resolveImage(const gcn::ImageResource& t) {
+        if (R().lockShared_) { // read only: a hit, or the draw starts over
+            if (t.storage || trace_) return sharedMiss(), ImageBinding{};
+            const size_t set = imageMemoSet(t);
+            const ImageMemo* m = &imageMemos_[set + 1];
+            if (!memoHit(*m, t)) m = &imageMemos_[set];
+            if (!memoHit(*m, t)) return sharedMiss(), ImageBinding{};
+            if (m->sampled) R().sampledSurfaces_.push_back(m->sampled);
+            return m->b;
+        }
         if (t.storage || trace_) return resolveImageUncached(t); // storage: marks the target written
         ImageMemo& m = imageMemo(t);
         if (memoHit(m, t)) {
@@ -3616,6 +3641,7 @@ private:
     };
 
     void captureCamera(const gcn::Program& vs, const DrawRegs& r) {
+        if (sharedMiss()) return;
         if (++camTries_ > 8) return; // shaders of another layout: not this frame
         const uint64_t table = vs.launch.userData[12] | uint64_t(vs.launch.userData[13]) << 32;
         uint32_t sharp[4];
@@ -4026,6 +4052,7 @@ void main() {
     std::map<uint64_t, uint64_t> gpuWrittenRanges_;  // [start, end), merged
     uint64_t vramBytes_ = 0, vramCount_ = 0;
     std::unordered_map<std::pair<uint64_t, uint64_t>, uint64_t, PairHash> vramCandidates_; // first seen in frame
+    std::mutex candMutex_; // vramCandidates_ among recorder threads holding m_ shared
 
     // Each VRAM buffer overlapping [lo, hi), via fn.
     template <typename F> void forVramOverlapping(uint64_t lo, uint64_t hi, F&& fn) {
@@ -4038,6 +4065,7 @@ void main() {
         const uint64_t end = addr + size;
         auto it = gpuWrittenRanges_.upper_bound(addr);
         if (it != gpuWrittenRanges_.begin() && std::prev(it)->second >= end) return; // known
+        if (sharedMiss()) return;
         uint64_t lo = addr, hi = end;
         if (it != gpuWrittenRanges_.begin() && std::prev(it)->second >= lo) --it;
         while (it != gpuWrittenRanges_.end() && it->first <= hi) {
@@ -4088,6 +4116,25 @@ void main() {
         } else if (auto found = vram_.find({base, size}); found != vram_.end()) {
             vp = found->second.get();
             hit = {base, size, vp};
+        }
+        if (R().lockShared_ && !inPass) { // a full draw on a recorder thread: changes nothing shared
+            if (!vp) {
+                if (gpuWritten(base, size)) return false;
+                std::lock_guard lock(candMutex_);
+                auto [cand, fresh] = vramCandidates_.try_emplace({base, size}, frame_);
+                if (fresh || cand->second == frame_) return false;
+                return !sharedMiss(); // a copy to make
+            }
+            VramBuffer& v = *vp;
+            if (!v.size) return !sharedMiss();
+            if (v.gpuWritten || frame_ < v.hostUntil) return false;
+            const bool settled = v.settled.load(std::memory_order_relaxed);
+            const bool skip = frame_ - v.changedFrame >= 600 && (frame_ + v.phase) % 4 != 0; // as below
+            if (!v.buf || v.dirty || (v.checkedFrame != frame_ && !settled && !skip)) return !sharedMiss();
+            if (v.lastUse != frame_) std::atomic_ref(v.lastUse).store(frame_, std::memory_order_relaxed);
+            out = v.buf;
+            off = 0;
+            return true;
         }
         if (inPass) {
             if (!vp) return false;
@@ -4988,6 +5035,14 @@ void main() {
 
     void noteMetadata(uint64_t meta, uint64_t surface, bool depth, uint32_t c0, uint32_t c1) {
         if (!meta || meta == surface) return;
+        if (R().lockShared_) {
+            auto it = metadata_.find(meta);
+            if (it != metadata_.end() && it->second.surface == surface && it->second.depth == depth &&
+                it->second.clear[0] == c0 && it->second.clear[1] == c1)
+                return;
+            sharedMiss();
+            return;
+        }
         Metadata& m = metadata_[meta];
         m.surface = surface;
         m.depth = depth;
@@ -5135,8 +5190,21 @@ void main() {
         const bool wasMergeable = R().lastMergeable_;
         R().lastMergeable_ = false;
         if (fastDraw(d, r, a, wasMergeable) || switchDraw(d, r, a)) return;
-        WLock wl(*this); // a recorder thread records a full draw holding the caches
         stashFast();
+        // A recorder thread looks the caches up holding m_ shared first: almost every full draw
+        // only finds what it needs. One that would change a cache (sharedMiss) starts over here
+        // holding it exclusively. Everything up to wl.unlock() can run twice.
+        bool sharedTry = R().worker_;
+    retry:
+        R().abort_ = false;
+        WLock wl(*this, sharedTry);
+        auto again = [&] { // true: start over exclusively
+            if (!R().abort_) return false;
+            wl.unlock();
+            sharedTry = false;
+            ++R().prof_.sharedRetries;
+            return true;
+        };
         gcn::Program& vs = a.vs;
 
         // Render targets. The pass and vectors below are reused from draw to draw (no allocations).
@@ -5223,7 +5291,10 @@ void main() {
                 gs.depthWriteOff = clearDepth;
             }
         }
-        if (!colorCount && !hasDepth) return;
+        if (!colorCount && !hasDepth) {
+            if (again()) goto retry;
+            return;
+        }
         // A scene draw (see dlssSmaa): every draw with the scene's depth buffer bound before SMAA,
         // full-screen passes too. Jittered alike, the lighting passes rebuild positions where the
         // depth was rendered: shadows flickered when only the geometry moved. After SMAA, 3D draws
@@ -5282,7 +5353,10 @@ void main() {
             layp = &layout(lb);
             pipe = graphicsPipeline(gs, vsm, psm, layp->pipeline, lb);
         }
-        if (!pipe) return;
+        if (!pipe) {
+            if (again()) goto retry;
+            return;
+        }
         Layout& lay = *layp;
 
         std::vector<VkWriteDescriptorSet>& writes = R().drawWrites_;
@@ -5326,7 +5400,10 @@ void main() {
         if (d.kind == DrawCall::kIndexed) {
             const uint32_t isz = r.indexType ? 4 : 2;
             if (!vramBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset) &&
-                !guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset)) return;
+                !guestBuffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, indexBuffer, indexOffset)) {
+                if (again()) goto retry;
+                return;
+            }
             if (trace_ && !traceDir_.empty() && uint64_t(d.indexOffset + d.count) * isz <= (1u << 20)) { // captures: the indices
                 std::vector<uint8_t> idx(size_t(d.count) * isz);
                 if (readGuest(d.indexAddr + uint64_t(d.indexOffset) * isz, idx.data(), idx.size()))
@@ -5337,6 +5414,8 @@ void main() {
             }
             if (raceCheck_) noteRead(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, 'i');
         }
+        if (again()) goto retry;
+        if (wl.shared()) ++R().prof_.sharedDraws;
         // Everything below is this thread's own (its pass, bindings and command buffer): at the
         // overlook, holding m_ to the end of each full draw left the threads waiting for it half
         // their time.
@@ -5617,9 +5696,18 @@ void main() {
             if (VkDescriptorBufferInfo* b = bufferAt(base)) *b = {R().ring_, at, bytes};
             std::swap(bound.data, p.data); // as fastDraw: the analysis is handed back after this draw
         };
+        R().abort_ = false;
         bind(a.vs, slot->prev->vs, moved, 0);
         if (a.psm) bind(a.ps, slot->prev->ps, psMoved, kPsBindingBase);
         wl.unlock();
+        if (R().abort_) { // a buffer needed a cache change: bound again holding m_
+            R().abort_ = false;
+            std::swap(slot->prev->vs.data, a.vs.data);
+            if (a.psm) std::swap(slot->prev->ps.data, a.ps.data);
+            WLock wx(*this);
+            bind(a.vs, slot->prev->vs, moved, 0);
+            if (a.psm) bind(a.ps, slot->prev->ps, psMoved, kPsBindingBase);
+        }
         if (R().bound_.pipeline != f.pipe) {
             rec([c = R().cmd_, pipe = f.pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); });
             R().bound_.pipeline = f.pipe;
@@ -5747,11 +5835,22 @@ void main() {
         };
         if (vsMoved || psMoved) ++R().prof_.fastMoved;
         if (vsImages || psImages) ++R().prof_.fastImages;
-        rebind(a.vs, R().prevDraw_->vs, vsMoved, 0);
-        if (a.psm) rebind(a.ps, R().prevDraw_->ps, psMoved, kPsBindingBase);
-        rebindImages(a.vs, R().prevDraw_->vs, vsImages, vsImg, 0, R().fast_);
-        if (a.psm) rebindImages(a.ps, R().prevDraw_->ps, psImages, psImg, kPsBindingBase, R().fast_);
+        auto rebindAll = [&] {
+            rebind(a.vs, R().prevDraw_->vs, vsMoved, 0);
+            if (a.psm) rebind(a.ps, R().prevDraw_->ps, psMoved, kPsBindingBase);
+            rebindImages(a.vs, R().prevDraw_->vs, vsImages, vsImg, 0, R().fast_);
+            if (a.psm) rebindImages(a.ps, R().prevDraw_->ps, psImages, psImg, kPsBindingBase, R().fast_);
+        };
+        const size_t bufsBefore = bufs.size(), writesBefore = writes.size(), imgsBefore = imgs.size();
+        R().abort_ = false;
+        rebindAll();
         wl.unlock();
+        if (R().abort_) { // a buffer needed a cache change: bound again holding m_
+            R().abort_ = false;
+            bufs.resize(bufsBefore), writes.resize(writesBefore), imgs.resize(imgsBefore);
+            WLock wx(*this);
+            rebindAll();
+        }
         auto data = [&](gcn::Program& p, gcn::Program& bound, uint32_t base, int alike, bool rebound) {
             const VkDeviceSize bytes = p.data.size() * 4;
             if (alike == 1 && !rebound) return; // the worker found it the same
@@ -6137,6 +6236,7 @@ private:
         // queued for the command thread), into a secondary command buffer; it never flushes.
         bool immediate_ = false, worker_ = false;
         bool locked_ = false, lockShared_ = false; // holds m_, shared (see WLock)
+        bool abort_ = false; // a full draw under the shared lock met a cache it would change (see sharedMiss)
         std::array<VramHit, kVramHits> vramHits_{}; // the copies last found (see vramBuffer); cleared when one is freed
         std::array<const Import*, kImportHits> importHits_{}; // the imports last found (see guestBuffer)
     };
@@ -6447,7 +6547,7 @@ private:
                                       &Profiler::dmaBytes, &Profiler::pipelinesMade, &Profiler::pipelineWaits, &Profiler::vramCopies,
                                       &Profiler::vramCopyBytes, &Profiler::imageMisses, &Profiler::imageGens, &Profiler::resolvedAhead,
                                       &Profiler::vramAllocs, &Profiler::vramEvicts, &Profiler::vramFreed, &Profiler::vramEvictsEmpty,
-                                      &Profiler::segments, &Profiler::drains, &Profiler::drainNs, &Profiler::workerNs, &Profiler::aheadNs, &Profiler::locks, &Profiler::lockWaits, &Profiler::lockNs})
+                                      &Profiler::segments, &Profiler::drains, &Profiler::drainNs, &Profiler::workerNs, &Profiler::aheadNs, &Profiler::sharedDraws, &Profiler::sharedRetries, &Profiler::locks, &Profiler::lockWaits, &Profiler::lockNs})
             a.*f += std::exchange(b.*f, 0);
         a.largestPass = std::max(a.largestPass, std::exchange(b.largestPass, 0));
         for (auto& [k, v] : b.fastCtx) a.fastCtx[k] += v;
@@ -6551,6 +6651,7 @@ private:
             rec_ = nullptr;
         }
         ~WLock() { unlock(); }
+        bool shared() const { return rec_ && shared_; }
 
     private:
         bool shared_;

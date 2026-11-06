@@ -82,3 +82,12 @@ With fast draws sharing m_ the overlook reached 58 fps (from ~55 single-threaded
 recorder still waited ~12 ms a frame in 20 drains. GPU-made DMA copies no longer drain: the copy is
 queued after the segments before it (same GPU order) and nothing those segments read on the CPU
 changes; CPU-made copies still drain. The profile line now splits drains by cause.
+
+### Lock (2026-11-06)
+
+With 4, 6 and 8 threads the overlook stayed at ~60 fps while waits for m_ grew 17, 35, 51 ms
+(summed): the exclusive hold of each full draw (~1,600 a frame) serialised the threads. A thread's
+full draw now looks the caches up holding m_ shared; any lookup that would change a shared cache
+(a new image, view, pipeline, import, VRAM copy or check, a surface marked written, ...) flags it
+(`sharedMiss`) and the draw starts over exclusively. Fast and switch draws whose moved buffers hit
+such a case bind them again exclusively. The profile line counts both.
