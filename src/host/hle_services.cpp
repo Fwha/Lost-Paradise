@@ -211,6 +211,80 @@ int32_t sceSaveDataUmount(const void*) {
     return 0;
 }
 
+// SceSaveDataParam: what the system's save list shows for a save. The game sets it after writing;
+// it is kept beside the save as sce_sys/param.bin (save_menu.cpp reads it) and the icon as
+// sce_sys/icon0.png, where a PS4 keeps them.
+struct SaveDataParam {
+    char title[128];
+    char subTitle[128];
+    char detail[1024];
+    uint32_t userParam;
+    uint8_t reserved[4];
+    int64_t mtime;
+    uint8_t reserved2[32];
+};
+static_assert(sizeof(SaveDataParam) == 1328);
+
+std::string mountedSysDir(const char* mountPoint) {
+    if (process().saveDir.empty() || !mountPoint || std::strncmp(mountPoint, "/savedata0", 16) != 0) return "";
+    const std::string dir = process().saveDir + "/sce_sys";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    return dir;
+}
+
+int32_t sceSaveDataSetParam(const char* mountPoint, uint32_t type, const void* buf, size_t size) {
+    const std::string dir = mountedSysDir(mountPoint);
+    // Only the save list uses this, so a call we cannot place is logged, not failed.
+    if (dir.empty() || !buf) {
+        std::fprintf(stderr, "[savedata] param %u: no save mounted at %s\n", type, mountPoint ? mountPoint : "(null)");
+        return 0;
+    }
+    SaveDataParam prm{};
+    if (FILE* f = std::fopen((dir + "/param.bin").c_str(), "rb")) {
+        if (std::fread(&prm, sizeof prm, 1, f) != 1) prm = {};
+        std::fclose(f);
+    }
+    auto copyStr = [&](char* dst, size_t cap) {
+        std::memset(dst, 0, cap);
+        std::memcpy(dst, buf, std::min(size, cap - 1));
+        dst[cap - 1] = 0;
+    };
+    switch (type) {
+    case 0: std::memcpy(&prm, buf, std::min(size, sizeof prm)); break; // ALL
+    case 1: copyStr(prm.title, sizeof prm.title); break;
+    case 2: copyStr(prm.subTitle, sizeof prm.subTitle); break;
+    case 3: copyStr(prm.detail, sizeof prm.detail); break;
+    case 4: std::memcpy(&prm.userParam, buf, std::min(size, sizeof prm.userParam)); break;
+    case 5: std::memcpy(&prm.mtime, buf, std::min(size, sizeof prm.mtime)); break;
+    default: return 0;
+    }
+    prm.title[127] = prm.subTitle[127] = prm.detail[1023] = 0;
+    if (FILE* f = std::fopen((dir + "/param.bin").c_str(), "wb")) {
+        std::fwrite(&prm, sizeof prm, 1, f);
+        std::fclose(f);
+    }
+    std::fprintf(stderr, "[savedata] param %u: \"%s\" / \"%s\"\n", type, prm.title, prm.subTitle);
+    return 0;
+}
+
+// SceSaveDataIcon: buf, bufSize, dataSize (the PNG's length).
+struct SaveDataIcon {
+    const void* buf;
+    size_t bufSize, dataSize;
+    uint8_t reserved[32];
+};
+int32_t sceSaveDataSaveIcon(const char* mountPoint, const SaveDataIcon* icon) {
+    const std::string dir = mountedSysDir(mountPoint);
+    if (dir.empty() || !icon || !icon->buf) return 0;
+    const size_t n = icon->dataSize ? std::min(icon->dataSize, icon->bufSize) : icon->bufSize;
+    if (FILE* f = std::fopen((dir + "/icon0.png").c_str(), "wb")) {
+        std::fwrite(icon->buf, 1, n, f);
+        std::fclose(f);
+    }
+    return 0;
+}
+
 struct DirNameSearchResult {
     uint32_t hitNum, pad;
     char (*dirNames)[32];
@@ -707,7 +781,9 @@ void registerServicesHle() {
     HLE(sd, sceSaveDataMount2);
     HLE(sd, sceSaveDataUmount);
     HLE(sd, sceSaveDataDirNameSearch);
-    regs(sd, {"sceSaveDataInitialize3", "sceSaveDataTerminate", "sceSaveDataSetParam", "sceSaveDataSaveIcon"}, zero);
+    HLE(sd, sceSaveDataSetParam);
+    HLE(sd, sceSaveDataSaveIcon);
+    regs(sd, {"sceSaveDataInitialize3", "sceSaveDataTerminate"}, zero);
 
     void* finished = reinterpret_cast<void*>(&dialogFinished);
     void* resultOk = reinterpret_cast<void*>(&dialogResultOk);
