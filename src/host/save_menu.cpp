@@ -1,5 +1,12 @@
 #include "host/save_menu.h"
 
+#include "host/kernel.h"
+#include "host/menu_font.h"
+
+#ifdef LPN_HAVE_SDL2
+#include <stb_image.h>
+#endif
+
 #include <sys/stat.h>
 
 #include <algorithm>
@@ -9,6 +16,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <map>
 #include <mutex>
 
 namespace fs = std::filesystem;
@@ -29,7 +37,13 @@ struct Row {
     SaveSlot slot;
     bool used = false;
     bool isNew = false; // the game's "new save" item, below the listed saves
-    std::string when; // newest file's time, "" when empty
+    time_t mtime = 0;     // newest file's time, 0 when empty
+    uint64_t bytes = 0;   // the save's size on disk
+    // What the game set for the system's save list (sce_sys/param.bin, see hle_services.cpp):
+    // the game's name, the chapter and place, and more detail. Empty for saves made before the
+    // port kept them.
+    std::string title, subTitle, detail;
+    std::string icon; // sce_sys/icon0.png, "" when the game gave none
 };
 std::vector<Row> gRows;
 
@@ -42,34 +56,44 @@ std::vector<Action> gActions;
 Action gPending = Action::Cancel;
 std::string gMessage; // shown under the list after a delete
 
+std::string cString(const char* p, size_t cap) { return std::string(p, strnlen(p, cap)); }
+
 void refreshRow(Row& r) {
     r.used = false;
     if (r.isNew) return;
-    r.when.clear();
-    time_t newest = 0;
+    r.mtime = 0;
+    r.bytes = 0;
+    r.title.clear(), r.subTitle.clear(), r.detail.clear(), r.icon.clear();
     std::error_code ec;
+    const fs::path sys = fs::path(r.slot.path) / "sce_sys";
     for (fs::recursive_directory_iterator it(r.slot.path, ec), end; !ec && it != end; it.increment(ec)) {
         struct stat st;
         if (!it->is_regular_file(ec) || ::stat(it->path().c_str(), &st) != 0) continue;
+        r.bytes += uint64_t(st.st_size);
+        if (it->path().parent_path() == sys) continue; // the list's own data is not the save
         r.used = true;
-        newest = std::max(newest, st.st_mtime);
+        r.mtime = std::max(r.mtime, st.st_mtime);
     }
-    if (r.used) {
-        char buf[32];
-        struct tm tm;
-        localtime_r(&newest, &tm);
-        std::strftime(buf, sizeof buf, "%Y-%m-%d %H:%M", &tm);
-        r.when = buf;
+    if (!r.used) return;
+    char prm[1328];
+    if (FILE* f = std::fopen((sys / "param.bin").c_str(), "rb")) {
+        if (std::fread(prm, sizeof prm, 1, f) == 1) {
+            r.title = cString(prm, 128);
+            r.subTitle = cString(prm + 128, 128);
+            r.detail = cString(prm + 256, 1024);
+        }
+        std::fclose(f);
     }
+    if (fs::exists(sys / "icon0.png", ec)) r.icon = (sys / "icon0.png").string();
 }
 
 const char* actionName(Action a) {
     switch (a) {
-    case Action::Save: return "SAVE";
-    case Action::Overwrite: return "OVERWRITE";
-    case Action::Load: return "LOAD";
-    case Action::Delete: return "DELETE";
-    case Action::Cancel: return "CANCEL";
+    case Action::Save: return "Save";
+    case Action::Overwrite: return "Overwrite";
+    case Action::Load: return "Load";
+    case Action::Delete: return "Delete";
+    case Action::Cancel: return "Cancel";
     }
     return "";
 }
@@ -105,7 +129,7 @@ void perform(Action a) {
         std::error_code ec;
         fs::remove_all(r.slot.path, ec);
         std::fprintf(stderr, "[save menu] deleted %s%s\n", r.slot.dir.c_str(), ec ? " (failed)" : "");
-        gMessage = ec ? "COULD NOT DELETE " + r.slot.dir : "DELETED " + r.slot.dir;
+        gMessage = ec ? "Could not delete save " + r.slot.dir : "Deleted save " + r.slot.dir;
         refreshRow(r);
         // A deleted save leaves the list, as on a PS4; a new save can take its number again.
         if (!r.used) {
@@ -228,6 +252,105 @@ void drawText(SDL_Renderer* ren, int x, int y, int px, const std::string& s) {
 }
 
 int textWidth(const std::string& s, int px) { return int(s.size()) * 6 * px; }
+
+// Menu text in Arial (menu_font.h), or the pixel font when no font file was found. size is the
+// line height in pixels.
+void text(SDL_Renderer* ren, int x, int y, int size, const std::string& s, bool bold = false) {
+    if (menufont::available()) menufont::draw(ren, x, y, size, s, bold);
+    else drawText(ren, x, y + size / 8, std::max(1, size / 9), s);
+}
+int textW(const std::string& s, int size, bool bold = false) {
+    return menufont::available() ? menufont::width(s, size, bold) : textWidth(s, std::max(1, size / 9));
+}
+std::string fitText(const std::string& s, int size, int maxW, bool bold = false) {
+    if (menufont::available()) return menufont::fit(s, size, maxW, bold);
+    const int n = std::max(0, maxW / (6 * std::max(1, size / 9)));
+    return int(s.size()) <= n ? s : s.substr(0, size_t(std::max(0, n - 3))) + "...";
+}
+
+std::string sizeText(uint64_t b) {
+    char buf[32];
+    if (b >= (1u << 20)) std::snprintf(buf, sizeof buf, "%.2f MB", double(b) / (1 << 20));
+    else std::snprintf(buf, sizeof buf, "%.0f KB", std::max(1.0, double(b) / 1024));
+    return buf;
+}
+
+std::string dateText(time_t t) {
+    char buf[48];
+    struct tm tm;
+    localtime_r(&t, &tm);
+    std::strftime(buf, sizeof buf, "%a %d %b %Y, %H:%M", &tm);
+    return buf;
+}
+
+// "Just now", "25 minutes ago", "Yesterday", ...: how old a save is at a glance.
+std::string agoText(time_t t) {
+    const time_t now = std::time(nullptr);
+    const long d = long(std::max<time_t>(0, now - t));
+    char buf[48];
+    if (d < 60) return "Just now";
+    if (d < 3600) std::snprintf(buf, sizeof buf, "%ld minute%s ago", d / 60, d / 60 == 1 ? "" : "s");
+    else if (d < 86400) std::snprintf(buf, sizeof buf, "%ld hour%s ago", d / 3600, d / 3600 == 1 ? "" : "s");
+    else if (d < 2 * 86400) return "Yesterday";
+    else std::snprintf(buf, sizeof buf, "%ld days ago", d / 86400);
+    return buf;
+}
+
+std::string firstLine(const std::string& s) {
+    const size_t n = s.find_first_of("\r\n");
+    return n == std::string::npos ? s : s.substr(0, n);
+}
+
+// Save icons by file, made into textures on the window thread; reloaded when the file changes.
+struct Icon {
+    SDL_Texture* tex = nullptr;
+    int w = 0, h = 0;
+    fs::file_time_type mtime{};
+};
+std::map<std::string, Icon> gIcons;
+SDL_Renderer* gIconRen = nullptr;
+
+const Icon* icon(SDL_Renderer* ren, const std::string& path) {
+    if (path.empty()) return nullptr;
+    if (ren != gIconRen) {
+        for (auto& [k, i] : gIcons) SDL_DestroyTexture(i.tex);
+        gIcons.clear();
+        gIconRen = ren;
+    }
+    std::error_code ec;
+    const auto mt = fs::last_write_time(path, ec);
+    if (ec) return nullptr;
+    auto it = gIcons.find(path);
+    if (it != gIcons.end() && it->second.mtime == mt) return it->second.tex ? &it->second : nullptr;
+    if (it != gIcons.end()) SDL_DestroyTexture(it->second.tex);
+    Icon i;
+    i.mtime = mt;
+    int n = 0;
+    if (unsigned char* px = stbi_load(path.c_str(), &i.w, &i.h, &n, 4)) {
+        i.tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, i.w, i.h);
+        if (i.tex) {
+            SDL_UpdateTexture(i.tex, nullptr, px, i.w * 4);
+            SDL_SetTextureBlendMode(i.tex, SDL_BLENDMODE_BLEND);
+            SDL_SetTextureScaleMode(i.tex, SDL_ScaleModeLinear);
+        }
+        stbi_image_free(px);
+    }
+    Icon& slot = gIcons[path] = i;
+    return slot.tex ? &slot : nullptr;
+}
+
+void fill(SDL_Renderer* ren, int x, int y, int w, int h, Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255) {
+    SDL_Rect rc{x, y, w, h};
+    SDL_SetRenderDrawColor(ren, r, g, b, a);
+    SDL_RenderFillRect(ren, &rc);
+}
+void outline(SDL_Renderer* ren, int x, int y, int w, int h, int t, Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255) {
+    fill(ren, x, y, w, t, r, g, b, a);
+    fill(ren, x, y + h - t, w, t, r, g, b, a);
+    fill(ren, x, y, t, h, r, g, b, a);
+    fill(ren, x + w - t, y, t, h, r, g, b, a);
+}
+void color(SDL_Renderer* ren, Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255) { SDL_SetRenderDrawColor(ren, r, g, b, a); }
 #endif
 
 } // namespace
@@ -320,81 +443,177 @@ bool saveMenuEvent(const SDL_Event& e) {
     return false;
 }
 
+// A list of saves, one row each: the save's icon with its number on it, the chapter and place
+// the game gave it, then when it was saved (and how long ago) and its size. The newest save is
+// marked. Under the list: the actions or the yes/no question for the highlighted save.
 void drawSaveMenu(SDL_Renderer* ren) {
     if (!gOpen) return;
     std::lock_guard lock(gM);
     int w = 0, h = 0;
     SDL_GetRendererOutputSize(ren, &w, &h);
-    const int px = std::max(1, h / 240);  // 3 at 720p
-    const int line = 12 * px;
+    const float u = std::max(0.5f, h / 720.0f); // 1 at 720p
+    auto U = [u](float v) { return std::max(1, int(std::lround(v * u))); };
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(ren, 0, 0, 0, 170);
-    SDL_RenderFillRect(ren, nullptr);
+    fill(ren, 0, 0, w, h, 0, 0, 0, 180);
 
-    const int visible = std::min<int>(int(gRows.size()), 10);
-    const int first = std::max(0, std::min(gCursor - visible / 2, int(gRows.size()) - visible));
-    const int panelW = std::min(w - 4 * px, 200 * px), panelH = (visible + 6) * line;
+    const int headH = U(64), rowH = U(96), gap = U(6), barH = U(56), hintH = U(34), pad = U(20);
+    const int maxRows = std::max(1, (int(h * 0.94f) - headH - barH - hintH - 2 * pad) / (rowH + gap));
+    const int n = int(gRows.size());
+    const int visible = std::min(n, maxRows);
+    const int first = std::max(0, std::min(gCursor - visible / 2, n - visible));
+    const int panelW = std::min(w - U(32), U(860));
+    const int listH = std::max(visible, 1) * (rowH + gap) - gap;
+    const int panelH = headH + pad + listH + pad + barH + hintH;
     const int x0 = (w - panelW) / 2, y0 = (h - panelH) / 2;
-    SDL_Rect panel{x0, y0, panelW, panelH};
-    SDL_SetRenderDrawColor(ren, 20, 20, 28, 235);
-    SDL_RenderFillRect(ren, &panel);
-    SDL_SetRenderDrawColor(ren, 200, 170, 90, 255);
-    SDL_RenderDrawRect(ren, &panel);
 
-    const char* title = gKind == SaveMenuKind::Save ? "SAVE GAME" : gKind == SaveMenuKind::Load ? "LOAD GAME" : "DELETE SAVE";
-    drawText(ren, x0 + 6 * px, y0 + 4 * px, px, title);
+    // Panel and header.
+    fill(ren, x0, y0, panelW, panelH, 16, 16, 22, 242);
+    fill(ren, x0, y0, panelW, headH, 26, 24, 30, 255);
+    fill(ren, x0, y0 + headH - U(2), panelW, U(2), 200, 170, 90);
+    const char* title = gKind == SaveMenuKind::Save ? "Save Game" : gKind == SaveMenuKind::Load ? "Load Game" : "Delete Save";
+    color(ren, 245, 240, 228);
+    text(ren, x0 + pad, y0 + (headH - U(30)) / 2, U(30), title, true);
+    int saves = 0, latest = -1;
+    for (int i = 0; i < n; ++i)
+        if (gRows[size_t(i)].used) {
+            ++saves;
+            if (latest < 0 || gRows[size_t(i)].mtime > gRows[size_t(latest)].mtime) latest = i;
+        }
+    const std::string count = saves == 0 ? "No saves" : std::to_string(saves) + (saves == 1 ? " save" : " saves");
+    color(ren, 150, 146, 138);
+    text(ren, x0 + panelW - pad - textW(count, U(18)), y0 + (headH - U(18)) / 2, U(18), count);
 
+    // Rows.
+    const int listX = x0 + pad, listY = y0 + headH + pad;
+    const int rowW = panelW - 2 * pad - (n > visible ? U(10) : 0);
+    const int thumbH = rowH - U(16), thumbW = thumbH * 16 / 9;
+    const std::string gameIcon = process().gameDir.empty() ? "" : process().gameDir + "/sce_sys/icon0.png";
     for (int i = 0; i < visible; ++i) {
         const int idx = first + i;
         const Row& r = gRows[size_t(idx)];
-        const int y = y0 + (i + 2) * line;
-        if (idx == gCursor) {
-            SDL_Rect hl{x0 + 3 * px, y - 2 * px, panelW - 6 * px, line - px};
-            SDL_SetRenderDrawColor(ren, 90, 70, 30, 255);
-            SDL_RenderFillRect(ren, &hl);
+        const bool sel = idx == gCursor;
+        const int ry = listY + i * (rowH + gap);
+        if (sel) {
+            fill(ren, listX, ry, rowW, rowH, 58, 47, 24);
+            outline(ren, listX, ry, rowW, rowH, U(2), 214, 182, 98);
+        } else {
+            fill(ren, listX, ry, rowW, rowH, 30, 30, 38);
         }
-        SDL_SetRenderDrawColor(ren, r.used ? 235 : 140, r.used ? 235 : 140, r.used ? 225 : 140, 255);
+
+        // Thumbnail: the save's icon (or the game's), fitted into a 16:9 box, number on its corner.
+        const int tx = listX + U(8), ty = ry + U(8);
+        fill(ren, tx, ty, thumbW, thumbH, 8, 8, 12);
         if (r.isNew) {
-            drawText(ren, x0 + 6 * px, y, px, "EMPTY");
+            color(ren, 214, 182, 98);
+            const int s = U(48);
+            text(ren, tx + (thumbW - textW("+", s, true)) / 2, ty + (thumbH - s) / 2, s, "+", true);
+        } else if (const Icon* ic = r.used ? icon(ren, r.icon.empty() ? gameIcon : r.icon) : nullptr) {
+            const float k = std::min(float(thumbW) / ic->w, float(thumbH) / ic->h);
+            const int dw = int(ic->w * k), dh = int(ic->h * k);
+            SDL_Rect dst{tx + (thumbW - dw) / 2, ty + (thumbH - dh) / 2, dw, dh};
+            SDL_SetTextureColorMod(ic->tex, sel ? 255 : 200, sel ? 255 : 200, sel ? 255 : 200);
+            SDL_RenderCopy(ren, ic->tex, nullptr, &dst);
+        }
+        if (!r.isNew) {
+            const int bs = U(17), bw = textW(r.slot.dir, bs, true) + U(12);
+            fill(ren, tx, ty, bw, bs + U(6), 0, 0, 0, 200);
+            color(ren, 232, 200, 112);
+            text(ren, tx + U(6), ty + U(3), bs, r.slot.dir, true);
+        }
+
+        // Text: headline, a second line, then the date and size.
+        const int cx = tx + thumbW + U(16), cw = listX + rowW - cx - U(12);
+        if (r.isNew) {
+            color(ren, 245, 240, 228);
+            text(ren, cx, ry + (rowH - U(24)) / 2 - U(10), U(24), "New Save", true);
+            color(ren, 150, 146, 138);
+            text(ren, cx, ry + (rowH - U(24)) / 2 + U(20), U(16), "Make a new save in the next free slot");
             continue;
         }
-        drawText(ren, x0 + 6 * px, y, px, "SLOT " + r.slot.dir);
-        drawText(ren, x0 + 6 * px + textWidth("SLOT " + r.slot.dir + "  ", px), y, px, r.used ? r.when : "EMPTY");
+        if (!r.used) {
+            color(ren, 140, 140, 140);
+            text(ren, cx, ry + (rowH - U(24)) / 2, U(24), "Empty Slot", true);
+            continue;
+        }
+        // The chapter and place are what tell saves apart, so they lead; the game's name, the same
+        // on every save, only stands in when nothing else was given.
+        std::string head = firstLine(r.subTitle), second = firstLine(r.detail);
+        if (head.empty()) head = firstLine(r.title);
+        else if (second.empty()) second = firstLine(r.title);
+        if (head.empty()) head = "Save " + r.slot.dir;
+        if (r.subTitle.empty() && r.detail.empty()) second = "No details: saved before they were recorded";
+        std::string tag = idx == latest && saves > 1 ? "LATEST" : "";
+        const int tagS = U(13), tagW = tag.empty() ? 0 : textW(tag, tagS, true) + U(14);
+        color(ren, 245, 240, 228);
+        text(ren, cx, ry + U(12), U(24), fitText(head, U(24), cw - (tagW ? tagW + U(10) : 0), true), true);
+        if (!tag.empty()) {
+            const int gx = listX + rowW - U(12) - tagW, gy = ry + U(14);
+            fill(ren, gx, gy, tagW, tagS + U(8), 200, 170, 90);
+            color(ren, 24, 20, 12);
+            text(ren, gx + U(7), gy + U(4), tagS, tag, true);
+        }
+        color(ren, 186, 182, 172);
+        text(ren, cx, ry + U(42), U(17), fitText(second, U(17), cw));
+        const std::string sep = menufont::available() ? "   \xC2\xB7   " : "   ";
+        const std::string when = dateText(r.mtime) + sep + sizeText(r.bytes);
+        const std::string ago = agoText(r.mtime);
+        color(ren, 214, 182, 98);
+        text(ren, cx, ry + U(68), U(16), fitText(when, U(16), cw - textW(ago, U(16)) - U(16)));
+        color(ren, 150, 146, 138);
+        text(ren, listX + rowW - U(12) - textW(ago, U(16)), ry + U(68), U(16), ago);
+    }
+    if (n == 0) {
+        color(ren, 150, 146, 138);
+        text(ren, listX, listY + (rowH - U(20)) / 2, U(20), "No saves");
+    }
+    // Scroll bar when the list runs past the panel.
+    if (n > visible) {
+        const int sx = x0 + panelW - pad - U(4);
+        fill(ren, sx, listY, U(4), listH, 40, 40, 48);
+        const int th = std::max(U(20), listH * visible / n), tyy = listY + (listH - th) * first / std::max(1, n - visible);
+        fill(ren, sx, tyy, U(4), th, 200, 170, 90);
     }
 
-    // The actions or the yes/no question for the highlighted slot, at the bottom of the panel.
-    const int yb = y0 + (visible + 3) * line;
-    SDL_SetRenderDrawColor(ren, 235, 235, 225, 255);
+    // The actions or the yes/no question for the highlighted save.
+    const int by = y0 + headH + pad + listH + pad;
+    fill(ren, x0, by, panelW, U(1), 50, 48, 56);
+    const int bs = U(19), bh = bs + U(14), byy = by + (barH - bh) / 2;
     if (gScreen == Screen::Actions || gScreen == Screen::Confirm) {
-        int x = x0 + 6 * px;
+        int x = x0 + pad;
         std::vector<std::string> items;
         if (gScreen == Screen::Actions) {
             for (Action a : gActions) items.push_back(actionName(a));
         } else {
-            const std::string q = std::string(actionName(gPending)) + " SLOT " + gRows[size_t(gCursor)].slot.dir + "?";
-            drawText(ren, x, yb, px, q);
-            x += textWidth(q + "  ", px);
-            items = {"YES", "NO"};
+            const Row& r = gRows[size_t(gCursor)];
+            const std::string q = std::string(actionName(gPending)) + " save " + r.slot.dir + "?";
+            color(ren, 245, 240, 228);
+            text(ren, x, byy + U(7), bs, q, true);
+            x += textW(q, bs, true) + U(20);
+            items = {"Yes", "No"};
         }
         const int sel = gScreen == Screen::Actions ? gActionCursor : gConfirmCursor;
         for (size_t i = 0; i < items.size(); ++i) {
+            const int iw = std::max(U(90), textW(items[i], bs) + U(28));
             if (int(i) == sel) {
-                SDL_Rect hl{x - 2 * px, yb - 2 * px, textWidth(items[i], px) + 3 * px, line - px};
-                SDL_SetRenderDrawColor(ren, 200, 170, 90, 255);
-                SDL_RenderFillRect(ren, &hl);
-                SDL_SetRenderDrawColor(ren, 20, 20, 28, 255);
+                fill(ren, x, byy, iw, bh, 200, 170, 90);
+                color(ren, 24, 20, 12);
             } else {
-                SDL_SetRenderDrawColor(ren, 235, 235, 225, 255);
+                outline(ren, x, byy, iw, bh, U(1), 110, 104, 92);
+                color(ren, 225, 220, 208);
             }
-            drawText(ren, x, yb, px, items[i]);
-            x += textWidth(items[i] + "   ", px);
+            text(ren, x + (iw - textW(items[i], bs)) / 2, byy + U(7), bs, items[i]);
+            x += iw + U(10);
         }
     } else if (!gMessage.empty()) {
-        drawText(ren, x0 + 6 * px, yb, px, gMessage);
+        color(ren, 225, 220, 208);
+        text(ren, x0 + pad, byy + U(7), bs, gMessage);
     }
-    SDL_SetRenderDrawColor(ren, 150, 150, 150, 255);
-    const int hpx = std::max(1, px * 2 / 3);
-    drawText(ren, x0 + 6 * px, y0 + panelH - line + px, hpx, "ENTER SELECT   BACKSPACE BACK   Z DELETE");
+
+    // Controls.
+    fill(ren, x0, y0 + panelH - hintH, panelW, hintH, 10, 10, 14, 255);
+    color(ren, 140, 136, 128);
+    text(ren, x0 + pad, y0 + panelH - hintH + (hintH - U(15)) / 2, U(15),
+         "Enter / A: select      Backspace / B: back      Z / X: delete");
     SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
 }
 #endif
