@@ -134,12 +134,18 @@ bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height) {
             // jb past the clamp to 1920x1080 -> jmp
             {0xe7beb9, {0x72, 0x13}, {0xEB, 0x13}},
         };
-        bool match = true;
+        // 0x55e820 fills in the setup's display size, 1920x1080 packed as width | height << 12
+        // (movl $0x1438780, 0x50(%rdi)): the output size instead.
+        const uint32_t packed = 0x1000000u | (height & 0xFFF) << 12 | (width & 0xFFF);
+        static const uint8_t kSizeWas[] = {0xC7, 0x47, 0x50, 0x80, 0x87, 0x43, 0x01};
+        bool match = width < 4096 && height < 4096 && std::equal(kSizeWas, kSizeWas + 7, text + 0x55e822);
         for (const Bytes& c : kDisplay) match = match && std::equal(c.was.begin(), c.was.end(), text + c.at);
-        if (match)
+        if (match) {
             for (const Bytes& c : kDisplay) std::copy(c.now.begin(), c.now.end(), text + c.at);
+            for (int i = 0; i < 4; ++i) text[0x55e825 + i] = uint8_t(packed >> (8 * i));
+        }
         else
-            std::fprintf(stderr, "[display] unexpected eboot code at 0xe7beb2: display buffers stay 1920x1080\n");
+            std::fprintf(stderr, "[display] unexpected eboot code at 0x55e822/0xe7beb2: display buffers stay 1920x1080\n");
     }
     gActiveW = width, gActiveH = height;
     std::fprintf(stderr, "[display] rendering at %ux%u (output %ux%u)\n", width, height, bigger ? width : 1920,
