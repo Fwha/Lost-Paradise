@@ -4,8 +4,6 @@
 
 #include <cstdio>
 #include <algorithm>
-#include <bitset>
-#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <type_traits>
@@ -97,10 +95,8 @@ public:
         return std::move(p_);
     }
 
-    // Re-evaluates prior_'s trace for this launch; false when the walk would differ. With a plan,
-    // only the steps it keeps (see ReplayPlan).
-    bool replay(const ReplayPlan* plan = nullptr);
-    bool replayAll() {
+    // Re-evaluates prior_'s trace for this launch; false when the walk would differ.
+    bool replay() {
         const Program& prior = *prior_;
         p_.data.assign(prior.data.size(), 0);
         p_.buffers = prior.buffers;
@@ -120,71 +116,8 @@ public:
         }
         return work.empty();
     }
-    bool replaySteps(const std::vector<uint32_t>& keep) {
-        const Program& prior = *prior_;
-        p_.data.assign(prior.data.size(), 0);
-        p_.buffers = prior.buffers;
-        p_.images = prior.images;
-        seenBuffers_.assign(p_.buffers.size(), false);
-        seenImages_.assign(p_.images.size(), false);
-        WorkQueue work{Work{p_.launch.entry, start()}};
-        State st;
-        for (uint32_t i : keep) {
-            const Program::TraceStep& t = prior.trace[i];
-            if (t.start) {
-                if (work.empty() || work.front().pc != t.pc) return false;
-                st = std::move(work.front().st);
-                work.pop_front();
-            } else if ((slot_ = t.slot, step(t.in, t.pc, st, t.pc + t.in.size, work) != t.result) || diverged_) {
-                return false;
-            }
-        }
-        return work.empty();
-    }
 
     Program& program() { return p_; }
-
-    // The SGPRs (0-127) a step only marks unknown, when it does nothing else a replay keeps.
-    static bool onlyUnknowns(const Instruction& in, uint32_t& d, unsigned& n) {
-        const uint32_t w = in.words[0];
-        switch (in.format) {
-        case Format::VOP3:
-            if (in.op < 256) return d = w & 0xFF, n = 2, true;
-            if (writesSgprPair(in)) return d = (w >> 8) & 0x7F, n = 2, true;
-            return false;
-        case Format::VOPC: return d = kVcc, n = 2, (in.op & 16) == 0; // v_cmpx also writes exec
-        case Format::VOP1: return in.op == 2 && (d = (w >> 17) & 0xFF, n = 1, true);
-        case Format::VOP2:
-            if (in.op == 1) return d = (w >> 17) & 0xFF, n = 1, true;
-            if (in.op >= 37 && in.op <= 42) return d = kVcc, n = 2, true;
-            return false;
-        default: return false;
-        }
-    }
-    // Every SGPR a kept step may read (a superset).
-    static void reads(const Instruction& in, std::bitset<128>& live) {
-        const uint32_t w = in.words[0], w1 = in.words[1];
-        auto add = [&](uint32_t code, unsigned n) {
-            for (unsigned i = 0; i < n; ++i)
-                if (code + i < 128) live.set(code + i);
-        };
-        switch (in.format) {
-        case Format::SOP2: add(w & 0xFF, 2), add((w >> 8) & 0xFF, 2), add((w >> 16) & 0x7F, 2); break;
-        case Format::SOPC: add(w & 0xFF, 2), add((w >> 8) & 0xFF, 2); break;
-        case Format::SOP1: add(w & 0xFF, 2), add((w >> 16) & 0x7F, 2); break;
-        case Format::SOPK: add((w >> 16) & 0x7F, 2); break;
-        case Format::SMRD:
-            add(((w >> 9) & 0x3F) * 2, 4);
-            if (!((w >> 8) & 1)) add(w & 0xFF, 1);
-            break;
-        case Format::MUBUF:
-        case Format::MTBUF: add(((w1 >> 16) & 0x1F) * 4, 4), add((w1 >> 24) & 0xFF, 1); break;
-        case Format::MIMG: add(((w1 >> 16) & 0x1F) * 4, 8), add(((w1 >> 21) & 0x1F) * 4, 4); break;
-        case Format::SOPP: case Format::VOP1: case Format::VOP2: case Format::VOP3: case Format::VOPC:
-        case Format::EXP: case Format::VINTRP: case Format::DS: break;
-        default: live.set(); break; // unknown to the plan: keep everything before it
-        }
-    }
 
 private:
     // The state at the entry point; also fills in the launch's part of the draw data.
@@ -680,113 +613,19 @@ private:
 
 } // namespace
 
-struct ReplayPlan {
-    std::vector<uint32_t> keep; // indices into the trace
-};
-
-namespace {
-
-std::shared_ptr<const ReplayPlan> makePlan(const std::vector<Program::TraceStep>& trace) {
-    auto plan = std::make_shared<ReplayPlan>();
-    std::bitset<128> live;
-    std::vector<uint32_t> keep;
-    for (size_t i = trace.size(); i-- > 0;) {
-        const Program::TraceStep& t = trace[i];
-        uint32_t d = 0;
-        unsigned n = 0;
-        if (!t.start && t.result && Analyzer::onlyUnknowns(t.in, d, n)) {
-            bool read = false;
-            for (unsigned k = 0; k < n; ++k) read |= d + k < 128 && live.test(d + k);
-            if (!read) continue;
-        }
-        if (!t.start) Analyzer::reads(t.in, live);
-        keep.push_back(uint32_t(i));
-    }
-    std::reverse(keep.begin(), keep.end());
-    plan->keep = std::move(keep);
-    return plan;
-}
-
-int fastReplayMode() { // 0 off, 1 on, 2 check
-    static const int mode = [] {
-        const char* e = std::getenv("LPN_FAST_REPLAY");
-        if (!e || !*e || *e == '0') return 0;
-        return std::strcmp(e, "check") == 0 ? 2 : 1;
-    }();
-    return mode;
-}
-
-std::atomic<uint64_t> gPlanned{0}, gSteps{0}, gKept{0}, gMismatches{0};
-
-bool sameReplay(const Program& a, const Program& b) {
-    if (a.data != b.data || a.buffers.size() != b.buffers.size() || a.images.size() != b.images.size()) return false;
-    for (size_t i = 0; i < a.buffers.size(); ++i) {
-        const BufferResource &x = a.buffers[i], &y = b.buffers[i];
-        if (x.pc != y.pc || std::memcmp(x.sharp, y.sharp, sizeof x.sharp) || x.dfmt != y.dfmt || x.nfmt != y.nfmt ||
-            x.store != y.store || x.known != y.known || x.data != y.data)
-            return false;
-    }
-    for (size_t i = 0; i < a.images.size(); ++i) {
-        const ImageResource &x = a.images[i], &y = b.images[i];
-        if (x.pc != y.pc || std::memcmp(x.t, y.t, sizeof x.t) || std::memcmp(x.s, y.s, sizeof x.s) ||
-            x.storage != y.storage || x.compare != y.compare || x.data != y.data)
-            return false;
-    }
-    return true;
-}
-
-} // namespace
-
-bool Analyzer::replay(const ReplayPlan* plan) { return plan ? replaySteps(plan->keep) : replayAll(); }
-
-ReplayStats takeReplayStats() {
-    ReplayStats s;
-    s.planned = gPlanned.exchange(0, std::memory_order_relaxed);
-    s.steps = gSteps.exchange(0, std::memory_order_relaxed);
-    s.kept = gKept.exchange(0, std::memory_order_relaxed);
-    s.mismatches = gMismatches.exchange(0, std::memory_order_relaxed);
-    return s;
-}
-
 Program analyze(const LaunchState& launch, const ReadMemory& readCode, const ReadMemory& readData) {
     return Analyzer(launch, readCode, readData).run();
 }
 
 bool replay(const Program& p, const LaunchState& launch, const ReadMemory& readData, Program& out) {
     if (p.trace.empty()) return false;
-    const int mode = fastReplayMode();
-    std::shared_ptr<const ReplayPlan> plan;
-    if (mode) {
-        plan = p.plan.get();
-        if (!plan) {
-            plan = makePlan(p.trace);
-            p.plan.set(plan);
-        }
-        gPlanned.fetch_add(1, std::memory_order_relaxed);
-        gSteps.fetch_add(p.trace.size(), std::memory_order_relaxed);
-        gKept.fetch_add(plan->keep.size(), std::memory_order_relaxed);
-    }
     Analyzer a(launch, readData, readData, &p);
     // A replay runs for every launch: it fills out's vectors, keeping their storage.
     Program& q = a.program();
     q.data.swap(out.data);
     q.buffers.swap(out.buffers);
     q.images.swap(out.images);
-    bool ok = a.replay(plan.get());
-    if (mode == 2) {
-        Analyzer full(launch, readData, readData, &p);
-        const bool fullOk = full.replay();
-        if (fullOk != ok || (ok && !sameReplay(q, full.program()))) {
-            static std::atomic<int> logged{0};
-            if (logged.fetch_add(1) < 20)
-                std::fprintf(stderr, "[replay] plan differs from full replay for shader 0x%llx (%s): %zu of %zu steps kept\n",
-                             (unsigned long long)launch.entry, ok != fullOk ? "result" : "output", plan->keep.size(),
-                             p.trace.size());
-            gMismatches.fetch_add(1, std::memory_order_relaxed);
-            q = std::move(full.program()); // the full replay's answer stands
-            ok = fullOk;
-        }
-    }
+    const bool ok = a.replay();
     out.launch = q.launch;
     out.data.swap(q.data);
     out.buffers.swap(q.buffers);

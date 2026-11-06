@@ -11,9 +11,7 @@
 
 #include <cstdint>
 #include <functional>
-#include <atomic>
 #include <map>
-#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -91,24 +89,6 @@ struct ImageResource {
     uint32_t lastArray() const { return (t[5] >> 13) & 0x1FFF; }
 };
 
-struct ReplayPlan; // a trace pre-decoded for fast replays (see replay())
-
-// Holds a program's replay plan; copies share it. Built lazily by whichever thread replays first.
-class PlanSlot {
-public:
-    PlanSlot() = default;
-    PlanSlot(const PlanSlot& o) : p_(o.p_.load()) {}
-    PlanSlot& operator=(const PlanSlot& o) {
-        p_.store(o.p_.load());
-        return *this;
-    }
-    std::shared_ptr<const ReplayPlan> get() const { return p_.load(std::memory_order_acquire); }
-    void set(std::shared_ptr<const ReplayPlan> v) const { p_.store(std::move(v), std::memory_order_release); }
-
-private:
-    mutable std::atomic<std::shared_ptr<const ReplayPlan>> p_;
-};
-
 // A shader as launched by one draw: its reachable code, resolved resources and scalar loads.
 struct Program {
     LaunchState launch;
@@ -134,7 +114,6 @@ struct Program {
         uint32_t slot = ~0u;  // SMRD: its result's offset in `data`; MUBUF/MTBUF/MIMG: its resource's index
     };
     std::vector<TraceStep> trace;
-    PlanSlot plan; // `trace` pre-decoded, once it has been replayed (LPN_FAST_REPLAY)
 
     // Identifies the translation: equal keys translate to the same GLSL.
     std::string key() const;
@@ -154,16 +133,6 @@ inline Program analyze(const LaunchState& launch, const ReadMemory& read) { retu
 // other user data or memory by replaying its trace. False when a branch would go another way;
 // otherwise `out` holds the launch's data and resources (and no code).
 bool replay(const Program& program, const LaunchState& launch, const ReadMemory& readData, Program& out);
-// Fast replays (LPN_FAST_REPLAY=1, or =check to also run the full replay and compare): a plan
-// keeps only the trace steps whose effect a later step can see, dropping the vector compares
-// and lane reads that only mark SGPRs unknown when nothing reads those SGPRs again. Counts since
-// the last call: replays run from a plan, trace steps they would have stepped and did step, and
-// check-mode mismatches.
-struct ReplayStats {
-    uint64_t planned = 0, steps = 0, kept = 0, mismatches = 0;
-};
-ReplayStats takeReplayStats();
-
 // Moves a replay's launch, data and resources into `program` when they translate alike (the
 // resources keep their formats, see Program::key). False leaves both unchanged.
 bool adopt(Program& program, Program& replayed);
