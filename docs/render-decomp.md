@@ -106,3 +106,11 @@ The bigger lever is milestone 4: merge runs of fast draws that differ only in dr
 multi-draw (vkCmdDrawIndexedIndirect, shaders indexing their draw data by gl_DrawID). The engine
 side supports this: ~60% of heavy draws come from one draw-command list through the same binder.
 `LPN_PROFILE=1` now reports `mergeable fast draws N in M runs` per frame to size it first.
+
+## Second run (2026-11-06, LPN_PROFILE)
+
+At the spots tested (~2,900 draws, 36-59 fps) the recorder takes ~4 ms and the GPU ~5 ms, but the
+recorder waits 8-10 ms a frame for the analysis workers (analyze ~28 ms summed over 3 workers).
+So there the replay is the limit after all, and the state-block hook (milestone 3) targets it.
+Merging is not worth it: only 1-9 fast draws a frame change draw data alone (~600 rebind a
+buffer, ~700 switch shaders).
