@@ -48,3 +48,30 @@ into pieces. `LPN_PROFILE=1` now prints `passes by draws` (counts and draws for 
    split is right).
 3. Per-thread recorder contexts and secondaries, behind `LPN_RECORD_THREADS=N`.
 4. Intra-pass splitting, if the counter shows big passes.
+
+## What was built (stage 2, LPN_RECORD_THREADS=N)
+
+The overlook run (2026-11-06) showed 74 passes a frame, ~15 of them holding 95% of the draws, the
+largest 1,000 (the 1,000-draw flush cuts them). So runs are cut by count, not by pass:
+
+- The main recorder (`lpn-record`) only collects draws into segments of up to
+  `LPN_RECORD_SEGMENT` (128) draws, with a copy of the context registers whenever they change
+  (`GpuRegs::ctxSerial`), and queues each segment's execution in its batch in order.
+- N threads (`lpn-record-w`) each record a segment into a secondary command buffer of its own
+  (own pool and 4 MB draw-data ring), from a fresh `Rec`: no pass, nothing bound, no fast-draw
+  states, a full barrier before its first pass. Vulkan calls are made at once on that thread.
+- The command thread executes a segment (`vkCmdExecuteCommands`) once it is recorded.
+- Shared caches stay under `m_`: a thread holds it for a whole full draw, and around a fast or
+  switch draw's lookups (images, index buffer, moved buffers). See `WLock`.
+- Uploads and copies made on a thread (texture uploads, VRAM copies, a new image's first layout
+  and clear) go into `pro_`, secondaries executed before the next segment the command thread
+  executes, so no segment recorded earlier misses them. See `Prologue`.
+- What a thread frees waits for the next flush of the main batch (every segment recorded by
+  then is in it or an earlier one).
+- Dispatches, DMA, memory writes, SMAA under DLSS, frame ends and traced frames wait for every
+  segment so far (`drainSegments`) and are recorded in order on the main recorder as before.
+- The main recorder stays at most ~2 batches ahead of the threads, and gives up `m_` while it
+  waits for a batch they may still have to record (`begin`, `waitIdle`).
+
+`LPN_PROFILE=1` adds a `[prof] ... recorder threads` line: segments, the threads' recording time
+summed, waits for them (drains) and waits to let them catch up, per frame.

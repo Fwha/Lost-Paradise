@@ -30,6 +30,7 @@ struct GpuRegs {
     uint32_t indexType = 0;       // 0: 16-bit, 1: 32-bit
     uint32_t numInstances = 1;
     uint64_t indirectBase = 0;    // SET_BASE for draw/dispatch indirect arguments
+    uint64_t ctxSerial = 0;       // counts SET_CONTEXT_REG packets (a copy of ctx is current while it holds)
 };
 
 struct DrawCall {

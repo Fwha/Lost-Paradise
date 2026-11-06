@@ -112,6 +112,16 @@ bool readGuest(uint64_t addr, void* dst, size_t size) {
 
 uint64_t shaderAddress(const GpuRegs& r, uint32_t lo) { return ((uint64_t(r.sh[lo + 1]) << 32) | r.sh[lo]) << 8; }
 
+// What recording a draw reads of the registers: the context registers (the live ones, or a copy
+// taken for a recorder thread) and the few others.
+struct DrawRegs {
+    const uint32_t* ctx = nullptr;
+    uint32_t prim = 0, indexType = 0, numInstances = 1;
+    static DrawRegs of(const GpuRegs& r, const uint32_t* ctx = nullptr) {
+        return {ctx ? ctx : r.ctx, r.uconfig[reg::kPrimitiveType], r.indexType, r.numInstances};
+    }
+};
+
 uint64_t hashBytes(const void* p, size_t n) {
     // FNV-1a over 8-byte words in four independent lanes (a single multiply chain is the
     // bottleneck on large textures); good enough to notice a changed texture.
@@ -556,6 +566,8 @@ struct Profiler {
     // Render passes by how many draws they hold (1-15, 16-127, 128-1023, 1024+): passes, and the
     // draws in them; and the largest pass's draws. Sizes how far recording can split by pass.
     uint64_t passBySize[4] = {}, drawsBySize[4] = {}, largestPass = 0;
+    // Recorder threads: segments recorded, waits for them (and their ns), their recording time summed.
+    uint64_t segments = 0, drains = 0, drainNs = 0, workerNs = 0, aheadNs = 0; // aheadNs: waits for the threads to catch up
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -674,6 +686,8 @@ private:
 };
 
 class Renderer final : public DrawListener {
+    struct DrawAnalysis; // declared further down
+
 public:
     bool init() {
         std::string error;
@@ -757,6 +771,7 @@ public:
         openPipelineCache();
         startPipelineWorkers();
         dumpGlsl_ = getenv("LPN_GPU_GLSL") != nullptr;
+        startRecorderThreads();
         return true;
     }
 
@@ -954,29 +969,18 @@ public:
         // Analyses move by pointer: moved by value (two Programs each), handing them along was
         // ~10% of the recorder at 8,000 draws a frame.
         std::unique_ptr<DrawAnalysis>& held = taken_[takenNext_++];
-        DrawAnalysis& a = *held;
-        struct Recycle { // hands `a` back to the analysis thread however the draw ends
-            Renderer& r;
-            std::unique_ptr<DrawAnalysis>& a;
-            ~Recycle() {
-                r.R().returned_.push_back(std::move(a));
-                if (r.R().returned_.size() < kTakeRun) return;
-                if (r.syncRecord_ || !r.deferUploads_) {
-                    r.spare(r.R().returned_);
-                    return;
-                }
-                // After the command thread has copied their data (see uploadData).
-                std::lock_guard lock(r.m_);
-                // Not rec(): a call between draws would end fastDraw's run (see FastDraw::rec).
-                r.R().chunk_->push([&r = r, run = std::move(r.R().returned_)]() mutable { r.spare(run); });
-                r.R().returned_.clear(); // moved from
-                r.R().returned_.reserve(kTakeRun);
+        if (recordThreads_) {
+            if (segmentable(d, *held)) {
+                addToSegment(d, r, held);
+                return;
             }
-        } recycle{*this, held};
+            drainSegments(); // recorded here, in order with everything before it
+        }
+        DrawAnalysis& a = *held;
+        Recycle recycle{*this, held};
         std::lock_guard lock(m_);
         ProfScope ps(R().prof_, kProfRenderer);
         if (prefetch_) prefetchAhead();
-        ++R().prof_.calls;
         ++drawIndex_;
         trace_ = frame_ == traceFrame_;
         if (trace_)
@@ -984,10 +988,58 @@ public:
                          d.kind == DrawCall::kDispatch ? "dispatch" : "draw", shaderAddress(r, reg::kPgmLoVs),
                          shaderAddress(r, reg::kPgmLoPs), shaderAddress(r, reg::kPgmLoCs));
         if (raceCheck_) raceShader_ = shaderAddress(r, d.kind == DrawCall::kDispatch ? reg::kPgmLoCs : reg::kPgmLoPs);
-        const uint64_t passesBefore = R().prof_.passes, drawsBefore = R().stats_.draws;
-        if (d.kind == DrawCall::kDispatch) dispatch(d, r, a);
-        else if (computeOnly_) return;
-        else if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r, a);
+        const uint64_t passesBefore = R().prof_.passes;
+        if (d.kind == DrawCall::kDispatch) {
+            ++R().prof_.calls;
+            dispatch(d, r, a);
+            R().prevSeq_ = 0;
+        } else if (computeOnly_) {
+            return;
+        } else {
+            recordDraw(d, DrawRegs::of(r), held);
+        }
+        if (frame_ == timingFrame_ && timing_ && R().recording_ && timingMeta_.size() + 1 < kTimingQueries) {
+            rec([c = R().cmd_, q = timing_, i = uint32_t(timingMeta_.size() + 1)] {
+                vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q, i);
+            });
+            timingMeta_.push_back({drawIndex_, shaderAddress(r, d.kind == DrawCall::kDispatch ? reg::kPgmLoCs : reg::kPgmLoPs),
+                                   d.kind == DrawCall::kDispatch, R().prof_.passes != passesBefore, d.count});
+        }
+        if (++R().drawsSinceHandOff_ >= 32) handOff(); // the command thread trails by a few draws
+        if (flushDraws_ && R().recording_ && ++R().drawsSinceFlush_ >= flushDraws_) flush();
+    }
+    // Every 1,000 draws: at 400, the 6,350 draws looking up the steps after New Game made 16
+    // batches a frame, and with kBatches in flight the recorder waited on the GPU (80 fps, 90 at 1,000).
+    const uint32_t flushDraws_ = getenv("LPN_FLUSH_DRAWS") ? std::atoi(getenv("LPN_FLUSH_DRAWS")) : 1000;
+
+    // Hands `a` back to the analysis thread however the draw ends.
+    struct Recycle {
+        Renderer& r;
+        std::unique_ptr<DrawAnalysis>& a;
+        ~Recycle() {
+            if (!a) return;
+            r.R().returned_.push_back(std::move(a));
+            if (r.R().returned_.size() < kTakeRun) return;
+            if (r.syncRecord_ || !r.deferUploads_ || r.R().immediate_) {
+                r.spare(r.R().returned_);
+                return;
+            }
+            // After the command thread has copied their data (see uploadData).
+            std::lock_guard lock(r.m_);
+            // Not rec(): a call between draws would end fastDraw's run (see FastDraw::rec).
+            r.R().chunk_->push([&r = r, run = std::move(r.R().returned_)]() mutable { r.spare(run); });
+            r.R().returned_.clear(); // moved from
+            r.R().returned_.reserve(kTakeRun);
+        }
+    };
+
+    // A draw (not a dispatch), on whichever thread records it: the main recorder under m_, or a
+    // recorder thread (which takes m_ itself where the caches are touched, see WLock).
+    void recordDraw(const DrawCall& d, const DrawRegs& r, std::unique_ptr<DrawAnalysis>& held) {
+        DrawAnalysis& a = *held;
+        ++R().prof_.calls;
+        const uint64_t drawsBefore = R().stats_.draws;
+        if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r, a);
         else warnOnce("indirect draws and dispatches are not rendered yet");
         if (R().prof_.on && R().stats_.draws != drawsBefore) {
             if (R().countedPass_ != R().passSerial_) {
@@ -1002,23 +1054,12 @@ public:
             R().keepDraw_ = false;
             std::swap(held, R().prevDraw_);
         }
-        if (frame_ == timingFrame_ && timing_ && R().recording_ && timingMeta_.size() + 1 < kTimingQueries) {
-            rec([c = R().cmd_, q = timing_, i = uint32_t(timingMeta_.size() + 1)] {
-                vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q, i);
-            });
-            timingMeta_.push_back({drawIndex_, shaderAddress(r, d.kind == DrawCall::kDispatch ? reg::kPgmLoCs : reg::kPgmLoPs),
-                                   d.kind == DrawCall::kDispatch, R().prof_.passes != passesBefore, d.count});
-        }
-        if (++R().drawsSinceHandOff_ >= 32) handOff(); // the command thread trails by a few draws
-        // Every 1,000 draws: at 400, the 6,350 draws looking up the steps after New Game made 16
-        // batches a frame, and with kBatches in flight the recorder waited on the GPU (80 fps, 90 at 1,000).
-        static const uint32_t flushDraws = getenv("LPN_FLUSH_DRAWS") ? std::atoi(getenv("LPN_FLUSH_DRAWS")) : 1000;
-        if (flushDraws && R().recording_ && ++R().drawsSinceFlush_ >= flushDraws) flush();
     }
 
     // The command processor copies descriptors and constants between draws (DMA_DATA): draws
     // after it must not see the page cache's older copy.
     void onMemoryWrite(uint64_t addr, uint64_t size) override {
+        if (recordThreads_) drainSegments();
         std::lock_guard lock(m_);
         R().fast_.valid = false;
         ++fastEpoch_;
@@ -1037,6 +1078,7 @@ public:
     }
 
     bool onDmaCopy(uint64_t dst, uint64_t src, uint64_t bytes, bool fill, uint32_t value) override {
+        if (recordThreads_) drainSegments();
         R().fast_.valid = false; // memory changes (recorder thread, like fastDraw)
         ++fastEpoch_;
         uint64_t id = 0; // the analysis thread's overlay for this copy
@@ -1080,11 +1122,13 @@ public:
     }
 
     void onWait() override {
+        if (recordThreads_) dispatchSegment();
         std::lock_guard lock(m_);
         flush();
     }
 
     void onSubmitEnd() override {
+        if (recordThreads_) dispatchSegment();
         std::lock_guard lock(m_);
         ProfScope ps(R().prof_, kProfRenderer);
         flush();
@@ -1099,7 +1143,9 @@ public:
         R().passDraws_ = 0;
     }
     void onFrameEnd() override {
+        if (recordThreads_) drainSegments();
         std::lock_guard lock(m_);
+        if (recordThreads_ && R().prof_.on) mergeRecorderProfiles();
         if (R().prof_.on) {
             notePassSize();
             R().countedPass_ = ~0ull;
@@ -1120,6 +1166,7 @@ public:
         savePipelineCache();
         dlssFrameEnd();
         sweepVram();
+        trace_ = false; // recorder threads read it (a traced frame is recorded here, in order)
         ++frame_;
         frameNow_.store(frame_, std::memory_order_relaxed);
         if (!pendingCapture_.empty()) { // F12: trace this frame into the capture folder
@@ -1292,6 +1339,11 @@ public:
                      profile::seconds(), R().prof_.passBySize[0] / n, R().prof_.drawsBySize[0] / n, R().prof_.passBySize[1] / n,
                      R().prof_.drawsBySize[1] / n, R().prof_.passBySize[2] / n, R().prof_.drawsBySize[2] / n, R().prof_.passBySize[3] / n,
                      R().prof_.drawsBySize[3] / n, R().prof_.largestPass);
+        if (recordThreads_)
+            std::fprintf(stderr, "[prof] t=%.1f recorder threads %u: %.0f segments, threads recording %.2f ms (summed), "
+                                 "%.0f waits for them %.2f ms, ahead-waits %.2f ms per frame\n",
+                         profile::seconds(), recordThreads_, R().prof_.segments / n, R().prof_.workerNs / 1e6 / n, R().prof_.drains / n,
+                         R().prof_.drainNs / 1e6 / n, R().prof_.aheadNs / 1e6 / n);
         std::fprintf(stderr, "[prof] t=%.1f VRAM copies %zu: %.1f allocations, %.2f evictions (%.1f freed, %.2f found none) per frame\n",
                      profile::seconds(), vram_.size(), R().prof_.vramAllocs / n, R().prof_.vramEvicts / n, R().prof_.vramFreed / n,
                      R().prof_.vramEvictsEmpty / n);
@@ -1515,11 +1567,11 @@ private:
     // command thread.
     template <typename F> void rec(F&& f) {
         ++R().recCount_;
-        if (syncRecord_) f();
+        if (syncRecord_ || R().immediate_) f();
         else R().chunk_->push(std::forward<F>(f));
     }
     // Storage for an array a queued call points to, valid until the call has run.
-    template <typename T> const T* keep(const T* p, size_t n) { return syncRecord_ ? p : R().chunk_->keep(p, n); }
+    template <typename T> const T* keep(const T* p, size_t n) { return syncRecord_ || R().immediate_ ? p : R().chunk_->keep(p, n); }
     void handOff() {
         R().drawsSinceHandOff_ = 0;
         if (syncRecord_ || R().chunk_->empty()) return;
@@ -1552,7 +1604,7 @@ private:
     }
     void pushDescriptors(VkPipelineBindPoint point, VkPipelineLayout layout, std::vector<VkWriteDescriptorSet>& writes,
                          std::vector<VkDescriptorBufferInfo>& bufs, std::vector<VkDescriptorImageInfo>& imgs) {
-        if (syncRecord_) {
+        if (syncRecord_ || R().immediate_) {
             linkWrites(writes, bufs, imgs);
             vk_.cmdPushDescriptorSet(R().cmd_, point, layout, 0, uint32_t(writes.size()), writes.data());
             return;
@@ -1579,10 +1631,25 @@ private:
 
     void begin() {
         if (R().recording_) return;
+        if (R().worker_) { // the uploads ahead of the segments (a segment's own Rec records from its start)
+            if (&R() == &pro_) openPrologue();
+            return;
+        }
         Batch& b = batches_[R().cur_];
         {
             ProfScope ps(R().prof_, kProfGpuWait);
             std::unique_lock lock(doneMutex_);
+            if (b.busy && recordThreads_ && !tRec_) {
+                // m_ held: the batch may still execute segments whose threads need it.
+                lock.unlock();
+                m_.unlock();
+                lock.lock();
+                doneCv_.wait(lock, [&] { return !b.busy; });
+                lock.unlock();
+                m_.lock();
+                if (R().recording_ || &b != &batches_[R().cur_]) return begin(); // another thread began meanwhile
+                lock.lock();
+            }
             doneCv_.wait(lock, [&] { return !b.busy; });
         }
         rec([this, c = R().cmd_, fence = b.fence] {
@@ -1609,6 +1676,11 @@ private:
     }
 
     void flush() {
+        if (R().worker_) {
+            if (&R() == &pro_) closePrologue(); // its ring is full: the next upload starts another
+            else warnOnce("a recorder thread's upload ring is full (draw data may be overwritten)");
+            return;
+        }
         if (!R().recording_) {
             if (!R().pendingDone_.empty()) {
                 // Nothing new to submit: due when the last submission finishes. Decided on the
@@ -1641,6 +1713,11 @@ private:
         if (timestamps_)
             rec([c = R().cmd_, q = timestamps_, i = 2 * R().cur_ + 1] { vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, q, i); });
         std::vector<std::function<void()>> fns = std::move(R().afterFlush_);
+        if (recordThreads_) { // what recorder threads freed: after every segment recorded by now
+            std::lock_guard lock(lateMutex_);
+            for (auto& f : lateFree_) fns.push_back(std::move(f));
+            lateFree_.clear();
+        }
         for (auto& f : R().pendingDone_) fns.push_back(std::move(f));
         R().afterFlush_.clear();
         R().pendingDone_.clear();
@@ -1673,9 +1750,32 @@ private:
     }
 
     // Submits what is recorded and waits until the GPU (and the deferred work) is done.
-    void waitIdle() {
+    void waitIdle() { // m_ held
+        const bool paused = pauseSegments();
         flush();
         waitSubmitted();
+        if (paused) resumeSegments();
+    }
+    // Before waiting on the GPU with m_ held: no new segments, and the dispatched ones recorded
+    // (their threads need m_, and the batches waited for execute them). Releases m_ meanwhile.
+    bool pauseSegments() {
+        if (!recordThreads_ || tRec_) return false;
+        std::unique_lock lock(segMutex_);
+        ++paused_;
+        if (outstanding_) {
+            m_.unlock();
+            segDoneCv_.wait(lock, [&] { return outstanding_ == 0; });
+            lock.unlock();
+            m_.lock();
+        }
+        return true;
+    }
+    void resumeSegments() {
+        {
+            std::lock_guard lock(segMutex_);
+            --paused_;
+        }
+        segDoneCv_.notify_all();
     }
     void waitSubmitted() {
         ProfScope ps(R().prof_, kProfGpuWait);
@@ -1721,6 +1821,7 @@ private:
 
 public:
     bool afterGpuWork(std::function<void()>& fn) override {
+        if (recordThreads_) dispatchSegment(); // due after the draws before it too
         std::lock_guard lock(m_);
         R().pendingDone_.push_back(std::move(fn));
         return true;
@@ -1760,7 +1861,7 @@ private:
     // Space in the upload ring; flushes first if the ring is full.
     VkDeviceSize ringAlloc(VkDeviceSize size, VkDeviceSize align) {
         VkDeviceSize at = (R().ringUsed_ + align - 1) & ~(align - 1);
-        if (at + size > kRingSize) {
+        if (at + size > R().ringSize_) {
             flush();
             begin();
             at = 0;
@@ -1768,7 +1869,7 @@ private:
         R().ringUsed_ = at + size;
         return at;
     }
-    bool ringFits(VkDeviceSize size) const { return R().ringUsed_ + size + 4096 <= kRingSize; }
+    bool ringFits(VkDeviceSize size) const { return R().ringUsed_ + size + 4096 <= R().ringSize_; }
     // A draw's data into the ring, copied by the command thread: the recorder's copies were 15% of
     // its time at the city overlook, nearly all misses on data the analysis workers had just
     // written. The data stays put until then: analyses go back to the workers through the command
@@ -1777,7 +1878,7 @@ private:
         const VkDeviceSize bytes = data.size() * 4;
         const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
         uint8_t* dst = static_cast<uint8_t*>(R().ringPtr_) + at;
-        if (syncRecord_ || !deferUploads_) std::memcpy(dst, data.data(), bytes);
+        if (syncRecord_ || !deferUploads_ || R().immediate_) std::memcpy(dst, data.data(), bytes);
         else rec([dst, src = data.data(), bytes] { std::memcpy(dst, src, bytes); });
         return at;
     }
@@ -1938,6 +2039,7 @@ private:
         if (format == VK_FORMAT_D32_SFLOAT_S8_UINT) img.aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
 
         // Everything stays in GENERAL; start it there.
+        Prologue pg(*this); // on a recorder thread: ahead of the segments
         begin();
         endPass();
         VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -3205,6 +3307,7 @@ private:
             }
         ++R().prof_.texUploads;
         R().prof_.texBytes += bytes;
+        Prologue pg(*this); // on a recorder thread: ahead of the segments
         if (!ringFits(bytes)) {
             flush();
             begin();
@@ -3496,7 +3599,7 @@ private:
         float xs = 0, xo = 0, ys = 0, yo = 0, zs = 1, zo = 0;
     };
 
-    void captureCamera(const gcn::Program& vs, const GpuRegs& r) {
+    void captureCamera(const gcn::Program& vs, const DrawRegs& r) {
         if (++camTries_ > 8) return; // shaders of another layout: not this frame
         const uint64_t table = vs.launch.userData[12] | uint64_t(vs.launch.userData[13]) << 32;
         uint32_t sharp[4];
@@ -3649,7 +3752,7 @@ void main() {
 
     // A draw of one of the SMAA shaders with DLSS on: true when it was handled (skipped, or the
     // blend replaced by DLSS).
-    bool dlssSmaa(const GpuRegs& r, uint8_t role) {
+    bool dlssSmaa(const DrawRegs& r, uint8_t role) {
         if (!dlss::usable()) return false;
         smaaSeen_ = true; // later draws are post-processing: not jittered
         if (role != 3) return true; // edges and weights: DLSS needs neither
@@ -4045,9 +4148,13 @@ void main() {
                 if (!changed) v.changedFrame = frame_; // the first copy
                 v.hash = hasher_.hash(base, size); // what the copy holds (the game does not write memory the GPU is about to read)
                 if (v.check) v.check->state.store(0, std::memory_order_relaxed); // a result in flight is about the old contents
-                fullBarrier();
-                const VkBufferCopy bc{soff, 0, size};
-                rec([c = R().cmd_, src, dst = v.buf, bc] { vkCmdCopyBuffer(c, src, dst, 1, &bc); });
+                {
+                    Prologue pg(*this); // on a recorder thread: ahead of the segments
+                    begin();
+                    fullBarrier();
+                    const VkBufferCopy bc{soff, 0, size};
+                    rec([c = R().cmd_, src, dst = v.buf, bc] { vkCmdCopyBuffer(c, src, dst, 1, &bc); });
+                }
                 ++R().prof_.vramCopies, R().prof_.vramCopyBytes += size;
             } else if (resolveAhead_ && frame_ - v.changedFrame >= kSettleFrames && !v.gpuWritten) {
                 v.settled.store(true, std::memory_order_release); // checked and unchanged for a while
@@ -4977,7 +5084,7 @@ void main() {
             std::fprintf(traceOut_, "[trace]   copied %ux%u back to 0x%" PRIx64 "\n", w, h, t.base());
     }
 
-    void draw(const DrawCall& d, const GpuRegs& r, DrawAnalysis& a) {
+    void draw(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
         const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
         const uint32_t dbRender = r.ctx[reg::kDbRenderControl];
         if (trace_)
@@ -4986,7 +5093,7 @@ void main() {
                          cbMode, dbRender, r.ctx[reg::kDbDepthControl], r.ctx[reg::kDbZInfo], r.ctx[reg::kDbStencilInfo],
                          r.ctx[reg::kDbStencilControl], r.ctx[reg::kDbStencilRefMask],
                          uint64_t(r.ctx[reg::kDbZReadBase]) << 8, uint64_t(r.ctx[reg::kDbHtileDataBase]) << 8,
-                         std::bit_cast<float>(r.ctx[reg::kDbDepthClear]), r.uconfig[reg::kPrimitiveType], d.count);
+                         std::bit_cast<float>(r.ctx[reg::kDbDepthClear]), r.prim, d.count);
         if (trace_ && (r.ctx[reg::kPaSuScModeCntl] & (3u << 11)))
             std::fprintf(traceOut_, "[trace]   polygon offset scale %g offset %g clamp %g (mode 0x%x)\n",
                          std::bit_cast<float>(r.ctx[reg::kPaSuPolyOffsetFrontScale]),
@@ -5000,7 +5107,7 @@ void main() {
         }
         if (cbMode > 1) return;           // fast-clear eliminate, resolve, decompress: nothing to do here
         if (dbRender & 0x1C) return;      // depth/stencil copy, resummarize
-        const uint32_t prim = r.uconfig[reg::kPrimitiveType];
+        const uint32_t prim = r.prim;
         if (prim == 0 || prim == 8 || prim == 13) {
             warnOnce("primitive type " + std::to_string(prim) + " not rendered");
             return;
@@ -5011,6 +5118,7 @@ void main() {
         const bool wasMergeable = R().lastMergeable_;
         R().lastMergeable_ = false;
         if (fastDraw(d, r, a, wasMergeable) || switchDraw(d, r, a)) return;
+        WLock wl(*this); // a recorder thread records a full draw holding the caches
         stashFast();
         gcn::Program& vs = a.vs;
 
@@ -5420,7 +5528,7 @@ void main() {
     // A draw repeating one in a slot (see FastSlot) but for its user data, constants and buffer
     // placement, with only draws recorded since in the same pass: its pipeline, dynamic state and
     // descriptors are set again from the slot, and its state becomes the bound one.
-    bool switchDraw(const DrawCall& d, const GpuRegs& r, DrawAnalysis& a) {
+    bool switchDraw(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
         if (!R().recording_ || !R().pass_.open || !ringFits(1 << 16)) return false;
         auto miss = [&](int why) {
             if (R().prof_.on && (R().fast_.vsm != a.vsm || R().fast_.psm != a.psm)) ++R().prof_.switchMiss[why];
@@ -5434,7 +5542,7 @@ void main() {
         FastDraw& f = slot->f;
         if (f.pass != R().passSerial_ || f.epoch != fastEpoch_ || f.frame != frame_ || f.imageGen != imageGen_) return miss(1);
         if (d.kind != f.kind || r.indexType != f.indexType || r.numInstances != f.numInstances ||
-            r.uconfig[reg::kPrimitiveType] != f.prim || a.ctxHash != f.ctxHash)
+            r.prim != f.prim || a.ctxHash != f.ctxHash)
             return miss(2);
         for (VkImage im : f.sampled) // sampling what a draw since has rendered to needs a new pass
             if (std::find(R().drawWritten_.begin(), R().drawWritten_.end(), im) != R().drawWritten_.end()) return miss(3);
@@ -5442,9 +5550,10 @@ void main() {
         ImageBinding vsImg[32], psImg[32];
         uint32_t psMoved = 0;
         if (sameButUserData(a.vs, slot->prev->vs, moved, noFastTextures_ ? nullptr : &vsImages) >= 0 ||
-            (a.psm && sameButUserData(a.ps, slot->prev->ps, psMoved, noFastTextures_ ? nullptr : &psImages) >= 0) ||
-            !peekImages(a.vs, vsImages, vsImg) || !peekImages(a.ps, psImages, psImg))
+            (a.psm && sameButUserData(a.ps, slot->prev->ps, psMoved, noFastTextures_ ? nullptr : &psImages) >= 0))
             return miss(4);
+        WLock wl(*this); // to the descriptors: the caches
+        if (!peekImages(a.vs, vsImages, vsImg) || !peekImages(a.ps, psImages, psImg)) return miss(4);
         VkBuffer indexBuffer = VK_NULL_HANDLE;
         VkDeviceSize indexOffset = 0;
         if (d.kind == DrawCall::kIndexed) {
@@ -5489,6 +5598,7 @@ void main() {
         };
         bind(a.vs, slot->prev->vs, moved, 0);
         if (a.psm) bind(a.ps, slot->prev->ps, psMoved, kPsBindingBase);
+        wl.unlock();
         if (R().bound_.pipeline != f.pipe) {
             rec([c = R().cmd_, pipe = f.pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); });
             R().bound_.pipeline = f.pipe;
@@ -5528,7 +5638,7 @@ void main() {
         ++R().prof_.fastSwitches;
         return true;
     }
-    bool fastDraw(const DrawCall& d, const GpuRegs& r, DrawAnalysis& a, bool prevMergeable) {
+    bool fastDraw(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a, bool prevMergeable) {
         const FastDraw& f = R().fast_;
         auto miss = [&](FastMiss why) {
             if (R().prof_.on) ++R().prof_.fastMiss[why];
@@ -5538,7 +5648,7 @@ void main() {
         if (f.rec != R().recCount_) return miss(kFastBetween);
         if (f.frame != frame_ || f.imageGen != imageGen_ || !R().recording_ || !R().pass_.open) return miss(kFastFrame);
         if (d.kind != f.kind || a.vsm != f.vsm || a.psm != f.psm || r.indexType != f.indexType ||
-            r.numInstances != f.numInstances || r.uconfig[reg::kPrimitiveType] != f.prim || !ringFits(1 << 16)) {
+            r.numInstances != f.numInstances || r.prim != f.prim || !ringFits(1 << 16)) {
             if (R().prof_.on) ++R().prof_.fastKind[d.kind != f.kind ? 0 : a.vsm != f.vsm || a.psm != f.psm ? 1 : 2];
             return miss(kFastKind);
         }
@@ -5573,6 +5683,7 @@ void main() {
         }
         // Other textures (another material on the same shaders): only ones already resolved this frame.
         ImageBinding vsImg[32], psImg[32];
+        WLock wl(*this); // from here to the descriptors: the caches
         if (why < 0 && !(peekImages(a.vs, vsImages, vsImg) && peekImages(a.ps, psImages, psImg))) why = 2;
         if (why >= 0) {
             if (R().prof_.on) ++R().prof_.fastRes[why];
@@ -5619,6 +5730,7 @@ void main() {
         if (a.psm) rebind(a.ps, R().prevDraw_->ps, psMoved, kPsBindingBase);
         rebindImages(a.vs, R().prevDraw_->vs, vsImages, vsImg, 0, R().fast_);
         if (a.psm) rebindImages(a.ps, R().prevDraw_->ps, psImages, psImg, kPsBindingBase, R().fast_);
+        wl.unlock();
         auto data = [&](gcn::Program& p, gcn::Program& bound, uint32_t base, int alike, bool rebound) {
             const VkDeviceSize bytes = p.data.size() * 4;
             if (alike == 1 && !rebound) return; // the worker found it the same
@@ -5763,7 +5875,7 @@ void main() {
         R().passClosedBy_ = kPassOther;
     }
 
-    void setViewportScissor(const GpuRegs& r, uint32_t width, uint32_t height, bool jitter = false) {
+    void setViewportScissor(const DrawRegs& r, uint32_t width, uint32_t height, bool jitter = false) {
         const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
         float xs = v[0], xo = v[1], ys = v[2], yo = v[3], zs = v[4], zo = v[5];
         const uint32_t vte = r.ctx[reg::kPaClVteCntl];
@@ -6000,6 +6112,11 @@ private:
         } stats_;
         Profiler prof_;
         uint64_t countedPass_ = ~0ull, passDraws_ = 0; // LPN_PROFILE: the pass being counted, and its draws so far
+        VkDeviceSize ringSize_ = kRingSize;
+        // A recorder thread's (or the uploads ahead of them): Vulkan calls are made at once (not
+        // queued for the command thread), into a secondary command buffer; it never flushes.
+        bool immediate_ = false, worker_ = false;
+        bool locked_ = false; // holds m_ (see WLock)
     };
     Rec rec0_;
     static inline thread_local Rec* tRec_ = nullptr;
@@ -6011,6 +6128,417 @@ private:
         const Rec* r = tRec_;
         return r ? *r : rec0_;
     }
+
+    // ---- recorder threads (LPN_RECORD_THREADS) -------------------------------------------------
+
+    // At ~9,000 draws a frame (the city overlook) one recorder took ~15 ms a frame, most of it
+    // waiting on memory, and capped the frame rate at ~55 while the GPU needed ~11 ms. With
+    // LPN_RECORD_THREADS=N, runs of up to LPN_RECORD_SEGMENT draws (128) go to N threads, each
+    // recording its run into a secondary command buffer of its own from a fresh state (its own
+    // pass, bindings and fast-draw slots, starting behind a full barrier); the main recorder
+    // queues an execution of each in order in its batch, which the command thread makes once the
+    // run is recorded. Everything else (dispatches, DMA, memory writes, SMAA under DLSS, frame
+    // ends) waits for the runs recorded so far and is recorded in order as before.
+    // The caches are shared under m_: a thread holds it for a whole full draw and around a fast
+    // draw's lookups. Uploads and copies a thread records go into a command buffer of their own
+    // that runs before the next run is executed (none recorded earlier can miss them), and what
+    // a thread frees waits for every run recorded by then.
+    struct SegSlot {
+        VkCommandPool pool = VK_NULL_HANDLE;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkBuffer ring = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        void* ptr = nullptr;
+        VkDeviceSize size = 0;
+    };
+    struct SegItem {
+        DrawCall d;
+        DrawRegs r;
+        std::unique_ptr<DrawAnalysis> a;
+    };
+    struct Segment {
+        SegSlot* slot = nullptr;
+        std::vector<SegItem> items;
+        std::vector<std::unique_ptr<uint32_t[]>> ctxs; // copies of the context registers the items read
+        size_t ctxUsed = 0;
+        bool done = false; // recorded (segMutex_)
+    };
+    static constexpr VkDeviceSize kSegRing = 4ull << 20, kProRing = 48ull << 20;
+
+    std::unique_ptr<SegSlot> makeSlot(VkDeviceSize ringSize) {
+        auto sl = std::make_unique<SegSlot>();
+        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        pci.queueFamilyIndex = vk_.family;
+        if (vkCreateCommandPool(vk_.device, &pci, nullptr, &sl->pool) != VK_SUCCESS) return nullptr;
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = sl->pool;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+        cai.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(vk_.device, &cai, &sl->cmd) != VK_SUCCESS) return nullptr;
+        sl->ring = createHostBuffer(ringSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &sl->mem, &sl->ptr);
+        if (!sl->ring) return nullptr;
+        sl->size = ringSize;
+        return sl;
+    }
+    void beginSecondary(SegSlot& sl) {
+        VK_CHECK(vkResetCommandPool(vk_.device, sl.pool, 0));
+        VkCommandBufferInheritanceInfo ii{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        bi.pInheritanceInfo = &ii;
+        VK_CHECK(vkBeginCommandBuffer(sl.cmd, &bi));
+    }
+    // A Rec starting on a slot's command buffer: nothing bound, no pass, no fast states.
+    static void startRec(Rec& rc, SegSlot& sl) {
+        rc.cmd_ = sl.cmd;
+        rc.ring_ = sl.ring;
+        rc.ringPtr_ = sl.ptr;
+        rc.ringUsed_ = 0;
+        rc.ringSize_ = sl.size;
+        rc.recording_ = true;
+        rc.bound_ = Bound{};
+        rc.needBarrier_ = true;
+        rc.drawWritten_.clear();
+        rc.drawSampled_.clear();
+        rc.pass_.open = false;
+        ++rc.passSerial_; // fast states from an earlier segment never match
+        rc.fast_.valid = false;
+        for (FastSlot& f : rc.fastSlots_) f.f.valid = false;
+        rc.lastMergeable_ = false;
+        rc.keepDraw_ = false;
+        rc.prevSeq_ = rc.recordedSeq_ = 0;
+    }
+
+    void startRecorderThreads() {
+        const char* n = getenv("LPN_RECORD_THREADS");
+        const unsigned want = n ? unsigned(std::atoi(n)) : 0;
+        if (want < 1) return;
+        const char* why = syncRecord_ ? "LPN_SYNC_RECORD" : sync_ ? "LPN_GPU_SYNC" : traceFrame_ != ~0ull ? "LPN_GPU_TRACE" : snap_ ? "LPN_GPU_SNAP"
+                          : raceCheck_ ? "LPN_RACE_CHECK" : computeOnly_ ? "compute only" : !analysisWorkers_ ? "no analysis workers"
+                                                                                                           : nullptr;
+        if (why) {
+            std::fprintf(stderr, "[gpu] LPN_RECORD_THREADS ignored (%s)\n", why);
+            return;
+        }
+        if (const char* sz = getenv("LPN_RECORD_SEGMENT")) segDraws_ = std::max(8, std::atoi(sz));
+        recordThreads_ = std::min(want, 16u);
+        pro_.worker_ = pro_.immediate_ = true;
+        pro_.prof_.on = R().prof_.on;
+        for (unsigned i = 0; i < recordThreads_; ++i) {
+            workerRecs_.push_back(std::make_unique<Rec>());
+            Rec& rc = *workerRecs_.back();
+            rc.worker_ = rc.immediate_ = true;
+            rc.prof_.on = R().prof_.on;
+            std::thread([this, &rc] { recorderThread(rc); }).detach();
+        }
+        std::fprintf(stderr, "[gpu] %u recorder threads, runs of up to %u draws\n", recordThreads_, segDraws_);
+    }
+    void recorderThread(Rec& rc) {
+        profile::nameThread("lpn-record-w");
+        tRec_ = &rc;
+        for (;;) {
+            Segment* g;
+            {
+                std::unique_lock lock(segMutex_);
+                segCv_.wait(lock, [&] { return !segQueue_.empty(); });
+                g = segQueue_.front();
+                segQueue_.pop_front();
+            }
+            recordSegment(rc, *g);
+            {
+                std::lock_guard lock(segMutex_);
+                g->done = true;
+                --outstanding_;
+            }
+            segDoneCv_.notify_all();
+        }
+    }
+    void recordSegment(Rec& rc, Segment& g) {
+        SegSlot& sl = *g.slot;
+        startRec(rc, sl);
+        beginSecondary(sl);
+        {
+            ProfScope ps(rc.prof_, kProfRenderer);
+            for (SegItem& it : g.items) {
+                Recycle recycle{*this, it.a};
+                recordDraw(it.d, it.r, it.a);
+            }
+            endPass();
+        }
+        VK_CHECK(vkEndCommandBuffer(sl.cmd));
+        rc.recording_ = false;
+        ++rc.prof_.segments;
+        g.items.clear();
+        g.ctxUsed = 0;
+        if (!rc.returned_.empty()) spare(rc.returned_);
+        if (!rc.afterFlush_.empty() || !rc.pendingDone_.empty()) { // freed: once every segment recorded by now is done
+            std::lock_guard lock(lateMutex_);
+            for (auto& f : rc.afterFlush_) lateFree_.push_back(std::move(f));
+            for (auto& f : rc.pendingDone_) lateFree_.push_back(std::move(f));
+            rc.afterFlush_.clear();
+            rc.pendingDone_.clear();
+        }
+    }
+
+    bool segmentable(const DrawCall& d, const DrawAnalysis& a) const {
+        if (d.kind != DrawCall::kAuto && d.kind != DrawCall::kIndexed) return false;
+        if (computeOnly_ || frame_ == traceFrame_ || frame_ == timingFrame_) return false;
+        return !(dlssOn_ && a.psm && a.psm->smaa); // SMAA under DLSS changes what later draws do
+    }
+    void addToSegment(const DrawCall& d, const GpuRegs& r, std::unique_ptr<DrawAnalysis>& held) {
+        ProfScope ps(R().prof_, kProfRenderer);
+        if (!open_) {
+            std::lock_guard lock(segMutex_);
+            if (segFree_.empty()) {
+                segAll_.push_back(std::make_unique<Segment>());
+                segFree_.push_back(segAll_.back().get());
+            }
+            open_ = segFree_.back();
+            segFree_.pop_back();
+            openCtx_ = nullptr;
+        }
+        Segment& g = *open_;
+        if (!openCtx_ || r.ctxSerial != openCtxSerial_) { // a copy of the context registers, while they hold
+            if (g.ctxUsed == g.ctxs.size()) g.ctxs.push_back(std::make_unique<uint32_t[]>(::gpu::kContextRegs));
+            uint32_t* c = g.ctxs[g.ctxUsed++].get();
+            std::memcpy(c, r.ctx, sizeof r.ctx);
+            openCtx_ = c;
+            openCtxSerial_ = r.ctxSerial;
+        }
+        g.items.push_back({d, DrawRegs::of(r, openCtx_), std::move(held)});
+        ++drawIndex_;
+        if (g.items.size() >= segDraws_) dispatchSegment();
+    }
+    SegSlot* acquireSlot() {
+        std::unique_lock lock(segMutex_);
+        if (slotFree_.empty() && slotsAll_.size() < 256) {
+            lock.unlock();
+            auto sl = makeSlot(kSegRing);
+            lock.lock();
+            if (sl) {
+                slotsAll_.push_back(std::move(sl));
+                slotFree_.push_back(slotsAll_.back().get());
+            }
+        }
+        if (slotFree_.empty()) {
+            ProfScope pw(R().prof_, kProfGpuWait);
+            segFreeCv_.wait(lock, [&] { return !slotFree_.empty(); });
+        }
+        SegSlot* sl = slotFree_.back();
+        slotFree_.pop_back();
+        return sl;
+    }
+    // The open segment to a recorder thread, its execution queued in the batch in order.
+    void dispatchSegment() {
+        Segment* g = open_;
+        open_ = nullptr;
+        openCtx_ = nullptr;
+        if (!g) return;
+        if (g->items.empty()) {
+            std::lock_guard lock(segMutex_);
+            segFree_.push_back(g);
+            return;
+        }
+        g->slot = acquireSlot();
+        const size_t n = g->items.size();
+        {
+            // At most a few batches ahead of the threads: the main recorder waits for a batch two
+            // flushes back while holding m_ (begin), and that batch's segments must be recorded.
+            const unsigned ahead = std::max(2u, flushDraws_ ? (kBatches - 2) * flushDraws_ / segDraws_ : 16u);
+            std::unique_lock lock(segMutex_);
+            if (outstanding_ >= ahead || paused_) {
+                const auto t0 = std::chrono::steady_clock::now();
+                segDoneCv_.wait(lock, [&] { return outstanding_ < ahead && !paused_; });
+                R().prof_.aheadNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+            }
+            g->done = false;
+            ++outstanding_;
+            segQueue_.push_back(g);
+        }
+        segCv_.notify_one();
+        std::lock_guard lock(m_);
+        begin();
+        endPass(); // secondaries run outside a render pass
+        rec([this, c = R().cmd_, batch = R().cur_, g] { executeSegment(c, batch, *g); });
+        R().afterFlush_.push_back([this, sl = g->slot] {
+            {
+                std::lock_guard lock(segMutex_);
+                slotFree_.push_back(sl);
+            }
+            segFreeCv_.notify_one();
+        });
+        handOff();
+        R().drawsSinceFlush_ += uint32_t(n);
+        if (flushDraws_ && R().drawsSinceFlush_ >= flushDraws_) flush();
+    }
+    // On the command thread: once the segment is recorded, the uploads queued so far, then it.
+    void executeSegment(VkCommandBuffer c, uint32_t batch, Segment& g) {
+        {
+            std::unique_lock lock(segMutex_);
+            segDoneCv_.wait(lock, [&] { return g.done; });
+        }
+        executePrologues(c, batch);
+        vkCmdExecuteCommands(c, 1, &g.slot->cmd);
+        std::lock_guard lock(segMutex_);
+        g.slot = nullptr;
+        segFree_.push_back(&g);
+    }
+    // Waits until every segment so far is recorded: what comes next is recorded in order here.
+    void drainSegments() {
+        dispatchSegment();
+        std::unique_lock lock(segMutex_);
+        if (!outstanding_) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        segDoneCv_.wait(lock, [&] { return outstanding_ == 0; });
+        R().prof_.drainNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        ++R().prof_.drains;
+    }
+    // Recorder threads' counters into the main ones (all threads idle: after drainSegments).
+    void mergeRecorderProfiles() {
+        auto take = [&](Rec& w) {
+            Profiler& to = R().prof_;
+            Profiler& p = w.prof_;
+            to.workerNs += p.ns[kProfRenderer];
+            p.ns[kProfRenderer] = 0;
+            addProfile(to, p);
+            R().stats_.draws += std::exchange(w.stats_.draws, 0);
+            R().stats_.dispatches += std::exchange(w.stats_.dispatches, 0);
+        };
+        for (auto& w : workerRecs_) take(*w);
+        std::lock_guard lock(proMutex_);
+        take(pro_);
+    }
+    static void addProfile(Profiler& a, Profiler& b) {
+        auto add = [](auto& x, auto& y) {
+            for (size_t i = 0; i < std::size(x); ++i) x[i] += std::exchange(y[i], 0);
+        };
+        add(a.ns, b.ns), add(a.passWhy, b.passWhy), add(a.feedbackOn, b.feedbackOn), add(a.missWhy, b.missWhy);
+        add(a.missUser, b.missUser), add(a.fastMiss, b.fastMiss), add(a.fastKind, b.fastKind), add(a.fastRes, b.fastRes);
+        add(a.switchMiss, b.switchMiss), add(a.passBySize, b.passBySize), add(a.drawsBySize, b.drawsBySize);
+        for (uint64_t Profiler::*f : {&Profiler::fastMoved, &Profiler::fastImages, &Profiler::diffsTaken, &Profiler::fastSwitches,
+                                      &Profiler::mergeable, &Profiler::mergeRuns, &Profiler::depthJoins, &Profiler::depthOnly,
+                                      &Profiler::barriers, &Profiler::calls, &Profiler::fastDraws, &Profiler::analysisHits,
+                                      &Profiler::repeats, &Profiler::analyses, &Profiler::passes, &Profiler::texChecks,
+                                      &Profiler::texUploads, &Profiler::texBytes, &Profiler::flushes, &Profiler::dmas,
+                                      &Profiler::dmaBytes, &Profiler::pipelinesMade, &Profiler::pipelineWaits, &Profiler::vramCopies,
+                                      &Profiler::vramCopyBytes, &Profiler::imageMisses, &Profiler::imageGens, &Profiler::resolvedAhead,
+                                      &Profiler::vramAllocs, &Profiler::vramEvicts, &Profiler::vramFreed, &Profiler::vramEvictsEmpty,
+                                      &Profiler::segments, &Profiler::drains, &Profiler::drainNs, &Profiler::workerNs, &Profiler::aheadNs})
+            a.*f += std::exchange(b.*f, 0);
+        a.largestPass = std::max(a.largestPass, std::exchange(b.largestPass, 0));
+        for (auto& [k, v] : b.fastCtx) a.fastCtx[k] += v;
+        b.fastCtx.clear();
+    }
+
+    // Uploads and copies a recorder thread makes (texture uploads, VRAM copies, new images' first
+    // layout and clear) go into the next secondary of pro_, executed before the next segment.
+    void openPrologue() { // proMutex_ held
+        SegSlot* sl = nullptr;
+        if (!proFree_.empty()) {
+            sl = proFree_.back();
+            proFree_.pop_back();
+        } else {
+            auto made = makeSlot(kProRing);
+            if (!made) {
+                warnOnce("cannot create an upload command buffer for the recorder threads");
+                return;
+            }
+            sl = made.get();
+            proAll_.push_back(std::move(made));
+        }
+        proSlot_ = sl;
+        startRec(pro_, *sl);
+        beginSecondary(*sl);
+    }
+    void closePrologue() { // proMutex_ held
+        if (!pro_.recording_) return;
+        VK_CHECK(vkEndCommandBuffer(proSlot_->cmd));
+        pro_.recording_ = false;
+        proPending_.push_back(proSlot_);
+        proSlot_ = nullptr;
+    }
+    void executePrologues(VkCommandBuffer c, uint32_t batch) {
+        std::vector<SegSlot*> run;
+        {
+            std::lock_guard lock(proMutex_);
+            closePrologue();
+            run.swap(proPending_);
+        }
+        if (run.empty()) return;
+        for (SegSlot* sl : run) vkCmdExecuteCommands(c, 1, &sl->cmd);
+        std::lock_guard lock(doneMutex_);
+        batches_[batch].done.push_back([this, run] {
+            std::lock_guard lock(proMutex_);
+            for (SegSlot* sl : run) proFree_.push_back(sl);
+        });
+    }
+    // Around code that records an upload or copy: on a recorder thread, into pro_.
+    class Prologue {
+    public:
+        explicit Prologue(Renderer& r) : r_(r) {
+            Rec* t = tRec_;
+            if (!t || !t->worker_ || t == &r.pro_) return;
+            lock_ = std::unique_lock(r.proMutex_);
+            saved_ = t;
+            tRec_ = &r.pro_;
+            r.begin();
+        }
+        ~Prologue() {
+            if (saved_) tRec_ = saved_;
+        }
+
+    private:
+        Renderer& r_;
+        std::unique_lock<std::mutex> lock_;
+        Rec* saved_ = nullptr;
+    };
+    // On a recorder thread: holds m_ (the caches), unless already held.
+    class WLock {
+    public:
+        explicit WLock(Renderer& r) {
+            Rec& x = r.R();
+            if (!x.worker_ || x.locked_) return;
+            m_ = &r.m_;
+            m_->lock();
+            x.locked_ = true;
+            rec_ = &x;
+        }
+        void unlock() {
+            if (!rec_) return;
+            rec_->locked_ = false;
+            m_->unlock();
+            rec_ = nullptr;
+        }
+        ~WLock() { unlock(); }
+
+    private:
+        std::mutex* m_ = nullptr;
+        Rec* rec_ = nullptr;
+    };
+
+    unsigned recordThreads_ = 0; // LPN_RECORD_THREADS
+    uint32_t segDraws_ = 128;
+    std::vector<std::unique_ptr<Rec>> workerRecs_;
+    std::mutex segMutex_; // the queue, free lists, outstanding_ and Segment::done
+    std::condition_variable segCv_, segDoneCv_, segFreeCv_;
+    std::deque<Segment*> segQueue_;
+    std::vector<std::unique_ptr<Segment>> segAll_;
+    std::vector<Segment*> segFree_;
+    std::vector<std::unique_ptr<SegSlot>> slotsAll_;
+    std::vector<SegSlot*> slotFree_;
+    unsigned outstanding_ = 0; // dispatched, not yet recorded
+    unsigned paused_ = 0;      // threads waiting on the GPU with m_ held (see pauseSegments)
+    Segment* open_ = nullptr;  // being filled (the main recorder's)
+    const uint32_t* openCtx_ = nullptr;
+    uint64_t openCtxSerial_ = 0;
+    Rec pro_;             // uploads ahead of the segments
+    std::mutex proMutex_; // pro_, proSlot_, proFree_, proPending_ (after m_)
+    SegSlot* proSlot_ = nullptr;
+    std::vector<SegSlot*> proFree_, proPending_;
+    std::vector<std::unique_ptr<SegSlot>> proAll_;
+    std::mutex lateMutex_;
+    std::vector<std::function<void()>> lateFree_; // freed by recorder threads: after the next flush
 };
 
 Renderer* gRenderer = nullptr;
