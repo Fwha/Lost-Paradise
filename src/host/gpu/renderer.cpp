@@ -553,6 +553,9 @@ struct Profiler {
     uint64_t barriers = 0, calls = 0, fastDraws = 0, analysisHits = 0, repeats = 0, analyses = 0, passes = 0, texChecks = 0, texUploads = 0, texBytes = 0, flushes = 0, dmas = 0, dmaBytes = 0, pipelinesMade = 0, pipelineWaits = 0, vramCopies = 0, vramCopyBytes = 0, imageMisses = 0, imageGens = 0, resolvedAhead = 0;
     // VRAM copies: allocations, evictions run, copies they freed, and evictions that found nothing to free.
     uint64_t vramAllocs = 0, vramEvicts = 0, vramFreed = 0, vramEvictsEmpty = 0;
+    // Render passes by how many draws they hold (1-15, 16-127, 128-1023, 1024+): passes, and the
+    // draws in them; and the largest pass's draws. Sizes how far recording can split by pass.
+    uint64_t passBySize[4] = {}, drawsBySize[4] = {}, largestPass = 0;
     std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
 };
 
@@ -981,11 +984,18 @@ public:
                          d.kind == DrawCall::kDispatch ? "dispatch" : "draw", shaderAddress(r, reg::kPgmLoVs),
                          shaderAddress(r, reg::kPgmLoPs), shaderAddress(r, reg::kPgmLoCs));
         if (raceCheck_) raceShader_ = shaderAddress(r, d.kind == DrawCall::kDispatch ? reg::kPgmLoCs : reg::kPgmLoPs);
-        const uint64_t passesBefore = prof_.passes;
+        const uint64_t passesBefore = prof_.passes, drawsBefore = stats_.draws;
         if (d.kind == DrawCall::kDispatch) dispatch(d, r, a);
         else if (computeOnly_) return;
         else if (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed) draw(d, r, a);
         else warnOnce("indirect draws and dispatches are not rendered yet");
+        if (prof_.on && stats_.draws != drawsBefore) {
+            if (countedPass_ != passSerial_) {
+                notePassSize();
+                countedPass_ = passSerial_;
+            }
+            ++passDraws_;
+        }
         // prevDraw_ holds this draw's resources if it was recorded (fast, or in full and kept).
         prevSeq_ = keepDraw_ || recordedSeq_ == a.seq ? a.seq : 0;
         if (keepDraw_) { // the next draw may repeat this one (see fastDraw)
@@ -1080,8 +1090,21 @@ public:
         flush();
     }
 
+    uint64_t countedPass_ = ~0ull, passDraws_ = 0; // LPN_PROFILE: the pass being counted, and its draws so far
+    void notePassSize() {
+        if (!passDraws_) return;
+        const int b = passDraws_ < 16 ? 0 : passDraws_ < 128 ? 1 : passDraws_ < 1024 ? 2 : 3;
+        ++prof_.passBySize[b];
+        prof_.drawsBySize[b] += passDraws_;
+        prof_.largestPass = std::max(prof_.largestPass, passDraws_);
+        passDraws_ = 0;
+    }
     void onFrameEnd() override {
         std::lock_guard lock(m_);
+        if (prof_.on) {
+            notePassSize();
+            countedPass_ = ~0ull;
+        }
         {
             ProfScope ps(prof_, kProfRenderer);
             flush();
@@ -1266,6 +1289,10 @@ public:
                 std::fprintf(stderr, " 0x%x %.0f", 0xA000 + regs[i].second, regs[i].first / n);
         }
         std::fprintf(stderr, " per frame\n");
+        std::fprintf(stderr, "[prof] t=%.1f passes by draws: 1-15 %.0f (%.0f draws), 16-127 %.0f (%.0f), 128-1023 %.0f (%.0f), 1024+ %.0f (%.0f) per frame; largest %" PRIu64 " draws\n",
+                     profile::seconds(), prof_.passBySize[0] / n, prof_.drawsBySize[0] / n, prof_.passBySize[1] / n,
+                     prof_.drawsBySize[1] / n, prof_.passBySize[2] / n, prof_.drawsBySize[2] / n, prof_.passBySize[3] / n,
+                     prof_.drawsBySize[3] / n, prof_.largestPass);
         std::fprintf(stderr, "[prof] t=%.1f VRAM copies %zu: %.1f allocations, %.2f evictions (%.1f freed, %.2f found none) per frame\n",
                      profile::seconds(), vram_.size(), prof_.vramAllocs / n, prof_.vramEvicts / n, prof_.vramFreed / n,
                      prof_.vramEvictsEmpty / n);
