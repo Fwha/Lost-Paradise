@@ -3311,7 +3311,7 @@ private:
         // minified textures (hair, skin detail, fences) shimmered and broke into pixels.
         // LPN_NO_MIPS=1: level 0 only, as before.
         uint32_t levels = 1;
-        if (!noMips_ && t.type() != 10) {
+        if (!noMips_ && slices == 1) { // cube maps and arrays: level 0 only (their mip layout is not verified)
             uint32_t full = 1;
             while ((std::max(w, h) >> full) != 0) ++full;
             levels = std::clamp(t.lastLevel() + 1, 1u, std::min(full, kMaxMips));
