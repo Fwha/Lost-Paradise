@@ -85,6 +85,7 @@ struct ImageResource {
     uint32_t tileMode() const { return (t[3] >> 20) & 0x1F; }
     uint32_t baseLevel() const { return (t[3] >> 12) & 0xF; }
     uint32_t lastLevel() const { return (t[3] >> 16) & 0xF; }
+    bool pow2Pad() const { return (t[3] >> 25) & 1; }
     uint32_t depth() const { return (t[4] & 0x1FFF) + 1; }
     uint32_t pitch() const { return ((t[4] >> 13) & 0x3FFF) + 1; }
     uint32_t baseArray() const { return t[5] & 0x1FFF; }

@@ -455,7 +455,7 @@ struct Image {
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0, layers = 1, levels = 1;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    std::map<std::array<uint32_t, 7>, VkImageView> views;
+    std::map<std::array<uint32_t, 8>, VkImageView> views;
 };
 
 // A render target or depth buffer at a guest address.
@@ -2028,14 +2028,14 @@ private:
     // ---- images --------------------------------------------------------------------------------
 
     bool createImage(Image& img, VkFormat format, uint32_t w, uint32_t h, VkImageUsageFlags usage, bool depth,
-                     VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D, uint32_t layers = 1) {
+                     VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D, uint32_t layers = 1, uint32_t levels = 1) {
         VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ici.flags = depth ? 0 : VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
         if (viewType == VK_IMAGE_VIEW_TYPE_CUBE) ici.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
         ici.imageType = viewType == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
         ici.format = format;
         ici.extent = {w, h, viewType == VK_IMAGE_VIEW_TYPE_3D ? layers : 1};
-        ici.mipLevels = 1;
+        ici.mipLevels = levels;
         ici.arrayLayers = viewType == VK_IMAGE_VIEW_TYPE_3D ? 1 : layers;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -2056,6 +2056,7 @@ private:
         img.width = w;
         img.height = h;
         img.layers = layers;
+        img.levels = levels;
         img.aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
         if (format == VK_FORMAT_D32_SFLOAT_S8_UINT) img.aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
 
@@ -2069,13 +2070,13 @@ private:
         ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         ib.image = img.image;
-        ib.subresourceRange = {img.aspect, 0, 1, 0, ici.arrayLayers};
+        ib.subresourceRange = {img.aspect, 0, levels, 0, ici.arrayLayers};
         rec([c = R().cmd_, ib] {
             vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
                                  &ib);
         });
         // Clear so never-written surfaces read as black rather than garbage.
-        const VkImageSubresourceRange range{img.aspect, 0, 1, 0, ici.arrayLayers};
+        const VkImageSubresourceRange range{img.aspect, 0, levels, 0, ici.arrayLayers};
         if (depth) {
             if (usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
                 rec([c = R().cmd_, im = img.image, range] {
@@ -2103,12 +2104,15 @@ private:
         img = Image{};
     }
 
+    // A view of mip levels [baseLevel, baseLevel + levelCount) (all of the image's by default).
     VkImageView view(Image& img, VkFormat format, VkImageViewType type, VkComponentMapping swz,
-                     VkImageAspectFlags aspect = 0) {
+                     VkImageAspectFlags aspect = 0, uint32_t baseLevel = 0, uint32_t levelCount = 0) {
         if (!aspect) aspect = img.aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT;
         if (!aspect) aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-        const std::array<uint32_t, 7> k{uint32_t(format), uint32_t(type), uint32_t(swz.r), uint32_t(swz.g),
-                                        uint32_t(swz.b), uint32_t(swz.a), aspect};
+        baseLevel = std::min(baseLevel, img.levels - 1);
+        levelCount = levelCount ? std::min(levelCount, img.levels - baseLevel) : img.levels - baseLevel;
+        const std::array<uint32_t, 8> k{uint32_t(format), uint32_t(type), uint32_t(swz.r), uint32_t(swz.g),
+                                        uint32_t(swz.b), uint32_t(swz.a), aspect, baseLevel << 8 | levelCount};
         auto it = img.views.find(k);
         if (it != img.views.end()) return it->second;
         if (sharedMiss()) return VK_NULL_HANDLE;
@@ -2117,7 +2121,7 @@ private:
         vci.viewType = type;
         vci.format = format;
         vci.components = swz;
-        vci.subresourceRange = {aspect, 0, 1, 0,
+        vci.subresourceRange = {aspect, baseLevel, levelCount, 0,
                                 type == VK_IMAGE_VIEW_TYPE_3D ? 1 : (type == VK_IMAGE_VIEW_TYPE_2D || type == VK_IMAGE_VIEW_TYPE_1D) ? 1 : img.layers};
         VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
         VkImageView v = VK_NULL_HANDLE;
@@ -3151,11 +3155,33 @@ private:
         ci.addressModeU = wrap(s[0] & 7);
         ci.addressModeV = wrap((s[0] >> 3) & 7);
         ci.addressModeW = wrap((s[0] >> 6) & 7);
-        ci.magFilter = ((s[2] >> 20) & 3) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-        ci.minFilter = ((s[2] >> 22) & 3) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-        ci.mipmapMode = ((s[2] >> 26) & 3) == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        // XY filters: 0 point, 1 bilinear, 2 anisotropic point, 3 anisotropic bilinear.
+        const uint32_t mag = (s[2] >> 20) & 3, min = (s[2] >> 22) & 3, mip = (s[2] >> 26) & 3;
+        ci.magFilter = (mag & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        ci.minFilter = (min & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        ci.mipmapMode = mip == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
         ci.minLod = float(s[1] & 0xFFF) / 256.0f;
         ci.maxLod = float((s[1] >> 12) & 0xFFF) / 256.0f;
+        if (mip == 0) ci.maxLod = std::min(ci.maxLod, 0.25f); // no mip filter: the base level only
+        ci.minLod = std::min(ci.minLod, ci.maxLod);
+        // LOD_BIAS: signed, 8 fraction bits.
+        const int32_t bias = int32_t(s[2] << 18) >> 18;
+        ci.mipLodBias = std::clamp(float(bias) / 256.0f, -vk_.props.limits.maxSamplerLodBias,
+                                   vk_.props.limits.maxSamplerLodBias);
+        // MAX_ANISO_RATIO 0-4: 1x to 16x, used when a filter is anisotropic. LPN_ANISO=N forces Nx
+        // on every filtered sampler (1 turns it off).
+        static const int forced = getenv("LPN_ANISO") ? std::atoi(getenv("LPN_ANISO")) : 0;
+        float aniso = (mag >= 2 || min >= 2) ? float(1u << std::min((s[0] >> 9) & 7, 4u)) : 1.0f;
+        if (forced > 0 && (min & 1) && !compare) aniso = float(forced);
+        static const bool canAniso = [this] { // the device enables it whenever it has it (vk.cpp)
+            VkPhysicalDeviceFeatures f{};
+            vkGetPhysicalDeviceFeatures(vk_.phys, &f);
+            return f.samplerAnisotropy == VK_TRUE;
+        }();
+        if (aniso > 1.0f && canAniso) {
+            ci.anisotropyEnable = VK_TRUE;
+            ci.maxAnisotropy = std::min(aniso, vk_.props.limits.maxSamplerAnisotropy);
+        }
         ci.compareEnable = compare;
         ci.compareOp = VkCompareOp((s[0] >> 12) & 7);
         ci.borderColor = compare ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
@@ -3277,14 +3303,32 @@ private:
             if (sampleHash(t.base(), span) == tex.sample) return &tex;
         }
         uint32_t mode = t.tileMode();
-        size_t slice = tiledSliceSize(mode, ep, eh, bpe);
-        if (!slice) {
+        if (!tiledSliceSize(mode, ep, eh, bpe)) {
             warnOnce("texture tile mode " + std::to_string(mode) + " is read as linear");
             mode = 8;
-            slice = tiledSliceSize(mode, ep, eh, bpe);
         }
-        const size_t tiled = slice * slices;
-        const VkDeviceSize bytes = VkDeviceSize(ew) * eh * bpe * slices;
+        // The T#'s mip chain (levels 0 to LAST_LEVEL), uploaded whole: sampled with only level 0,
+        // minified textures (hair, skin detail, fences) shimmered and broke into pixels.
+        // LPN_NO_MIPS=1: level 0 only, as before.
+        uint32_t levels = 1;
+        if (!noMips_ && t.type() != 10) {
+            uint32_t full = 1;
+            while ((std::max(w, h) >> full) != 0) ++full;
+            levels = std::clamp(t.lastLevel() + 1, 1u, std::min(full, kMaxMips));
+        }
+        MipLevel mips[kMaxMips];
+        size_t tiled = mipLayout(mode, w, h, pitchPx, bc, bpe, slices, levels, t.pow2Pad(), mips);
+        if (levels == 1) { // as before: level 0 exactly as the T# describes it
+            mips[0] = {0, tiledSliceSize(mode, ep, eh, bpe), ep, ew, eh};
+            tiled = mips[0].sliceBytes * slices;
+        }
+        // Linear copies of the levels, each at a 16-byte boundary.
+        size_t linearAt[kMaxMips];
+        VkDeviceSize bytes = 0;
+        for (uint32_t m = 0; m < levels; ++m) {
+            linearAt[m] = bytes;
+            bytes += (VkDeviceSize(mips[m].width) * mips[m].height * bpe * slices + 15) & ~VkDeviceSize(15);
+        }
         if (!bytes || bytes > kRingSize / 2 || tiled > (256u << 20)) return nullptr;
         // The full check of a texture already uploaded runs on a hasher thread, its result taken
         // at the next use (~2.7 ms a frame off the recorder in crowds). The fingerprint is still
@@ -3341,23 +3385,34 @@ private:
         }
         const VkDeviceSize at = ringAlloc(bytes, 16);
         uint8_t* dst = static_cast<uint8_t*>(R().ringPtr_) + at;
-        for (uint32_t s = 0; s < slices; ++s)
-            detile(mode, scratch_.data() + s * slice, dst + size_t(s) * ew * eh * bpe, ew, eh, ep, bpe);
+        for (uint32_t m = 0; m < levels; ++m) {
+            const MipLevel& l = mips[m];
+            const size_t linSlice = size_t(l.width) * l.height * bpe;
+            for (uint32_t s = 0; s < slices; ++s)
+                detile(mode, scratch_.data() + l.offset + s * l.sliceBytes, dst + linearAt[m] + s * linSlice, l.width,
+                       l.height, l.pitch, bpe);
+        }
         if (!tex.img.image) {
             tex.phase = textureCount_++ % 8;
             const VkImageViewType vt = viewType(t.type());
             if (!createImage(tex.img, format, w, h, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, false,
-                             vt, slices))
+                             vt, slices, levels))
                 return nullptr;
         }
         tex.hash = h64;
         fullBarrier();
-        VkBufferImageCopy c{};
-        c.bufferOffset = at;
-        c.bufferRowLength = bc ? ew * 4 : ew;
-        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, t.type() == 10 ? 1 : layers};
-        c.imageExtent = {w, h, t.type() == 10 ? t.depth() : 1};
-        rec([cb = R().cmd_, buf = R().ring_, im = tex.img.image, c] { vkCmdCopyBufferToImage(cb, buf, im, VK_IMAGE_LAYOUT_GENERAL, 1, &c); });
+        std::array<VkBufferImageCopy, kMaxMips> cs{};
+        for (uint32_t m = 0; m < levels; ++m) {
+            VkBufferImageCopy& c = cs[m];
+            c.bufferOffset = at + linearAt[m];
+            c.bufferRowLength = bc ? mips[m].width * 4 : mips[m].width;
+            c.bufferImageHeight = bc ? mips[m].height * 4 : mips[m].height;
+            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, t.type() == 10 ? 1 : layers};
+            c.imageExtent = {std::max(w >> m, 1u), std::max(h >> m, 1u), t.type() == 10 ? t.depth() : 1};
+        }
+        rec([cb = R().cmd_, buf = R().ring_, im = tex.img.image, cs, levels] {
+            vkCmdCopyBufferToImage(cb, buf, im, VK_IMAGE_LAYOUT_GENERAL, levels, cs.data());
+        });
         return &tex;
     }
 
@@ -3552,7 +3607,7 @@ private:
         if (format == VK_FORMAT_UNDEFINED) {
             warnOnce("texture format " + std::to_string(t.dataFormat()) + "/" + std::to_string(nf) + " unsupported");
         } else if (GuestTexture* g = guestTexture(t, format)) {
-            b.view = view(g->img, format, vt, swz);
+            b.view = view(g->img, format, vt, swz, 0, t.baseLevel(), t.lastLevel() + 1 - std::min(t.baseLevel(), t.lastLevel()));
         }
         if (!b.view) b.view = dummyView(vt, kind, false);
         return b;
@@ -6112,6 +6167,8 @@ void main() {
     std::unordered_map<uint64_t, Surface> colors_, depths_;
     std::unordered_map<uint64_t, Metadata> metadata_; // by HTILE/CMASK address
     std::unordered_map<std::array<uint32_t, 6>, GuestTexture, WordsHash> textures_;
+    static constexpr uint32_t kMaxMips = 15;
+    const bool noMips_ = getenv("LPN_NO_MIPS") != nullptr;
     std::map<std::array<uint32_t, 5>, VkSampler> samplers_;
     std::unordered_map<std::string, std::unique_ptr<ShaderModule>> shaders_;
     std::unordered_map<uint64_t, VkShaderModule> expanders_;
