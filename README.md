@@ -9,6 +9,23 @@ shaders to Vulkan.
 The game boots, reaches the menus and plays. See [docs/STATUS.md](docs/STATUS.md) for progress
 and known issues.
 
+## Features
+
+- **Display modes:** windowed, borderless fullscreen or fullscreen.
+- **Resolutions:** 720p, 896p (PS4), 1080p (PS4 Pro) and native 1440p output.
+- **Frame rate:** cap at 30, 60 or 90 fps, or uncapped, with the game still running at normal
+  speed. The title screen, menus and real-time cutscenes go uncapped too. Optional FPS counter.
+- **DLAA:** NVIDIA DLSS anti-aliasing in place of the game's SMAA (RTX cards, see Build).
+- **PC Settings:** these options from the F11 menu, or from a PC SETTINGS entry in the title
+  and pause menus.
+- **Sharper image:** full texture mipmaps, anisotropic filtering and smooth scaling to the window.
+- **Performance:** draws recorded on several threads, shader analysis ahead of the frame, and a
+  pipeline cache that removes stutter on later runs.
+- **Faster save loading:** loading screens run as fast as they draw.
+- **Save/load menu:** pick a slot to save, load, overwrite or delete, with icon, chapter, date,
+  play time and controller button hints.
+- **Sound and controllers** through SDL.
+
 ## Build
 
 Needs CMake, Ninja, a C++20 compiler, and the Vulkan, glslang, zlib and SDL2 development packages
