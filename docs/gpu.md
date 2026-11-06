@@ -53,7 +53,10 @@ screen loop). Addresses are guest addresses and change between runs.
 - **Surfaces.** Render targets and depth buffers are Vulkan images keyed by guest address; a
   texture at the same address samples that image (scaled when the T# is smaller than the
   padded target, e.g. 1600x896 inside 1664x896). Other textures are uploaded from guest
-  memory, detiled if needed, and re-uploaded when their bytes change. Each texture is hashed
+  memory with their whole mip chain (levels 0 to the T#'s LAST_LEVEL, laid out as GCN does for
+  linear-aligned and 1D-thin modes), detiled if needed, and re-uploaded when their bytes change.
+  Samplers take the S#'s LOD bias and anisotropy. `LPN_NO_MIPS=1` uploads level 0 only;
+  `LPN_ANISO=N` forces Nx anisotropic filtering on filtered samplers. Each texture is hashed
   once per frame, in 128 KiB chunks on worker threads (~90 MB per gameplay frame).
 - **Draws.** RECTLIST and QUADLIST go through a generated geometry shader; GNM's
   decompress/eliminate passes are skipped; screen-space draws (viewport transform off) are
