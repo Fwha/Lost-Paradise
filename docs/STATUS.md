@@ -126,6 +126,8 @@ Last updated 2026-10-16.
   thread's CPU use (`[cpu]`, host threads are named `lpn-*`), plus each frame over 50 ms
   (`[prof] slow frame`); F10 writes `[mark] N at t=...` to tag a spot where the fps drops,
   `LPN_GPU_SYNC=1` waits for the GPU after every submission (to rule out async issues),
+  `LPN_FULL_TEX_CHECKS=1` fully hashes every texture at its first use in each frame (slow; rules
+  stale textures in or out),
   `LPN_GPU_TRACE=<frame>` logs every draw of that frame and dumps its render targets,
   adding `LPN_GPU_SNAP=1` saves the target after each draw (or `LPN_GPU_SNAP=2750-2760,2886` for
   just those draws); 32-bit float targets also get their min/max/mean logged.

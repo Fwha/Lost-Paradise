@@ -468,7 +468,10 @@ struct Surface {
     uint64_t writtenFrame = 0; // last frame the GPU rendered into it
     uint64_t memSample = 0;    // sampleHash of its memory, while the GPU leaves it alone
     bool cpuOwned = false;     // its memory changed meanwhile: the CPU's contents win
+    bool writtenBack = false;  // the GPU copies it to memory (writeBack): sampled lazily instead
     uint64_t checkedFrame = ~0ull;
+    uint64_t addr = 0, memBytes = 0; // the memory memSample covers
+    uint64_t loggedFrame = ~0ull;    // writtenFrame of the last "[gpu] stale target" line
 };
 
 // A texture's full hash, computed off the recorder (see Renderer::guestTexture).
@@ -2158,6 +2161,8 @@ private:
             return nullptr;
         }
         std::fprintf(stderr, "[gpu] render target 0x%" PRIx64 " %ux%u format %d\n", addr, w, h, int(format));
+        s.addr = addr;
+        s.memBytes = uint64_t(w) * h * bytes;
         return &(colors_[addr] = std::move(s));
     }
 
@@ -3295,7 +3300,15 @@ private:
             tex.check->state.store(0, std::memory_order_relaxed);
             asyncChanged = tex.check->result != tex.hash;
         }
-        if (!asyncChanged && tex.img.image && frame_ - tex.changedFrame >= 60 && (++tex.uses + tex.phase) % 8 != 0) {
+        // The cheap checks below only follow a texture while it is in use. One left unused for a
+        // few frames is fully hashed in line at its next use: the game loads each special move's
+        // banner into the same memory, and an entry last used for an earlier move's banner (never
+        // checked while idle, so "unchanged for 10 s") was bound unchecked or passed the
+        // fingerprint, which mostly samples transparent texels. It flashed the earlier banner.
+        // Settled textures are left to the sweep, which checks them every frame, used or not.
+        const bool idle = tex.img.image && !tex.settled && frame_ - tex.checkedFrame > 2;
+        if (!asyncChanged && !idle && !fullTexChecks_ && tex.img.image && frame_ - tex.changedFrame >= 60 &&
+            (++tex.uses + tex.phase) % 8 != 0) {
             tex.checkedFrame = frame_;
             // Unchanged for 10 s: fingerprinted on every other use only. A syscall each, they
             // took ~16% of the recorder looking up the steps after New Game (hundreds of textures).
@@ -3334,7 +3347,7 @@ private:
         // at the next use (~2.7 ms a frame off the recorder in crowds). The fingerprint is still
         // taken now, so a texture rewritten as a whole (a video frame) is uploaded at once; a
         // partial rewrite shows one use later than before. LPN_SYNC_TEX_CHECKS=1: all in line.
-        if (tex.img.image && asyncTexChecks_ && !asyncChanged) {
+        if (tex.img.image && asyncTexChecks_ && !asyncChanged && !idle && !fullTexChecks_) {
             tex.checkedFrame = frame_;
             if (sampleHash(t.base(), span) == tex.sample) {
                 if (!tex.check) tex.check = std::make_shared<AsyncHash>();
@@ -3461,6 +3474,9 @@ private:
         size_t size = 0;
     };
     const bool asyncTexChecks_ = getenv("LPN_SYNC_TEX_CHECKS") == nullptr;
+    // LPN_FULL_TEX_CHECKS=1: every texture is fully hashed at its first use in each frame (slow;
+    // rules stale textures in or out).
+    const bool fullTexChecks_ = getenv("LPN_FULL_TEX_CHECKS") != nullptr;
     std::mutex texHashMutex_;
     std::condition_variable texHashCv_;
     std::deque<TexHashJob> texHashJobs_;
@@ -3472,10 +3488,15 @@ private:
     };
 
     void gpuWrote(Surface& s) {
-        if (s.writtenFrame == frame_ && !s.memSample && !s.cpuOwned) return;
+        // The memory is sampled when the GPU renders into it, not when the target is next sampled
+        // as a texture: by then the game may have loaded a texture there (a special move's banner,
+        // in memory a render target had used), which became the baseline, so the old render
+        // target was bound in its place. Once a frame per target.
+        const bool again = s.writtenFrame == frame_;
+        if (again && !s.cpuOwned && !(s.writtenBack && s.memSample)) return;
         if (sharedMiss()) return;
+        if (!again || s.writtenBack) s.memSample = s.writtenBack || !s.memBytes ? 0 : sampleHash(s.addr, s.memBytes);
         s.writtenFrame = frame_;
-        s.memSample = 0;
         if (s.cpuOwned) ++imageGen_, ++R().prof_.imageGens; // sampled as a render target again, not from memory
         s.cpuOwned = false;
     }
@@ -3489,9 +3510,21 @@ private:
         if (s.cpuOwned) return true;
         if (frame_ < s.writtenFrame + 2 || s.checkedFrame == frame_) return false; // once a frame
         s.checkedFrame = frame_;
-        const uint64_t sample = sampleHash(t.base(), size_t(t.pitch()) * t.height() * s.elementBytes);
+        const uint64_t sample = s.writtenBack || !s.memBytes
+                                    ? sampleHash(t.base(), size_t(t.pitch()) * t.height() * s.elementBytes)
+                                    : sampleHash(s.addr, s.memBytes);
         if (!s.memSample) s.memSample = sample;
         else if (sample && sample != s.memSample) s.cpuOwned = true, ++imageGen_, ++R().prof_.imageGens;
+        // A texture bound to a render target the GPU left alone for a while: what to look for
+        // when a texture shows something else (once per target and write).
+        if (!s.cpuOwned && frame_ > s.writtenFrame + 30 && s.loggedFrame != s.writtenFrame) {
+            s.loggedFrame = s.writtenFrame;
+            std::fprintf(stderr, "[gpu] texture 0x%" PRIx64 " %ux%u fmt %u/%u sampled from render target %ux%u drawn %" PRIu64
+                                 " frames ago\n", t.base(), t.width(), t.height(), t.dataFormat(), t.numFormat(),
+                         s.img.width, s.img.height, frame_ - s.writtenFrame);
+        }
+        if (s.cpuOwned)
+            std::fprintf(stderr, "[gpu] render target 0x%" PRIx64 " rewritten in memory: sampled from memory\n", s.addr);
         return s.cpuOwned;
     }
 
@@ -5213,6 +5246,7 @@ void main() {
         if (it == colors_.end()) return;
         if (raceCheck_) noteWrite(t.base(), uint64_t(std::max(t.pitch(), t.width())) * t.height() * it->second.elementBytes);
         Surface& s = it->second;
+        s.writtenBack = true;
         gpuWrote(s); // its memory changes now, from the GPU
         const uint32_t w = std::min(t.width(), s.img.width), h = std::min(t.height(), s.img.height);
         const uint32_t pitch = std::max(t.pitch(), w);
