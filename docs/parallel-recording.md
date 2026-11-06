@@ -91,3 +91,10 @@ full draw now looks the caches up holding m_ shared; any lookup that would chang
 (a new image, view, pipeline, import, VRAM copy or check, a surface marked written, ...) flags it
 (`sharedMiss`) and the draw starts over exclusively. Fast and switch draws whose moved buffers hit
 such a case bind them again exclusively. The profile line counts both.
+
+### Hashing and default (2026-11-06)
+
+With the lock shared the overlook reached 69 fps, then waited on analysis while three hasher
+threads re-hashed every settled VRAM copy and texture each 8th frame. Long-settled ones are now
+hashed every 32nd frame (LPN_HASH_FRAMES): 76 fps, GPU ~11.7 ms of the 13.1 ms frame. Recorder
+threads are now on by default (6 on 16+ hardware threads; LPN_RECORD_THREADS=0 turns them off).

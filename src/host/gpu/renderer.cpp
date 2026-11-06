@@ -6342,13 +6342,15 @@ private:
 
     void startRecorderThreads() {
         const char* n = getenv("LPN_RECORD_THREADS");
-        const unsigned want = n ? unsigned(std::atoi(n)) : 0;
+        // 6 on 16+ hardware threads (=0 turns them off): the overlook went from ~55 to ~76 fps on
+        // an i7-12700K, where 4, 6 and 8 did alike before the lock was shared.
+        const unsigned want = n ? unsigned(std::atoi(n)) : std::thread::hardware_concurrency() >= 16 ? 6 : 0;
         if (want < 1) return;
         const char* why = syncRecord_ ? "LPN_SYNC_RECORD" : sync_ ? "LPN_GPU_SYNC" : traceFrame_ != ~0ull ? "LPN_GPU_TRACE" : snap_ ? "LPN_GPU_SNAP"
                           : raceCheck_ ? "LPN_RACE_CHECK" : computeOnly_ ? "compute only" : !analysisWorkers_ ? "no analysis workers"
                                                                                                            : nullptr;
         if (why) {
-            std::fprintf(stderr, "[gpu] LPN_RECORD_THREADS ignored (%s)\n", why);
+            if (n) std::fprintf(stderr, "[gpu] LPN_RECORD_THREADS ignored (%s)\n", why);
             return;
         }
         if (const char* sz = getenv("LPN_RECORD_SEGMENT")) segDraws_ = std::max(8, std::atoi(sz));
