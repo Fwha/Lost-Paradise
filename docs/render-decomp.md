@@ -147,3 +147,10 @@ points at guest memory changing while it is being read (the game writing ahead i
 LPN_ANALYSIS_WORKERS=6 on the owner's i7-12700K: mid-size spots (1,500-3,700 draws) went from
 36-59 to 90-140 fps with analysis-wait ~1 ms; the default is now 6 on 16+ hardware threads. The
 ~8,400-draw overlook stays ~56 fps with no analysis wait: the recorder (~16 ms) is its limit.
+
+## Fast replay check (2026-11-06)
+
+LPN_FAST_REPLAY=check past the overlook: 37-54% of trace steps run directly; 4 differences in
+~85 s, all shader 0x53c3fd200, the same one that differed when the plan ran every step (so not
+the fast path; most likely its memory changing between the two reads). Left off by default:
+with 6 workers analysis no longer limits fps, so its gain is spare CPU.
