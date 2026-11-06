@@ -8,6 +8,7 @@
 #include "host/input_history.h"
 #include "host/pause_menu.h"
 #include "host/title_menu.h"
+#include "host/draw_sites.h"
 #include "host/gpu/frame_dump.h"
 #include "host/hle.h"
 #include "host/kernel.h"
@@ -146,6 +147,7 @@ int main(int argc, char** argv) {
     host::patchInputHistory(*modules[0]);
     if (host::patchTitleMenu(*modules[0])) host::patchPauseMenu(*modules[0]);
     host::patchRenderResolution(*modules[0], host::displaySettings().width, host::displaySettings().height);
+    host::patchDrawSites(*modules[0]);
 
     const int32_t fsOffset = host::guestThreadPointerFsOffset();
     for (auto* m : modules) {
