@@ -1,79 +1,88 @@
 # lost-paradise-native
 
-A native Linux reimplementation of *Fist of the North Star: Lost Paradise* (PS4, CUSA12776),
-in the spirit of [Severed Chains](https://github.com/Legend-of-Dragoon-Modding/Severed-Chains),
-written in C++.
+Runs *Fist of the North Star: Lost Paradise* (PS4, CUSA12776) natively on Linux. A C++ host loads
+the game's original x86-64 code, answers its PS4 system calls itself, and recompiles its GPU
+shaders to Vulkan.
 
 **No game code or data is included.** You need your own decrypted dump.
 
-## Plan
-
-1. **Map the game.** Recover functions, imports and asset formats from `eboot.bin`.
-2. **C++ host.** Load the original x86-64 code natively on Linux and route its 372 PS4 system
-   calls to our own implementations (files, threads, SDL input/audio, Vulkan renderer).
-3. **Replace piece by piece.** Rewrite each subsystem in C++ until no original code remains.
-4. **Extras.** Uncapped framerate, resolution, widescreen, mods.
-
-## Status
-
-Step 1.
-- `lpn-inspect` parses the decrypted eboot, resolves imports and recovers ~60k function
-  boundaries from `.eh_frame` for Ghidra.
-- `lpn-par` lists and extracts `.par` archives, including SLLZ decompression and nested
-  archives. See [docs/formats.md](docs/formats.md).
-- `lpn-gmd` reads GMD models (meshes, skeleton, material bindings) and exports OBJ for viewing,
-  optionally posed by an animation.
-- `lpn-gmt` reads GMT skeletal animations.
+The game boots, reaches the menus and plays. See [docs/STATUS.md](docs/STATUS.md) for progress
+and known issues.
 
 ## Build
+
+Needs CMake, Ninja, a C++20 compiler, and the Vulkan, glslang, zlib and SDL2 development packages
+(without SDL2 there is no window).
 
 ```sh
 cmake -S . -B build -G Ninja
 ninja -C build
+scripts/fetch-nids.sh aerolib.csv     # import names, needed to run
 ```
 
-## Usage
+Optional, for NVIDIA DLSS: run `scripts/fetch-dlss.sh`, then the two build commands again.
+
+## Run
+
+Put the decrypted dump (the folder with `eboot.bin` and `sce_module/`) somewhere, then:
 
 ```sh
-scripts/fetch-nids.sh aerolib.csv
-build/tools/inspect/lpn-inspect /path/to/CUSA12776/eboot.bin --nids aerolib.csv --out analysis/
+build/src/host/lpn-host /path/to/CUSA12776 --nids aerolib.csv
 ```
 
-Unpack an archive (add `--recursive` to unpack archives nested inside it):
+Saves go to `./lpn-data` (change with `--data DIR`). `lpn-host` with no arguments lists every
+option.
+
+A `launch.sh` beside the repo and the dump keeps this to one command and writes the log to
+`play.log`:
 
 ```sh
-build/tools/par/lpn-par list    /path/to/CUSA12776/data/hact/c10_0102.par --recursive
-build/tools/par/lpn-par extract /path/to/CUSA12776/data/hact/c10_0102.par out/c10_0102 --recursive
-build/tools/par/lpn-par extract /path/to/CUSA12776/data/chara/ps4/adv/c_ca_ken/mesh.par out/mesh
-build/tools/gmd/lpn-gmd info out/mesh/c_ca_ken.gmd
-build/tools/gmd/lpn-gmd obj  out/mesh/c_ca_ken.gmd out/mesh/ken.obj   # textures resolve from the same folder
-build/tools/gmt/lpn-gmt info out/c10_0102/000.par/c10_000_11.gmt
-build/tools/gmd/lpn-gmd obj  out/mesh/c_ca_ken.gmd out/mesh/posed.obj \
-    --anim out/c10_0102/000.par/c10_000_11.gmt --frame 80
-ctest --test-dir build
+#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+exec lost-paradise/build/src/host/lpn-host CUSA12776 --nids lost-paradise/aerolib.csv --data lpn-data "$@" 2> play.log
 ```
 
-Then in Ghidra, load `eboot.bin` (the [GhidraOrbis](https://github.com/astrelsky/GhidraOrbis)
-loader is recommended; Ghidra's built-in ELF loader also maps the segments correctly), run
-auto-analysis, and run `ghidra/ImportLpnAnalysis.py` on `analysis/`. Headless (Ghidra 12 needs
-the bundled Jython extension installed and JDK 21+):
+In the game window, **F11** opens the display menu (window mode, resolution, FPS cap) and
+**F12** saves a debug capture to `lpn-captures/`.
+
+### Tuning
+
+Defaults suit most machines. These environment variables override them:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `LPN_RECORD_THREADS` | 6 on 16+ hardware threads, else 0 | Threads that record draws in parallel. `0` turns them off. |
+| `LPN_ANALYSIS_WORKERS` | 6 on 16+ threads, 3 on 8+, else 1 | Threads that analyse shaders and draws. |
+| `LPN_PROFILE=1` | off | Prints per-frame timings. |
+
+Example: `LPN_RECORD_THREADS=0 ./launch.sh`
+
+## Tools
+
+Command-line tools for studying the game files, built with the rest:
+
+| Tool | Does |
+| --- | --- |
+| `lpn-par` | Lists and extracts `.par` archives (`--recursive` for nested ones) |
+| `lpn-gmd` | Reads GMD models and exports OBJ, optionally posed by an animation |
+| `lpn-gmt` | Reads GMT skeletal animations |
+| `lpn-inspect` | Names the eboot's imports and finds function starts for Ghidra |
+| `lpn-gcn` | Disassembles GCN shaders |
 
 ```sh
-analyzeHeadless ghidra-project LostParadise -import /path/to/eboot.bin \
-    -scriptPath ghidra -postScript ImportLpnAnalysis.py "$PWD/analysis"
+build/tools/par/lpn-par extract CUSA12776/data/chara/ps4/adv/c_ca_ken/mesh.par out/mesh
+build/tools/gmd/lpn-gmd obj out/mesh/c_ca_ken.gmd out/mesh/ken.obj
 ```
 
-If no loader accepts the file, import it as Raw Binary (`x86:LE:64:default`, `gcc`, base 0) and
-run `ghidra/MapLpnSegments.py` on `analysis/` before analysis to map the segments.
+File formats are written up in [docs/formats.md](docs/formats.md), and Ghidra import scripts are
+in [ghidra/](ghidra/). Run the tests with `ctest --test-dir build`.
 
 ## Layout
 
-- `src/ps4elf/`: PS4 ELF, dynamic linking and `.eh_frame` parsing
-- `src/formats/`: game file formats (PARC, SLLZ, GMD, GMT) and skinning
-- `tools/inspect/`: `lpn-inspect`
-- `tools/par/`: `lpn-par`
-- `tools/gmd/`: `lpn-gmd`
-- `tools/gmt/`: `lpn-gmt`
-- `tests/`: unit tests on synthetic data
-- `ghidra/`: Ghidra scripts
-- `docs/`: findings about the game
+- `src/host/`: the host (`lpn-host`): loader, system calls, Vulkan renderer
+- `src/gcn/`: GCN shader decoding and translation to SPIR-V
+- `src/ps4elf/`: PS4 ELF and dynamic linking
+- `src/formats/`: game file formats (PARC, SLLZ, GMD, GMT)
+- `tools/`: the command-line tools
+- `tests/`: unit tests
+- `docs/`: findings about the game and how the host works
