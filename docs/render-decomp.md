@@ -71,3 +71,26 @@ mask (bits 0x10 PS, 0x20 VS, 0x40, 0x100, 0x200, 0xc...); shaders come from tabl
 0x2698148 / 0x2698168 / 0x26981e8 indexed by 16-bit ids at ctx+0xe80/0xe82, and it writes into
 a Gnmx-like state block at `*(ctx+0x18)+800`. Because it only re-emits what changed, hooking it
 gives us exactly the per-draw deltas, which is what the renderer currently reconstructs.
+
+## The draw commit (0xeac430 -> 0xeabdb0)
+
+0xeac430 (engine drawIndex) calls 0xeabdb0 (preDraw), then 0xe574c0, then sceGnmDrawIndex via
+the 0xfa0a10 wrapper. 0xeabdb0 is a Gnmx ConstantUpdateEngine-style commit over a state block
+at `ctx+800` (`param_1[200]`). For each active stage (mask at +0xdc) it walks dirty bitmasks and
+calls one setter per changed slot:
+
+| Slots | Array (per stage) | Stride | Setter |
+|---|---|---|---|
+| textures / buffers (T#, V#) | +0x1d38 + stage*0x210 | 0x20 | 0xe583a0 |
+| constant buffers | +0x6c8 + stage*0x220 | 8 | 0xe584d0 / 0xe58680 |
+| samplers (S#) | +0x1378 + stage*0x90 | 8 | 0xe58830 |
+| RW buffers / textures | +0x16d8 + stage*0x110 | 0x10 | 0xe587c0 / 0xe58610 |
+
+Vertex streams come from +0x288 (0x20 per stream: base, offset, count, stride). Samplers are
+built and cached by 0xe9cce0 (key -> S#, binary search under a lock).
+
+So at 0xeac430 the state block already holds every resource of the draw, by slot. Plan for
+milestone 3: hook 0xeac430 and the auto-index draw, snapshot the changed slots (the dirty masks
+tell us which) into a side record tagged with the draw's PM4 position, and have the renderer map
+slots to shader inputs with the shader binary's own input-usage table (static, once per shader)
+instead of replaying scalar code per draw.
