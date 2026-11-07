@@ -9,6 +9,9 @@
 
 #ifdef LPN_HAVE_SDL2
 #include <stb_image.h>
+
+#include "host/display_settings.h"
+#include "host/pad_glyphs.h"
 #endif
 
 #include <sys/stat.h>
@@ -470,9 +473,17 @@ SDL_Texture* buttonSheet(SDL_Renderer* ren) {
     return nullptr;
 }
 
-// Draws the icon in a size x size box at (x, y): the game's own, or drawn shapes without it.
+// Draws the icon in a size x size box at (x, y), in the Button Icons setting's style. PlayStation
+// is the game's own icon (it matches the game's screens), or ControllerImage's without the game's
+// sheet; Xbox and Switch are ControllerImage's (pad_glyphs.h). Drawn shapes when neither works.
 void padIcon(SDL_Renderer* ren, int x, int y, int size, Pad b) {
-    if (SDL_Texture* sheet = buttonSheet(ren)) {
+    const PadStyle style = padStyle(displaySettings().buttonIcons);
+    const SDL_GameControllerButton sdl = b == Pad::Cross ? SDL_CONTROLLER_BUTTON_A
+                                         : b == Pad::Circle ? SDL_CONTROLLER_BUTTON_B
+                                                            : SDL_CONTROLLER_BUTTON_X;
+    SDL_Texture* sheet = style == PadStyle::PlayStation ? buttonSheet(ren) : nullptr;
+    if (!sheet && drawPadGlyph(ren, x, y, size, style, sdl)) return;
+    if (sheet) {
         const int col = b == Pad::Circle ? 0 : b == Pad::Cross ? 1 : 2;
         SDL_Rect src{col * 64, 0, 64, 64}, dst{x, y, size, size};
         SDL_RenderCopy(ren, sheet, &src, &dst);
@@ -778,8 +789,8 @@ void drawSaveMenu(SDL_Renderer* ren) {
 
     // Controls.
     fillR(ren, x0, y0 + panelH - hintH, panelW, hintH, U(10), 10, 10, 14, 255, ui::kBottom);
-    // With a controller plugged in: its buttons (cross, circle, square, as SDL's A, B and X are on
-    // a DualSense); otherwise the keys.
+    // With a controller plugged in: its buttons (SDL's A, B and X: cross, circle and square on a
+    // DualSense), as the Button Icons setting draws them; otherwise the keys.
     const int hs = U(15), hy = y0 + panelH - hintH + (hintH - hs) / 2;
     int hx = x0 + pad;
     const bool usePad = controllerAttached();

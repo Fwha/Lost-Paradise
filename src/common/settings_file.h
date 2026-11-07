@@ -13,6 +13,11 @@ enum class WindowMode { Windowed, Borderless, Fullscreen };
 enum class DlssMode { Off, Dlaa, Quality, Balanced, Performance };
 constexpr int kDlssModes = 5;
 const char* dlssModeName(DlssMode m); // "Off", "DLAA", "Quality", ...
+// Which controller's buttons the menus' control hints show (host/pad_glyphs.h). Auto follows the
+// controller plugged in.
+enum class ButtonIcons { PlayStation, Xbox, Switch, Auto };
+constexpr int kButtonIconChoices = 4;
+constexpr const char* kButtonIconNames[kButtonIconChoices] = {"PlayStation", "Xbox", "Switch", "Auto"};
 
 struct DisplaySettings {
     WindowMode window = WindowMode::Windowed;
@@ -23,6 +28,7 @@ struct DisplaySettings {
     bool fpsCounter = false; // frames shown a second, in the top right corner
     DlssMode dlss = DlssMode::Off;
     bool skipIntro = false; // fast-forward the boot logos to the title screen
+    ButtonIcons buttonIcons = ButtonIcons::PlayStation; // as the game draws its own
 };
 
 constexpr const char* kSettingsFile = "lpn-display.ini";

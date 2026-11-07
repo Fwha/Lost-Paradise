@@ -41,6 +41,14 @@ void skipIntroChoose(int i) {
     saveDisplaySettings();
 }
 
+std::vector<std::string> buttonIconChoices() { return {std::begin(kButtonIconNames), std::end(kButtonIconNames)}; }
+int buttonIconsValue() { return int(displaySettings().buttonIcons); }
+void buttonIconsChoose(int i) {
+    if (i < 0 || i >= kButtonIconChoices) return;
+    displaySettings().buttonIcons = ButtonIcons(i);
+    saveDisplaySettings();
+}
+
 } // namespace
 
 const std::vector<PcSetting>& pcSettings() {
@@ -55,6 +63,9 @@ const std::vector<PcSetting>& pcSettings() {
          &dlssChoices, &dlssValue, &dlssChoose},
         {"Skip Intro Logos", "Go straight to the title screen when the game starts. Takes effect at the next start.",
          &onOff, &skipIntroValue, &skipIntroChoose},
+        {"Button Icons",
+         "Choose which controller's buttons the menus show. Auto follows the controller plugged in.",
+         &buttonIconChoices, &buttonIconsValue, &buttonIconsChoose},
         display<4>("Exit Game", "Close the game. Progress since your last save is lost."),
     };
     return settings;
