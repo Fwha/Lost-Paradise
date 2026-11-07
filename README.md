@@ -4,6 +4,12 @@ Runs *Fist of the North Star: Lost Paradise* (PS4, CUSA12776) natively on Linux.
 the game's original x86-64 code, answers its PS4 system calls itself, and recompiles its GPU
 shaders to Vulkan.
 
+Did all my testing on CachyOS.
+PC Specs:
+4070 ti SUPER
+i7 12700k
+32GB RAM
+
 **No game code or data is included.** You need your own dump.
 
 The game boots, reaches the menus and plays. See [docs/STATUS.md](docs/STATUS.md) for progress
