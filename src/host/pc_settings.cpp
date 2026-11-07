@@ -64,7 +64,7 @@ const std::vector<PcSetting>& pcSettings() {
         {"Skip Intro Logos", "Go straight to the title screen when the game starts. Takes effect at the next start.",
          &onOff, &skipIntroValue, &skipIntroChoose},
         {"Button Icons",
-         "Choose which controller's buttons the menus show. Auto follows the controller plugged in.",
+         "Which controller's buttons to show. Auto matches your controller. Takes effect at the next start.",
          &buttonIconChoices, &buttonIconsValue, &buttonIconsChoose},
         display<4>("Exit Game", "Close the game. Progress since your last save is lost."),
     };

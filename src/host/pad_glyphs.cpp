@@ -41,18 +41,25 @@ struct Cached {
 SDL_Renderer* gRen = nullptr;
 std::vector<Cached> gCache;
 
-SDL_Texture* rasterise(SDL_Renderer* ren, int style, int pos, int size) {
+std::vector<uint8_t> pixels(int style, int pos, int size, float zoom) {
     std::string svg = glyph_data::kSvgs[style][pos]; // nsvgParse writes into the text
     NSVGimage* img = nsvgParse(svg.data(), "px", 96.0f);
     if (!img || img->width <= 0) {
         if (img) nsvgDelete(img);
-        return nullptr;
+        return {};
     }
     NSVGrasterizer* rast = nsvgCreateRasterizer();
-    std::vector<unsigned char> px(size_t(size) * size * 4);
-    nsvgRasterize(rast, img, 0, 0, size / img->width, px.data(), size, size, size * 4);
+    std::vector<uint8_t> px(size_t(size) * size * 4);
+    const float scale = size * zoom / img->width, off = -size * (zoom - 1) / 2;
+    nsvgRasterize(rast, img, off, off, scale, px.data(), size, size, size * 4);
     nsvgDeleteRasterizer(rast);
     nsvgDelete(img);
+    return px;
+}
+
+SDL_Texture* rasterise(SDL_Renderer* ren, int style, int pos, int size) {
+    const std::vector<uint8_t> px = pixels(style, pos, size, 1.0f);
+    if (px.empty()) return nullptr;
     SDL_Texture* tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, size, size);
     if (!tex) return nullptr;
     SDL_UpdateTexture(tex, nullptr, px.data(), size * 4);
@@ -86,6 +93,12 @@ PadStyle padStyle(ButtonIcons setting) {
         }
     }
     return PadStyle::PlayStation;
+}
+
+std::vector<uint8_t> padGlyphPixels(PadStyle style, SDL_GameControllerButton b, int size, float zoom) {
+    const int pos = position(style, b);
+    if (pos < 0 || size <= 0 || size > 1024) return {};
+    return pixels(int(style), pos, size, zoom);
 }
 
 bool drawPadGlyph(SDL_Renderer* ren, int x, int y, int size, PadStyle style, SDL_GameControllerButton b) {

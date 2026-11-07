@@ -1,5 +1,6 @@
 // libkernel files: PS4 paths (/app0, /savedata0, ...) mapped onto host folders.
 #include "host/hle.h"
+#include "host/button_icon_files.h"
 #include "host/videoout.h"
 #include "host/kernel.h"
 #include "host/profile.h"
@@ -34,7 +35,7 @@ std::string hostPath(const char* guest) {
         return root + p.substr(n);
     };
     const Process& pr = process();
-    if (auto h = mount("/app0", pr.gameDir); !h.empty()) return h;
+    if (auto h = mount("/app0", pr.gameDir); !h.empty()) return buttonIconFile(h);
     if (!pr.saveDir.empty())
         if (auto h = mount("/savedata0", pr.saveDir); !h.empty()) return h;
     for (const char* m : {"/download0", "/savedata0", "/temp0", "/data"})

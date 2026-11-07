@@ -34,6 +34,7 @@ add_executable(lpn-host
     window.cpp
     save_menu.cpp
     pad_glyphs.cpp
+    button_icon_files.cpp
     menu_font.cpp
     stb_impl.cpp
     display_menu.cpp

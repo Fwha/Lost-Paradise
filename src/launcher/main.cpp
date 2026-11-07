@@ -92,7 +92,7 @@ const Row kRows[] = {
     {"FPS Counter", "Show the frame rate in the top right corner of the screen."},
     {"DLSS", "NVIDIA DLAA: DLSS anti-aliasing in place of the game's. Needs an RTX card; Off on other GPUs."},
     {"Skip Intro Logos", "Go straight to the title screen when the game starts."},
-    {"Button Icons", "Choose which controller's buttons the menus show. Auto follows the controller plugged in."},
+    {"Button Icons", "Which controller's buttons to show. Auto matches your controller. Takes effect at the next start."},
 };
 constexpr int kRowCount = int(sizeof kRows / sizeof kRows[0]);
 

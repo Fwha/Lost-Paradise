@@ -5,6 +5,9 @@
 
 #include <SDL.h>
 
+#include <cstdint>
+#include <vector>
+
 #include "common/settings_file.h"
 
 namespace host {
@@ -20,5 +23,9 @@ PadStyle padStyle(ButtonIcons setting);
 // label, as SDL2 maps a Nintendo pad (A is its right button), unless
 // SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS is off. False when the icon could not be drawn.
 bool drawPadGlyph(SDL_Renderer* ren, int x, int y, int size, PadStyle style, SDL_GameControllerButton b);
+
+// The same icon as size x size RGBA pixels (not premultiplied), drawn zoom times larger about its
+// centre (the art leaves a margin round the button); empty when it could not be drawn.
+std::vector<uint8_t> padGlyphPixels(PadStyle style, SDL_GameControllerButton b, int size, float zoom = 1.0f);
 
 } // namespace host
