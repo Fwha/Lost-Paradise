@@ -146,6 +146,8 @@ int main(int argc, char** argv) {
     host::process().eboot = modules[0];
     host::process().gameDir = fs::absolute(gameDir).string();
     host::process().dataDir = fs::absolute(dataDir).string();
+    host::process().titleId = host::gameTitleId(gameDir);
+    host::prepareSaveFolder();
     host::installCrashHandler();
     host::registerBuiltinHle();
     host::layoutStaticTls(modules);

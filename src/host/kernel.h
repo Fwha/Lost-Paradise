@@ -12,6 +12,7 @@ struct Process {
     Module* eboot = nullptr;
     std::string gameDir; // /app0
     std::string dataDir; // host folder for /download0, /savedata0, /temp0
+    std::string titleId; // the dump's (e.g. CUSA12776): saves go in <dataDir>/savedata/<titleId>
     std::string saveDir; // folder /savedata0 points at while save data is mounted
     bool traceFiles = false;
 };

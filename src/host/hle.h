@@ -69,6 +69,10 @@ void* findHle(const std::string& library, const std::string& name);
 // Install the built-in implementations (see hle_*.cpp).
 void registerBuiltinHle();
 
+// Makes <dataDir>/savedata/<titleId>, the current version's save folder. Saves from before the
+// folders were split per version (directly in savedata/) were CUSA12776's and move into its folder.
+void prepareSaveFolder();
+
 // Logging switches, set from the command line.
 struct HleOptions {
     bool abortOnUnimplemented = false;
