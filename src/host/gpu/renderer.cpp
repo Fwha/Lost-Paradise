@@ -5543,6 +5543,7 @@ void main() {
         if (psm) bindResources(ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT, writes, bufs, imgs, aheadFor(a, ps));
         linkWrites(writes, bufs, imgs);
         const uint8_t hud = hudDraw(r, hasDepth, vs, psm ? &ps : nullptr, d, prim, width, height);
+        if (hud) hudTransform(vs, r, width, height, hud);
 
         // Index buffer.
         VkBuffer indexBuffer = VK_NULL_HANDLE;
@@ -6309,16 +6310,15 @@ void main() {
     std::mutex hudLogMutex_;
     std::set<std::tuple<uint64_t, uint64_t, int>> hudLogged_;
 
-    void setViewportScissor(const DrawRegs& r, uint32_t width, uint32_t height, bool jitter = false, uint8_t hudMode = 0) {
+    // The game's viewport (x, y, width and height; width and height signed).
+    static VkViewport gameViewport(const DrawRegs& r, uint32_t width, uint32_t height) {
         const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
-        float xs = v[0], xo = v[1], ys = v[2], yo = v[3], zs = v[4], zo = v[5];
+        float xs = v[0], xo = v[1], ys = v[2], yo = v[3];
         const uint32_t vte = r.ctx[reg::kPaClVteCntl];
         if (!(vte & 1)) xs = 1;
         if (!(vte & 2)) xo = 0;
         if (!(vte & 4)) ys = 1;
         if (!(vte & 8)) yo = 0;
-        if (!(vte & 16)) zs = 1;
-        if (!(vte & 32)) zo = 0;
         VkViewport vp{};
         vp.x = xo - xs;
         vp.width = 2 * xs;
@@ -6330,11 +6330,33 @@ void main() {
             vp.width = float(width);
             vp.height = float(height);
         }
+        return vp;
+    }
+    // Aspect Ratio: a HUD draw moved into the 16:9 rectangle (hudDraw's mode 1; mode 2 only its
+    // height) by its vertex shader's position transform, the viewport left as the game set it: a
+    // smaller viewport cut off what reached past the rectangle (the minimap's ping).
+    static void hudTransform(gcn::Program& vs, const DrawRegs& r, uint32_t width, uint32_t height, uint8_t mode) {
         const Hud& h = hud();
-        if (hudMode) { // into the 16:9 rectangle (pixels as the vertex shader maps them included)
-            if (hudMode == 1) vp.x = h.x + vp.x * h.sx, vp.width *= h.sx;
-            vp.y = h.y + vp.y * h.sy, vp.height *= h.sy;
-        }
+        const VkViewport vp = gameViewport(r, width, height);
+        float t[4];
+        std::memcpy(t, &vs.data[gcn::data::kPosTransform], sizeof t);
+        // pixel' = offset + pixel * scale, as clip space for the same viewport: x * scale + o * w.
+        auto fit = [](float& scale, float& offset, float s, float o, float vx, float vw) {
+            if (vw == 0) return;
+            const float add = s - 1 + 2 * (o + (s - 1) * vx) / vw;
+            scale *= s, offset = offset * s + add;
+        };
+        if (mode == 1) fit(t[0], t[2], h.sx, h.x, vp.x, vp.width);
+        fit(t[1], t[3], h.sy, h.y, vp.y, vp.height);
+        std::memcpy(&vs.data[gcn::data::kPosTransform], t, sizeof t);
+    }
+
+    void setViewportScissor(const DrawRegs& r, uint32_t width, uint32_t height, bool jitter = false, uint8_t hudMode = 0) {
+        const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
+        const uint32_t vte = r.ctx[reg::kPaClVteCntl];
+        const float zs = (vte & 16) ? v[4] : 1, zo = (vte & 32) ? v[5] : 0;
+        VkViewport vp = gameViewport(r, width, height);
+        const Hud& h = hud();
         const bool dx = (r.ctx[reg::kPaClClipCntl] >> 19) & 1;
         vp.minDepth = dx ? zo : zo - zs;
         vp.maxDepth = zo + zs;
@@ -6359,10 +6381,15 @@ void main() {
         clip(r.ctx[reg::kGenericScissorTl], r.ctx[reg::kGenericScissorBr]);
         clip(r.ctx[reg::kWindowScissorTl], r.ctx[reg::kWindowScissorBr]);
         if ((r.ctx[0x292] >> 1) & 1) clip(r.ctx[reg::kVportScissorTl], r.ctx[reg::kVportScissorBr]);
-        // The HUD's clipping (the minimap's, say) moves with it. Clipping to the whole picture stays
-        // so: in the 16:9 rectangle it cut off glows reaching past it (the minimap's).
+        // The HUD's clipping (the minimap's, say) moves with it. Clipping to the whole picture keeps
+        // its height and becomes the 16:9 rectangle with a margin, for glows reaching a little past
+        // it (the minimap's ping) but not what the game slides in from off screen.
         const bool whole = x0 == 0 && y0 == 0 && x1 >= int32_t(h.outW) && y1 >= int32_t(h.outH);
-        if (hudMode && !whole) {
+        if (hudMode == 1 && whole) {
+            const float w = h.outW * h.sx, margin = w * 0.06f;
+            x0 = std::max<int32_t>(0, int32_t(std::floor(h.x - margin)));
+            x1 = std::min<int32_t>(int32_t(width), int32_t(std::ceil(h.x + w + margin)));
+        } else if (hudMode && !whole) {
             if (hudMode == 1) x0 = int32_t(std::floor(h.x + x0 * h.sx)), x1 = int32_t(std::ceil(h.x + x1 * h.sx));
             y0 = int32_t(std::floor(h.y + y0 * h.sy)), y1 = int32_t(std::ceil(h.y + y1 * h.sy));
             x1 = std::min<int32_t>(x1, int32_t(width)), y1 = std::min<int32_t>(y1, int32_t(height));
