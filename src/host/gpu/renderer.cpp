@@ -5539,7 +5539,7 @@ void main() {
         bindResources(vs, 0, VK_SHADER_STAGE_VERTEX_BIT, writes, bufs, imgs, aheadFor(a, vs));
         if (psm) bindResources(ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT, writes, bufs, imgs, aheadFor(a, ps));
         linkWrites(writes, bufs, imgs);
-        const bool hud = hudDraw(r, hasDepth, vs, psm ? &ps : nullptr, d, prim, width, height);
+        const uint8_t hud = hudDraw(r, hasDepth, vs, psm ? &ps : nullptr, d, prim, width, height);
 
         // Index buffer.
         VkBuffer indexBuffer = VK_NULL_HANDLE;
@@ -5725,7 +5725,8 @@ void main() {
         VkPipeline pipe = VK_NULL_HANDLE;
         DynamicState dyn{};
         uint32_t depthControl = 0, width = 0, height = 0;
-        bool jitter = false, hud = false;
+        bool jitter = false;
+        uint8_t hud = 0; // see hudDraw
         uint64_t pass = 0, epoch = 0;
         std::vector<VkImage> sampled;
         std::vector<VkWriteDescriptorSet> writes;
@@ -5946,6 +5947,8 @@ void main() {
             if (R().prof_.on) ++R().prof_.fastRes[why];
             return miss(kFastResources);
         }
+        // Aspect Ratio: HUD shading drawn wider than the HUD (see hudDraw) takes a full draw.
+        if (f.hud && (hudWide(a.vs, a.psm ? &a.ps : nullptr, d) ? 2 : 1) != f.hud) return miss(kFastResources);
         VkBuffer indexBuffer = VK_NULL_HANDLE;
         VkDeviceSize indexOffset = 0;
         if (d.kind == DrawCall::kIndexed) {
@@ -6199,12 +6202,14 @@ void main() {
     // display buffers' draws sample that no draw with a depth buffer renders into (the scene's
     // targets have those). Draws into it, and into the display buffers, are HUD but for the ones
     // sampling a picture-shaped render target (the scene being copied in, post-processing).
-    bool hudDraw(const DrawRegs& r, bool hasDepth, const gcn::Program& vs, const gcn::Program* ps, const DrawCall& d,
-                 uint32_t prim, uint32_t width, uint32_t height) {
+    // 0: drawn as it is, 1: the HUD (into the 16:9 rectangle), 2: HUD shading wider than the HUD
+    // (stretched across the whole picture, only its height fitted).
+    uint8_t hudDraw(const DrawRegs& r, bool hasDepth, const gcn::Program& vs, const gcn::Program* ps, const DrawCall& d,
+                    uint32_t prim, uint32_t width, uint32_t height) {
         const Hud& h = hud();
-        if (!h.on) return false;
+        if (!h.on) return 0;
         // A picture-sized target (a little padding allowed): the others are not the HUD's.
-        if (width < h.outW || width > h.outW + 128 || height < h.outH || height > h.outH + 32) return false;
+        if (width < h.outW || width > h.outW + 128 || height < h.outH || height > h.outH + 32) return 0;
         const uint64_t target = uint64_t(r.ctx[reg::kCbColorBase]) << 8;
         uint64_t picture[8];
         int pictures = 0;
@@ -6242,10 +6247,11 @@ void main() {
                 for (const auto& t : p->images) textured = textured || !t.storage;
         const bool fill = prim == 17 && d.count == 3 && !textured;
         const bool isHud = !hasDepth && (display || layer) && sceneW == 0 && !fill;
+        const uint8_t mode = !isHud ? 0 : hudWide(vs, ps, d) ? 2 : 1;
         if (hudLog_) {
             std::lock_guard lock(hudLogMutex_);
             const uint64_t vsAddr = vs.launch.entry, psAddr = ps ? ps->launch.entry : 0;
-            if (hudLogged_.insert({target ^ vsAddr, psAddr, (hasDepth ? 2 : 0) | (isHud ? 1 : 0)}).second &&
+            if (hudLogged_.insert({target ^ vsAddr, psAddr, (hasDepth ? 4 : 0) | mode}).second &&
                 hudLogged_.size() <= 600) {
                 std::string samples;
                 for (int i = 0; i < pictures; ++i) samples += " 0x" + hex(picture[i]);
@@ -6253,19 +6259,54 @@ void main() {
                                      " prim %u count %u vte 0x%x: %s%s\n",
                              frame_, target, display ? " (display)" : "", layer ? " (HUD buffer)" : "",
                              hasDepth ? " with depth" : "", vsAddr, psAddr, prim, d.count, r.ctx[reg::kPaClVteCntl],
-                             isHud ? "HUD, 16:9 in the middle" : "full picture",
+                             mode == 2 ? "HUD shading, full width" : isHud ? "HUD, 16:9 in the middle" : "full picture",
                              samples.empty() ? "" : ("; samples" + samples).c_str());
             }
         }
-        return isHud;
+        return mode;
+    }
+    // An untextured HUD draw reaching past both sides of the HUD's layout: the game's vignette and
+    // its top and bottom shading, which squeezed into 16:9 left a band at the sides (21:9).
+    static bool hudWide(const gcn::Program& vs, const gcn::Program* ps, const DrawCall& d) {
+        if (d.count > 256 || vs.buffers.empty()) return false;
+        for (const gcn::Program* p : {&vs, ps})
+            if (p)
+                for (const auto& t : p->images)
+                    if (!t.storage) return false;
+        // The layout's width, from the draw data's (2/w, -2/h, -1, 1).
+        auto at = [&](size_t i) {
+            float v;
+            std::memcpy(&v, &vs.data[i], 4);
+            return v;
+        };
+        float layoutW = 0;
+        for (size_t i = gcn::data::kSmrd; i + 4 <= vs.data.size(); ++i)
+            if (at(i) > 0 && at(i + 1) < 0 && at(i + 2) == -1.0f && at(i + 3) == 1.0f) {
+                layoutW = 2 / at(i);
+                break;
+            }
+        if (layoutW < 256) return false;
+        const auto& b = vs.buffers[0]; // the positions (x, y first)
+        const uint32_t n = b.numRecords(), stride = b.stride();
+        if (!b.known || stride < 8 || !n || n > 256) return false;
+        std::vector<uint8_t> bytes(size_t(stride) * n);
+        if (!readGuest(b.base(), bytes.data(), bytes.size())) return false;
+        float lo = INFINITY, hi = -INFINITY;
+        for (uint32_t i = 0; i < n; ++i) {
+            float x;
+            std::memcpy(&x, &bytes[size_t(i) * stride], 4);
+            if (!std::isfinite(x)) return false;
+            lo = std::min(lo, x), hi = std::max(hi, x);
+        }
+        return lo < 0.5f && hi > layoutW - 0.5f && hi - lo < 4 * layoutW;
     }
     std::mutex hudMutex_;
     std::unordered_set<uint64_t> sceneTargets_, hudLayers_;
     const bool hudLog_ = getenv("LPN_HUD_LOG") != nullptr;
     std::mutex hudLogMutex_;
-    std::set<std::tuple<uint64_t, uint64_t, bool>> hudLogged_;
+    std::set<std::tuple<uint64_t, uint64_t, int>> hudLogged_;
 
-    void setViewportScissor(const DrawRegs& r, uint32_t width, uint32_t height, bool jitter = false, bool hudDraw = false) {
+    void setViewportScissor(const DrawRegs& r, uint32_t width, uint32_t height, bool jitter = false, uint8_t hudMode = 0) {
         const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
         float xs = v[0], xo = v[1], ys = v[2], yo = v[3], zs = v[4], zo = v[5];
         const uint32_t vte = r.ctx[reg::kPaClVteCntl];
@@ -6287,8 +6328,8 @@ void main() {
             vp.height = float(height);
         }
         const Hud& h = hud();
-        if (hudDraw) { // into the 16:9 rectangle (pixels as the vertex shader maps them included)
-            vp.x = h.x + vp.x * h.sx, vp.width *= h.sx;
+        if (hudMode) { // into the 16:9 rectangle (pixels as the vertex shader maps them included)
+            if (hudMode == 1) vp.x = h.x + vp.x * h.sx, vp.width *= h.sx;
             vp.y = h.y + vp.y * h.sy, vp.height *= h.sy;
         }
         const bool dx = (r.ctx[reg::kPaClClipCntl] >> 19) & 1;
@@ -6315,8 +6356,8 @@ void main() {
         clip(r.ctx[reg::kGenericScissorTl], r.ctx[reg::kGenericScissorBr]);
         clip(r.ctx[reg::kWindowScissorTl], r.ctx[reg::kWindowScissorBr]);
         if ((r.ctx[0x292] >> 1) & 1) clip(r.ctx[reg::kVportScissorTl], r.ctx[reg::kVportScissorBr]);
-        if (hudDraw) { // the HUD's clipping (the minimap's, say) moves with it
-            x0 = int32_t(std::floor(h.x + x0 * h.sx)), x1 = int32_t(std::ceil(h.x + x1 * h.sx));
+        if (hudMode) { // the HUD's clipping (the minimap's, say) moves with it
+            if (hudMode == 1) x0 = int32_t(std::floor(h.x + x0 * h.sx)), x1 = int32_t(std::ceil(h.x + x1 * h.sx));
             y0 = int32_t(std::floor(h.y + y0 * h.sy)), y1 = int32_t(std::ceil(h.y + y1 * h.sy));
             x1 = std::min<int32_t>(x1, int32_t(width)), y1 = std::min<int32_t>(y1, int32_t(height));
         }
