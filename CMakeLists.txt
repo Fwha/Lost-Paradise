@@ -11,6 +11,11 @@ endif()
 
 add_compile_options(-Wall -Wextra)
 
+# The accent colour of the menus and the launcher (src/common/ui_palette.h): 0 soft silver,
+# 1 pure white, 2 steel blue, 3 crimson.
+set(LPN_UI_ACCENT 0 CACHE STRING "Menu and launcher accent colour (0-3, see src/common/ui_palette.h)")
+add_compile_definitions(LPN_UI_ACCENT=${LPN_UI_ACCENT})
+
 enable_testing()
 
 add_subdirectory(src/ps4elf)

@@ -7,6 +7,7 @@
 // Play replaces the launcher with lpn-host, its log going to play.log. Check for updates: updater.h.
 #include "common/game_dir.h"
 #include "common/settings_file.h"
+#include "common/ui_palette.h"
 #include "host/menu_font.h"
 #include "launcher/updater.h"
 
@@ -145,6 +146,7 @@ SDL_Texture* gArt = nullptr; // the game's own key art (sce_sys/pic1.png), when 
 int gArtW = 0, gArtH = 0;
 
 void color(Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255) { SDL_SetRenderDrawColor(gRen, r, g, b, a); }
+void color(ui::Rgb c, Uint8 a = 255) { color(c.r, c.g, c.b, a); }
 void fill(int x, int y, int w, int h) {
     SDL_Rect r{x, y, w, h};
     SDL_RenderFillRect(gRen, &r);
@@ -225,13 +227,13 @@ const Box kBack{kW / 2 + 12, kPanel.y + kPanel.h + 20, 200, 48};
 const Box kDefaults{kW / 2 - 212, kPanel.y + kPanel.h + 20, 200, 48};
 
 void button(const Box& b, const std::string& label, bool focus, bool primary, bool enabled = true) {
-    if (primary && enabled) color(focus ? 236 : 214, focus ? 204 : 182, focus ? 120 : 98, 255);
+    if (primary && enabled) color(focus ? ui::kAccent.bright : ui::kAccent.line);
     else color(0, 0, 0, focus ? 200 : 150);
     fill(b.x, b.y, b.w, b.h);
-    color(214, 182, 98, enabled ? 255 : 90);
+    color(ui::kAccent.line, enabled ? 255 : 90);
     outline(b.x, b.y, b.w, b.h, focus ? 3 : 1);
     const int size = b.h * 9 / 20;
-    if (primary && enabled) color(20, 14, 8);
+    if (primary && enabled) color(ui::kAccent.on);
     else color(245, 240, 228, enabled ? 255 : 110);
     textCentered(b.x + b.w / 2, b.y + (b.h - size) / 2, size, label, true);
 }
@@ -240,7 +242,7 @@ void checkbox(const Box& b, const std::string& label, bool on, bool focus) {
     const int s = b.h - 6;
     color(0, 0, 0, 170);
     fill(b.x, b.y + 3, s, s);
-    color(214, 182, 98);
+    color(ui::kAccent.line);
     outline(b.x, b.y + 3, s, s, focus ? 3 : 2);
     if (on) fill(b.x + 6, b.y + 9, s - 12, s - 12);
     color(245, 240, 228);
@@ -297,24 +299,24 @@ void drawSettings(int focus) {
     drawBackground(true);
     color(10, 8, 6, 225);
     fill(kPanel.x, kPanel.y, kPanel.w, kPanel.h);
-    color(214, 182, 98);
+    color(ui::kAccent.line);
     outline(kPanel.x, kPanel.y, kPanel.w, kPanel.h, 1);
     color(245, 240, 228);
     text(kPanel.x + 28, kPanel.y + 22, 30, "PC Settings", true);
-    color(214, 182, 98);
+    color(ui::kAccent.line);
     fill(kPanel.x + 28, kPanel.y + 62, kPanel.w - 56, 2);
     for (int r = 0; r < kRowCount; ++r) {
         const Box b = rowBox(r);
         if (focus == r) {
-            color(214, 182, 98, 60);
+            color(ui::kAccent.line, 60);
             fill(b.x, b.y, b.w, b.h);
-            color(214, 182, 98);
+            color(ui::kAccent.line);
             fill(b.x, b.y, 4, b.h);
         }
         color(245, 240, 228);
         text(b.x + 18, b.y + (b.h - 22) / 2, 22, kRows[r].label, focus == r);
         const Box l = arrowBox(r, false), rr = arrowBox(r, true);
-        color(214, 182, 98);
+        color(ui::kAccent.line);
         textCentered(l.x + l.w / 2, l.y + (l.h - 24) / 2, 24, "<", true);
         textCentered(rr.x + rr.w / 2, rr.y + (rr.h - 24) / 2, 24, ">", true);
         color(245, 240, 228);
