@@ -541,8 +541,9 @@ SDL_AudioDeviceID openAudioDevice(const AudioPort& p) {
         std::fprintf(stderr, "[audio] cannot open device: %s\n", SDL_GetError());
         return 0;
     }
-    std::fprintf(stderr, "[audio] port %u ch %s %u Hz on %s\n", p.channels, p.sampleBytes == 4 ? "float" : "s16",
-                 p.freq, SDL_GetCurrentAudioDriver());
+    std::fprintf(stderr, "[audio] port %u ch %s %u Hz on %s (device: %u ch, format 0x%x, %d Hz, %u frames)\n", p.channels,
+                 p.sampleBytes == 4 ? "float" : "s16", p.freq, SDL_GetCurrentAudioDriver(), unsigned(have.channels),
+                 unsigned(have.format), have.freq, unsigned(have.samples));
     SDL_PauseAudioDevice(dev, 0);
     return dev;
 }
@@ -624,7 +625,24 @@ int32_t sceAudioOutOutput(int32_t h, const void* samples) {
             if (!f) f = std::fopen((std::string(dumpDir) + "/port-" + std::to_string(h) + ".raw").c_str(), "wb");
             if (f) std::fwrite(samples, frameBytes, p.grain, f);
         }
-        if (samples) SDL_QueueAudio(p.dev, samples, p.grain * frameBytes);
+        // The first seconds of each port: how loud the game's samples are, and how much is queued
+        // (whether silence comes from the game or from the device).
+        if (samples && p.outputs > 0 && p.outputs % 1000 == 0 && p.outputs <= 5000) {
+            float peak = 0;
+            const size_t n = size_t(p.grain) * p.channels;
+            for (size_t i = 0; i < n; ++i) {
+                const float v = p.sampleBytes == 4 ? static_cast<const float*>(samples)[i]
+                                                   : static_cast<const int16_t*>(samples)[i] / 32768.0f;
+                peak = std::max(peak, v < 0 ? -v : v);
+            }
+            std::fprintf(stderr, "[audio] port %d output %llu: peak %.4f, %u bytes queued, device %s\n", h,
+                         (unsigned long long)p.outputs, peak, SDL_GetQueuedAudioSize(p.dev),
+                         SDL_GetAudioDeviceStatus(p.dev) == SDL_AUDIO_PLAYING ? "playing" : "not playing");
+        }
+        if (samples && SDL_QueueAudio(p.dev, samples, p.grain * frameBytes) != 0) {
+            static std::atomic<int> logged{0};
+            if (logged++ < 5) std::fprintf(stderr, "[audio] queue failed: %s\n", SDL_GetError());
+        }
         // Block one grain at a time on a steady clock, like the hardware. Waiting for the queue
         // to drain instead releases the game in bursts as the device takes 1024-frame chunks,
         // and the game then reads its mix before its mixer thread has finished it (a 47 Hz
