@@ -1,6 +1,6 @@
 # lost-paradise-native
 
-Runs *Fist of the North Star: Lost Paradise* (PS4, CUSA12776) natively on Linux. A C++ host loads
+Runs *Fist of the North Star: Lost Paradise* (PS4, CUSA12776 or CUSA12781) natively on Linux. A C++ host loads
 the game's original x86-64 code, answers its PS4 system calls itself, and recompiles its GPU
 shaders to Vulkan.
 
@@ -60,6 +60,10 @@ Lost Paradise/
   lost-paradise/           this repo, built
   launch.sh                or Lost_Paradise-x86_64.AppImage
 ```
+
+The US (CUSA12776) and EU (CUSA12781, with its v1.09 update) releases run the same game code, so
+every patch works on both. The eboot and modules may be plain ELF files or fake-signed SELF files
+(as the EU dump comes): the host unwraps those itself. Encrypted SELFs need decrypting first.
 
 Saves go to `lpn-data/savedata/<title ID>` (one folder per version, e.g. `CUSA12776`, read from
 the dump's `sce_sys/param.sfo`), the PC settings to `lpn-display.ini` and the log to `play.log`, all

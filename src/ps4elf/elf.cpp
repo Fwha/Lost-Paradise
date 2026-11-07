@@ -15,6 +15,59 @@ T read(std::span<const uint8_t> d, uint64_t off) {
     return v;
 }
 
+// A SELF (signed ELF) holds the ELF header and program headers after its own header and entry
+// table, and each segment's bytes in an entry of their own. Fake-signed dumps (fSELF, as some
+// releases' eboot.bin and modules come) keep those bytes in the clear: they are put back at each
+// segment's file offset, giving the ELF the console's loader would have seen. Encrypted or
+// compressed entries are refused.
+constexpr uint8_t kSelfMagic[4] = {0x4f, 0x15, 0x3d, 0x1d};
+constexpr uint64_t kSelfEncrypted = 1u << 1, kSelfCompressed = 1u << 3, kSelfBlocks = 1u << 11;
+
+bool unwrapSelf(std::vector<uint8_t>& data, std::string* error) {
+    auto fail = [&](const char* why) {
+        if (error) *error = why;
+        return false;
+    };
+    std::span<const uint8_t> d = data;
+    if (d.size() < 0x20) return fail("truncated SELF header");
+    const uint16_t entries = read<uint16_t>(d, 0x18);
+    const uint64_t elfAt = 0x20 + uint64_t(entries) * 0x20;
+    if (elfAt + 64 > d.size() || std::memcmp(d.data() + elfAt, "\x7f" "ELF", 4) != 0)
+        return fail("SELF without an ELF header");
+    const uint64_t phoff = read<uint64_t>(d, elfAt + 32);
+    const uint16_t phentsize = read<uint16_t>(d, elfAt + 54), phnum = read<uint16_t>(d, elfAt + 56);
+    if (phentsize != 56 || elfAt + phoff + uint64_t(phnum) * 56 > d.size()) return fail("bad SELF program header table");
+    struct Entry {
+        uint64_t props, offset, size;
+    };
+    std::vector<Entry> list;
+    for (uint16_t i = 0; i < entries; ++i) {
+        const uint64_t e = 0x20 + uint64_t(i) * 0x20;
+        list.push_back({read<uint64_t>(d, e), read<uint64_t>(d, e + 8), read<uint64_t>(d, e + 16)});
+    }
+    uint64_t size = phoff + uint64_t(phnum) * 56;
+    for (uint16_t i = 0; i < phnum; ++i) {
+        const uint64_t p = elfAt + phoff + uint64_t(i) * 56;
+        size = std::max(size, read<uint64_t>(d, p + 8) + read<uint64_t>(d, p + 32));
+    }
+    if (size > (uint64_t(1) << 32)) return fail("bad SELF program header table");
+    std::vector<uint8_t> out(size);
+    std::memcpy(out.data(), d.data() + elfAt, phoff + uint64_t(phnum) * 56);
+    for (const Entry& e : list) {
+        if (!(e.props & kSelfBlocks)) continue; // signatures and digests
+        if (e.props & kSelfEncrypted) return fail("encrypted SELF: decrypt it first (only fake-signed SELFs load)");
+        if (e.props & kSelfCompressed) return fail("compressed SELF segments are not supported");
+        const uint64_t seg = (e.props >> 20) & 0xfff;
+        if (seg >= phnum || e.offset + e.size > d.size()) return fail("bad SELF segment entry");
+        const uint64_t p = elfAt + phoff + seg * 56;
+        const uint64_t at = read<uint64_t>(d, p + 8), filesz = read<uint64_t>(d, p + 32);
+        if (e.size > filesz) return fail("bad SELF segment entry");
+        std::memcpy(out.data() + at, d.data() + e.offset, e.size);
+    }
+    data = std::move(out);
+    return true;
+}
+
 } // namespace
 
 std::optional<Elf> Elf::load(const std::string& path, std::string* error) {
@@ -25,10 +78,12 @@ std::optional<Elf> Elf::load(const std::string& path, std::string* error) {
     }
     Elf elf;
     elf.data_.assign(std::istreambuf_iterator<char>(in), {});
+    if (elf.data_.size() >= 4 && std::memcmp(elf.data_.data(), kSelfMagic, 4) == 0 && !unwrapSelf(elf.data_, error))
+        return std::nullopt;
     std::span<const uint8_t> d = elf.data_;
 
     if (d.size() < 64 || std::memcmp(d.data(), "\x7f" "ELF", 4) != 0) {
-        if (error) *error = "not an ELF file (still encrypted SELF?)";
+        if (error) *error = "not an ELF or SELF file";
         return std::nullopt;
     }
     if (d[4] != 2 || d[5] != 1) {
