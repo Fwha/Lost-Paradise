@@ -27,7 +27,7 @@ and known issues.
 - **DLAA:** NVIDIA DLSS anti-aliasing in place of the game's SMAA (RTX cards, see Build).
 - **PC Settings:** these options from the F11 menu, from a PC SETTINGS entry in the title
   and pause menus, or from the launcher.
-- **Launcher:** an AppImage with Play, Settings and Skip intro logos.
+- **Launcher:** an AppImage with Play, Settings, Skip intro logos and a .pkg unpacker.
 - **Sharper image:** full texture mipmaps, anisotropic filtering and smooth scaling to the window.
 - **Performance:** draws recorded on several threads, shader analysis ahead of the frame, and a
   pipeline cache that removes stutter on later runs.
@@ -83,6 +83,15 @@ it draws until the title screen.
 
 **Check for updates** (top right) asks GitHub for the latest release. From the AppImage, a newer
 one is downloaded over it and started; a build from source is told to pull and rebuild. 
+
+The **gear** (bottom right) opens **Tools**. **Unpack a .pkg** extracts a PS4 package into the game
+folder, as `game/<title ID>` (`-UPDATE` for a patch, `-DLC` for add-on content): pick it with the
+desktop's file chooser (zenity or kdialog) or drop it on the window. It works with fake PKGs (fpkg,
+made with the homebrew tools' published keys) and refuses a retail PKG, whose files are encrypted
+with keys only a PS4 has. It never writes over a folder that is already there. The same from a
+terminal: `build/src/pkg/lpn-pkg extract <file.pkg> [game folder]` (`lpn-pkg info` shows what a
+package is). The extractor (`src/pkg`) is written from the format's documentation, with no code
+from GPL tools such as shadPS4's old extractor.
 
 ### launch.sh
 

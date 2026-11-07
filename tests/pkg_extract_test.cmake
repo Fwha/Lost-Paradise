@@ -1,0 +1,21 @@
+# Makes a fake PKG, extracts it with lpn-pkg and compares the result with what went in.
+file(REMOVE_RECURSE "${WORK}")
+file(MAKE_DIRECTORY "${WORK}")
+execute_process(COMMAND "${PYTHON}" -I "${SRC}/tests/make_fake_pkg.py" "${SRC}/src/pkg/keys.h" "${WORK}/test.pkg"
+                        "${WORK}/expected" RESULT_VARIABLE r)
+if(NOT r EQUAL 0)
+    message(FATAL_ERROR "make_fake_pkg.py failed")
+endif()
+execute_process(COMMAND "${LPN_PKG}" extract "${WORK}/test.pkg" "${WORK}/game" RESULT_VARIABLE r)
+if(NOT r EQUAL 0)
+    message(FATAL_ERROR "lpn-pkg extract failed")
+endif()
+execute_process(COMMAND diff -r "${WORK}/expected" "${WORK}/game/CUSA12776" RESULT_VARIABLE r)
+if(NOT r EQUAL 0)
+    message(FATAL_ERROR "extracted files differ")
+endif()
+# A second extraction must not touch the folder the first made.
+execute_process(COMMAND "${LPN_PKG}" extract "${WORK}/test.pkg" "${WORK}/game" RESULT_VARIABLE r ERROR_QUIET OUTPUT_QUIET)
+if(r EQUAL 0)
+    message(FATAL_ERROR "lpn-pkg extracted over an existing folder")
+endif()

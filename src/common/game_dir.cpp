@@ -67,8 +67,11 @@ std::string findGameDir(const std::string& installDir) {
     if (hasEboot(games / kGameId)) return (games / kGameId).string();
     std::error_code ec;
     std::vector<fs::path> others;
-    for (const auto& e : fs::directory_iterator(games, ec))
+    for (const auto& e : fs::directory_iterator(games, ec)) {
+        // A .part folder is a .pkg the launcher is still unpacking (pkg/pkg.h).
+        if (e.path().extension() == ".part") continue;
         if (e.is_directory(ec) && hasEboot(e.path())) others.push_back(e.path());
+    }
     if (!others.empty()) return std::min_element(others.begin(), others.end())->string();
     return {};
 }

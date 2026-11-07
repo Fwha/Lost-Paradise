@@ -5,6 +5,8 @@
 // lpn-display.ini and play.log, as for launch.sh. The settings are the in-game PC Settings: both
 // read and write lpn-display.ini (common/settings_file.h), so a change in either shows in the other.
 // Play replaces the launcher with lpn-host, its log going to play.log. Check for updates: updater.h.
+// The gear at the bottom right opens Tools: unpacking a PS4 .pkg into the game folder (pkg/pkg.h),
+// picked with the desktop's file chooser (zenity or kdialog) or dropped on the window.
 #include "common/game_dir.h"
 #include "common/settings_file.h"
 #include "common/ui_palette.h"
@@ -12,17 +14,26 @@
 #include "host/pad_glyphs.h"
 #include "host/rounded.h"
 #include "launcher/updater.h"
+#include "pkg/pkg.h"
 
 #include <SDL.h>
+#include <nanosvg.h>
+#include <nanosvgrast.h>
 #include <stb_image.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
@@ -236,6 +247,7 @@ const Box kPlay{kW - 340, kH - 196, 300, 64};
 const Box kSettings{kW - 340, kH - 116, 300, 52};
 const Box kSkip{40, kH - 64, 300, 32};
 const Box kUpdate{kW - 260, 24, 236, 40};
+const Box kGear{kW - 84, kH - 56, 44, 44};
 // Settings screen
 const Box kPanel{176, 64, kW - 352, 470};
 constexpr int kRowY0 = 132, kRowH = 42;
@@ -246,6 +258,10 @@ Box arrowBox(int r, bool right) {
 }
 const Box kBack{kW / 2 + 12, kPanel.y + kPanel.h + 20, 200, 48};
 const Box kDefaults{kW / 2 - 212, kPanel.y + kPanel.h + 20, 200, 48};
+// Tools screen
+const Box kToolsPanel{226, 84, kW - 452, 420};
+const Box kChoose{kToolsPanel.x + 28, kToolsPanel.y + 214, 280, 48};
+const Box kToolsBack{kW / 2 - 100, kToolsPanel.y + kToolsPanel.h + 20, 200, 48};
 
 void button(const Box& b, const std::string& label, bool focus, bool primary, bool enabled = true) {
     if (primary && enabled) color(focus ? ui::kAccent.bright : ui::kAccent.line);
@@ -268,6 +284,77 @@ void checkbox(const Box& b, const std::string& label, bool on, bool focus) {
     if (on) fillR(b.x + 6, b.y + 9, s - 12, s - 12, 3);
     color(245, 240, 228);
     text(b.x + s + 12, b.y + (b.h - 20) / 2, 20, label, focus);
+}
+
+// A gear, white on clear, rasterised once at the size it is drawn: eight teeth round a ring.
+SDL_Texture* gGear = nullptr;
+int gGearSize = 0;
+
+SDL_Texture* gearTexture(int size) {
+    if (gGear && gGearSize == size) return gGear;
+    if (gGear) SDL_DestroyTexture(gGear), gGear = nullptr;
+    constexpr float kPi = 3.14159265f, c = 50, rOut = 47, rBody = 36, rHole = 15;
+    std::string d;
+    char buf[64];
+    for (int i = 0; i < 8; ++i) {
+        const float a = i * kPi / 4;
+        const float pts[4][2] = {{rBody, a - 0.25f}, {rOut, a - 0.16f}, {rOut, a + 0.16f}, {rBody, a + 0.25f}};
+        for (int k = 0; k < 4; ++k) {
+            std::snprintf(buf, sizeof buf, "%c%.2f %.2f ", i == 0 && k == 0 ? 'M' : 'L',
+                          c + pts[k][0] * std::cos(pts[k][1]), c + pts[k][0] * std::sin(pts[k][1]));
+            d += buf;
+        }
+    }
+    std::snprintf(buf, sizeof buf, "Z M%.0f %.0f A%.0f %.0f 0 1 0 %.0f %.0f A%.0f %.0f 0 1 0 %.0f %.0f Z", c + rHole, c,
+                  rHole, rHole, c - rHole, c, rHole, rHole, c + rHole, c);
+    d += buf;
+    std::string svg = "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><path fill='#ffffff' "
+                      "fill-rule='evenodd' d='" + d + "'/></svg>";
+    NSVGimage* img = nsvgParse(svg.data(), "px", 96.0f);
+    if (!img) return nullptr;
+    std::vector<uint8_t> px(size_t(size) * size * 4);
+    NSVGrasterizer* rast = nsvgCreateRasterizer();
+    nsvgRasterize(rast, img, 0, 0, size / 100.0f, px.data(), size, size, size * 4);
+    nsvgDeleteRasterizer(rast);
+    nsvgDelete(img);
+    gGear = SDL_CreateTexture(gRen, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, size, size);
+    if (!gGear) return nullptr;
+    SDL_UpdateTexture(gGear, nullptr, px.data(), size * 4);
+    SDL_SetTextureBlendMode(gGear, SDL_BLENDMODE_BLEND);
+    gGearSize = size;
+    return gGear;
+}
+
+void gearButton(const Box& b, bool focus) {
+    color(0, 0, 0, focus ? 200 : 150);
+    fillR(b.x, b.y, b.w, b.h, 8);
+    color(ui::kAccent.line);
+    outlineR(b.x, b.y, b.w, b.h, 8, focus ? 3 : 1);
+    const int s = b.h * 6 / 10;
+    if (SDL_Texture* t = gearTexture(s)) {
+        const ui::Rgb c = focus ? ui::kAccent.bright : ui::Rgb{245, 240, 228};
+        SDL_SetTextureColorMod(t, c.r, c.g, c.b);
+        SDL_Rect dst{b.x + (b.w - s) / 2, b.y + (b.h - s) / 2, s, s};
+        SDL_RenderCopy(gRen, t, nullptr, &dst);
+    }
+}
+
+// Text broken between words into lines no wider than maxW.
+std::vector<std::string> wrap(const std::string& s, int size, int maxW) {
+    std::vector<std::string> lines;
+    std::string line;
+    size_t at = 0;
+    while (at < s.size()) {
+        size_t sp = s.find(' ', at);
+        if (sp == std::string::npos) sp = s.size();
+        const std::string word = s.substr(at, sp - at);
+        const std::string next = line.empty() ? word : line + " " + word;
+        if (!line.empty() && font::width(next, size) > maxW) lines.push_back(line), line = word;
+        else line = next;
+        at = sp + 1;
+    }
+    if (!line.empty()) lines.push_back(line);
+    return lines;
 }
 
 // With a controller plugged in (or LPN_MENU_BUTTONS=pad), its Select and Back buttons at (x, y),
@@ -317,6 +404,105 @@ bool tryPlay() {
     return canPlay() && !gGameDir.empty();
 }
 
+// Unpacking a .pkg (Tools): the file chooser and the extraction run on a thread of their own,
+// sharing one of these with the window.
+struct Unpack {
+    enum State { Idle, Choosing, Working, Finished };
+    std::atomic<int> state{Idle};
+    pkg::Progress progress;
+    std::mutex mutex;
+    std::string message; // the result, or why the chooser could not open
+    std::string folder;  // game/<folder> being made
+    bool ok = false;
+};
+std::shared_ptr<Unpack> gUnpack = std::make_shared<Unpack>();
+
+bool unpackBusy() {
+    const int s = gUnpack->state;
+    return s == Unpack::Choosing || s == Unpack::Working;
+}
+
+// The desktop's file chooser: zenity (GNOME and most others), else kdialog (KDE). Empty when
+// cancelled, or with err set when there is no chooser.
+std::string chooseFile(std::string& err) {
+    const char* home = std::getenv("HOME");
+    const std::string start = home && *home ? std::string(home) + "/" : "./";
+    auto quote = [](const std::string& s) {
+        std::string q = "'";
+        for (char c : s) q += c == '\'' ? std::string("'\\''") : std::string(1, c);
+        return q + "'";
+    };
+    std::string cmd;
+    if (std::system("command -v zenity >/dev/null 2>&1") == 0)
+        cmd = "zenity --file-selection --title='Choose a .pkg file' --filename=" + quote(start) +
+              " --file-filter='PS4 packages (*.pkg) | *.pkg *.PKG' --file-filter='All files | *' 2>/dev/null";
+    else if (std::system("command -v kdialog >/dev/null 2>&1") == 0)
+        cmd = "kdialog --title 'Choose a .pkg file' --getopenfilename " + quote(start) +
+              " 'PS4 packages (*.pkg *.PKG)' 2>/dev/null";
+    else {
+        err = "No file chooser found (zenity or kdialog): drop the .pkg file on this window instead";
+        return {};
+    }
+    std::FILE* f = popen(cmd.c_str(), "r");
+    if (!f) {
+        err = "Cannot open the file chooser";
+        return {};
+    }
+    std::string out;
+    char buf[4096];
+    while (std::fgets(buf, sizeof buf, f)) out += buf;
+    pclose(f);
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    return out;
+}
+
+// Unpacks path (or the file the chooser picks, when empty) into game/<title ID>.
+void startUnpack(std::string path) {
+    if (unpackBusy()) return;
+    auto u = std::make_shared<Unpack>();
+    u->state = path.empty() ? Unpack::Choosing : Unpack::Working;
+    gUnpack = u;
+    const fs::path games = gInstall / host::kGameFolder;
+    std::thread([u, path, games]() mutable {
+        auto finish = [&](bool ok, const std::string& message) {
+            {
+                std::lock_guard lock(u->mutex);
+                u->ok = ok, u->message = message;
+            }
+            u->state = Unpack::Finished;
+        };
+        std::string err;
+        if (path.empty()) {
+            path = chooseFile(err);
+            if (path.empty()) {
+                if (err.empty()) u->state = Unpack::Idle;
+                else finish(false, err);
+                return;
+            }
+            u->state = Unpack::Working;
+        }
+        pkg::Info info;
+        if (!pkg::readInfo(path, info, err)) return finish(false, "Cannot unpack " + fs::path(path).filename().string() + ": " + err);
+        const std::string folder = pkg::folderName(info);
+        {
+            std::lock_guard lock(u->mutex);
+            u->folder = folder;
+        }
+        std::fprintf(stderr, "[launcher] unpacking %s (%s) into %s\n", path.c_str(), info.contentId.c_str(),
+                     (games / folder).c_str());
+        if (pkg::extract(path, (games / folder).string(), &u->progress, err))
+            return finish(true, "Unpacked " + (info.title.empty() ? info.titleId : info.title) + " into game/" + folder);
+        std::fprintf(stderr, "[launcher] unpacking failed: %s\n", err.c_str());
+        finish(false, err == "cancelled" ? "Unpacking cancelled" : "Cannot unpack: " + err);
+    }).detach();
+}
+
+bool isPkg(const std::string& p) {
+    std::string ext = fs::path(p).extension().string();
+    for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
+    return ext == ".pkg";
+}
+
 void drawMain(int focus) {
     drawBackground(false);
     button(kPlay, "Play", focus == 0, true, canPlay());
@@ -335,12 +521,87 @@ void drawMain(int focus) {
     fillR(kUpdate.x + kUpdate.w - lw - 12, kUpdate.y + kUpdate.h + 8, lw + 12, 24, 6);
     color(245, 240, 228, 230);
     text(kUpdate.x + kUpdate.w - lw - 6, kUpdate.y + kUpdate.h + 12, 16, fitted);
+    gearButton(kGear, focus == 4);
     padHints(40, 24, "Quit");
-    if (!gStatus.empty()) {
-        color(245, 240, 228, 220);
-        const std::string s = font::fit(gStatus, 17, kW - 420);
-        text(kW - 40 - font::width(s, 17), kH - 46, 17, s);
+    std::string status = gStatus;
+    if (gUnpack->state == Unpack::Working) {
+        const uint64_t total = gUnpack->progress.total, done = gUnpack->progress.done;
+        status = "Unpacking .pkg: " + std::to_string(total ? int(done * 100 / total) : 0) + "%";
     }
+    if (!status.empty()) {
+        color(245, 240, 228, 220);
+        const std::string s = font::fit(status, 17, kGear.x - 16 - 380);
+        text(kGear.x - 16 - font::width(s, 17), kGear.y + (kGear.h - 17) / 2, 17, s);
+    }
+}
+
+void drawTools(int focus) {
+    drawBackground(true);
+    const Box& p = kToolsPanel;
+    color(10, 8, 6, 225);
+    fillR(p.x, p.y, p.w, p.h, 12);
+    color(ui::kAccent.line);
+    outlineR(p.x, p.y, p.w, p.h, 12, 1);
+    color(245, 240, 228);
+    text(p.x + 28, p.y + 22, 30, "Tools", true);
+    color(ui::kAccent.line);
+    fill(p.x + 28, p.y + 62, p.w - 56, 2);
+    color(245, 240, 228);
+    text(p.x + 28, p.y + 88, 22, "Unpack a .pkg", true);
+    color(200, 192, 176);
+    int y = p.y + 124;
+    for (const std::string& l :
+         wrap("Extracts a PS4 .pkg into the game folder (e.g. game/CUSA12776), ready for Play. Works with fake "
+              "PKGs (fpkg): a retail PKG's files are encrypted with keys only a PS4 has.",
+              17, p.w - 56))
+        text(p.x + 28, y, 17, l), y += 23;
+
+    const std::shared_ptr<Unpack> u = gUnpack;
+    const int state = u->state;
+    const char* label = state == Unpack::Working ? "Cancel" : state == Unpack::Choosing ? "Choosing..." : "Choose .pkg file";
+    button(kChoose, label, focus == 0, state != Unpack::Working, state != Unpack::Choosing);
+    if (state == Unpack::Idle || state == Unpack::Finished) {
+        color(200, 192, 176);
+        text(kChoose.x + kChoose.w + 20, kChoose.y + (kChoose.h - 17) / 2, 17, "or drop one on this window");
+    }
+
+    const int x = p.x + 28, w = p.w - 56;
+    y = kChoose.y + kChoose.h + 30;
+    if (state == Unpack::Working) {
+        const uint64_t total = u->progress.total, done = u->progress.done;
+        const int pct = total ? int(done * 100 / total) : 0;
+        std::string folder, file;
+        {
+            std::lock_guard lock(u->mutex);
+            folder = u->folder;
+        }
+        {
+            std::lock_guard lock(u->progress.mutex);
+            file = u->progress.file;
+        }
+        color(245, 240, 228);
+        text(x, y, 19, "Unpacking into game/" + folder + ": " + std::to_string(pct) + "%", true);
+        color(0, 0, 0, 170);
+        fillR(x, y + 32, w, 14, 7);
+        color(ui::kAccent.fill);
+        if (pct > 0) fillR(x, y + 32, std::max(14, w * pct / 100), 14, 7);
+        color(ui::kAccent.line);
+        outlineR(x, y + 32, w, 14, 7, 1);
+        color(200, 192, 176);
+        text(x, y + 56, 15, font::fit(file, 15, w));
+    } else if (state == Unpack::Finished) {
+        std::string message;
+        bool ok;
+        {
+            std::lock_guard lock(u->mutex);
+            message = u->message, ok = u->ok;
+        }
+        if (ok) color(ui::kAccent.bright);
+        else color(245, 240, 228);
+        for (const std::string& l : wrap(message, 18, w)) text(x, y, 18, font::fit(l, 18, w)), y += 25;
+    }
+    button(kToolsBack, "Back", focus == 1, false);
+    padHints(40, kToolsBack.y + (kToolsBack.h - 40) / 2, "Back");
 }
 
 void drawSettings(int focus) {
@@ -446,29 +707,44 @@ int main(int argc, char** argv) {
     loadArt(win);
     SDL_GameController* pad = nullptr;
 
-    bool settings = false;
-    int focus = canPlay() ? 0 : 1; // main: 0 play, 1 settings, 2 skip, 3 update; settings: rows, defaults, back
-    const char* shot = std::getenv("LPN_LAUNCHER_SCREENSHOT"); // for docs: "main.bmp" or "settings:x.bmp"
-    if (shot && !std::strncmp(shot, "settings:", 9)) settings = true, focus = 0, shot += 9;
+    enum Screen { Main, Settings, Tools } screen = Main;
+    // main: 0 play, 1 settings, 2 skip, 3 update, 4 tools; settings: rows, defaults, back;
+    // tools: 0 choose (or cancel), 1 back
+    int focus = canPlay() ? 0 : 1;
+    // For docs: "main.bmp", "settings:x.bmp" or "tools:x.bmp" (LPN_LAUNCHER_UNPACK=<file.pkg> to show one unpacking).
+    const char* shot = std::getenv("LPN_LAUNCHER_SCREENSHOT");
+    if (shot && !std::strncmp(shot, "settings:", 9)) screen = Settings, focus = 0, shot += 9;
+    if (shot && !std::strncmp(shot, "tools:", 6)) screen = Tools, focus = 0, shot += 6;
+    if (const char* p = std::getenv("LPN_LAUNCHER_UNPACK"); p && *p) screen = Tools, focus = 0, startUnpack(p);
+    auto chooseOrCancel = [&] {
+        if (gUnpack->state == Unpack::Working) gUnpack->progress.cancel = true;
+        else startUnpack({});
+    };
     auto confirm = [&]() -> bool {
-        if (!settings) {
+        if (screen == Main) {
             if (focus == 0 && canPlay()) return tryPlay();
-            if (focus == 1) settings = true, focus = 0;
+            if (focus == 1) screen = Settings, focus = 0;
             if (focus == 2) gS.skipIntro = !gS.skipIntro, save();
             if (focus == 3) updateButton();
+            if (focus == 4) screen = Tools, focus = 0;
+        } else if (screen == Tools) {
+            if (focus == 0) chooseOrCancel();
+            else screen = Main, focus = 4;
         } else if (focus < kRowCount) stepValue(focus, +1);
         else if (focus == kRowCount) gS = DisplaySettings{}, save();
-        else settings = false, focus = 1;
+        else screen = Main, focus = 1;
         return false;
     };
     auto back = [&] {
-        if (settings) settings = false, focus = 1;
+        if (screen == Settings) screen = Main, focus = 1;
+        else if (screen == Tools) screen = Main, focus = 4;
     };
     auto move = [&](int d) {
-        const int n = settings ? kRowCount + 2 : 4;
+        const int n = screen == Settings ? kRowCount + 2 : screen == Tools ? 2 : 5;
         focus = ((focus + d) % n + n) % n;
-        if (!settings && focus == 0 && !canPlay()) focus = (focus + d + n) % n;
+        if (screen == Main && focus == 0 && !canPlay()) focus = (focus + d + n) % n;
     };
+    const Unpack* seen = nullptr; // the finished unpack the game folder was looked at again for
     for (bool run = true; run;) {
         SDL_Event e;
         bool start = false;
@@ -480,13 +756,22 @@ int main(int argc, char** argv) {
                 host::readSettings(host::kSettingsFile, gS);
             }
             else if (e.type == SDL_CONTROLLERDEVICEADDED && !pad) pad = SDL_GameControllerOpen(e.cdevice.which);
+            else if (e.type == SDL_DROPFILE) {
+                const std::string path = e.drop.file;
+                SDL_free(e.drop.file);
+                if (isPkg(path) && !unpackBusy()) screen = Tools, focus = 0, startUnpack(path);
+            }
             else if (e.type == SDL_MOUSEMOTION) {
                 const int x = e.motion.x, y = e.motion.y;
-                if (!settings) {
+                if (screen == Main) {
                     if (kPlay.in(x, y) && canPlay()) focus = 0;
                     else if (kSettings.in(x, y)) focus = 1;
                     else if (kSkip.in(x, y)) focus = 2;
                     else if (kUpdate.in(x, y)) focus = 3;
+                    else if (kGear.in(x, y)) focus = 4;
+                } else if (screen == Tools) {
+                    if (kChoose.in(x, y)) focus = 0;
+                    else if (kToolsBack.in(x, y)) focus = 1;
                 } else {
                     for (int r = 0; r < kRowCount; ++r)
                         if (rowBox(r).in(x, y)) focus = r;
@@ -495,16 +780,20 @@ int main(int argc, char** argv) {
                 }
             } else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
                 const int x = e.button.x, y = e.button.y;
-                if (!settings) {
+                if (screen == Main) {
                     if (kPlay.in(x, y) && canPlay()) start = tryPlay();
-                    else if (kSettings.in(x, y)) settings = true, focus = 0;
+                    else if (kSettings.in(x, y)) screen = Settings, focus = 0;
                     else if (kSkip.in(x, y)) gS.skipIntro = !gS.skipIntro, save();
                     else if (kUpdate.in(x, y)) updateButton();
+                    else if (kGear.in(x, y)) screen = Tools, focus = 0;
+                } else if (screen == Tools) {
+                    if (kChoose.in(x, y)) chooseOrCancel();
+                    else if (kToolsBack.in(x, y)) screen = Main, focus = 4;
                 } else {
                     for (int r = 0; r < kRowCount; ++r)
                         if (rowBox(r).in(x, y)) stepValue(r, arrowBox(r, false).in(x, y) ? -1 : +1);
                     if (kDefaults.in(x, y)) gS = DisplaySettings{}, save();
-                    if (kBack.in(x, y)) settings = false, focus = 1;
+                    if (kBack.in(x, y)) screen = Main, focus = 1;
                 }
             } else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_RIGHT) {
                 back();
@@ -531,17 +820,32 @@ int main(int argc, char** argv) {
                 }
                 if (key == 1) move(-1);
                 else if (key == 2) move(+1);
-                else if ((key == 3 || key == 4) && settings && focus < kRowCount) stepValue(focus, key == 3 ? -1 : +1);
-                else if ((key == 3 || key == 4) && !settings) move(key == 3 ? -1 : +1);
+                else if ((key == 3 || key == 4) && screen == Settings && focus < kRowCount)
+                    stepValue(focus, key == 3 ? -1 : +1);
+                else if (key == 3 || key == 4) move(key == 3 ? -1 : +1);
                 else if (key == 5) start = confirm();
                 else if (key == 6) {
-                    if (settings) back();
+                    if (screen != Main) back();
                     else run = false;
                 }
             }
         }
         if (!run) break;
-        if (settings) drawSettings(focus);
+        // A .pkg just unpacked: the game may be there now.
+        if (gUnpack->state == Unpack::Finished && seen != gUnpack.get()) {
+            seen = gUnpack.get();
+            findFiles();
+            refreshStatus();
+            if (!gArt) loadArt(win);
+            if (screen == Main && canPlay()) focus = 0;
+        }
+        if (shot && std::getenv("LPN_LAUNCHER_UNPACK")) {
+            // Wait for some of it to be done, to show the progress bar.
+            while (unpackBusy() && (!gUnpack->progress.total || gUnpack->progress.done * 3 < gUnpack->progress.total))
+                SDL_Delay(1);
+        }
+        if (screen == Settings) drawSettings(focus);
+        else if (screen == Tools) drawTools(focus);
         else drawMain(focus);
         if (shot) {
             // Read back what was drawn and save it, then quit (for screenshots in docs and tests).
@@ -559,6 +863,11 @@ int main(int argc, char** argv) {
             SDL_Quit();
             launcher::restart(argc, argv);
         }
+    }
+    // Stop an unpack so it does not leave a .part folder behind (the chooser is left to close).
+    if (gUnpack->state == Unpack::Working) {
+        gUnpack->progress.cancel = true;
+        for (int i = 0; i < 1000 && gUnpack->state == Unpack::Working; ++i) SDL_Delay(10);
     }
     if (pad) SDL_GameControllerClose(pad);
     SDL_DestroyRenderer(gRen);
