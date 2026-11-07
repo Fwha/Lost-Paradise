@@ -14,7 +14,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++ libvulkan-dev glslang-dev libsdl2-dev zlib1g-dev
+          sudo apt-get install -y cmake ninja-build g++ libvulkan-dev glslang-dev glslang-tools libsdl2-dev zlib1g-dev
       - name: Import names and DLSS SDK
         run: |
           scripts/fetch-nids.sh aerolib.csv
