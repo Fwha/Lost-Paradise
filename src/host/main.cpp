@@ -107,16 +107,12 @@ int main(int argc, char** argv) {
     }
     if (nidPath.empty()) return usage();
     if (gameDir.empty()) {
-        bool legacy = false;
-        gameDir = host::findGameDir(".", &legacy);
+        gameDir = host::findGameDir(".");
         if (gameDir.empty()) {
-            std::fprintf(stderr, "error: no game found: put the dump (the folder with eboot.bin) in %s/%s/%s\n",
-                         fs::current_path().string().c_str(), host::kGameFolder, host::kGameId);
+            std::fprintf(stderr, "error: game not found: put the dump (the folder with eboot.bin) in %s/%s\n",
+                         fs::current_path().string().c_str(), host::kGameFolder);
             return 1;
         }
-        if (legacy)
-            std::fprintf(stderr, "[host] using ./%s: move it into %s/ (%s/%s)\n", host::kGameId, host::kGameFolder,
-                         host::kGameFolder, host::kGameId);
         std::fprintf(stderr, "[host] game: %s\n", gameDir.c_str());
     }
 

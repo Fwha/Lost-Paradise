@@ -53,8 +53,8 @@ Lost Paradise/
 ```
 
 Saves go to `lpn-data`, the PC settings to `lpn-display.ini` and the log to `play.log`, all in
-that folder. `lpn-host` looks for the game in `game/` of the folder it runs in (a dump left at
-`./CUSA12776` from before still works, with a note in the log), or takes its path first:
+that folder. `lpn-host` looks for the game in `game/` of the folder it runs in, or takes its path
+first:
 
 ```sh
 build/src/host/lpn-host /path/to/CUSA12776 --nids aerolib.csv

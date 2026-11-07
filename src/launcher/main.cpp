@@ -36,7 +36,6 @@ constexpr int kW = 1152, kH = 648;
 // Paths
 fs::path gInstall, gExeDir;
 std::string gGameDir, gHost, gNids;
-bool gLegacyGame = false;
 DisplaySettings gS;
 
 fs::path exeDir() {
@@ -59,7 +58,10 @@ std::string firstExisting(std::initializer_list<fs::path> paths) {
 }
 
 void findFiles() {
-    gGameDir = host::findGameDir(gInstall.string(), &gLegacyGame);
+    // The game folder is made for the player to put the dump in.
+    std::error_code ec;
+    fs::create_directories(gInstall / host::kGameFolder, ec);
+    gGameDir = host::findGameDir(gInstall.string());
     // In the AppImage: usr/bin/lpn-launcher, lpn-host beside it and usr/share/lost-paradise.
     // In a build tree: build/src/launcher, build/src/host and the repo's aerolib.csv.
     gHost = firstExisting({gExeDir / "lpn-host", gExeDir / "../host/lpn-host",
@@ -247,15 +249,23 @@ void checkbox(const Box& b, const std::string& label, bool on, bool focus) {
 
 std::string gStatus; // why Play cannot start, or a launch error
 
-bool canPlay() { return !gGameDir.empty() && !gHost.empty() && !gNids.empty(); }
+// Play stays pressable while only the game is missing: pressing it looks again (tryPlay).
+bool canPlay() { return !gHost.empty() && !gNids.empty(); }
 
 void refreshStatus() {
     if (gGameDir.empty())
-        gStatus = "Game not found: put the CUSA12776 folder in " + (gInstall / host::kGameFolder).string();
+        gStatus = "Game not found. Please place in the game folder then press Play";
     else if (gHost.empty()) gStatus = "lpn-host not found beside the launcher";
     else if (gNids.empty()) gStatus = "aerolib.csv not found (scripts/fetch-nids.sh)";
-    else if (gLegacyGame) gStatus = "Tip: move CUSA12776 into the game folder";
     else gStatus.clear();
+}
+
+// Looks for the game again (it may have been put in place since); false with the status saying
+// what is missing.
+bool tryPlay() {
+    findFiles();
+    refreshStatus();
+    return canPlay() && !gGameDir.empty();
 }
 
 void drawMain(int focus) {
@@ -380,7 +390,7 @@ int main(int argc, char** argv) {
     if (shot && !std::strncmp(shot, "settings:", 9)) settings = true, focus = 0, shot += 9;
     auto confirm = [&]() -> bool {
         if (!settings) {
-            if (focus == 0 && canPlay()) return true;
+            if (focus == 0 && canPlay()) return tryPlay();
             if (focus == 1) settings = true, focus = 0;
             if (focus == 2) gS.skipIntro = !gS.skipIntro, save();
             if (focus == 3) updateButton();
@@ -424,7 +434,7 @@ int main(int argc, char** argv) {
             } else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
                 const int x = e.button.x, y = e.button.y;
                 if (!settings) {
-                    if (kPlay.in(x, y) && canPlay()) start = true;
+                    if (kPlay.in(x, y) && canPlay()) start = tryPlay();
                     else if (kSettings.in(x, y)) settings = true, focus = 0;
                     else if (kSkip.in(x, y)) gS.skipIntro = !gS.skipIntro, save();
                     else if (kUpdate.in(x, y)) updateButton();

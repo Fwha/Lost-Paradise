@@ -10,9 +10,7 @@ constexpr const char* kGameFolder = "game";
 constexpr const char* kGameId = "CUSA12776"; // the version the host's patches are written for
 
 // The dump under <installDir>/game: game/CUSA12776 when it holds an eboot.bin, else the first
-// other folder there that does. Before the game/ folder existed the dump sat in the install
-// folder itself, so <installDir>/CUSA12776 is still found (legacy is then set). Empty when there
-// is none.
-std::string findGameDir(const std::string& installDir, bool* legacy = nullptr);
+// other folder there that does. Empty when there is none.
+std::string findGameDir(const std::string& installDir);
 
 } // namespace host
