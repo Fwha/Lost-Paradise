@@ -80,11 +80,7 @@ change in one shows in the other) and a **Skip intro logos** box, which runs the
 it draws until the title screen.
 
 **Check for updates** (top right) asks GitHub for the latest release. From the AppImage, a newer
-one is downloaded over it and started; a build from source is told to pull and rebuild. The repo
-is private, so it needs a GitHub login: `gh auth login`, or a token (read access to the repo's
-contents) in a `github-token` file in the install folder, or `$GITHUB_TOKEN`. Releases come from
-pushing a version tag (`git tag v0.2.0 && git push origin v0.2.0`): `.github/workflows/release.yml`
-builds the AppImage and attaches it.
+one is downloaded over it and started; a build from source is told to pull and rebuild. 
 
 ### launch.sh
 
