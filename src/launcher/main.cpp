@@ -551,9 +551,7 @@ void drawTools(int focus) {
     color(200, 192, 176);
     int y = p.y + 124;
     for (const std::string& l :
-         wrap("Extracts a PS4 .pkg into the game folder (e.g. game/CUSA12776), ready for Play. Works with fake "
-              "PKGs (fpkg): a retail PKG's files are encrypted with keys only a PS4 has.",
-              17, p.w - 56))
+         wrap("Extracts .pkg file", 17, p.w - 56))
         text(p.x + 28, y, 17, l), y += 23;
 
     const std::shared_ptr<Unpack> u = gUnpack;
