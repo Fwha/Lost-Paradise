@@ -136,3 +136,21 @@ in [ghidra/](ghidra/). Run the tests with `ctest --test-dir build`.
 - `tools/`: the command-line tools
 - `tests/`: unit tests
 - `docs/`: findings about the game and how the host works
+
+## License
+
+MIT, see [LICENSE](LICENSE). This covers the code in this repository only, not the game, which
+you must own.
+
+Third-party code and art keep their own licenses:
+
+- `external/stb`: MIT or public domain (`external/stb/LICENSE`).
+- `external/nanosvg`: zlib (notice at the top of each header).
+- `external/controllerimage`: button art is public domain, see its `DATA-LICENSE.txt` and
+  `credits.txt`.
+- NVIDIA DLSS SDK (optional, fetched by `scripts/fetch-dlss.sh`, not in this repository):
+  NVIDIA RTX SDKs license. Release builds that bundle the DLSS runtime are subject to it.
+- `aerolib.csv` (fetched by `scripts/fetch-nids.sh`, not in this repository): from
+  [zecoxao/sce_symbols](https://github.com/zecoxao/sce_symbols).
+
+This project is not affiliated with or endorsed by Sega, Sony or NVIDIA.
