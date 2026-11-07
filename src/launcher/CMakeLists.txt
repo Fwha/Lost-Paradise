@@ -1,4 +1,4 @@
-# lpn-launcher: Play and Settings in front of lpn-host (scripts/make-appimage.sh packs both).
+# lpn-launcher: Play, Settings and Tools (.pkg unpacking) in front of lpn-host (scripts/make-appimage.sh packs both).
 find_package(SDL2 QUIET)
 if(NOT SDL2_FOUND)
     message(STATUS "SDL2 not found: no lpn-launcher")
@@ -11,7 +11,7 @@ add_executable(lpn-launcher
     ../host/pad_glyphs.cpp
     ../host/stb_impl.cpp
 )
-target_link_libraries(lpn-launcher PRIVATE lpn-common SDL2::SDL2)
+target_link_libraries(lpn-launcher PRIVATE lpn-common pkg SDL2::SDL2)
 target_compile_definitions(lpn-launcher PRIVATE LPN_HAVE_SDL2)
 target_include_directories(lpn-launcher SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/external/stb"
                            "${PROJECT_SOURCE_DIR}/external/nanosvg")
