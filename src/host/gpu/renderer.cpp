@@ -5535,15 +5535,18 @@ void main() {
                 for (const auto& w : prog->warnings) std::fprintf(traceOut_, "[trace]   warning: %s\n", w.c_str());
             }
         }
-        if (!(r.ctx[reg::kPaClVteCntl] & 0xF)) {
-            const float t[4] = {2.0f / float(width), 2.0f / float(height), -1.0f, -1.0f};
+        { // set again on each try: hudTransform builds on it
+            const bool pixels = !(r.ctx[reg::kPaClVteCntl] & 0xF);
+            const float t[4] = {pixels ? 2.0f / float(width) : 1.0f, pixels ? 2.0f / float(height) : 1.0f,
+                                pixels ? -1.0f : 0.0f, pixels ? -1.0f : 0.0f};
             std::memcpy(&vs.data[gcn::data::kPosTransform], t, sizeof(t));
         }
+        // Before the draw data goes up with the resources (hudTransform changes it).
+        const uint8_t hud = hudDraw(r, hasDepth, vs, psm ? &ps : nullptr, d, prim, width, height);
+        if (hud) hudTransform(vs, r, width, height, hud);
         bindResources(vs, 0, VK_SHADER_STAGE_VERTEX_BIT, writes, bufs, imgs, aheadFor(a, vs));
         if (psm) bindResources(ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT, writes, bufs, imgs, aheadFor(a, ps));
         linkWrites(writes, bufs, imgs);
-        const uint8_t hud = hudDraw(r, hasDepth, vs, psm ? &ps : nullptr, d, prim, width, height);
-        if (hud) hudTransform(vs, r, width, height, hud);
 
         // Index buffer.
         VkBuffer indexBuffer = VK_NULL_HANDLE;
