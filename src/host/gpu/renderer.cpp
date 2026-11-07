@@ -1899,11 +1899,11 @@ private:
         const bool fix = hud().on;
         if (syncRecord_ || !deferUploads_ || R().immediate_) {
             std::memcpy(dst, data.data(), bytes);
-            if (fix) fixViewRays(dst, bytes);
+            if (fix) fixViewRays(data.data(), dst, bytes);
         } else {
             rec([dst, src = data.data(), bytes, fix] {
                 std::memcpy(dst, src, bytes);
-                if (fix) fixViewRays(dst, bytes);
+                if (fix) fixViewRays(src, dst, bytes);
             });
         }
         return at;
@@ -1912,8 +1912,11 @@ private:
     // (s/w, -s/h, -1, 1) with s 1 or 2 and a tan quad (tan x, tan y, -1, 0), in either order. The
     // pixel size is right but tan x is worked out for 16:9 by code not found (ghost shadows at
     // 21:9). Where both quads sit side by side, tan x is made to match the pixel size's shape.
-    static void fixViewRays(uint8_t* p, size_t bytes) {
-        float* f = reinterpret_cast<float*>(p);
+    // It reads the draw's own data and writes only the fixed values to the ring, which is slow
+    // to read (uncached).
+    static void fixViewRays(const uint32_t* src, uint8_t* dst, size_t bytes) {
+        const float* f = reinterpret_cast<const float*>(src);
+        float* out = reinterpret_cast<float*>(dst);
         const size_t n = bytes / 4;
         auto pixel = [&](size_t i) {
             return f[i] > 0 && f[i + 1] < 0 && f[i + 2] == -1.0f && f[i + 3] == 1.0f;
@@ -1926,8 +1929,8 @@ private:
             if (!pixel(i)) continue;
             const float aspect = -f[i + 1] / f[i]; // (s/h) / (s/w)
             if (std::fabs(aspect - 16.0f / 9) < 0.02f || aspect < 1.0f || aspect > 4.0f) continue;
-            if (i + 8 <= n && tan(i + 4)) f[i + 4] = f[i + 5] * aspect;
-            if (i >= gcn::data::kSmrd + 4 && tan(i - 4)) f[i - 4] = f[i - 3] * aspect;
+            if (i + 8 <= n && tan(i + 4)) out[i + 4] = f[i + 5] * aspect;
+            if (i >= gcn::data::kSmrd + 4 && tan(i - 4)) out[i - 4] = f[i - 3] * aspect;
         }
     }
 
