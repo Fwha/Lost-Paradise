@@ -6204,7 +6204,14 @@ void main() {
                 layer = hudLayers_.count(target) != 0;
             }
         }
-        const bool isHud = !hasDepth && (display || layer) && sceneW == 0;
+        // One untextured full-screen-style rectangle (RECTLIST, 3 vertices): a fill, tint or fade
+        // over the whole picture. Squeezed, it left a seam at the 16:9 edges.
+        bool textured = false;
+        for (const gcn::Program* p : {&vs, ps})
+            if (p)
+                for (const auto& t : p->images) textured = textured || !t.storage;
+        const bool fill = prim == 17 && d.count == 3 && !textured;
+        const bool isHud = !hasDepth && (display || layer) && sceneW == 0 && !fill;
         if (hudLog_) {
             std::lock_guard lock(hudLogMutex_);
             const uint64_t vsAddr = vs.launch.entry, psAddr = ps ? ps->launch.entry : 0;
