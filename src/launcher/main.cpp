@@ -4,10 +4,11 @@
 // the working directory. That folder holds game/CUSA12776 (common/game_dir.h), lpn-data,
 // lpn-display.ini and play.log, as for launch.sh. The settings are the in-game PC Settings: both
 // read and write lpn-display.ini (common/settings_file.h), so a change in either shows in the other.
-// Play replaces the launcher with lpn-host, its log going to play.log.
+// Play replaces the launcher with lpn-host, its log going to play.log. Check for updates: updater.h.
 #include "common/game_dir.h"
 #include "common/settings_file.h"
 #include "host/menu_font.h"
+#include "launcher/updater.h"
 
 #include <SDL.h>
 #include <stb_image.h>
@@ -209,6 +210,7 @@ struct Box {
 const Box kPlay{kW - 340, kH - 196, 300, 64};
 const Box kSettings{kW - 340, kH - 116, 300, 52};
 const Box kSkip{40, kH - 64, 300, 32};
+const Box kUpdate{kW - 260, 24, 236, 40};
 // Settings screen
 const Box kPanel{176, 64, kW - 352, 470};
 constexpr int kRowY0 = 140, kRowH = 52;
@@ -247,7 +249,7 @@ std::string gStatus; // why Play cannot start, or a launch error
 
 bool canPlay() { return !gGameDir.empty() && !gHost.empty() && !gNids.empty(); }
 
-void updateStatus() {
+void refreshStatus() {
     if (gGameDir.empty())
         gStatus = "Game not found: put the CUSA12776 folder in " + (gInstall / host::kGameFolder).string();
     else if (gHost.empty()) gStatus = "lpn-host not found beside the launcher";
@@ -261,6 +263,19 @@ void drawMain(int focus) {
     button(kPlay, "Play", focus == 0, true, canPlay());
     button(kSettings, "Settings", focus == 1, false);
     checkbox(kSkip, "Skip intro logos", gS.skipIntro, focus == 2);
+    // Check for updates, top right, with what it found under it.
+    const launcher::UpdateStatus u = launcher::updateStatus();
+    const bool busy = u.state == launcher::UpdateState::Checking || u.state == launcher::UpdateState::Downloading;
+    const bool canApply = u.state == launcher::UpdateState::Available && std::getenv("APPIMAGE");
+    button(kUpdate, canApply ? "Update to " + u.latest : "Check for updates", focus == 3, canApply, !busy);
+    SDL_SetRenderDrawBlendMode(gRen, SDL_BLENDMODE_BLEND);
+    const std::string line = u.message.empty() ? std::string("Version ") + launcher::version() : u.message;
+    const std::string fitted = font::fit(line, 16, 520);
+    const int lw = font::width(fitted, 16);
+    color(0, 0, 0, 160);
+    fill(kUpdate.x + kUpdate.w - lw - 12, kUpdate.y + kUpdate.h + 8, lw + 12, 24);
+    color(245, 240, 228, 230);
+    text(kUpdate.x + kUpdate.w - lw - 6, kUpdate.y + kUpdate.h + 12, 16, fitted);
     if (!gStatus.empty()) {
         color(245, 240, 228, 220);
         const std::string s = font::fit(gStatus, 17, kW - 420);
@@ -323,6 +338,13 @@ void play(SDL_Window* win, int argc, char** argv) {
     std::exit(1);
 }
 
+// Check for updates, or apply the update a check found.
+void updateButton() {
+    const launcher::UpdateStatus u = launcher::updateStatus();
+    if (u.state == launcher::UpdateState::Available) launcher::applyUpdate();
+    else launcher::checkForUpdates(gInstall.string());
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -333,7 +355,7 @@ int main(int argc, char** argv) {
     if (ec) std::fprintf(stderr, "[launcher] cannot enter %s: %s\n", gInstall.c_str(), ec.message().c_str());
     findFiles();
     host::readSettings(host::kSettingsFile, gS);
-    updateStatus();
+    refreshStatus();
     std::fprintf(stderr, "[launcher] install %s, game %s, host %s, nids %s\n", gInstall.c_str(),
                  gGameDir.empty() ? "(none)" : gGameDir.c_str(), gHost.empty() ? "(none)" : gHost.c_str(),
                  gNids.empty() ? "(none)" : gNids.c_str());
@@ -353,7 +375,7 @@ int main(int argc, char** argv) {
     SDL_GameController* pad = nullptr;
 
     bool settings = false;
-    int focus = canPlay() ? 0 : 1; // main: 0 play, 1 settings, 2 skip; settings: rows, defaults, back
+    int focus = canPlay() ? 0 : 1; // main: 0 play, 1 settings, 2 skip, 3 update; settings: rows, defaults, back
     const char* shot = std::getenv("LPN_LAUNCHER_SCREENSHOT"); // for docs: "main.bmp" or "settings:x.bmp"
     if (shot && !std::strncmp(shot, "settings:", 9)) settings = true, focus = 0, shot += 9;
     auto confirm = [&]() -> bool {
@@ -361,6 +383,7 @@ int main(int argc, char** argv) {
             if (focus == 0 && canPlay()) return true;
             if (focus == 1) settings = true, focus = 0;
             if (focus == 2) gS.skipIntro = !gS.skipIntro, save();
+            if (focus == 3) updateButton();
         } else if (focus < kRowCount) stepValue(focus, +1);
         else if (focus == kRowCount) gS = DisplaySettings{}, save();
         else settings = false, focus = 1;
@@ -370,7 +393,7 @@ int main(int argc, char** argv) {
         if (settings) settings = false, focus = 1;
     };
     auto move = [&](int d) {
-        const int n = settings ? kRowCount + 2 : 3;
+        const int n = settings ? kRowCount + 2 : 4;
         focus = ((focus + d) % n + n) % n;
         if (!settings && focus == 0 && !canPlay()) focus = (focus + d + n) % n;
     };
@@ -391,6 +414,7 @@ int main(int argc, char** argv) {
                     if (kPlay.in(x, y) && canPlay()) focus = 0;
                     else if (kSettings.in(x, y)) focus = 1;
                     else if (kSkip.in(x, y)) focus = 2;
+                    else if (kUpdate.in(x, y)) focus = 3;
                 } else {
                     for (int r = 0; r < kRowCount; ++r)
                         if (rowBox(r).in(x, y)) focus = r;
@@ -403,6 +427,7 @@ int main(int argc, char** argv) {
                     if (kPlay.in(x, y) && canPlay()) start = true;
                     else if (kSettings.in(x, y)) settings = true, focus = 0;
                     else if (kSkip.in(x, y)) gS.skipIntro = !gS.skipIntro, save();
+                    else if (kUpdate.in(x, y)) updateButton();
                 } else {
                     for (int r = 0; r < kRowCount; ++r)
                         if (rowBox(r).in(x, y)) stepValue(r, arrowBox(r, false).in(x, y) ? -1 : +1);
@@ -456,6 +481,12 @@ int main(int argc, char** argv) {
         }
         SDL_RenderPresent(gRen);
         if (start) play(win, argc, argv);
+        if (launcher::restartReady()) {
+            SDL_DestroyRenderer(gRen);
+            SDL_DestroyWindow(win);
+            SDL_Quit();
+            launcher::restart(argc, argv);
+        }
     }
     if (pad) SDL_GameControllerClose(pad);
     SDL_DestroyRenderer(gRen);
