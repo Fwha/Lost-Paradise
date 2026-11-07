@@ -43,7 +43,7 @@ add_executable(lpn-host
 )
 find_package(ZLIB REQUIRED)
 find_package(Vulkan REQUIRED)
-target_link_libraries(lpn-host PRIVATE ps4elf gcn formats ZLIB::ZLIB Vulkan::Vulkan)
+target_link_libraries(lpn-host PRIVATE lpn-common ps4elf gcn formats ZLIB::ZLIB Vulkan::Vulkan)
 # stb_truetype and stb_image (public domain, external/stb) for the menu font and save icons.
 target_include_directories(lpn-host SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/external/stb")
 # The guest TLS slot must sit at a fixed offset from %fs, which the initial-exec model gives.

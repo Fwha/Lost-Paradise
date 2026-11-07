@@ -22,68 +22,17 @@ namespace host {
 
 namespace {
 
-constexpr const char* kFile = "lpn-display.ini";
 DisplaySettings gSettings;
 uint32_t gActiveW = 0, gActiveH = 0;
 
-const char* modeName(WindowMode m) {
-    return m == WindowMode::Borderless ? "borderless" : m == WindowMode::Fullscreen ? "fullscreen" : "windowed";
-}
-
-const char* const kDlssKeys[kDlssModes] = {"off", "dlaa", "quality", "balanced", "performance"};
-
 } // namespace
-
-const char* dlssModeName(DlssMode m) {
-    static const char* const names[kDlssModes] = {"Off", "DLAA", "Quality", "Balanced", "Performance"};
-    return names[int(m)];
-}
 
 DisplaySettings& displaySettings() { return gSettings; }
 
-void loadDisplaySettings() {
-    FILE* f = std::fopen(kFile, "r");
-    if (!f) return;
-    char line[256];
-    while (std::fgets(line, sizeof line, f)) {
-        char key[64], value[64];
-        if (std::sscanf(line, " %63[^= ] = %63s", key, value) != 2) continue;
-        if (!std::strcmp(key, "window")) {
-            for (WindowMode m : {WindowMode::Windowed, WindowMode::Borderless, WindowMode::Fullscreen})
-                if (!std::strcmp(value, modeName(m))) gSettings.window = m;
-        } else if (!std::strcmp(key, "resolution")) {
-            unsigned w = 0, h = 0;
-            if (std::sscanf(value, "%ux%u", &w, &h) == 2 && w >= 320 && h >= 180 && w <= 7680 && h <= 4320)
-                gSettings.width = w, gSettings.height = h;
-            else gSettings.width = gSettings.height = 0;
-        } else if (!std::strcmp(key, "fps")) {
-            const int fps = std::atoi(value);
-            if (!std::strcmp(value, "uncapped")) gSettings.fps = 0;
-            else if (fps >= 10 && fps <= 240) gSettings.fps = fps;
-        } else if (!std::strcmp(key, "fps_counter")) {
-            gSettings.fpsCounter = !std::strcmp(value, "on");
-        } else if (!std::strcmp(key, "dlss")) {
-            for (int i = 0; i < kDlssModes; ++i)
-                if (!std::strcmp(value, kDlssKeys[i])) gSettings.dlss = DlssMode(i);
-        }
-    }
-    std::fclose(f);
-}
+void loadDisplaySettings() { readSettings(kSettingsFile, gSettings); }
 
 void saveDisplaySettings() {
-    FILE* f = std::fopen(kFile, "w");
-    if (!f) {
-        std::fprintf(stderr, "[display] cannot write %s\n", kFile);
-        return;
-    }
-    std::fprintf(f, "window = %s\n", modeName(gSettings.window));
-    if (gSettings.width) std::fprintf(f, "resolution = %ux%u\n", gSettings.width, gSettings.height);
-    else std::fprintf(f, "resolution = default\n");
-    if (gSettings.fps) std::fprintf(f, "fps = %d\n", gSettings.fps);
-    else std::fprintf(f, "fps = uncapped\n");
-    std::fprintf(f, "fps_counter = %s\n", gSettings.fpsCounter ? "on" : "off");
-    std::fprintf(f, "dlss = %s\n", kDlssKeys[int(gSettings.dlss)]);
-    std::fclose(f);
+    if (!writeSettings(kSettingsFile, gSettings)) std::fprintf(stderr, "[display] cannot write %s\n", kSettingsFile);
 }
 
 bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height) {
@@ -241,6 +190,11 @@ const uint8_t kPopWas[] = {0x48, 0x63, 0x87, 0x98, 0, 0, 0, 0xc7, 0x84, 0x87, 0x
 
 bool titleRunning() { return gTitleAlive.load(std::memory_order_relaxed); }
 
+// Skip intro logos: on from the first flip until the title sequence first starts.
+std::atomic<bool> gTitleSeen{false};
+constexpr double kSkipLimitS = 60; // in case the title is never seen
+bool gStepHooks = false;            // pushStep is in place, so the title can be seen
+
 // The 1/30 cutscene and 1/20 loading steps stay fixed. (Cutscenes stepped by the measured time
 // flashed frames from later in the scene, so they stay at 30.) The game's table holds 1/60 as
 // this same float.
@@ -260,6 +214,7 @@ extern "C" uint32_t stepNs(uint32_t measured) {
     const Clock& c = clock();
     const bool uncapped = gClockActive.load(std::memory_order_relaxed) == 2;
     if (c.overrideDt > 0) ++gSteps.override; // the clock replaces this step after the call
+    if (skippingIntro()) return std::max<uint32_t>(kMaxNs, fixedStepKept(c) ? uint32_t(double(c.fixedDt) * 1e9) : 0);
     if (fixedStepKept(c)) {
         ++gSteps.fixed;
         const double ns = double(c.fixedDt) * 1e9;
@@ -314,7 +269,11 @@ uint64_t pushRequest(uint8_t* stack, uint32_t value, uintptr_t caller) {
 
 extern "C" uint64_t pushStep(uint8_t* stack, uint32_t index) {
     const uintptr_t caller = uintptr_t(__builtin_return_address(0));
-    if (caller - uintptr_t(gEbootText) == kTitleStepCaller) gTitleAlive = true;
+    if (caller - uintptr_t(gEbootText) == kTitleStepCaller) {
+        gTitleAlive = true;
+        if (!gTitleSeen.exchange(true) && gSettings.skipIntro)
+            std::fprintf(stderr, "[boot] intro logos skipped: title at flip %llu\n", (unsigned long long)flipCount());
+    }
     return pushRequest(stack, index, caller);
 }
 
@@ -377,6 +336,7 @@ bool prepareFrameClock(Module& eboot) {
         jumpTo(kPushStep, reinterpret_cast<const void*>(&pushStep));
         jumpTo(kPushMeasured, reinterpret_cast<const void*>(&pushMeasured));
         jumpTo(kPopStep, reinterpret_cast<const void*>(&popStep));
+        gStepHooks = true;
     }
     return true;
 }
@@ -426,6 +386,16 @@ void clockStats() {
 
 bool frameClockUncapped() { return gClockActive.load(std::memory_order_relaxed) == 2; }
 
+bool skippingIntro() {
+    if (!gSettings.skipIntro || !gStepHooks || gTitleSeen.load(std::memory_order_relaxed)) return false;
+    using Wall = std::chrono::steady_clock;
+    static const Wall::time_point start = Wall::now();
+    if (std::chrono::duration<double>(Wall::now() - start).count() < kSkipLimitS) return true;
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) std::fprintf(stderr, "[boot] title not seen after %.0f s: intro skip stopped\n", kSkipLimitS);
+    return false;
+}
+
 namespace {
 
 // Uncapped, the title menu runs with its 1/30 step turned off, as the clock's own off switch
@@ -445,7 +415,8 @@ bool uncap30FpsScenes() {
 
 void syncFrameClock() {
     if (gEbootText) clockStats();
-    const int want = gClockWanted;
+    // Skipping the intro, the host picks every step (stepNs), whatever the cap.
+    const int want = skippingIntro() ? std::max(1, gClockWanted.load()) : gClockWanted.load();
     if (gEbootText) titleStep(want == 2 && gClockActive == want && !keep30FpsScenes());
     if (!gEbootText || want == gClockActive) return;
     write(kMeasured[0], want >= 1);

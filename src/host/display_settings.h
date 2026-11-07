@@ -1,28 +1,15 @@
 // Display settings the F11 menu changes: how the window is shown, the resolution the game
-// renders at and the frame rate cap. They are kept in lpn-display.ini in the working directory.
+// renders at and the frame rate cap. They are kept in lpn-display.ini in the working directory
+// (common/settings_file.h), which the launcher changes too.
 #pragma once
+
+#include "common/settings_file.h"
 
 #include <cstdint>
 
 namespace host {
 
 class Module;
-
-enum class WindowMode { Windowed, Borderless, Fullscreen };
-// NVIDIA DLSS (gpu/dlss.h): anti-aliasing at the render size (DLAA) or upscaling to it.
-enum class DlssMode { Off, Dlaa, Quality, Balanced, Performance };
-constexpr int kDlssModes = 5;
-const char* dlssModeName(DlssMode m); // "Off", "DLAA", "Quality", ...
-
-struct DisplaySettings {
-    WindowMode window = WindowMode::Windowed;
-    // The game's 3D resolution; 0 keeps the game's own (1600x896, as on a base PS4).
-    uint32_t width = 0, height = 0;
-    // Frames a second shown at most (see setFpsCap); 0 leaves the rate to the game.
-    int fps = 30;
-    bool fpsCounter = false; // frames shown a second, in the top right corner
-    DlssMode dlss = DlssMode::Off;
-};
 
 DisplaySettings& displaySettings();
 void loadDisplaySettings();
@@ -54,5 +41,10 @@ bool frameClockUncapped();
 // cutscenes ask for 30 fps with a fixed 1/30 step or, like the one before the Shin fight, with
 // measured steps, and flash when shown faster.
 bool uncap30FpsScenes();
+
+// With Skip intro logos on: from boot until the title sequence starts, the game is run as fast as
+// it draws (the vblank clock as on loading screens, the frame clock's longest step), so the
+// logos and the photosensitivity notice go by in a moment. Off again at the title, or after 60 s.
+bool skippingIntro();
 
 } // namespace host

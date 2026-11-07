@@ -1,0 +1,4 @@
+#!/bin/sh
+# The AppImage's entry: the launcher, which runs in the folder the AppImage is in ($APPIMAGE).
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/usr/bin/lpn-launcher" "$@"

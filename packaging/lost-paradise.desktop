@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Lost Paradise
+Comment=Fist of the North Star: Lost Paradise, run natively
+Exec=lpn-launcher
+Icon=lost-paradise
+Categories=Game;
+Terminal=false

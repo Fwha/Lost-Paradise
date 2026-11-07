@@ -46,24 +46,6 @@ int gRow = 0;         // 0 window mode, 1 resolution, 2 fps, 3 fps counter, 4 ex
 bool gList = false;   // a drop-down is open under gRow
 int gItem = 0;        // highlighted drop-down entry
 
-const char* const kModes[] = {"Windowed", "Borderless Fullscreen", "Fullscreen"};
-struct Res {
-    uint32_t w, h;
-    const char* label;
-};
-const Res kResolutions[] = {
-    {1280, 720, "1280x720"},
-    {0, 0, "1600x896 (PS4)"},
-    {1920, 1080, "1920x1080 (PS4 Pro)"},
-    {2560, 1440, "2560x1440"},
-};
-constexpr int kResCount = int(sizeof kResolutions / sizeof kResolutions[0]);
-// The game runs at 60 and drops itself to 30 in cutscenes and 20 on loading screens. Above 60
-// (90, or uncapped at the monitor's refresh rate) the frame clock is patched to keep its speed,
-// and the pad history keeps one entry per 1/60 s so mashing moves still count (input_history.h).
-// Uncapped, the title screen runs at the monitor's rate too; cutscenes stay at 30.
-const int kFps[] = {30, 60, 90, 0};
-constexpr int kFpsCount = int(sizeof kFps / sizeof kFps[0]);
 constexpr int kRows = 5;
 
 int resIndex(uint32_t w, uint32_t h) {
@@ -79,7 +61,7 @@ std::string resLabel(uint32_t w, uint32_t h) {
 
 int fpsIndex(int fps) {
     for (int i = 0; i < kFpsCount; ++i)
-        if (kFps[i] == fps) return i;
+        if (kFpsChoices[i] == fps) return i;
     return -1;
 }
 
@@ -88,7 +70,7 @@ std::string fpsLabel(int fps) { return fps ? std::to_string(fps) : "Uncapped"; }
 int itemCount() { return gRow == 0 ? 3 : gRow == 1 ? kResCount : kFpsCount; }
 
 std::string itemLabel(int i) {
-    return gRow == 0 ? kModes[i] : gRow == 1 ? kResolutions[i].label : fpsLabel(kFps[i]);
+    return gRow == 0 ? kWindowModeNames[i] : gRow == 1 ? kResolutions[i].label : fpsLabel(kFpsChoices[i]);
 }
 
 // A choice of a row (0..4) made, from the menu or the game's PC SETTINGS screen.
@@ -100,7 +82,7 @@ void apply(SDL_Window* win, int row, int item) {
         applyFrameRate(win);
     } else if (row == 2) {
         if (item >= kFpsCount) return; // the cap it has
-        s.fps = kFps[item];
+        s.fps = kFpsChoices[item];
         setFpsCap(s.fps);
         setFrameClock(s.fps);
         applyFrameRate(win);
@@ -245,7 +227,7 @@ void drawDisplayMenu(SDL_Renderer* ren) {
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     fill(ren, 0, 0, w, h, 0, 0, 0, 150);
 
-    const std::string values[4] = {kModes[int(s.window)], resLabel(s.width, s.height), fpsLabel(s.fps),
+    const std::string values[4] = {kWindowModeNames[int(s.window)], resLabel(s.width, s.height), fpsLabel(s.fps),
                                    s.fpsCounter ? "On" : "Off"};
     const char* const labels[kRows] = {"Window Mode", "Resolution", "Frame Rate Cap", "FPS Counter", "Exit Game"};
     const int listRows = gList ? itemCount() : 0;
@@ -420,10 +402,10 @@ std::string displayOptionName(int row, int i) {
     std::lock_guard lock(gM);
     const DisplaySettings& s = displaySettings();
     switch (row) {
-    case 0: return kModes[std::clamp(i, 0, 2)];
+    case 0: return kWindowModeNames[std::clamp(i, 0, 2)];
     case 1: return i < kResCount ? kResolutions[i].label : std::to_string(s.width) + "x" + std::to_string(s.height);
     case 2: {
-        const int fps = i < kFpsCount ? kFps[i] : s.fps;
+        const int fps = i < kFpsCount ? kFpsChoices[i] : s.fps;
         return fps ? std::to_string(fps) : "Uncapped";
     }
     case 3: return i ? "On" : "Off";

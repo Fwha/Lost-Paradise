@@ -16,8 +16,9 @@ and known issues.
 - **Frame rate:** cap at 30, 60 or 90 fps, or uncapped, with the game still running at normal
   speed. The title screen, menus and real-time cutscenes go uncapped too. Optional FPS counter.
 - **DLAA:** NVIDIA DLSS anti-aliasing in place of the game's SMAA (RTX cards, see Build).
-- **PC Settings:** these options from the F11 menu, or from a PC SETTINGS entry in the title
-  and pause menus.
+- **PC Settings:** these options from the F11 menu, from a PC SETTINGS entry in the title
+  and pause menus, or from the launcher.
+- **Launcher:** an AppImage with Play, Settings and Skip intro logos.
 - **Sharper image:** full texture mipmaps, anisotropic filtering and smooth scaling to the window.
 - **Performance:** draws recorded on several threads, shader analysis ahead of the frame, and a
   pipeline cache that removes stutter on later runs.
@@ -41,22 +42,42 @@ Optional, for NVIDIA DLSS: run `scripts/fetch-dlss.sh`, then the two build comma
 
 ## Run
 
-Put the dump (the folder with `eboot.bin` and `sce_module/`) somewhere, then:
+Lay out an install folder like this, with the dump (the folder with `eboot.bin` and
+`sce_module/`) inside a `game` folder:
+
+```
+Lost Paradise/
+  game/CUSA12776/          the dump
+  lost-paradise/           this repo, built
+  launch.sh                or Lost_Paradise-x86_64.AppImage
+```
+
+Saves go to `lpn-data`, the PC settings to `lpn-display.ini` and the log to `play.log`, all in
+that folder. `lpn-host` looks for the game in `game/` of the folder it runs in (a dump left at
+`./CUSA12776` from before still works, with a note in the log), or takes its path first:
 
 ```sh
 build/src/host/lpn-host /path/to/CUSA12776 --nids aerolib.csv
 ```
 
-Saves go to `./lpn-data` (change with `--data DIR`). `lpn-host` with no arguments lists every
-option.
+`--data DIR` changes the save folder; `lpn-host` with no arguments lists every option.
 
-A `launch.sh` beside the repo and the dump keeps this to one command and writes the log to
-`play.log`:
+### Launcher
+
+`scripts/make-appimage.sh "<install folder>"` packs the launcher, `lpn-host` and `aerolib.csv` into
+`Lost_Paradise-x86_64.AppImage` (it downloads appimagetool the first time) and copies it there.
+The launcher has **Play**, **Settings** (the in-game PC Settings: the same `lpn-display.ini`, so a
+change in one shows in the other) and a **Skip intro logos** box, which runs the boot as fast as
+it draws until the title screen.
+
+### launch.sh
+
+A `launch.sh` in the install folder keeps it to one command and writes the log to `play.log`:
 
 ```sh
 #!/bin/sh
 cd "$(dirname "$0")" || exit 1
-exec lost-paradise/build/src/host/lpn-host CUSA12776 --nids lost-paradise/aerolib.csv --data lpn-data "$@" 2> play.log
+exec lost-paradise/build/src/host/lpn-host --nids lost-paradise/aerolib.csv --data lpn-data "$@" 2> play.log
 ```
 
 In the game window, **F11** opens the display menu (window mode, resolution, FPS cap) and
