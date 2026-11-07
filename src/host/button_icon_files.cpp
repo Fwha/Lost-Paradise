@@ -29,7 +29,7 @@ namespace {
 namespace fs = std::filesystem;
 
 // Bump when the redrawing changes, so old copies are made again.
-constexpr int kVersion = 2;
+constexpr int kVersion = 3;
 
 // The four face buttons, as SDL names them: cross is A, circle B, square X, triangle Y.
 constexpr SDL_GameControllerButton kCircle = SDL_CONTROLLER_BUTTON_B, kCross = SDL_CONTROLLER_BUTTON_A,
@@ -79,11 +79,17 @@ const std::vector<Sheet>& sheets() {
          }()},
         {"2d_jm_qte2.dds", 256, 128, 1.12f,
          {{150, 2, 44, 36, kCircle}, {206, 2, 44, 36, kCross}, {150, 40, 44, 36, kTriangle}, {206, 42, 44, 36, kSquare}}},
+        // surfboard/pjcm_btl_ougibutton_add.par: the finisher and Heat buttons over an enemy and
+        // in the button-press scenes (BC7; a 128x128 cell each, the button 84 across).
+        {"2d_mr_ougiadd_01.dds", 512, 256, 1.1f,
+         {{16, 16, 96, 96, kCircle}, {144, 16, 96, 96, kCross}, {272, 16, 96, 96, kTriangle}, {400, 16, 96, 96, kSquare}}},
     };
     return s;
 }
 // Archives inside the archives that hold some of the above.
-bool isContainer(const std::string& name) { return name == "pjcm_action_button.par" || name == "pjcm_kyaba.par"; }
+bool isContainer(const std::string& name) {
+    return name == "pjcm_action_button.par" || name == "pjcm_kyaba.par" || name == "pjcm_btl_ougibutton_add.par";
+}
 
 uint32_t be32(const std::vector<uint8_t>& d, size_t o) {
     return uint32_t(d[o]) << 24 | uint32_t(d[o + 1]) << 16 | uint32_t(d[o + 2]) << 8 | d[o + 3];
@@ -99,7 +105,8 @@ uint32_t le32(const std::vector<uint8_t>& d, size_t o) {
 
 struct Dds {
     uint32_t w = 0, h = 0;
-    bool bgra = false, dxt5 = false;
+    bool bgra = false, dxt5 = false, bc7 = false;
+    size_t data = 128; // where the pixels start: after the DX10 header extension for BC7
 };
 Dds ddsInfo(const std::vector<uint8_t>& d) {
     Dds i;
@@ -108,8 +115,13 @@ Dds ddsInfo(const std::vector<uint8_t>& d) {
     const uint32_t flags = le32(d, 80), bits = le32(d, 88);
     i.bgra = (flags & 0x40) && bits == 32 && le32(d, 92) == 0x00FF0000u && le32(d, 104) == 0xFF000000u &&
              d.size() >= 128 + size_t(i.w) * i.h * 4;
-    i.dxt5 = (flags & 0x4) && !std::memcmp(&d[84], "DXT5", 4) && i.w % 4 == 0 && i.h % 4 == 0 &&
-             d.size() >= 128 + size_t(i.w) * i.h;
+    const bool blocks = (flags & 0x4) && i.w % 4 == 0 && i.h % 4 == 0;
+    i.dxt5 = blocks && !std::memcmp(&d[84], "DXT5", 4) && d.size() >= 128 + size_t(i.w) * i.h;
+    if (blocks && !std::memcmp(&d[84], "DX10", 4) && d.size() >= 148) {
+        const uint32_t dxgi = le32(d, 128); // 98 BC7_UNORM, 99 BC7_UNORM_SRGB
+        i.bc7 = (dxgi == 98 || dxgi == 99) && d.size() >= 148 + size_t(i.w) * i.h;
+        i.data = 148;
+    }
     return i;
 }
 
@@ -181,6 +193,48 @@ void dxt5Encode(const uint8_t px[16][4], uint8_t out[16]) {
     for (int b = 0; b < 4; ++b) out[12 + b] = uint8_t(cbits >> (8 * b));
 }
 
+// 16 RGBA pixels to one BC7 block in mode 6: one pair of RGBA end points (the block's range),
+// sixteen steps between them.
+void bc7Encode(const uint8_t px[16][4], uint8_t out[16]) {
+    int lo[4] = {255, 255, 255, 255}, hi[4] = {0, 0, 0, 0};
+    for (int i = 0; i < 16; ++i)
+        for (int c = 0; c < 4; ++c) lo[c] = std::min(lo[c], int(px[i][c])), hi[c] = std::max(hi[c], int(px[i][c]));
+    // 7 bits a channel and a shared low bit (0 for lo, 1 for hi, which keeps both ends reachable).
+    int e[2][4];
+    for (int c = 0; c < 4; ++c) e[0][c] = lo[c] >> 1, e[1][c] = hi[c] >> 1;
+    int p[2] = {0, 1};
+    auto value = [&](int k, int c) { return e[k][c] << 1 | p[k]; };
+    static const int kWeight[16] = {0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64};
+    int idx[16];
+    for (int i = 0; i < 16; ++i) {
+        int best = 0, bestErr = 1 << 30;
+        for (int k = 0; k < 16; ++k) {
+            int err = 0;
+            for (int c = 0; c < 4; ++c) {
+                const int v = (value(0, c) * (64 - kWeight[k]) + value(1, c) * kWeight[k] + 32) >> 6;
+                err += (v - px[i][c]) * (v - px[i][c]);
+            }
+            if (err < bestErr) best = k, bestErr = err;
+        }
+        idx[i] = best;
+    }
+    // The first pixel's index is stored in 3 bits, so it must be under 8: swap the ends if not.
+    if (idx[0] >= 8) {
+        std::swap(e[0], e[1]), std::swap(p[0], p[1]);
+        for (int& k : idx) k = 15 - k;
+    }
+    std::memset(out, 0, 16);
+    int bit = 0;
+    auto put = [&](uint32_t v, int n) {
+        for (int k = 0; k < n; ++k, ++bit)
+            if (v >> k & 1) out[bit / 8] |= uint8_t(1 << (bit % 8));
+    };
+    put(1u << 6, 7); // mode 6
+    for (int c = 0; c < 4; ++c) put(uint32_t(e[0][c]), 7), put(uint32_t(e[1][c]), 7);
+    put(uint32_t(p[0]), 1), put(uint32_t(p[1]), 1);
+    for (int i = 0; i < 16; ++i) put(uint32_t(idx[i]), i == 0 ? 3 : 4);
+}
+
 // The icon at w x h: drawn square at the larger side, then stretched.
 std::vector<uint8_t> icon(PadStyle style, SDL_GameControllerButton b, int w, int h, float zoom) {
     const int n = std::max(w, h);
@@ -209,7 +263,7 @@ bool redraw(const std::string& name, std::vector<uint8_t>& dds, PadStyle style) 
         if (name == s.name) sheet = &s;
     if (!sheet) return false;
     const Dds i = ddsInfo(dds);
-    if (i.w != sheet->w || i.h != sheet->h || !(i.bgra || i.dxt5)) {
+    if (i.w != sheet->w || i.h != sheet->h || !(i.bgra || i.dxt5 || i.bc7)) {
         std::fprintf(stderr, "[button icons] %s is not the expected %ux%u texture\n", name.c_str(), sheet->w, sheet->h);
         return false;
     }
@@ -221,6 +275,10 @@ bool redraw(const std::string& name, std::vector<uint8_t>& dds, PadStyle style) 
             const uint8_t* s = &dds[128 + p * 4];
             img[p * 4] = s[2], img[p * 4 + 1] = s[1], img[p * 4 + 2] = s[0], img[p * 4 + 3] = s[3];
         }
+    } else if (i.bc7) {
+        // Not decoded: only whole blocks inside the spots are written.
+        for (const Spot& s : sheet->spots)
+            if (s.x % 4 || s.y % 4 || s.w % 4 || s.h % 4) return false;
     } else {
         for (uint32_t by = 0; by < i.h / 4; ++by)
             for (uint32_t bx = 0; bx < bw; ++bx) {
@@ -260,7 +318,9 @@ bool redraw(const std::string& name, std::vector<uint8_t>& dds, PadStyle style) 
                 if (!dirty[size_t(by) * bw + bx]) continue;
                 uint8_t px[16][4];
                 for (int k = 0; k < 16; ++k) std::memcpy(px[k], &img[((size_t(by) * 4 + k / 4) * i.w + bx * 4 + k % 4) * 4], 4);
-                dxt5Encode(px, &dds[128 + (size_t(by) * bw + bx) * 16]);
+                uint8_t* block = &dds[i.data + (size_t(by) * bw + bx) * 16];
+                if (i.bc7) bc7Encode(px, block);
+                else dxt5Encode(px, block);
             }
     }
     return true;

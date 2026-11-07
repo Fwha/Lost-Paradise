@@ -2,7 +2,8 @@
 // are textures in three archives: the font's symbol glyphs (fontpar/font.par, kigou00-03: the
 // circle, triangle, square and cross the menus' "Confirm"/"Back" bar and the text use), the
 // button sheets in 2dpar/sprite_e.par (the HUD's prompts) and the fights' prompts in
-// 2dpar/ui_e.par (finishers, Heat actions; the textures are listed in button_icon_files.cpp).
+// 2dpar/ui_e.par (finishers, Heat actions, the buttons over enemies; the textures are listed in
+// button_icon_files.cpp).
 // For Xbox or Switch the game reads a copy of each archive with those face buttons redrawn,
 // made once in lpn-data/button-icons;
 // the other icons (L1, R2, OPTIONS, ...) stay as the game draws them. The game loads these at
