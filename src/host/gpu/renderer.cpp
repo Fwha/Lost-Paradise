@@ -20,8 +20,17 @@
 #include "host/pm4.h"
 #include "host/profile.h"
 
-#include <sys/mman.h>
+#include "common/compat.h"
+#include "host/mman.h"
+#ifdef _WIN32
+// LPN_SYSCALL_READS has no Windows counterpart; the iovec lists are kept for the sampled reads.
+struct iovec {
+    void* iov_base;
+    size_t iov_len;
+};
+#else
 #include <sys/uio.h>
+#endif
 #include <unistd.h>
 
 #include <algorithm>
@@ -92,14 +101,20 @@ constexpr uint64_t kImportGranule = 2ull << 20;
 // Guest memory is read in place, a fault (unmapped or PROT_NONE) caught by host::guarded.
 // process_vm_readv did the same safely, but pinning each page in the kernel cost ~20% of the
 // recorder and most of the texture checker outside the city gate. LPN_SYSCALL_READS=1: the old way.
+#ifdef _WIN32
+const bool gSyscallReads = false;
+#else
 const bool gSyscallReads = getenv("LPN_SYSCALL_READS") != nullptr;
+#endif
 
 bool readGuest(uint64_t addr, void* dst, size_t size) {
     if (!addr || addr >= (1ull << 40)) return false;
+#ifndef _WIN32
     if (gSyscallReads) {
         iovec local{dst, size}, remote{reinterpret_cast<void*>(addr), size};
         return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(size);
     }
+#endif
     struct Copy {
         void* dst;
         uint64_t addr;
@@ -181,9 +196,12 @@ uint64_t sampleHash(uint64_t addr, size_t size) {
         remote.push_back({reinterpret_cast<void*>(addr + off), kSample});
     if (remote.empty() || !addr || addr + size > (1ull << 40)) return 0;
     iovec local{buf.data(), remote.size() * kSample};
+#ifndef _WIN32
     if (gSyscallReads) {
         if (process_vm_readv(getpid(), &local, 1, remote.data(), remote.size(), 0) != ssize_t(local.iov_len)) return 0;
-    } else if (!host::guarded([](void*) {
+    } else
+#endif
+    if (!host::guarded([](void*) {
                    for (size_t i = 0; i < remote.size(); ++i)
                        std::memcpy(buf.data() + i * kSample, remote[i].iov_base, kSample);
                }, nullptr)) {
@@ -2328,14 +2346,14 @@ private:
         std::snprintf(name, sizeof name, "%016" PRIx64 "%016" PRIx64, a, b);
         return name;
     }
-    // The on-disk caches' folder: $LPN_SHADER_CACHE (default ~/.cache/lpn-host/spirv; "off": none).
+    // The on-disk caches' folder: $LPN_SHADER_CACHE (default ~/.cache/lpn-host/spirv, on Windows
+    // %LOCALAPPDATA%\lpn-host\spirv; "off": none).
     void cacheDir() {
         if (!spirvDir_.empty()) return;
         const char* env = getenv("LPN_SHADER_CACHE");
         if (env && !std::strcmp(env, "off")) spirvDir_ = "-";
         else if (env && *env) spirvDir_ = env;
-        else if (const char* x = getenv("XDG_CACHE_HOME"); x && *x) spirvDir_ = std::string(x) + "/lpn-host/spirv";
-        else if (const char* h = getenv("HOME"); h && *h) spirvDir_ = std::string(h) + "/.cache/lpn-host/spirv";
+        else if (const std::string c = host::userCacheDir(); !c.empty()) spirvDir_ = c + "/lpn-host/spirv";
         else spirvDir_ = "-";
         if (spirvDir_ != "-") {
             std::error_code ec;

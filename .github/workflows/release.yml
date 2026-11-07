@@ -1,4 +1,5 @@
-# Pushing a tag such as v0.2.0 builds the launcher AppImage and publishes it as that release,
+# Pushing a tag such as v0.2.0 builds the launcher AppImage (and the Windows zip) and publishes
+# them as that release,
 # which the launcher's Check for updates then offers (src/launcher/updater.h).
 name: Release
 on:
@@ -30,3 +31,40 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "${GITHUB_REF_NAME}" build/Lost_Paradise-x86_64.AppImage --title "${GITHUB_REF_NAME}" --generate-notes
+  # The Windows zip, added to the same release (the launcher's update on Windows looks for an
+  # asset ending in -windows.zip).
+  windows:
+    needs: appimage
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            zip
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-SDL2
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-vulkan-loader
+            mingw-w64-ucrt-x86_64-glslang
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-python
+      - name: Build
+        run: |
+          scripts/fetch-nids.sh aerolib.csv
+          cmake -S . -B build -G Ninja -DLPN_VERSION="${GITHUB_REF_NAME}"
+          ninja -C build
+          ctest --test-dir build --output-on-failure
+          scripts/make-windows-zip.sh
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$env:GITHUB_REF_NAME" build/Lost_Paradise-windows.zip --clobber

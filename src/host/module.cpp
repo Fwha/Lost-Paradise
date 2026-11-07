@@ -2,7 +2,7 @@
 
 #include "host/memory.h"
 
-#include <sys/mman.h>
+#include "host/mman.h"
 
 #include <algorithm>
 #include <cstring>
@@ -55,7 +55,7 @@ Module::~Module() {
     if (base_) munmap(base_, size_);
 }
 
-size_t Module::patchThreadPointerReads(int32_t fsOffset) {
+size_t Module::patchThreadPointerReads(uint8_t segment, int32_t disp) {
     size_t patched = 0;
     for (const auto& s : elf_.segments()) {
         if (s.type != ps4elf::PT_LOAD || !(s.flags & 1)) continue; // executable segments only
@@ -67,7 +67,8 @@ size_t Module::patchThreadPointerReads(int32_t fsOffset) {
             if (p[0] != 0x64 || (p[1] != 0x48 && p[1] != 0x4C) || p[2] != 0x8B) continue;
             if ((p[3] & 0xC7) != 0x04 || p[4] != 0x25) continue;
             if (p[5] | p[6] | p[7] | p[8]) continue;
-            std::memcpy(p + 5, &fsOffset, 4);
+            p[0] = segment;
+            std::memcpy(p + 5, &disp, 4);
             ++patched;
             p += 8;
         }

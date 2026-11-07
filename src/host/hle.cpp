@@ -1,5 +1,6 @@
 #include "host/hle.h"
 
+#include "host/guest_abi.h"
 #include "host/videoout.h"
 
 #include <algorithm>
@@ -58,7 +59,8 @@ void printUnimplementedSummary() {
 } // namespace host
 
 // Called from lpn_unimplemented_stub (trampoline.S) with the guest's integer arguments.
-extern "C" uint64_t lpn_on_unimplemented(host::ImportInfo* info, const uint64_t* regs) {
+namespace {
+uint64_t onUnimplemented(host::ImportInfo* info, const uint64_t* regs) {
     using namespace host;
     {
         std::lock_guard lock(logMutex());
@@ -77,9 +79,12 @@ extern "C" uint64_t lpn_on_unimplemented(host::ImportInfo* info, const uint64_t*
     return 0;
 }
 
+} // namespace
+
 // Called from lpn_trace_stub (trampoline.S): logs the first call to each import, and the first
 // after --trace-hle's flip, then returns the implementation to run.
-extern "C" void* lpn_on_traced(host::ImportInfo* info) {
+namespace {
+void* onTraced(host::ImportInfo* info) {
     using namespace host;
     const uint64_t flip = flipCount();
     std::lock_guard lock(logMutex());
@@ -92,4 +97,15 @@ extern "C" void* lpn_on_traced(host::ImportInfo* info) {
                      info->name.empty() ? info->nid.c_str() : info->name.c_str(), flip, first ? "" : " (again)");
     }
     return info->target;
+}
+} // namespace
+
+// The stubs in trampoline.S call these the System V way.
+extern "C" LPN_GUEST uint64_t lpn_on_unimplemented(host::ImportInfo* info, const uint64_t* regs) {
+    uint64_t (*volatile f)(host::ImportInfo*, const uint64_t*) = onUnimplemented;
+    return f(info, regs);
+}
+extern "C" LPN_GUEST void* lpn_on_traced(host::ImportInfo* info) {
+    void* (*volatile f)(host::ImportInfo*) = onTraced;
+    return f(info);
 }

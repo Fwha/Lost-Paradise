@@ -1,3 +1,4 @@
+#include "common/compat.h"
 #include "host/save_menu.h"
 
 #include "common/ui_palette.h"
@@ -77,7 +78,7 @@ void refreshRow(Row& r) {
     const fs::path sys = fs::path(r.slot.path) / "sce_sys";
     for (fs::recursive_directory_iterator it(r.slot.path, ec), end; !ec && it != end; it.increment(ec)) {
         struct stat st;
-        if (!it->is_regular_file(ec) || ::stat(it->path().c_str(), &st) != 0) continue;
+        if (!it->is_regular_file(ec) || ::stat(it->path().string().c_str(), &st) != 0) continue;
         r.bytes += uint64_t(st.st_size);
         if (it->path().parent_path() == sys) continue; // the list's own data is not the save
         r.used = true;
@@ -85,7 +86,7 @@ void refreshRow(Row& r) {
     }
     if (!r.used) return;
     char prm[1328];
-    if (FILE* f = std::fopen((sys / "param.bin").c_str(), "rb")) {
+    if (FILE* f = std::fopen((sys / "param.bin").string().c_str(), "rb")) {
         if (std::fread(prm, sizeof prm, 1, f) == 1) {
             r.title = cString(prm, 128);
             r.subTitle = cString(prm + 128, 128);

@@ -25,6 +25,10 @@ Font gRegular, gBold;
 bool gLoaded = false;
 
 std::string fcMatch(const char* pattern) {
+#ifdef _WIN32
+    (void)pattern; // no fontconfig; running it would flash a console window per call
+    return {};
+#endif
     std::string cmd = std::string("fc-match -f '%{file}' '") + pattern + "' 2>/dev/null";
     std::string out;
     if (FILE* p = popen(cmd.c_str(), "r")) {
@@ -49,6 +53,13 @@ bool load(Font& f, const std::string& path) {
 // Arial first, then fonts with Arial's metrics, then fontconfig's own pick for "Arial".
 bool loadFirst(Font& f, bool bold, const char* env) {
     if (env && *env) return load(f, env);
+#ifdef _WIN32
+    // Windows' own Arial, in %WINDIR%\Fonts.
+    const char* win = std::getenv("WINDIR");
+    const std::string fonts = std::string(win && *win ? win : "C:\\Windows") + "\\Fonts\\";
+    if (load(f, fonts + (bold ? "arialbd.ttf" : "arial.ttf"))) return true;
+    return load(f, fonts + (bold ? "segoeuib.ttf" : "segoeui.ttf"));
+#endif
     static const char* const kDirs[] = {"/usr/share/fonts/truetype/msttcorefonts/", "/usr/share/fonts/TTF/",
                                         "/usr/share/fonts/truetype/", "/usr/share/fonts/corefonts/",
                                         "/usr/share/fonts/microsoft/", "/usr/local/share/fonts/"};

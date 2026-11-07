@@ -1,5 +1,6 @@
 // The PKG and PFS layouts are described at psdevwiki.com (PS4 PKG files, PFS); the fake-PKG
 // key steps follow what the homebrew fpkg tools do.
+#include "common/compat.h"
 #include "pkg/pkg.h"
 
 #include "pkg/crypto.h"
@@ -36,7 +37,7 @@ struct Error {
 
 class File {
 public:
-    explicit File(const std::string& path) : fd_(open(path.c_str(), O_RDONLY | O_CLOEXEC)) {
+    explicit File(const std::string& path) : fd_(open(path.c_str(), O_RDONLY | O_CLOEXEC | LPN_O_BINARY)) {
         if (fd_ < 0) throw Error{"cannot open " + path + ": " + std::strerror(errno)};
     }
     ~File() { close(fd_); }
@@ -472,7 +473,7 @@ struct Package {
 
 class Writer {
 public:
-    explicit Writer(const fs::path& p) : f_(std::fopen(p.c_str(), "wb")) {
+    explicit Writer(const fs::path& p) : f_(std::fopen(p.string().c_str(), "wb")) {
         if (!f_) throw Error{"cannot write " + p.string() + ": " + std::strerror(errno)};
     }
     ~Writer() {

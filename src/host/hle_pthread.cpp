@@ -3,6 +3,7 @@
 // Each PS4 handle (ScePthreadMutex, ScePthreadAttr, ...) is a pointer-sized slot in guest
 // memory; we store a pointer to a host object in it. A zero slot is a static initialiser,
 // so objects are created on first use.
+#include "host/guest_abi.h"
 #include "host/hle.h"
 #include "host/kernel.h"
 #include "host/tls.h"
@@ -44,11 +45,13 @@ struct Attr {
 struct Thread {
     pthread_t host{};
     std::string name;
-    void* (*entry)(void*) = nullptr;
+    void* (LPN_GUEST* entry)(void*) = nullptr;
     void* arg = nullptr;
     void* result = nullptr;
     Attr attr;
-    jmp_buf exitJump;
+    // scePthreadExit leaves the guest frames without the host's unwinder (they have no unwind
+    // data, and Windows' longjmp would look for it), so this is the compiler's plain one.
+    void* exitJump[5];
 };
 
 thread_local Thread* tSelf = nullptr;
@@ -62,12 +65,17 @@ Thread* self() {
     return tSelf;
 }
 
+// System V itself on Windows, so the jump buffer and the game's call share one convention.
+LPN_GUEST __attribute__((noinline)) void runGuest(Thread* t) {
+    if (__builtin_setjmp(t->exitJump) == 0) t->result = t->entry(t->arg);
+}
+
 void* threadStart(void* p) {
     auto* t = static_cast<Thread*>(p);
     tSelf = t;
     createGuestTls();
     pthread_setname_np(pthread_self(), t->name.substr(0, 15).c_str());
-    if (setjmp(t->exitJump) == 0) t->result = t->entry(t->arg);
+    runGuest(t);
     return t->result;
 }
 
@@ -96,7 +104,7 @@ int32_t scePthreadAttrGet(Thread* t, Attr** a) {
     return 0;
 }
 
-int32_t scePthreadCreate(Thread** out, Attr** attr, void* (*entry)(void*), void* arg, const char* name) {
+int32_t scePthreadCreate(Thread** out, Attr** attr, void* (LPN_GUEST* entry)(void*), void* arg, const char* name) {
     if (!out || !entry) return sceError(ps4errno::kEINVAL);
     auto* t = new Thread;
     t->entry = entry;
@@ -133,7 +141,7 @@ int32_t scePthreadDetach(Thread* t) { return ret(pthread_detach(t->host)); }
 void scePthreadExit(void* value) {
     Thread* t = self();
     t->result = value;
-    if (t->entry) longjmp(t->exitJump, 1); // unwind guest frames without the host unwinder
+    if (t->entry) __builtin_longjmp(t->exitJump, 1); // unwind guest frames without the host unwinder
     std::fprintf(stderr, "[thread] main thread called scePthreadExit\n");
     pthread_exit(value);
 }
@@ -318,9 +326,16 @@ int32_t scePthreadRwlockUnlock(pthread_rwlock_t** s) { return ret(pthread_rwlock
 
 // --- thread-specific data and once ----------------------------------------------------
 
-int32_t scePthreadKeyCreate(int32_t* key, void (*dtor)(void*)) {
+int32_t scePthreadKeyCreate(int32_t* key, void (LPN_GUEST* dtor)(void*)) {
     pthread_key_t k;
+#ifdef _WIN32
+    // The game's destructor would need a System V call from the thread's exit; values are left
+    // to the game (a thread's last ones leak when it ends).
+    (void)dtor;
+    const int e = pthread_key_create(&k, nullptr);
+#else
     const int e = pthread_key_create(&k, dtor);
+#endif
     if (e) return sceErrorFromHost(e);
     *key = int32_t(k);
     return 0;
@@ -330,7 +345,7 @@ void* scePthreadGetspecific(int32_t key) { return pthread_getspecific(pthread_ke
 int32_t scePthreadSetspecific(int32_t key, const void* v) { return ret(pthread_setspecific(pthread_key_t(key), v)); }
 
 // FreeBSD pthread_once_t: { int state; pthread_mutex_t mutex; }, state 0 = not run, 1 = done.
-int32_t scePthreadOnce(int32_t* once, void (*fn)()) {
+int32_t scePthreadOnce(int32_t* once, void (LPN_GUEST* fn)()) {
     enum { kNeedsInit = 0, kDone = 1, kRunning = 2 };
     int32_t expected = kNeedsInit;
     if (__atomic_compare_exchange_n(once, &expected, kRunning, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {

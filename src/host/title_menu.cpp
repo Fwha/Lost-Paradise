@@ -1,3 +1,4 @@
+#include "host/guest_abi.h"
 #include "host/title_menu.h"
 
 #include "host/hooks.h"
@@ -33,9 +34,9 @@ constexpr size_t kItems = 0x338, kItemCount = 0x340;
 
 uint8_t* gEboot = nullptr;
 uint8_t* gLayout = nullptr; // the title layout, as decompressed (then loaded in place)
-int32_t (*gDecompress)(uint8_t*, uint32_t, const uint8_t*) = nullptr;
-void (*gBuildItems)(uint8_t*) = nullptr;
-void** (*gText)(void**, uint32_t, uint32_t) = nullptr;
+int32_t (LPN_GUEST* gDecompress)(uint8_t*, uint32_t, const uint8_t*) = nullptr;
+void (LPN_GUEST* gBuildItems)(uint8_t*) = nullptr;
+void** (LPN_GUEST* gText)(void**, uint32_t, uint32_t) = nullptr;
 
 template <class T> T& at(uint8_t* p, size_t off) { return *reinterpret_cast<T*>(p + off); }
 
@@ -125,12 +126,12 @@ constexpr size_t kHeaderRecord = 4 * 17; // frame 5's
 constexpr uint16_t kRectHeader = 39, kRectLabel = 37;
 
 
-void (*gSettingsState)(uint8_t*) = nullptr;
-void (*gScreenInit)(uint8_t*) = nullptr;
-void (*gScreenDraw)(uint8_t*) = nullptr;
-void (*gValueChange)(uint8_t*, uint32_t, uint32_t) = nullptr;
-uint32_t (*gCommit)(uint8_t*, void*) = nullptr;
-uint32_t (*gCancelEdit)(uint8_t*, void*) = nullptr;
+void (LPN_GUEST* gSettingsState)(uint8_t*) = nullptr;
+void (LPN_GUEST* gScreenInit)(uint8_t*) = nullptr;
+void (LPN_GUEST* gScreenDraw)(uint8_t*) = nullptr;
+void (LPN_GUEST* gValueChange)(uint8_t*, uint32_t, uint32_t) = nullptr;
+uint32_t (LPN_GUEST* gCommit)(uint8_t*, void*) = nullptr;
+uint32_t (LPN_GUEST* gCancelEdit)(uint8_t*, void*) = nullptr;
 
 std::atomic<bool> gPcPending{false}; // PC SETTINGS chosen: the next screen built is ours
 uint8_t* gPcScreen = nullptr;        // the game thread's, as all below
@@ -229,8 +230,8 @@ void screenInit(uint8_t* self) {
     }
     at<uint32_t>(self, kRowCount) = uint32_t(n);
     setRanges(true);
-    auto list = reinterpret_cast<uint8_t* (*)(uint8_t*, uint32_t)>(gEboot + kListOf);
-    auto listSize = reinterpret_cast<void (*)(uint8_t*, uint32_t, uint32_t)>(gEboot + kListSize);
+    auto list = reinterpret_cast<uint8_t* (LPN_GUEST*)(uint8_t*, uint32_t)>(gEboot + kListOf);
+    auto listSize = reinterpret_cast<void (LPN_GUEST*)(uint8_t*, uint32_t, uint32_t)>(gEboot + kListSize);
     listSize(list(self, 0), 0xb, uint32_t(n));
 }
 
@@ -396,25 +397,25 @@ bool patchTitleMenu(Module& eboot) {
     if (const char* e = std::getenv("LPN_PC_SETTINGS"); e && std::strcmp(e, "0") == 0) return false;
     Hook hooks[] = {
         {kDecompress, {0x41, 0x57, 0x41, 0x56, 0x53, 0x81, 0x3a, 0x53, 0x4c, 0x4c, 0x5a, 0xb8, 0x05, 0x40, 0x00, 0x80},
-         reinterpret_cast<const void*>(&decompress), reinterpret_cast<void**>(&gDecompress)},
+         guestEntry<&decompress>(), reinterpret_cast<void**>(&gDecompress)},
         {kBuildItems, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x89, 0xfb},
-         reinterpret_cast<const void*>(&buildItems), reinterpret_cast<void**>(&gBuildItems)},
+         guestEntry<&buildItems>(), reinterpret_cast<void**>(&gBuildItems)},
         {kText, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x49, 0x89, 0xff},
-         reinterpret_cast<const void*>(&text), reinterpret_cast<void**>(&gText)},
+         guestEntry<&text>(), reinterpret_cast<void**>(&gText)},
         {kChosen, {0xc5, 0xfa, 0x7e, 0x05, 0x40, 0x00, 0x84, 0x01, 0xc5, 0xfa, 0x7e, 0x0d},
-         reinterpret_cast<const void*>(&chosen), nullptr},
+         guestEntry<&chosen>(), nullptr},
         {kSettingsState, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0xbb, 0xa8, 0x02, 0x00, 0x00},
-         reinterpret_cast<const void*>(&settingsState), reinterpret_cast<void**>(&gSettingsState)},
+         guestEntry<&settingsState>(), reinterpret_cast<void**>(&gSettingsState)},
         {kScreenInit, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53},
-         reinterpret_cast<const void*>(&screenInit), reinterpret_cast<void**>(&gScreenInit)},
+         guestEntry<&screenInit>(), reinterpret_cast<void**>(&gScreenInit)},
         {kScreenDraw, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53},
-         reinterpret_cast<const void*>(&screenDraw), reinterpret_cast<void**>(&gScreenDraw)},
+         guestEntry<&screenDraw>(), reinterpret_cast<void**>(&gScreenDraw)},
         {kValueChange, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50},
-         reinterpret_cast<const void*>(&valueChange), reinterpret_cast<void**>(&gValueChange)},
+         guestEntry<&valueChange>(), reinterpret_cast<void**>(&gValueChange)},
         {kCommit, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x31, 0xf6},
-         reinterpret_cast<const void*>(&commit), reinterpret_cast<void**>(&gCommit)},
+         guestEntry<&commit>(), reinterpret_cast<void**>(&gCommit)},
         {kCancelEdit, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x31, 0xf6},
-         reinterpret_cast<const void*>(&cancelEdit), reinterpret_cast<void**>(&gCancelEdit)},
+         guestEntry<&cancelEdit>(), reinterpret_cast<void**>(&gCancelEdit)},
     };
     uint8_t* base = eboot.base();
     if (!installHooks(base, hooks, std::size(hooks), "title")) return false;

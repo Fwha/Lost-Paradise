@@ -10,7 +10,7 @@
 #include "host/pm4.h"
 #include "host/videoout.h"
 
-#include <sys/mman.h>
+#include "host/mman.h"
 
 #include <atomic>
 #include <chrono>
@@ -64,13 +64,15 @@ void execute(const CommandBuffers& cbs) {
     ++gSubmits;
     if (statsAt && gSubmits == statsAt - 300) gStats = Pm4Stats{};
     if (statsAt && gSubmits == statsAt) {
-        std::fprintf(stderr, "[gnm] PM4 opcodes over submissions %lu-%lu:\n", statsAt - 300, statsAt);
+        std::fprintf(stderr, "[gnm] PM4 opcodes over submissions %llu-%llu:\n", (unsigned long long)(statsAt - 300),
+                     (unsigned long long)statsAt);
         for (int op = 0; op < 256; ++op)
-            if (gStats.opcodes[op]) std::fprintf(stderr, "  0x%02x %10lu\n", op, gStats.opcodes[op]);
+            if (gStats.opcodes[op]) std::fprintf(stderr, "  0x%02x %10llu\n", op, (unsigned long long)gStats.opcodes[op]);
     }
     if (gSubmits == 1 || gSubmits % 600 == 0)
-        std::fprintf(stderr, "[gnm] %lu submits: %lu packets, %lu fences, %lu interrupts\n", gSubmits, gStats.packets,
-                     gStats.fences, gStats.interrupts);
+        std::fprintf(stderr, "[gnm] %llu submits: %llu packets, %llu fences, %llu interrupts\n",
+                     (unsigned long long)gSubmits, (unsigned long long)gStats.packets,
+                     (unsigned long long)gStats.fences, (unsigned long long)gStats.interrupts);
 }
 
 int32_t sceGnmSubmitCommandBuffers(uint32_t count, void* const* dcb, const uint32_t* dcbBytes, void* const* ccb,
@@ -219,14 +221,14 @@ void registerGnmHle() {
 
     // Packet writers not translated yet (other shader stages, markers, waits): NOP-filled.
     for (const char* name : {"sceGnmDrawIndexIndirectCountMulti", "sceGnmDrawIndexMultiInstanced", "sceGnmDrawIndirectCountMulti", "sceGnmDispatchIndirectOnMec", "sceGnmSetEmbeddedPsShader", "sceGnmSetEmbeddedVsShader", "sceGnmSetEsShader", "sceGnmSetGsShader", "sceGnmSetHsShader", "sceGnmSetLsShader", "sceGnmUpdateGsShader", "sceGnmUpdateHsShader", "sceGnmInsertPushMarker", "sceGnmInsertPopMarker", "sceGnmInsertSetMarker", "sceGnmInsertPushColorMarker", "sceGnmInsertSetColorMarker", "sceGnmInsertThreadTraceMarker", "sceGnmInsertDingDongMarker", "sceGnmInsertWaitFlipDone", "sceGnmComputeWaitOnAddress", "sceGnmComputeWaitSemaphore"})
-        registerHle(g, name, reinterpret_cast<void*>(&writesNop));
+        registerHle(g, name, guestEntry<&writesNop>());
     // Default-state writers return how many dwords they wrote; writing none is valid.
     for (const char* name : {"sceGnmDrawInitDefaultHardwareState350", "sceGnmDrawInitToDefaultContextState400",
                              "sceGnmDispatchInitDefaultHardwareState", "sceGnmIsUserPaEnabled",
                              "sceGnmDriverCaptureInProgress", "sceGnmDriverTraceInProgress", "sceRazorIsLoaded",
                              "sceGnmSetGsRingSizes", "sceGnmSetWaveLimitMultipliers"})
-        registerHle(g, name, reinterpret_cast<void*>(&returnsZero));
-    registerHle(g, "sceGnmFlushGarlic", reinterpret_cast<void*>(&doesNothing));
+        registerHle(g, name, guestEntry<&returnsZero>());
+    registerHle(g, "sceGnmFlushGarlic", guestEntry<&doesNothing>());
 }
 
 } // namespace host

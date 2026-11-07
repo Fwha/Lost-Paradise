@@ -5,7 +5,8 @@
 #include "host/kernel.h"
 #include "host/profile.h"
 
-#include <dirent.h>
+#include "common/compat.h"
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -55,7 +56,7 @@ int hostOpenFlags(int32_t f) {
     if (f & 0x400) h |= O_TRUNC;
     if (f & 0x800) h |= O_EXCL;
     if (f & 0x20000) h |= O_DIRECTORY;
-    return h | O_CLOEXEC;
+    return h | O_CLOEXEC | LPN_O_BINARY;
 }
 
 // FreeBSD struct stat as the PS4 sees it.
@@ -77,27 +78,64 @@ void convertStat(const struct stat& s, Ps4Stat* o) {
     o->ino = uint32_t(s.st_ino);
     o->mode = uint16_t(s.st_mode);
     o->nlink = uint16_t(s.st_nlink);
+#ifdef _WIN32
+    o->atimeSec = s.st_atime, o->mtimeSec = s.st_mtime, o->ctimeSec = s.st_ctime;
+    o->blocks = (int64_t(s.st_size) + 511) / 512;
+#else
     o->atimeSec = s.st_atim.tv_sec, o->atimeNsec = s.st_atim.tv_nsec;
     o->mtimeSec = s.st_mtim.tv_sec, o->mtimeNsec = s.st_mtim.tv_nsec;
     o->ctimeSec = s.st_ctim.tv_sec, o->ctimeNsec = s.st_ctim.tv_nsec;
+    o->blocks = s.st_blocks;
+#endif
     o->birthSec = o->ctimeSec, o->birthNsec = o->ctimeNsec;
     o->size = s.st_size;
-    o->blocks = s.st_blocks;
     o->blksize = 0x10000;
 }
 
 int32_t check(int64_t r) { return r < 0 ? sceErrorFromHost(errno) : int32_t(r); }
 int64_t check64(int64_t r) { return r < 0 ? sceErrorFromHost(errno) : r; }
 
+#ifdef _WIN32
+// Windows can't open a folder as a file: a folder gets a descriptor of the null device, and
+// sceKernelGetdirentries finds the folder here.
+std::mutex gDirFdMutex;
+std::map<int32_t, std::string> gDirFds;
+
+std::string dirOfFd(int32_t fd) {
+    std::lock_guard lock(gDirFdMutex);
+    auto it = gDirFds.find(fd);
+    return it != gDirFds.end() ? it->second : std::string();
+}
+#endif
+
 int32_t sceKernelOpen(const char* path, int32_t flags, uint16_t mode) {
     const std::string h = hostPath(path);
+#ifdef _WIN32
+    std::error_code dec;
+    if (fs::is_directory(h, dec)) {
+        const int dfd = ::open("NUL", O_RDONLY | O_BINARY);
+        if (dfd >= 0) {
+            std::lock_guard lock(gDirFdMutex);
+            gDirFds[dfd] = h;
+        }
+        return check(dfd);
+    }
+#endif
     const int fd = ::open(h.c_str(), hostOpenFlags(flags), mode ? mode : 0644);
     if (fd >= 0) profile::io().opens.fetch_add(1, std::memory_order_relaxed);
     if (fd < 0) std::fprintf(stderr, "[file] open %s failed: %s\n", path, std::strerror(errno));
     else if (process().traceFiles) std::fprintf(stderr, "[file] open %s (flip %llu)\n", path, (unsigned long long)flipCount());
     return check(fd);
 }
-int32_t sceKernelClose(int32_t fd) { return check(::close(fd)); }
+int32_t sceKernelClose(int32_t fd) {
+#ifdef _WIN32
+    {
+        std::lock_guard lock(gDirFdMutex);
+        gDirFds.erase(fd);
+    }
+#endif
+    return check(::close(fd));
+}
 // LPN_IOSTATS=1 (debugging): file reads per 2 seconds.
 void ioStat(int64_t got, uint64_t ns) {
     if (got >= 0) {
@@ -145,7 +183,11 @@ int64_t sceKernelPwrite(int32_t fd, const void* buf, uint64_t n, int64_t off) {
 int64_t sceKernelLseek(int32_t fd, int64_t off, int32_t whence) { return check64(::lseek(fd, off, whence)); }
 int32_t sceKernelFsync(int32_t fd) { return check(::fsync(fd)); }
 int32_t sceKernelFtruncate(int32_t fd, int64_t len) { return check(::ftruncate(fd, len)); }
-int32_t sceKernelTruncate(const char* path, int64_t len) { return check(::truncate(hostPath(path).c_str(), len)); }
+int32_t sceKernelTruncate(const char* path, int64_t len) {
+    std::error_code ec;
+    fs::resize_file(hostPath(path), uint64_t(len), ec);
+    return ec ? sceErrorFromHost(ec.value()) : 0;
+}
 int32_t sceKernelStat(const char* path, Ps4Stat* out) {
     struct stat s;
     if (::stat(hostPath(path).c_str(), &s) != 0) return sceErrorFromHost(errno);
@@ -158,11 +200,18 @@ int32_t sceKernelFstat(int32_t fd, Ps4Stat* out) {
     convertStat(s, out);
     return 0;
 }
-int32_t sceKernelMkdir(const char* path, uint16_t mode) { return check(::mkdir(hostPath(path).c_str(), mode)); }
+int32_t sceKernelMkdir(const char* path, uint16_t mode) { return check(lpnMkdir(hostPath(path).c_str(), mode)); }
 int32_t sceKernelRmdir(const char* path) { return check(::rmdir(hostPath(path).c_str())); }
 int32_t sceKernelUnlink(const char* path) { return check(::unlink(hostPath(path).c_str())); }
 int32_t sceKernelRename(const char* from, const char* to) {
+#ifdef _WIN32
+    // Windows' rename() won't replace an existing file; this does, as POSIX's does.
+    std::error_code ec;
+    fs::rename(hostPath(from), hostPath(to), ec);
+    return ec ? sceErrorFromHost(ec.value()) : 0;
+#else
     return check(::rename(hostPath(from).c_str(), hostPath(to).c_str()));
+#endif
 }
 
 // FreeBSD dirent records: { u32 fileno; u16 reclen; u8 type; u8 namlen; char name[]; }, 4-aligned.
@@ -172,11 +221,16 @@ std::map<int32_t, size_t> gDirPositions; // fd -> entries already returned
 int32_t sceKernelGetdirentries(int32_t fd, char* buf, int32_t nbytes, int64_t* basep) {
     std::vector<std::pair<std::string, uint8_t>> entries;
     {
+        std::error_code ec;
+#ifdef _WIN32
+        const fs::path dir = dirOfFd(fd);
+        if (dir.empty()) return sceError(ps4errno::kEBADF);
+#else
         char link[64];
         std::snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
-        std::error_code ec;
         const fs::path dir = fs::read_symlink(link, ec);
         if (ec) return sceError(ps4errno::kEBADF);
+#endif
         entries.push_back({".", 4});
         entries.push_back({"..", 4});
         for (const auto& e : fs::directory_iterator(dir, ec))

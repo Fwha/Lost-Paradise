@@ -1,3 +1,4 @@
+#include "host/guest_abi.h"
 #include "host/draw_sites.h"
 
 #include "host/hooks.h"
@@ -30,7 +31,7 @@ constexpr int kTop = 20;
 enum Kind : uint32_t { kAuto, kIndexed, kDispatch };
 constexpr const char* kKindName[] = {"auto", "index", "dispatch"};
 
-using Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+using Fn = uint64_t (LPN_GUEST*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 Fn gAuto = nullptr, gIndexed = nullptr, gDispatch = nullptr;
 uint8_t* gBase = nullptr;
 
@@ -103,15 +104,15 @@ void count(Kind kind, const uint64_t* frame) {
 }
 
 uint64_t drawAuto(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
-    count(kAuto, static_cast<const uint64_t*>(__builtin_frame_address(0)));
+    count(kAuto, static_cast<const uint64_t*>(LPN_GUEST_FRAME()));
     return gAuto(a, b, c, d, e, f);
 }
 uint64_t drawIndexed(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
-    count(kIndexed, static_cast<const uint64_t*>(__builtin_frame_address(0)));
+    count(kIndexed, static_cast<const uint64_t*>(LPN_GUEST_FRAME()));
     return gIndexed(a, b, c, d, e, f);
 }
 uint64_t dispatch(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
-    count(kDispatch, static_cast<const uint64_t*>(__builtin_frame_address(0)));
+    count(kDispatch, static_cast<const uint64_t*>(LPN_GUEST_FRAME()));
     return gDispatch(a, b, c, d, e, f);
 }
 
@@ -123,11 +124,11 @@ bool patchDrawSites(Module& eboot) {
     // First instructions of each wrapper, moved to the trampoline (none are rip-relative).
     const Hook hooks[] = {
         {kDrawIndexAuto, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x89, 0xfb, 0x41, 0x89, 0xf6},
-         reinterpret_cast<const void*>(&drawAuto), reinterpret_cast<void**>(&gAuto)},
+         guestHook<&drawAuto>(), reinterpret_cast<void**>(&gAuto)},
         {kDrawIndex, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x48, 0x89, 0xfb},
-         reinterpret_cast<const void*>(&drawIndexed), reinterpret_cast<void**>(&gIndexed)},
+         guestHook<&drawIndexed>(), reinterpret_cast<void**>(&gIndexed)},
         {kDispatchDirect, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x89, 0xfb},
-         reinterpret_cast<const void*>(&dispatch), reinterpret_cast<void**>(&gDispatch)},
+         guestHook<&dispatch>(), reinterpret_cast<void**>(&gDispatch)},
     };
     gBase = eboot.base();
     gLast = std::chrono::steady_clock::now();

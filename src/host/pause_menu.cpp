@@ -1,3 +1,4 @@
+#include "host/guest_abi.h"
 #include "host/pause_menu.h"
 
 #include "host/hooks.h"
@@ -31,20 +32,20 @@ constexpr char kNoDesc[] = "";
 const uint64_t kPcAction = 0x12; // read as the settings screen's sequence; its address marks our row
 
 uint8_t* gEboot = nullptr;
-void (*gAddRow)(uint8_t*, const char*, const char*, uint32_t, const void*) = nullptr;
-void (*gConfirm)(uint8_t*) = nullptr;
+void (LPN_GUEST* gAddRow)(uint8_t*, const char*, const char*, uint32_t, const void*) = nullptr;
+void (LPN_GUEST* gConfirm)(uint8_t*) = nullptr;
 
 template <class T> T& at(uint8_t* p, size_t off) { return *reinterpret_cast<T*>(p + off); }
 
 void addRow(uint8_t* self, const char* text, const char* desc, uint32_t enabled, const void* data) {
     gAddRow(self, text, desc, enabled, data);
-    if (__builtin_return_address(0) == gEboot + kAfterSettings) gAddRow(self, kLabel, kNoDesc, 1, &kPcAction);
+    if (LPN_GUEST_RETURN_ADDRESS() == gEboot + kAfterSettings) gAddRow(self, kLabel, kNoDesc, 1, &kPcAction);
 }
 
 void confirm(uint8_t* self) {
-    auto listOf = reinterpret_cast<uint8_t* (*)(uint8_t*, uint32_t)>(gEboot + kListOf);
+    auto listOf = reinterpret_cast<uint8_t* (LPN_GUEST*)(uint8_t*, uint32_t)>(gEboot + kListOf);
     uint8_t* list = listOf(self, 0);
-    using Cursor = uint32_t (*)(uint8_t*);
+    using Cursor = uint32_t (LPN_GUEST*)(uint8_t*);
     const uint32_t i = (*reinterpret_cast<Cursor**>(list))[2](list);
     if (i < at<uint32_t>(self, kRowCount) && at<const void*>(at<uint8_t*>(self, kRows) + kRowSize * i, kRowData) == &kPcAction) {
         std::fprintf(stderr, "[pause] PC Settings\n");
@@ -59,9 +60,9 @@ bool patchPauseMenu(Module& eboot) {
     if (const char* e = std::getenv("LPN_PC_SETTINGS"); e && std::strcmp(e, "0") == 0) return false;
     const Hook hooks[] = {
         {kAddRow, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54},
-         reinterpret_cast<const void*>(&addRow), reinterpret_cast<void**>(&gAddRow)},
+         guestHook<&addRow>(), reinterpret_cast<void**>(&gAddRow)},
         {kConfirm, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x31, 0xf6, 0x48, 0x89, 0xfb},
-         reinterpret_cast<const void*>(&confirm), reinterpret_cast<void**>(&gConfirm)},
+         guestEntry<&confirm>(), reinterpret_cast<void**>(&gConfirm)},
     };
     uint8_t* base = eboot.base();
     gEboot = base;

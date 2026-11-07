@@ -1,7 +1,7 @@
 // lpn-launcher: a small window with Play and Settings in front of lpn-host.
 //
 // It runs in the install folder: the folder the AppImage is in ($APPIMAGE), else $LPN_HOME, else
-// the working directory. That folder holds game/CUSA12776 (common/game_dir.h), lpn-data,
+// the working directory (on Windows: $LPN_HOME, else the folder of the .exe). That folder holds game/CUSA12776 (common/game_dir.h), lpn-data,
 // lpn-display.ini and play.log, as for launch.sh. The settings are the in-game PC Settings: both
 // read and write lpn-display.ini (common/settings_file.h), so a change in either shows in the other.
 // Play replaces the launcher with lpn-host, its log going to play.log. Check for updates: updater.h.
@@ -40,6 +40,16 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <commdlg.h>
+#include <shlobj.h>
+#endif
+
 namespace fs = std::filesystem;
 namespace font = host::menufont;
 using host::DisplaySettings;
@@ -54,15 +64,25 @@ std::string gGameDir, gHost, gNids;
 DisplaySettings gS;
 
 fs::path exeDir() {
+#ifdef _WIN32
+    wchar_t buf[MAX_PATH * 4];
+    const DWORD n = GetModuleFileNameW(nullptr, buf, DWORD(std::size(buf)));
+    return n ? fs::path(std::wstring(buf, n)).parent_path() : fs::current_path();
+#else
     std::error_code ec;
     const fs::path p = fs::read_symlink("/proc/self/exe", ec);
     return ec ? fs::current_path() : p.parent_path();
+#endif
 }
 
 fs::path installDir() {
     if (const char* a = std::getenv("APPIMAGE"); a && *a) return fs::absolute(a).parent_path();
     if (const char* h = std::getenv("LPN_HOME"); h && *h) return fs::absolute(h);
+#ifdef _WIN32
+    return gExeDir; // the unzipped folder, which the game folder goes in
+#else
     return fs::current_path();
+#endif
 }
 
 std::string firstExisting(std::initializer_list<fs::path> paths) {
@@ -79,8 +99,12 @@ void findFiles() {
     gGameDir = host::findGameDir(gInstall.string());
     // In the AppImage: usr/bin/lpn-launcher, lpn-host beside it and usr/share/lost-paradise.
     // In a build tree: build/src/launcher, build/src/host and the repo's aerolib.csv.
+#ifdef _WIN32
+    gHost = firstExisting({gExeDir / "lpn-host.exe", gExeDir / "../host/lpn-host.exe"});
+#else
     gHost = firstExisting({gExeDir / "lpn-host", gExeDir / "../host/lpn-host",
                            gInstall / "lost-paradise/build/src/host/lpn-host"});
+#endif
     const char* env = std::getenv("LPN_NIDS");
     gNids = firstExisting({env ? fs::path(env) : fs::path(), gExeDir / "../share/lost-paradise/aerolib.csv",
                            gExeDir / "aerolib.csv", gExeDir / "../../../aerolib.csv",
@@ -89,7 +113,7 @@ void findFiles() {
 
 void save() {
     if (!host::writeSettings(host::kSettingsFile, gS))
-        std::fprintf(stderr, "[launcher] cannot write %s/%s\n", gInstall.c_str(), host::kSettingsFile);
+        std::fprintf(stderr, "[launcher] cannot write %s/%s\n", gInstall.string().c_str(), host::kSettingsFile);
 }
 
 // Settings rows: the in-game PC Settings, in its order (src/host/pc_settings.cpp).
@@ -194,7 +218,7 @@ void textCentered(int cx, int y, int size, const std::string& s, bool bold = fal
 
 SDL_Surface* loadPng(const fs::path& p) {
     int w, h, n;
-    unsigned char* px = stbi_load(p.c_str(), &w, &h, &n, 4);
+    unsigned char* px = stbi_load(p.string().c_str(), &w, &h, &n, 4);
     if (!px) return nullptr;
     SDL_Surface* s = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_RGBA32);
     if (s)
@@ -430,6 +454,30 @@ bool unpackBusy() {
 
 // The desktop's file chooser: zenity (GNOME and most others), else kdialog (KDE); a .pkg file or
 // a folder. Empty when cancelled, or with err set when there is no chooser.
+#ifdef _WIN32
+// Windows' own open dialogs. Empty when cancelled.
+std::string choosePath(bool folder, std::string&) {
+    char path[MAX_PATH * 4] = {};
+    if (folder) {
+        BROWSEINFOA bi{};
+        bi.lpszTitle = "Choose an unpacked update or DLC folder";
+        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+        LPITEMIDLIST id = SHBrowseForFolderA(&bi);
+        if (!id) return {};
+        const bool ok = SHGetPathFromIDListA(id, path);
+        CoTaskMemFree(id);
+        return ok ? path : std::string();
+    }
+    OPENFILENAMEA o{};
+    o.lStructSize = sizeof o;
+    o.lpstrFilter = "PS4 packages (*.pkg)\0*.pkg;*.PKG\0All files\0*.*\0";
+    o.lpstrFile = path;
+    o.nMaxFile = DWORD(sizeof path);
+    o.lpstrTitle = "Choose a .pkg file";
+    o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    return GetOpenFileNameA(&o) ? path : std::string();
+}
+#else
 std::string choosePath(bool folder, std::string& err) {
     const char* home = std::getenv("HOME");
     const std::string start = home && *home ? std::string(home) + "/" : "./";
@@ -465,6 +513,7 @@ std::string choosePath(bool folder, std::string& err) {
     while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
     return out;
 }
+#endif
 
 // Runs a Tools job on path: a .pkg is unpacked (a game) or applied (an update or DLC), a folder
 // is applied as an unpacked update or DLC. An empty path asks the chooser for one (a folder
@@ -520,7 +569,7 @@ void drawMain(int focus) {
     // Check for updates, top right, with what it found under it.
     const launcher::UpdateStatus u = launcher::updateStatus();
     const bool busy = u.state == launcher::UpdateState::Checking || u.state == launcher::UpdateState::Downloading;
-    const bool canApply = u.state == launcher::UpdateState::Available && std::getenv("APPIMAGE");
+    const bool canApply = u.state == launcher::UpdateState::Available && launcher::canSelfUpdate();
     button(kUpdate, canApply ? "Update to " + u.latest : "Check for updates", focus == 3, canApply, !busy);
     SDL_SetRenderDrawBlendMode(gRen, SDL_BLENDMODE_BLEND);
     const std::string line = u.message.empty() ? std::string("Version ") + launcher::version() : u.message;
@@ -722,11 +771,39 @@ void play(SDL_Window* win, int argc, char** argv) {
     SDL_DestroyRenderer(gRen);
     SDL_DestroyWindow(win);
     SDL_Quit();
+#ifdef _WIN32
+    // No exec on Windows: start lpn-host with its output in play.log, and leave.
+    (void)cargs;
+    std::string cmd;
+    for (const std::string& a : args) {
+        std::string q = "\"";
+        for (char c : a) q += c == '"' ? std::string("\\\"") : std::string(1, c);
+        cmd += (cmd.empty() ? "" : " ") + q + "\"";
+    }
+    SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
+    HANDLE log = CreateFileA("play.log", GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    STARTUPINFOA si{};
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = log;
+    si.hStdError = log;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessA(gHost.c_str(), cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        const std::string why = "Cannot start " + gHost + " (error " + std::to_string(GetLastError()) + ")";
+        MessageBoxA(nullptr, why.c_str(), "Lost Paradise", MB_ICONERROR);
+        std::exit(1);
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    std::exit(0);
+#else
     const int log = open("play.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (log >= 0) dup2(log, 2), close(log);
     execv(gHost.c_str(), cargs.data());
     std::fprintf(stderr, "[launcher] cannot start %s: %s\n", gHost.c_str(), std::strerror(errno));
     std::exit(1);
+#endif
 }
 
 // Check for updates, or apply the update a check found.
@@ -743,11 +820,12 @@ int main(int argc, char** argv) {
     gInstall = installDir();
     std::error_code ec;
     fs::current_path(gInstall, ec);
-    if (ec) std::fprintf(stderr, "[launcher] cannot enter %s: %s\n", gInstall.c_str(), ec.message().c_str());
+    if (ec) std::fprintf(stderr, "[launcher] cannot enter %s: %s\n", gInstall.string().c_str(), ec.message().c_str());
+    launcher::cleanUpAfterUpdate(gInstall.string());
     findFiles();
     host::readSettings(host::kSettingsFile, gS);
     refreshStatus();
-    std::fprintf(stderr, "[launcher] install %s, game %s, host %s, nids %s\n", gInstall.c_str(),
+    std::fprintf(stderr, "[launcher] install %s, game %s, host %s, nids %s\n", gInstall.string().c_str(),
                  gGameDir.empty() ? "(none)" : gGameDir.c_str(), gHost.empty() ? "(none)" : gHost.c_str(),
                  gNids.empty() ? "(none)" : gNids.c_str());
 

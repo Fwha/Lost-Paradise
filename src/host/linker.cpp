@@ -3,7 +3,7 @@
 #include "host/hle.h"
 #include "host/module.h"
 
-#include <sys/mman.h>
+#include "host/mman.h"
 
 #include <cstring>
 #include <map>
