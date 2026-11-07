@@ -31,6 +31,15 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <timeapi.h>
+#endif
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -69,6 +78,11 @@ void onGuestExit() { std::fprintf(stderr, "[host] guest exit handler called\n");
 } // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    // 1 ms sleeps: Windows' default timer tick is 15.6 ms, too coarse for the audio grains
+    // (about 5 ms each) and the frame pacing, which sleep until a deadline.
+    timeBeginPeriod(1);
+#endif
     host::profile::avoidRecorderCore(); // inherited by every thread started from here
     host::profile::start();
     std::string gameDir, nidPath, dataDir = "lpn-data";

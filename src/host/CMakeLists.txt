@@ -58,6 +58,7 @@ if(WIN32)
     target_link_options(lpn-host PRIVATE -Xlinker --stack -Xlinker 0x2000000,0x2000000)
     # Keeps Windows' own allocations low, out of the guest range (8 GiB to 1 TiB, mman_win.cpp).
     target_link_options(lpn-host PRIVATE -Wl,--disable-high-entropy-va)
+    target_link_libraries(lpn-host PRIVATE winmm)
 else()
     # The guest TLS slot must sit at a fixed offset from %fs, which the initial-exec model gives.
     target_compile_options(lpn-host PRIVATE -ftls-model=initial-exec)
