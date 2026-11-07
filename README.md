@@ -61,8 +61,10 @@ Lost Paradise/
   launch.sh                or Lost_Paradise-x86_64.AppImage
 ```
 
-Saves go to `lpn-data`, the PC settings to `lpn-display.ini` and the log to `play.log`, all in
-that folder. `lpn-host` looks for the game in `game/` of the folder it runs in, or takes its path
+Saves go to `lpn-data/savedata/<title ID>` (one folder per version, e.g. `CUSA12776`, read from
+the dump's `sce_sys/param.sfo`), the PC settings to `lpn-display.ini` and the log to `play.log`, all
+in that folder. Saves from before the split are moved into `lpn-data/savedata/CUSA12776` on the
+first run. `lpn-host` looks for the game in `game/` of the folder it runs in, or takes its path
 first:
 
 ```sh

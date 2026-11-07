@@ -13,4 +13,8 @@ constexpr const char* kGameId = "CUSA12776"; // the version the host's patches a
 // other folder there that does. Empty when there is none.
 std::string findGameDir(const std::string& installDir);
 
+// The dump's title ID (e.g. CUSA12776): TITLE_ID from sce_sys/param.sfo, else the folder's name
+// when it looks like one, else kGameId. Each version keeps its saves under its own title ID.
+std::string gameTitleId(const std::string& gameDir);
+
 } // namespace host

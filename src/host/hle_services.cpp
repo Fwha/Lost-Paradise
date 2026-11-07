@@ -2,6 +2,7 @@
 // user accounts, controller, save data, system dialogs, trophies, PlayGo, networking,
 // clocks, audio pacing and zlib. Each answers the way an offline console would.
 #include "host/hle.h"
+#include "common/game_dir.h"
 #include "host/kernel.h"
 #include "host/profile.h"
 #include "host/save_menu.h"
@@ -179,7 +180,13 @@ int32_t scePadGetControllerInformation(int32_t, PadControllerInformation* i) {
 
 // --- SaveData -------------------------------------------------------------------------
 
-std::string saveRoot() { return process().dataDir + "/savedata"; }
+// Each version of the game (title ID) has its own saves.
+std::string saveRoot() { return process().dataDir + "/savedata/" + process().titleId; }
+
+bool looksLikeTitleId(const std::string& s) {
+    return s.size() == 9 && std::all_of(s.begin(), s.begin() + 4, [](char c) { return c >= 'A' && c <= 'Z'; }) &&
+           std::all_of(s.begin() + 4, s.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
 
 struct SaveDataMount2 {
     int32_t userId, pad;
@@ -735,6 +742,30 @@ void regs(const char* lib, std::initializer_list<const char*> names, void* fn) {
 }
 
 } // namespace
+
+void prepareSaveFolder() {
+    const fs::path all = fs::path(process().dataDir) / "savedata";
+    std::error_code ec;
+    std::vector<fs::path> old;
+    for (const auto& e : fs::directory_iterator(all, ec))
+        if (e.is_directory(ec) && !looksLikeTitleId(e.path().filename().string())) old.push_back(e.path());
+    if (!old.empty()) {
+        const fs::path to = all / kGameId;
+        fs::create_directories(to, ec);
+        for (const auto& p : old) {
+            const fs::path dest = to / p.filename();
+            if (fs::exists(dest, ec)) {
+                std::fprintf(stderr, "[savedata] %s left in place: %s already has one\n", p.filename().c_str(), kGameId);
+                continue;
+            }
+            fs::rename(p, dest, ec);
+            std::fprintf(stderr, "[savedata] moved %s into %s/%s\n", p.filename().c_str(), kGameId,
+                         ec ? (" failed: " + ec.message()).c_str() : "");
+        }
+    }
+    fs::create_directories(saveRoot(), ec);
+    std::fprintf(stderr, "[savedata] %s saves in %s\n", process().titleId.c_str(), saveRoot().c_str());
+}
 
 void setAudioEnabled(bool on) { gAudioEnabled = on; }
 
