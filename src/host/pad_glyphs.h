@@ -14,6 +14,9 @@ namespace host {
 
 enum class PadStyle { PlayStation, Xbox, Switch };
 
+// The right trigger (R2, RT, ZR), which SDL counts as an axis, for drawPadGlyph and padGlyphPixels.
+constexpr SDL_GameControllerButton kRightTrigger = SDL_CONTROLLER_BUTTON_MAX;
+
 // The style the setting asks for. Auto: the first controller plugged in (PlayStation and Switch
 // pads as themselves, every other pad as Xbox), PlayStation with none.
 PadStyle padStyle(ButtonIcons setting);

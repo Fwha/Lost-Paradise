@@ -17,8 +17,8 @@ namespace host {
 
 namespace {
 
-// pad_glyphs_data.h's order: south, east, west, north.
-enum Pos { South, East, West, North };
+// pad_glyphs_data.h's order: south, east, west, north, right trigger.
+enum Pos { South, East, West, North, RightTrigger };
 
 int position(PadStyle style, SDL_GameControllerButton b) {
     bool labels = style == PadStyle::Switch;
@@ -30,6 +30,7 @@ int position(PadStyle style, SDL_GameControllerButton b) {
     case SDL_CONTROLLER_BUTTON_B: return labels ? South : East;
     case SDL_CONTROLLER_BUTTON_X: return labels ? North : West;
     case SDL_CONTROLLER_BUTTON_Y: return labels ? West : North;
+    case kRightTrigger: return RightTrigger;
     default: return -1;
     }
 }

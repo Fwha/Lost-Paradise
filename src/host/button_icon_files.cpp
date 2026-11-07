@@ -29,7 +29,7 @@ namespace {
 namespace fs = std::filesystem;
 
 // Bump when the redrawing changes, so old copies are made again.
-constexpr int kVersion = 3;
+constexpr int kVersion = 4;
 
 // The four face buttons, as SDL names them: cross is A, circle B, square X, triangle Y.
 constexpr SDL_GameControllerButton kCircle = SDL_CONTROLLER_BUTTON_B, kCross = SDL_CONTROLLER_BUTTON_A,
@@ -83,12 +83,19 @@ const std::vector<Sheet>& sheets() {
         // in the button-press scenes (BC7; a 128x128 cell each, the button 84 across).
         {"2d_mr_ougiadd_01.dds", 512, 256, 1.1f,
          {{16, 16, 96, 96, kCircle}, {144, 16, 96, 96, kCross}, {272, 16, 96, 96, kTriangle}, {400, 16, 96, 96, kSquare}}},
+        // pjcm_btl_ovhd_gauge.par and pjcm_btl_hikou.par: the circle beside an enemy's health bar
+        // when a finisher is ready.
+        {"2d_mr_ovhd_gauge02.dds", 128, 128, 1.2f, {{80, 0, 47, 47, kCircle}}},
+        {"2d_mr_btl_hikou01.dds", 128, 128, 1.2f, {{0, 0, 46, 46, kCircle}}},
+        // pjcm_btl_life_gauge.par: the R2 that starts rage mode, beside the player's health bar.
+        {"2d_btl_life_gauge01.dds", 512, 128, 1.0f, {{398, 56, 32, 32, kRightTrigger}}},
     };
     return s;
 }
 // Archives inside the archives that hold some of the above.
 bool isContainer(const std::string& name) {
-    return name == "pjcm_action_button.par" || name == "pjcm_kyaba.par" || name == "pjcm_btl_ougibutton_add.par";
+    return name == "pjcm_action_button.par" || name == "pjcm_kyaba.par" || name == "pjcm_btl_ougibutton_add.par" ||
+           name == "pjcm_btl_ovhd_gauge.par" || name == "pjcm_btl_hikou.par" || name == "pjcm_btl_life_gauge.par";
 }
 
 uint32_t be32(const std::vector<uint8_t>& d, size_t o) {
