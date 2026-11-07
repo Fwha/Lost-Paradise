@@ -88,6 +88,7 @@ struct Row {
 const Row kRows[] = {
     {"Window Mode", "Play in a window, a borderless window or fullscreen."},
     {"Resolution", "Set the 3D rendering resolution."},
+    {"Aspect Ratio", "Match your monitor's shape: the 3D view widens to fit, the HUD stays 16:9 in the middle."},
     {"Frame Rate Cap", "Set the most frames shown per second. Uncapped follows the monitor's refresh rate."},
     {"FPS Counter", "Show the frame rate in the top right corner of the screen."},
     {"DLSS", "NVIDIA DLAA: DLSS anti-aliasing in place of the game's. Needs an RTX card; Off on other GPUs."},
@@ -112,10 +113,17 @@ std::string valueName(int row) {
     case 0: return host::kWindowModeNames[int(gS.window)];
     case 1: return resIndex() >= 0 ? host::kResolutions[resIndex()].label
                                    : std::to_string(gS.width) + "x" + std::to_string(gS.height);
-    case 2: return gS.fps ? std::to_string(gS.fps) : "Uncapped";
-    case 3: return gS.fpsCounter ? "On" : "Off";
-    case 4: return gS.dlss != host::DlssMode::Off ? "DLAA" : "Off";
-    case 5: return gS.skipIntro ? "On" : "Off";
+    case 2: {
+        std::string name = host::kAspectNames[int(gS.aspect)];
+        uint32_t w, h;
+        host::renderSize(gS, &w, &h);
+        if (gS.aspect != host::AspectRatio::Wide16x9) name += " (" + std::to_string(w) + "x" + std::to_string(h) + ")";
+        return name;
+    }
+    case 3: return gS.fps ? std::to_string(gS.fps) : "Uncapped";
+    case 4: return gS.fpsCounter ? "On" : "Off";
+    case 5: return gS.dlss != host::DlssMode::Off ? "DLAA" : "Off";
+    case 6: return gS.skipIntro ? "On" : "Off";
     default: return host::kButtonIconNames[int(gS.buttonIcons)];
     }
 }
@@ -132,14 +140,15 @@ void stepValue(int row, int d) {
         gS.width = host::kResolutions[n].w, gS.height = host::kResolutions[n].h;
         break;
     }
-    case 2: {
+    case 2: gS.aspect = host::AspectRatio(wrap(int(gS.aspect) + d, host::kAspectChoices)); break;
+    case 3: {
         const int i = fpsIndex();
         gS.fps = host::kFpsChoices[wrap(i < 0 ? (d > 0 ? 0 : -1) : i + d, host::kFpsCount)];
         break;
     }
-    case 3: gS.fpsCounter = !gS.fpsCounter; break;
-    case 4: gS.dlss = gS.dlss == host::DlssMode::Off ? host::DlssMode::Dlaa : host::DlssMode::Off; break;
-    case 5: gS.skipIntro = !gS.skipIntro; break;
+    case 4: gS.fpsCounter = !gS.fpsCounter; break;
+    case 5: gS.dlss = gS.dlss == host::DlssMode::Off ? host::DlssMode::Dlaa : host::DlssMode::Off; break;
+    case 6: gS.skipIntro = !gS.skipIntro; break;
     default: gS.buttonIcons = host::ButtonIcons(wrap(int(gS.buttonIcons) + d, host::kButtonIconChoices)); break;
     }
     save();
@@ -229,7 +238,7 @@ const Box kSkip{40, kH - 64, 300, 32};
 const Box kUpdate{kW - 260, 24, 236, 40};
 // Settings screen
 const Box kPanel{176, 64, kW - 352, 470};
-constexpr int kRowY0 = 136, kRowH = 46;
+constexpr int kRowY0 = 132, kRowH = 42;
 Box rowBox(int r) { return {kPanel.x + 24, kRowY0 + r * kRowH, kPanel.w - 48, kRowH - 6}; }
 Box arrowBox(int r, bool right) {
     const Box b = rowBox(r);
@@ -365,7 +374,7 @@ void drawSettings(int focus) {
     if (focus < kRowCount) {
         color(200, 192, 176);
         std::string d = kRows[focus].description;
-        if (focus == 1 || focus == 4) d += " Takes effect at the next start.";
+        if (focus == 1 || focus == 2 || focus == 5) d += " Takes effect at the next start.";
         // Up to two lines, broken between words.
         const int maxW = kPanel.w - 56;
         std::string first = d, rest;

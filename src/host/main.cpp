@@ -157,7 +157,11 @@ int main(int argc, char** argv) {
     if (host::prepareFrameClock(*modules[0])) host::setFrameClock(int(fpsCap >= 0 ? fpsCap : host::displaySettings().fps));
     host::patchInputHistory(*modules[0]);
     if (host::patchTitleMenu(*modules[0])) host::patchPauseMenu(*modules[0]);
-    host::patchRenderResolution(*modules[0], host::displaySettings().width, host::displaySettings().height);
+    {
+        uint32_t w, h; // with the Aspect Ratio's width
+        host::renderSize(host::displaySettings(), &w, &h);
+        host::patchRenderResolution(*modules[0], w, h);
+    }
     host::patchDrawSites(*modules[0]);
 
     const int32_t fsOffset = host::guestThreadPointerFsOffset();

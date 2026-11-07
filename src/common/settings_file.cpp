@@ -1,5 +1,6 @@
 #include "common/settings_file.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,8 +15,23 @@ const char* modeKey(WindowMode m) {
 
 const char* const kDlssKeys[kDlssModes] = {"off", "dlaa", "quality", "balanced", "performance"};
 const char* const kButtonIconKeys[kButtonIconChoices] = {"playstation", "xbox", "switch", "auto"};
+const char* const kAspectKeys[kAspectChoices] = {"16:9", "16:10", "21:9"};
 
 } // namespace
+
+double aspectValue(AspectRatio a) {
+    return a == AspectRatio::Wide16x10 ? 16.0 / 10 : a == AspectRatio::Ultrawide21x9 ? 64.0 / 27 : 16.0 / 9;
+}
+
+void renderSize(const DisplaySettings& s, uint32_t* width, uint32_t* height) {
+    *width = s.width, *height = s.height;
+    if (s.aspect == AspectRatio::Wide16x9) return;
+    const uint32_t h = s.height ? s.height : 896;
+    uint32_t w = uint32_t(h * aspectValue(s.aspect) / 32 + 0.5) * 32;
+    // The game packs its display size into 12 bits a side (display_settings.cpp).
+    w = std::min<uint32_t>(w, 4064);
+    *width = w, *height = h;
+}
 
 const char* dlssModeName(DlssMode m) {
     static const char* const names[kDlssModes] = {"Off", "DLAA", "Quality", "Balanced", "Performance"};
@@ -51,6 +67,9 @@ void readSettings(const std::string& path, DisplaySettings& s) {
         } else if (!std::strcmp(key, "button_icons")) {
             for (int i = 0; i < kButtonIconChoices; ++i)
                 if (!std::strcmp(value, kButtonIconKeys[i])) s.buttonIcons = ButtonIcons(i);
+        } else if (!std::strcmp(key, "aspect")) {
+            for (int i = 0; i < kAspectChoices; ++i)
+                if (!std::strcmp(value, kAspectKeys[i])) s.aspect = AspectRatio(i);
         }
     }
     std::fclose(f);
@@ -68,6 +87,7 @@ bool writeSettings(const std::string& path, const DisplaySettings& s) {
     std::fprintf(f, "dlss = %s\n", kDlssKeys[int(s.dlss)]);
     std::fprintf(f, "skip_intro = %s\n", s.skipIntro ? "on" : "off");
     std::fprintf(f, "button_icons = %s\n", kButtonIconKeys[int(s.buttonIcons)]);
+    std::fprintf(f, "aspect = %s\n", kAspectKeys[int(s.aspect)]);
     return std::fclose(f) == 0;
 }
 

@@ -34,6 +34,14 @@ void dlssChoose(int i) {
     saveDisplaySettings();
 }
 
+std::vector<std::string> aspectChoices() { return {std::begin(kAspectNames), std::end(kAspectNames)}; }
+int aspectSetting() { return int(displaySettings().aspect); }
+void aspectChoose(int i) {
+    if (i < 0 || i >= kAspectChoices) return;
+    displaySettings().aspect = AspectRatio(i);
+    saveDisplaySettings();
+}
+
 std::vector<std::string> onOff() { return {"Off", "On"}; }
 int skipIntroValue() { return displaySettings().skipIntro ? 1 : 0; }
 void skipIntroChoose(int i) {
@@ -55,6 +63,10 @@ const std::vector<PcSetting>& pcSettings() {
     static const std::vector<PcSetting> settings = {
         display<0>("Window Mode", "Play in a window, a borderless window or fullscreen."),
         display<1>("Resolution", "Set the 3D rendering resolution. Takes effect after restarting the game."),
+        {"Aspect Ratio",
+         "Match your monitor's shape: the 3D view widens to fit, the HUD stays 16:9 in the middle. Takes effect "
+         "after restarting the game.",
+         &aspectChoices, &aspectSetting, &aspectChoose},
         display<2>("Frame Rate Cap",
                    "Set the most frames shown per second. Uncapped follows the monitor's refresh rate."),
         display<3>("FPS Counter", "Show the frame rate in the top right corner of the screen."),

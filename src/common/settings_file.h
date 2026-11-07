@@ -18,6 +18,13 @@ const char* dlssModeName(DlssMode m); // "Off", "DLAA", "Quality", ...
 enum class ButtonIcons { PlayStation, Xbox, Switch, Auto };
 constexpr int kButtonIconChoices = 4;
 constexpr const char* kButtonIconNames[kButtonIconChoices] = {"PlayStation", "Xbox", "Switch", "Auto"};
+// The picture's shape. 16:9 is the game's own. The others render wider (or, at 16:10, narrower)
+// at the resolution's height, with the 3D view widened to match (the same vertical field of view)
+// and the HUD kept at 16:9 in the middle (display_settings.h).
+enum class AspectRatio { Wide16x9, Wide16x10, Ultrawide21x9 };
+constexpr int kAspectChoices = 3;
+constexpr const char* kAspectNames[kAspectChoices] = {"16:9", "16:10", "21:9"};
+double aspectValue(AspectRatio a); // 16/9, 16/10, 64/27 (2560x1080)
 
 struct DisplaySettings {
     WindowMode window = WindowMode::Windowed;
@@ -29,6 +36,7 @@ struct DisplaySettings {
     DlssMode dlss = DlssMode::Off;
     bool skipIntro = false; // fast-forward the boot logos to the title screen
     ButtonIcons buttonIcons = ButtonIcons::PlayStation; // as the game draws its own
+    AspectRatio aspect = AspectRatio::Wide16x9;
 };
 
 constexpr const char* kSettingsFile = "lpn-display.ini";
@@ -36,6 +44,11 @@ constexpr const char* kSettingsFile = "lpn-display.ini";
 // Missing or unreadable: s is left as it is.
 void readSettings(const std::string& path, DisplaySettings& s);
 bool writeSettings(const std::string& path, const DisplaySettings& s);
+
+// The size the game renders (and outputs) at: at 16:9 the resolution as set (0x0: the game's
+// own); otherwise the resolution's height (896 for the game's own) and as wide as the aspect ratio
+// makes it, to 32 pixels: 1080p at 21:9 is 2560x1080, at 16:10 1728x1080.
+void renderSize(const DisplaySettings& s, uint32_t* width, uint32_t* height);
 
 // The choices the menus offer.
 constexpr const char* kWindowModeNames[] = {"Windowed", "Borderless Fullscreen", "Fullscreen"};

@@ -33,6 +33,7 @@
 #include <filesystem>
 #include <functional>
 #include <thread>
+#include <tuple>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstdio>
@@ -1382,6 +1383,7 @@ public:
     // Records a copy of the image at display buffer addr into readback slot c.slot and submits it.
     // The copy sits in GPU order with the game's work, so the caller can wait for it elsewhere.
     bool queueDisplay(uint64_t addr, uint32_t width, uint32_t height, DisplayCopy& c) {
+        noteDisplay(addr);
         std::lock_guard lock(m_);
         auto it = colors_.find(addr);
         if (it == colors_.end()) {
@@ -1894,9 +1896,42 @@ private:
         const VkDeviceSize bytes = data.size() * 4;
         const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
         uint8_t* dst = static_cast<uint8_t*>(R().ringPtr_) + at;
-        if (syncRecord_ || !deferUploads_ || R().immediate_) std::memcpy(dst, data.data(), bytes);
-        else rec([dst, src = data.data(), bytes] { std::memcpy(dst, src, bytes); });
+        const bool fix = hud().on;
+        if (syncRecord_ || !deferUploads_ || R().immediate_) {
+            std::memcpy(dst, data.data(), bytes);
+            if (fix) fixViewRays(data.data(), dst, bytes);
+        } else {
+            rec([dst, src = data.data(), bytes, fix] {
+                std::memcpy(dst, src, bytes);
+                if (fix) fixViewRays(src, dst, bytes);
+            });
+        }
         return at;
+    }
+    // Aspect Ratio: the ambient occlusion pass gets its view rays as constants, a pixel size quad
+    // (s/w, -s/h, -1, 1) with s 1 or 2 and a tan quad (tan x, tan y, -1, 0), in either order. The
+    // pixel size is right but tan x is worked out for 16:9 by code not found (ghost shadows at
+    // 21:9). Where both quads sit side by side, tan x is made to match the pixel size's shape.
+    // It reads the draw's own data and writes only the fixed values to the ring, which is slow
+    // to read (uncached).
+    static void fixViewRays(const uint32_t* src, uint8_t* dst, size_t bytes) {
+        const float* f = reinterpret_cast<const float*>(src);
+        float* out = reinterpret_cast<float*>(dst);
+        const size_t n = bytes / 4;
+        auto pixel = [&](size_t i) {
+            return f[i] > 0 && f[i + 1] < 0 && f[i + 2] == -1.0f && f[i + 3] == 1.0f;
+        };
+        auto tan = [&](size_t i) {
+            return f[i] > 0 && f[i + 1] > 0 && f[i + 2] == -1.0f && f[i + 3] == 0.0f &&
+                   std::fabs(f[i] / f[i + 1] - 16.0f / 9) < 1e-3f;
+        };
+        for (size_t i = gcn::data::kSmrd; i + 4 <= n; ++i) {
+            if (!pixel(i)) continue;
+            const float aspect = -f[i + 1] / f[i]; // (s/h) / (s/w)
+            if (std::fabs(aspect - 16.0f / 9) < 0.02f || aspect < 1.0f || aspect > 4.0f) continue;
+            if (i + 8 <= n && tan(i + 4)) out[i + 4] = f[i + 5] * aspect;
+            if (i >= gcn::data::kSmrd + 4 && tan(i - 4)) out[i - 4] = f[i - 3] * aspect;
+        }
     }
 
     // Under the shared lock (a recorder thread's draw), a lookup that would change a shared cache
@@ -5500,10 +5535,15 @@ void main() {
                 for (const auto& w : prog->warnings) std::fprintf(traceOut_, "[trace]   warning: %s\n", w.c_str());
             }
         }
-        if (!(r.ctx[reg::kPaClVteCntl] & 0xF)) {
-            const float t[4] = {2.0f / float(width), 2.0f / float(height), -1.0f, -1.0f};
+        { // set again on each try: hudTransform builds on it
+            const bool pixels = !(r.ctx[reg::kPaClVteCntl] & 0xF);
+            const float t[4] = {pixels ? 2.0f / float(width) : 1.0f, pixels ? 2.0f / float(height) : 1.0f,
+                                pixels ? -1.0f : 0.0f, pixels ? -1.0f : 0.0f};
             std::memcpy(&vs.data[gcn::data::kPosTransform], t, sizeof(t));
         }
+        // Before the draw data goes up with the resources (hudTransform changes it).
+        const uint8_t hud = hudDraw(r, hasDepth, vs, psm ? &ps : nullptr, d, prim, width, height);
+        if (hud) hudTransform(vs, r, width, height, hud);
         bindResources(vs, 0, VK_SHADER_STAGE_VERTEX_BIT, writes, bufs, imgs, aheadFor(a, vs));
         if (psm) bindResources(ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT, writes, bufs, imgs, aheadFor(a, ps));
         linkWrites(writes, bufs, imgs);
@@ -5584,7 +5624,7 @@ void main() {
             R().bound_.pipeline = pipe;
         }
         pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, lay.pipeline, writes, bufs, imgs);
-        setViewportScissor(r, width, height, jitter);
+        setViewportScissor(r, width, height, jitter, hud);
         if (!R().bound_.state || std::memcmp(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
             std::memcpy(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
             rec([c = R().cmd_, b = std::bit_cast<std::array<float, 4>>(R().bound_.blend)] { vkCmdSetBlendConstants(c, b.data()); });
@@ -5658,6 +5698,7 @@ void main() {
             f.dyn = dyn;
             f.depthControl = gs.depthControl;
             f.jitter = jitter;
+            f.hud = hud;
             f.width = width;
             f.height = height;
             f.pass = R().passSerial_;
@@ -5692,6 +5733,7 @@ void main() {
         DynamicState dyn{};
         uint32_t depthControl = 0, width = 0, height = 0;
         bool jitter = false;
+        uint8_t hud = 0; // see hudDraw
         uint64_t pass = 0, epoch = 0;
         std::vector<VkImage> sampled;
         std::vector<VkWriteDescriptorSet> writes;
@@ -5827,7 +5869,7 @@ void main() {
             R().bound_.pipeline = f.pipe;
         }
         pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, f.layout, f.writes, f.bufs, f.imgs);
-        setViewportScissor(r, f.width, f.height, f.jitter);
+        setViewportScissor(r, f.width, f.height, f.jitter, f.hud);
         if (!R().bound_.state || std::memcmp(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
             std::memcpy(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
             rec([c = R().cmd_, b = std::bit_cast<std::array<float, 4>>(R().bound_.blend)] { vkCmdSetBlendConstants(c, b.data()); });
@@ -5912,6 +5954,8 @@ void main() {
             if (R().prof_.on) ++R().prof_.fastRes[why];
             return miss(kFastResources);
         }
+        // Aspect Ratio: HUD shading drawn wider than the HUD (see hudDraw) takes a full draw.
+        if (f.hud && (hudWide(a.vs, a.psm ? &a.ps : nullptr, d) ? 2 : 1) != f.hud) return miss(kFastResources);
         VkBuffer indexBuffer = VK_NULL_HANDLE;
         VkDeviceSize indexOffset = 0;
         if (d.kind == DrawCall::kIndexed) {
@@ -6109,16 +6153,175 @@ void main() {
         R().passClosedBy_ = kPassOther;
     }
 
-    void setViewportScissor(const DrawRegs& r, uint32_t width, uint32_t height, bool jitter = false) {
+    // ---- Aspect Ratio (display_settings.h hudLayout) ------------------------------------------
+    // With a picture that is not 16:9 the game outputs at its size and draws its scene to all of
+    // it, but lays its HUD out as 16:9 at the picture's width: past the edges of a wider picture. Draws into
+    // the display buffers are mapped into the largest 16:9 rectangle in the middle, but for the
+    // full-screen scene passes: draws that sample a render target of the picture's shape (the
+    // scene) or have a depth buffer bound. Videos (1920x1080 textures) come out 16:9 that way too.
+    struct Hud {
+        bool on = false;
+        uint32_t outW = 0, outH = 0;
+        double aspect = 16.0 / 9;
+        float x = 0, y = 0, sx = 1, sy = 1; // target pixel = (x, y) + HUD pixel * (sx, sy)
+    };
+    static const Hud& hud() {
+        static const Hud h = [] {
+            Hud k;
+            if (!hudLayout(&k.outW, &k.outH) || !k.outH) return k;
+            if (const char* e = getenv("LPN_HUD_STRETCH"); e && std::strcmp(e, "0") != 0) return k;
+            k.on = true;
+            k.aspect = double(k.outW) / k.outH;
+            // The game lays the HUD out at the picture's width, 16:9 and from the top: at 21:9 it runs
+            // past the bottom (the minimap was cut off). That 16:9 layout is scaled into the largest
+            // 16:9 rectangle in the middle, alike in x and y.
+            const double scale = std::min(1.0, k.outH * 16.0 / 9 / k.outW);
+            const double w = k.outW * scale, h = k.outW * 9.0 / 16 * scale;
+            k.sx = k.sy = float(scale);
+            k.x = float((k.outW - w) / 2), k.y = float((k.outH - h) / 2);
+            std::fprintf(stderr, "[hud] HUD drawn %.0fx%.0f at %.0f,%.0f of the %ux%u picture\n", w, h, k.x, k.y, k.outW, k.outH);
+            return k;
+        }();
+        return h;
+    }
+    // The display buffers' addresses, as flips show them (any thread).
+    static constexpr int kMaxDisplays = 16;
+    std::atomic<uint64_t> displayAddrs_[kMaxDisplays] = {};
+    void noteDisplay(uint64_t addr) {
+        for (auto& a : displayAddrs_) {
+            uint64_t v = a.load(std::memory_order_relaxed);
+            if (v == addr) return;
+            if (!v && a.compare_exchange_strong(v, addr)) return;
+            if (v == addr) return;
+        }
+    }
+    bool isDisplay(uint64_t addr) const {
+        for (const auto& a : displayAddrs_) {
+            const uint64_t v = a.load(std::memory_order_relaxed);
+            if (!v) return false;
+            if (v == addr) return true;
+        }
+        return false;
+    }
+    // Whether a draw is HUD (above). Holding m_ (the surfaces are looked up).
+    // The game draws its HUD over the finished scene in a picture-sized buffer of its own, which a
+    // full-screen pass then copies into the display buffer. Such a buffer is told apart as one the
+    // display buffers' draws sample that no draw with a depth buffer renders into (the scene's
+    // targets have those). Draws into it, and into the display buffers, are HUD but for the ones
+    // sampling a picture-shaped render target (the scene being copied in, post-processing).
+    // 0: drawn as it is, 1: the HUD (into the 16:9 rectangle), 2: HUD shading wider than the HUD
+    // (stretched across the whole picture, only its height fitted).
+    uint8_t hudDraw(const DrawRegs& r, bool hasDepth, const gcn::Program& vs, const gcn::Program* ps, const DrawCall& d,
+                    uint32_t prim, uint32_t width, uint32_t height) {
+        const Hud& h = hud();
+        if (!h.on) return 0;
+        // A picture-sized target (a little padding allowed): the others are not the HUD's.
+        if (width < h.outW || width > h.outW + 128 || height < h.outH || height > h.outH + 32) return 0;
+        const uint64_t target = uint64_t(r.ctx[reg::kCbColorBase]) << 8;
+        uint64_t picture[8];
+        int pictures = 0;
+        uint32_t sceneW = 0, sceneH = 0;
+        for (const gcn::Program* p : {&vs, ps}) {
+            if (!p) continue;
+            for (const auto& t : p->images) {
+                if (t.storage || !t.height() || t.width() < h.outW / 8) continue;
+                if (std::fabs(double(t.width()) / t.height() - h.aspect) > 0.06 * h.aspect) continue;
+                if (!colors_.count(t.base()) && !depths_.count(t.base())) continue;
+                sceneW = t.width(), sceneH = t.height();
+                if (pictures < 8) picture[pictures++] = t.base();
+            }
+        }
+        const bool display = isDisplay(target);
+        bool layer = false;
+        {
+            std::lock_guard lock(hudMutex_);
+            if (hasDepth) {
+                sceneTargets_.insert(target);
+                hudLayers_.erase(target);
+            } else {
+                if (display)
+                    for (int i = 0; i < pictures; ++i)
+                        if (!sceneTargets_.count(picture[i]) && hudLayers_.insert(picture[i]).second)
+                            std::fprintf(stderr, "[hud] 0x%" PRIx64 " taken for the HUD's buffer\n", picture[i]);
+                layer = hudLayers_.count(target) != 0;
+            }
+        }
+        // One untextured full-screen-style rectangle (RECTLIST, 3 vertices): a fill, tint or fade
+        // over the whole picture. Squeezed, it left a seam at the 16:9 edges.
+        bool textured = false;
+        for (const gcn::Program* p : {&vs, ps})
+            if (p)
+                for (const auto& t : p->images) textured = textured || !t.storage;
+        const bool fill = prim == 17 && d.count == 3 && !textured;
+        const bool isHud = !hasDepth && (display || layer) && sceneW == 0 && !fill;
+        const uint8_t mode = !isHud ? 0 : hudWide(vs, ps, d) ? 2 : 1;
+        if (hudLog_) {
+            std::lock_guard lock(hudLogMutex_);
+            const uint64_t vsAddr = vs.launch.entry, psAddr = ps ? ps->launch.entry : 0;
+            if (hudLogged_.insert({target ^ vsAddr, psAddr, (hasDepth ? 4 : 0) | mode}).second &&
+                hudLogged_.size() <= 600) {
+                std::string samples;
+                for (int i = 0; i < pictures; ++i) samples += " 0x" + hex(picture[i]);
+                std::fprintf(stderr, "[hud] frame %" PRIu64 " into 0x%" PRIx64 "%s%s%s: vs 0x%" PRIx64 " ps 0x%" PRIx64
+                                     " prim %u count %u vte 0x%x: %s%s\n",
+                             frame_, target, display ? " (display)" : "", layer ? " (HUD buffer)" : "",
+                             hasDepth ? " with depth" : "", vsAddr, psAddr, prim, d.count, r.ctx[reg::kPaClVteCntl],
+                             mode == 2 ? "HUD shading, full width" : isHud ? "HUD, 16:9 in the middle" : "full picture",
+                             samples.empty() ? "" : ("; samples" + samples).c_str());
+            }
+        }
+        return mode;
+    }
+    // An untextured HUD draw reaching past both sides of the HUD's layout: the game's vignette and
+    // its top and bottom shading, which squeezed into 16:9 left a band at the sides (21:9).
+    static bool hudWide(const gcn::Program& vs, const gcn::Program* ps, const DrawCall& d) {
+        if (d.count > 256 || vs.buffers.empty()) return false;
+        for (const gcn::Program* p : {&vs, ps})
+            if (p)
+                for (const auto& t : p->images)
+                    if (!t.storage) return false;
+        // The layout's width, from the draw data's (2/w, -2/h, -1, 1).
+        auto at = [&](size_t i) {
+            float v;
+            std::memcpy(&v, &vs.data[i], 4);
+            return v;
+        };
+        float layoutW = 0;
+        for (size_t i = gcn::data::kSmrd; i + 4 <= vs.data.size(); ++i)
+            if (at(i) > 0 && at(i + 1) < 0 && at(i + 2) == -1.0f && at(i + 3) == 1.0f) {
+                layoutW = 2 / at(i);
+                break;
+            }
+        if (layoutW < 256) return false;
+        const auto& b = vs.buffers[0]; // the positions (x, y first)
+        const uint32_t n = b.numRecords(), stride = b.stride();
+        if (!b.known || stride < 8 || !n || n > 256) return false;
+        std::vector<uint8_t> bytes(size_t(stride) * n);
+        if (!readGuest(b.base(), bytes.data(), bytes.size())) return false;
+        float lo = INFINITY, hi = -INFINITY;
+        for (uint32_t i = 0; i < n; ++i) {
+            float x;
+            std::memcpy(&x, &bytes[size_t(i) * stride], 4);
+            if (!std::isfinite(x)) return false;
+            lo = std::min(lo, x), hi = std::max(hi, x);
+        }
+        return lo < 0.5f && hi > layoutW - 0.5f && hi - lo < 4 * layoutW;
+    }
+    std::mutex hudMutex_;
+    std::unordered_set<uint64_t> sceneTargets_, hudLayers_;
+    const bool hudLog_ = getenv("LPN_HUD_LOG") != nullptr;
+    std::mutex hudLogMutex_;
+    std::set<std::tuple<uint64_t, uint64_t, int>> hudLogged_;
+
+    // The game's viewport (x, y, width and height; width and height signed).
+    static VkViewport gameViewport(const DrawRegs& r, uint32_t width, uint32_t height) {
         const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
-        float xs = v[0], xo = v[1], ys = v[2], yo = v[3], zs = v[4], zo = v[5];
+        float xs = v[0], xo = v[1], ys = v[2], yo = v[3];
         const uint32_t vte = r.ctx[reg::kPaClVteCntl];
         if (!(vte & 1)) xs = 1;
         if (!(vte & 2)) xo = 0;
         if (!(vte & 4)) ys = 1;
         if (!(vte & 8)) yo = 0;
-        if (!(vte & 16)) zs = 1;
-        if (!(vte & 32)) zo = 0;
         VkViewport vp{};
         vp.x = xo - xs;
         vp.width = 2 * xs;
@@ -6130,6 +6333,33 @@ void main() {
             vp.width = float(width);
             vp.height = float(height);
         }
+        return vp;
+    }
+    // Aspect Ratio: a HUD draw moved into the 16:9 rectangle (hudDraw's mode 1; mode 2 only its
+    // height) by its vertex shader's position transform, the viewport left as the game set it: a
+    // smaller viewport cut off what reached past the rectangle (the minimap's ping).
+    static void hudTransform(gcn::Program& vs, const DrawRegs& r, uint32_t width, uint32_t height, uint8_t mode) {
+        const Hud& h = hud();
+        const VkViewport vp = gameViewport(r, width, height);
+        float t[4];
+        std::memcpy(t, &vs.data[gcn::data::kPosTransform], sizeof t);
+        // pixel' = offset + pixel * scale, as clip space for the same viewport: x * scale + o * w.
+        auto fit = [](float& scale, float& offset, float s, float o, float vx, float vw) {
+            if (vw == 0) return;
+            const float add = s - 1 + 2 * (o + (s - 1) * vx) / vw;
+            scale *= s, offset = offset * s + add;
+        };
+        if (mode == 1) fit(t[0], t[2], h.sx, h.x, vp.x, vp.width);
+        fit(t[1], t[3], h.sy, h.y, vp.y, vp.height);
+        std::memcpy(&vs.data[gcn::data::kPosTransform], t, sizeof t);
+    }
+
+    void setViewportScissor(const DrawRegs& r, uint32_t width, uint32_t height, bool jitter = false, uint8_t hudMode = 0) {
+        const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
+        const uint32_t vte = r.ctx[reg::kPaClVteCntl];
+        const float zs = (vte & 16) ? v[4] : 1, zo = (vte & 32) ? v[5] : 0;
+        VkViewport vp = gameViewport(r, width, height);
+        const Hud& h = hud();
         const bool dx = (r.ctx[reg::kPaClClipCntl] >> 19) & 1;
         vp.minDepth = dx ? zo : zo - zs;
         vp.maxDepth = zo + zs;
@@ -6154,6 +6384,19 @@ void main() {
         clip(r.ctx[reg::kGenericScissorTl], r.ctx[reg::kGenericScissorBr]);
         clip(r.ctx[reg::kWindowScissorTl], r.ctx[reg::kWindowScissorBr]);
         if ((r.ctx[0x292] >> 1) & 1) clip(r.ctx[reg::kVportScissorTl], r.ctx[reg::kVportScissorBr]);
+        // The HUD's clipping (the minimap's, say) moves with it. Clipping to the whole picture keeps
+        // its height and becomes the 16:9 rectangle with a margin, for glows reaching a little past
+        // it (the minimap's ping) but not what the game slides in from off screen.
+        const bool whole = x0 == 0 && y0 == 0 && x1 >= int32_t(h.outW) && y1 >= int32_t(h.outH);
+        if (hudMode == 1 && whole) {
+            const float w = h.outW * h.sx, margin = w * 0.06f;
+            x0 = std::max<int32_t>(0, int32_t(std::floor(h.x - margin)));
+            x1 = std::min<int32_t>(int32_t(width), int32_t(std::ceil(h.x + w + margin)));
+        } else if (hudMode && !whole) {
+            if (hudMode == 1) x0 = int32_t(std::floor(h.x + x0 * h.sx)), x1 = int32_t(std::ceil(h.x + x1 * h.sx));
+            y0 = int32_t(std::floor(h.y + y0 * h.sy)), y1 = int32_t(std::ceil(h.y + y1 * h.sy));
+            x1 = std::min<int32_t>(x1, int32_t(width)), y1 = std::min<int32_t>(y1, int32_t(height));
+        }
         VkRect2D sc{{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
         if (trace_)
             std::fprintf(traceOut_, "[trace]   scissors screen %x %x window %x %x generic %x %x vport %x %x mode0 %x\n",
