@@ -6115,7 +6115,7 @@ void main() {
 
     // ---- Aspect Ratio (display_settings.h hudLayout) ------------------------------------------
     // With a picture that is not 16:9 the game outputs at its size and draws its scene to all of
-    // it, but lays its HUD out for 16:9 over the whole picture, which would stretch it. Draws into
+    // it, but lays its HUD out as 16:9 at the picture's width: past the edges of a wider picture. Draws into
     // the display buffers are mapped into the largest 16:9 rectangle in the middle, but for the
     // full-screen scene passes: draws that sample a render target of the picture's shape (the
     // scene) or have a depth buffer bound. Videos (1920x1080 textures) come out 16:9 that way too.
@@ -6132,8 +6132,12 @@ void main() {
             if (const char* e = getenv("LPN_HUD_STRETCH"); e && std::strcmp(e, "0") != 0) return k;
             k.on = true;
             k.aspect = double(k.outW) / k.outH;
-            const double w = std::min<double>(k.outW, k.outH * 16.0 / 9), h = std::min<double>(k.outH, k.outW * 9.0 / 16);
-            k.sx = float(w / k.outW), k.sy = float(h / k.outH);
+            // The game lays the HUD out at the picture's width, 16:9 and from the top: at 21:9 it runs
+            // past the bottom (the minimap was cut off). That 16:9 layout is scaled into the largest
+            // 16:9 rectangle in the middle, alike in x and y.
+            const double scale = std::min(1.0, k.outH * 16.0 / 9 / k.outW);
+            const double w = k.outW * scale, h = k.outW * 9.0 / 16 * scale;
+            k.sx = k.sy = float(scale);
             k.x = float((k.outW - w) / 2), k.y = float((k.outH - h) / 2);
             std::fprintf(stderr, "[hud] HUD drawn %.0fx%.0f at %.0f,%.0f of the %ux%u picture\n", w, h, k.x, k.y, k.outW, k.outH);
             return k;
