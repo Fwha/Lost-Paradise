@@ -5509,7 +5509,7 @@ void main() {
         bindResources(vs, 0, VK_SHADER_STAGE_VERTEX_BIT, writes, bufs, imgs, aheadFor(a, vs));
         if (psm) bindResources(ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT, writes, bufs, imgs, aheadFor(a, ps));
         linkWrites(writes, bufs, imgs);
-        const bool hud = hudDraw(r, hasDepth, vs, psm ? &ps : nullptr, d, prim);
+        const bool hud = hudDraw(r, hasDepth, vs, psm ? &ps : nullptr, d, prim, width, height);
 
         // Index buffer.
         VkBuffer indexBuffer = VK_NULL_HANDLE;
@@ -6160,33 +6160,66 @@ void main() {
         return false;
     }
     // Whether a draw is HUD (above). Holding m_ (the surfaces are looked up).
+    // The game draws its HUD over the finished scene in a picture-sized buffer of its own, which a
+    // full-screen pass then copies into the display buffer. Such a buffer is told apart as one the
+    // display buffers' draws sample that no draw with a depth buffer renders into (the scene's
+    // targets have those). Draws into it, and into the display buffers, are HUD but for the ones
+    // sampling a picture-shaped render target (the scene being copied in, post-processing).
     bool hudDraw(const DrawRegs& r, bool hasDepth, const gcn::Program& vs, const gcn::Program* ps, const DrawCall& d,
-                 uint32_t prim) {
+                 uint32_t prim, uint32_t width, uint32_t height) {
         const Hud& h = hud();
-        if (!h.on || hasDepth) return false;
+        if (!h.on) return false;
+        // A picture-sized target (a little padding allowed): the others are not the HUD's.
+        if (width < h.outW || width > h.outW + 128 || height < h.outH || height > h.outH + 32) return false;
         const uint64_t target = uint64_t(r.ctx[reg::kCbColorBase]) << 8;
-        if (!isDisplay(target)) return false;
+        uint64_t picture[8];
+        int pictures = 0;
         uint32_t sceneW = 0, sceneH = 0;
         for (const gcn::Program* p : {&vs, ps}) {
             if (!p) continue;
             for (const auto& t : p->images) {
                 if (t.storage || !t.height() || t.width() < h.outW / 8) continue;
                 if (std::fabs(double(t.width()) / t.height() - h.aspect) > 0.06 * h.aspect) continue;
-                if (colors_.count(t.base()) || depths_.count(t.base())) sceneW = t.width(), sceneH = t.height();
+                if (!colors_.count(t.base()) && !depths_.count(t.base())) continue;
+                sceneW = t.width(), sceneH = t.height();
+                if (pictures < 8) picture[pictures++] = t.base();
             }
         }
+        const bool display = isDisplay(target);
+        bool layer = false;
+        {
+            std::lock_guard lock(hudMutex_);
+            if (hasDepth) {
+                sceneTargets_.insert(target);
+                hudLayers_.erase(target);
+            } else {
+                if (display)
+                    for (int i = 0; i < pictures; ++i)
+                        if (!sceneTargets_.count(picture[i]) && hudLayers_.insert(picture[i]).second)
+                            std::fprintf(stderr, "[hud] 0x%" PRIx64 " taken for the HUD's buffer\n", picture[i]);
+                layer = hudLayers_.count(target) != 0;
+            }
+        }
+        const bool isHud = !hasDepth && (display || layer) && sceneW == 0;
         if (hudLog_) {
             std::lock_guard lock(hudLogMutex_);
             const uint64_t vsAddr = vs.launch.entry, psAddr = ps ? ps->launch.entry : 0;
-            if (hudLogged_.insert({vsAddr, psAddr, sceneW != 0}).second && hudLogged_.size() <= 400)
-                std::fprintf(stderr, "[hud] frame %" PRIu64 " into 0x%" PRIx64 ": vs 0x%" PRIx64 " ps 0x%" PRIx64
-                                     " prim %u count %u vte 0x%x: %s\n",
-                             frame_, target, vsAddr, psAddr, prim, d.count, r.ctx[reg::kPaClVteCntl],
-                             sceneW ? ("full picture (samples " + std::to_string(sceneW) + "x" + std::to_string(sceneH) + ")").c_str()
-                                    : "HUD, 16:9 in the middle");
+            if (hudLogged_.insert({target ^ vsAddr, psAddr, (hasDepth ? 2 : 0) | (isHud ? 1 : 0)}).second &&
+                hudLogged_.size() <= 600) {
+                std::string samples;
+                for (int i = 0; i < pictures; ++i) samples += " 0x" + hex(picture[i]);
+                std::fprintf(stderr, "[hud] frame %" PRIu64 " into 0x%" PRIx64 "%s%s%s: vs 0x%" PRIx64 " ps 0x%" PRIx64
+                                     " prim %u count %u vte 0x%x: %s%s\n",
+                             frame_, target, display ? " (display)" : "", layer ? " (HUD buffer)" : "",
+                             hasDepth ? " with depth" : "", vsAddr, psAddr, prim, d.count, r.ctx[reg::kPaClVteCntl],
+                             isHud ? "HUD, 16:9 in the middle" : "full picture",
+                             samples.empty() ? "" : ("; samples" + samples).c_str());
+            }
         }
-        return sceneW == 0;
+        return isHud;
     }
+    std::mutex hudMutex_;
+    std::unordered_set<uint64_t> sceneTargets_, hudLayers_;
     const bool hudLog_ = getenv("LPN_HUD_LOG") != nullptr;
     std::mutex hudLogMutex_;
     std::set<std::tuple<uint64_t, uint64_t, bool>> hudLogged_;
