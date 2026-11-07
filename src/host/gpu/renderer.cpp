@@ -1896,9 +1896,33 @@ private:
         const VkDeviceSize bytes = data.size() * 4;
         const VkDeviceSize at = ringAlloc(bytes, storageAlign_);
         uint8_t* dst = static_cast<uint8_t*>(R().ringPtr_) + at;
-        if (syncRecord_ || !deferUploads_ || R().immediate_) std::memcpy(dst, data.data(), bytes);
-        else rec([dst, src = data.data(), bytes] { std::memcpy(dst, src, bytes); });
+        const bool fix = hud().on;
+        if (syncRecord_ || !deferUploads_ || R().immediate_) {
+            std::memcpy(dst, data.data(), bytes);
+            if (fix) fixViewRays(dst, bytes);
+        } else {
+            rec([dst, src = data.data(), bytes, fix] {
+                std::memcpy(dst, src, bytes);
+                if (fix) fixViewRays(dst, bytes);
+            });
+        }
         return at;
+    }
+    // Aspect Ratio: the ambient occlusion pass gets its view rays as constants (2/w, -2/h, -1, 1,
+    // tan x, tan y, -1, 0), its pixel size right but tan x worked out for 16:9 by code not found
+    // (ghost shadows beside characters at 21:9). In draw data with that layout, tan x is made to
+    // match the pixel size's shape.
+    static void fixViewRays(uint8_t* p, size_t bytes) {
+        float* f = reinterpret_cast<float*>(p);
+        const size_t n = bytes / 4;
+        for (size_t i = gcn::data::kSmrd; i + 8 <= n; ++i) {
+            if (f[i + 2] != -1.0f || f[i + 3] != 1.0f || f[i + 6] != -1.0f) continue;
+            if (!(f[i] > 0) || !(f[i + 1] < 0) || !(f[i + 4] > 0) || !(f[i + 5] > 0)) continue;
+            if (std::fabs(f[i + 4] / f[i + 5] - 16.0f / 9) > 1e-3f) continue;
+            const float aspect = -f[i + 1] / f[i]; // (2/h) / (2/w)
+            if (std::fabs(aspect - 16.0f / 9) < 0.02f) continue;
+            f[i + 4] = f[i + 5] * aspect;
+        }
     }
 
     // Under the shared lock (a recorder thread's draw), a lookup that would change a shared cache
