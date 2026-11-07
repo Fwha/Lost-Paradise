@@ -13,6 +13,9 @@ and known issues.
 
 - **Display modes:** windowed, borderless fullscreen or fullscreen.
 - **Resolutions:** 720p, 896p (PS4), 1080p (PS4 Pro) and native 1440p output.
+- **Aspect ratio:** 16:9, 16:10 or 21:9. The game renders at that shape (2560x1080 for 1080p at
+  21:9) with its 3D view widened to match (same vertical field of view, so 21:9 shows more to the
+  sides and 16:10 a little less), and the HUD stays 16:9 in the middle. Not stretched.
 - **Frame rate:** cap at 30, 60 or 90 fps, or uncapped, with the game still running at normal
   speed. The title screen, menus and real-time cutscenes go uncapped too. Optional FPS counter.
 - **DLAA:** NVIDIA DLSS anti-aliasing in place of the game's SMAA (RTX cards, see Build).
@@ -99,6 +102,8 @@ Defaults suit most machines. These environment variables override them:
 | `LPN_RECORD_THREADS` | 6 on 16+ hardware threads, else 0 | Threads that record draws in parallel. `0` turns them off. |
 | `LPN_ANALYSIS_WORKERS` | 6 on 16+ threads, 3 on 8+, else 1 | Threads that analyse shaders and draws. |
 | `LPN_PROFILE=1` | off | Prints per-frame timings. |
+| `LPN_HUD_STRETCH=1` | off | With a 16:10 or 21:9 aspect ratio, stretch the HUD over the whole picture instead of keeping it 16:9. |
+| `LPN_HUD_LOG=1` | off | Logs which draws are treated as HUD (`[hud]` lines), for reporting HUD problems. |
 
 Example: `LPN_RECORD_THREADS=0 ./launch.sh`
 

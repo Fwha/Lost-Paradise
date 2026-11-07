@@ -33,6 +33,7 @@
 #include <filesystem>
 #include <functional>
 #include <thread>
+#include <tuple>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstdio>
@@ -1382,6 +1383,7 @@ public:
     // Records a copy of the image at display buffer addr into readback slot c.slot and submits it.
     // The copy sits in GPU order with the game's work, so the caller can wait for it elsewhere.
     bool queueDisplay(uint64_t addr, uint32_t width, uint32_t height, DisplayCopy& c) {
+        noteDisplay(addr);
         std::lock_guard lock(m_);
         auto it = colors_.find(addr);
         if (it == colors_.end()) {
@@ -5507,6 +5509,7 @@ void main() {
         bindResources(vs, 0, VK_SHADER_STAGE_VERTEX_BIT, writes, bufs, imgs, aheadFor(a, vs));
         if (psm) bindResources(ps, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT, writes, bufs, imgs, aheadFor(a, ps));
         linkWrites(writes, bufs, imgs);
+        const bool hud = hudDraw(r, hasDepth, vs, psm ? &ps : nullptr, d, prim);
 
         // Index buffer.
         VkBuffer indexBuffer = VK_NULL_HANDLE;
@@ -5584,7 +5587,7 @@ void main() {
             R().bound_.pipeline = pipe;
         }
         pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, lay.pipeline, writes, bufs, imgs);
-        setViewportScissor(r, width, height, jitter);
+        setViewportScissor(r, width, height, jitter, hud);
         if (!R().bound_.state || std::memcmp(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
             std::memcpy(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
             rec([c = R().cmd_, b = std::bit_cast<std::array<float, 4>>(R().bound_.blend)] { vkCmdSetBlendConstants(c, b.data()); });
@@ -5658,6 +5661,7 @@ void main() {
             f.dyn = dyn;
             f.depthControl = gs.depthControl;
             f.jitter = jitter;
+            f.hud = hud;
             f.width = width;
             f.height = height;
             f.pass = R().passSerial_;
@@ -5691,7 +5695,7 @@ void main() {
         VkPipeline pipe = VK_NULL_HANDLE;
         DynamicState dyn{};
         uint32_t depthControl = 0, width = 0, height = 0;
-        bool jitter = false;
+        bool jitter = false, hud = false;
         uint64_t pass = 0, epoch = 0;
         std::vector<VkImage> sampled;
         std::vector<VkWriteDescriptorSet> writes;
@@ -5827,7 +5831,7 @@ void main() {
             R().bound_.pipeline = f.pipe;
         }
         pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, f.layout, f.writes, f.bufs, f.imgs);
-        setViewportScissor(r, f.width, f.height, f.jitter);
+        setViewportScissor(r, f.width, f.height, f.jitter, f.hud);
         if (!R().bound_.state || std::memcmp(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
             std::memcpy(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
             rec([c = R().cmd_, b = std::bit_cast<std::array<float, 4>>(R().bound_.blend)] { vkCmdSetBlendConstants(c, b.data()); });
@@ -6109,7 +6113,85 @@ void main() {
         R().passClosedBy_ = kPassOther;
     }
 
-    void setViewportScissor(const DrawRegs& r, uint32_t width, uint32_t height, bool jitter = false) {
+    // ---- Aspect Ratio (display_settings.h hudLayout) ------------------------------------------
+    // With a picture that is not 16:9 the game outputs at its size and draws its scene to all of
+    // it, but lays its HUD out for 16:9 over the whole picture, which would stretch it. Draws into
+    // the display buffers are mapped into the largest 16:9 rectangle in the middle, but for the
+    // full-screen scene passes: draws that sample a render target of the picture's shape (the
+    // scene) or have a depth buffer bound. Videos (1920x1080 textures) come out 16:9 that way too.
+    struct Hud {
+        bool on = false;
+        uint32_t outW = 0, outH = 0;
+        double aspect = 16.0 / 9;
+        float x = 0, y = 0, sx = 1, sy = 1; // target pixel = (x, y) + HUD pixel * (sx, sy)
+    };
+    static const Hud& hud() {
+        static const Hud h = [] {
+            Hud k;
+            if (!hudLayout(&k.outW, &k.outH) || !k.outH) return k;
+            if (const char* e = getenv("LPN_HUD_STRETCH"); e && std::strcmp(e, "0") != 0) return k;
+            k.on = true;
+            k.aspect = double(k.outW) / k.outH;
+            const double w = std::min<double>(k.outW, k.outH * 16.0 / 9), h = std::min<double>(k.outH, k.outW * 9.0 / 16);
+            k.sx = float(w / k.outW), k.sy = float(h / k.outH);
+            k.x = float((k.outW - w) / 2), k.y = float((k.outH - h) / 2);
+            std::fprintf(stderr, "[hud] HUD drawn %.0fx%.0f at %.0f,%.0f of the %ux%u picture\n", w, h, k.x, k.y, k.outW, k.outH);
+            return k;
+        }();
+        return h;
+    }
+    // The display buffers' addresses, as flips show them (any thread).
+    static constexpr int kMaxDisplays = 16;
+    std::atomic<uint64_t> displayAddrs_[kMaxDisplays] = {};
+    void noteDisplay(uint64_t addr) {
+        for (auto& a : displayAddrs_) {
+            uint64_t v = a.load(std::memory_order_relaxed);
+            if (v == addr) return;
+            if (!v && a.compare_exchange_strong(v, addr)) return;
+            if (v == addr) return;
+        }
+    }
+    bool isDisplay(uint64_t addr) const {
+        for (const auto& a : displayAddrs_) {
+            const uint64_t v = a.load(std::memory_order_relaxed);
+            if (!v) return false;
+            if (v == addr) return true;
+        }
+        return false;
+    }
+    // Whether a draw is HUD (above). Holding m_ (the surfaces are looked up).
+    bool hudDraw(const DrawRegs& r, bool hasDepth, const gcn::Program& vs, const gcn::Program* ps, const DrawCall& d,
+                 uint32_t prim) {
+        const Hud& h = hud();
+        if (!h.on || hasDepth) return false;
+        const uint64_t target = uint64_t(r.ctx[reg::kCbColorBase]) << 8;
+        if (!isDisplay(target)) return false;
+        uint32_t sceneW = 0, sceneH = 0;
+        for (const gcn::Program* p : {&vs, ps}) {
+            if (!p) continue;
+            for (const auto& t : p->images) {
+                if (t.storage || !t.height() || t.width() < h.outW / 8) continue;
+                if (std::fabs(double(t.width()) / t.height() - h.aspect) > 0.06 * h.aspect) continue;
+                if (colors_.count(t.base()) || depths_.count(t.base())) sceneW = t.width(), sceneH = t.height();
+            }
+        }
+        if (hudLog_) {
+            std::lock_guard lock(hudLogMutex_);
+            const uint64_t vsAddr = vs.launch.entry, psAddr = ps ? ps->launch.entry : 0;
+            if (hudLogged_.insert({vsAddr, psAddr, sceneW != 0}).second && hudLogged_.size() <= 400)
+                std::fprintf(stderr, "[hud] frame %" PRIu64 " into 0x%" PRIx64 ": vs 0x%" PRIx64 " ps 0x%" PRIx64
+                                     " prim %u count %u vte 0x%x: %s\n",
+                             frame_, target, vsAddr, psAddr, prim, d.count, r.ctx[reg::kPaClVteCntl],
+                             sceneW ? ("full picture (samples " + std::to_string(sceneW) + "x" + std::to_string(sceneH) + ")").c_str()
+                                    : "HUD, 16:9 in the middle");
+        }
+        return sceneW == 0;
+    }
+    const bool hudLog_ = getenv("LPN_HUD_LOG") != nullptr;
+    std::mutex hudLogMutex_;
+    std::set<std::tuple<uint64_t, uint64_t, bool>> hudLogged_;
+
+    void setViewportScissor(const DrawRegs& r, uint32_t width, uint32_t height, bool jitter = false, bool hudDraw = false) {
         const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
         float xs = v[0], xo = v[1], ys = v[2], yo = v[3], zs = v[4], zo = v[5];
         const uint32_t vte = r.ctx[reg::kPaClVteCntl];
@@ -6129,6 +6211,11 @@ void main() {
             vp.y = 0;
             vp.width = float(width);
             vp.height = float(height);
+        }
+        const Hud& h = hud();
+        if (hudDraw) { // into the 16:9 rectangle (pixels as the vertex shader maps them included)
+            vp.x = h.x + vp.x * h.sx, vp.width *= h.sx;
+            vp.y = h.y + vp.y * h.sy, vp.height *= h.sy;
         }
         const bool dx = (r.ctx[reg::kPaClClipCntl] >> 19) & 1;
         vp.minDepth = dx ? zo : zo - zs;
@@ -6154,6 +6241,11 @@ void main() {
         clip(r.ctx[reg::kGenericScissorTl], r.ctx[reg::kGenericScissorBr]);
         clip(r.ctx[reg::kWindowScissorTl], r.ctx[reg::kWindowScissorBr]);
         if ((r.ctx[0x292] >> 1) & 1) clip(r.ctx[reg::kVportScissorTl], r.ctx[reg::kVportScissorBr]);
+        if (hudDraw) { // the HUD's clipping (the minimap's, say) moves with it
+            x0 = int32_t(std::floor(h.x + x0 * h.sx)), x1 = int32_t(std::ceil(h.x + x1 * h.sx));
+            y0 = int32_t(std::floor(h.y + y0 * h.sy)), y1 = int32_t(std::ceil(h.y + y1 * h.sy));
+            x1 = std::min<int32_t>(x1, int32_t(width)), y1 = std::min<int32_t>(y1, int32_t(height));
+        }
         VkRect2D sc{{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
         if (trace_)
             std::fprintf(traceOut_, "[trace]   scissors screen %x %x window %x %x generic %x %x vport %x %x mode0 %x\n",

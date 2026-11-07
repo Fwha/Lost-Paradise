@@ -19,8 +19,14 @@ void saveDisplaySettings();
 // Changing the resolution therefore takes a restart. Returns false when the eboot does not
 // hold the expected instructions (another game version).
 bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height);
+// With a picture that is not 16:9 (renderSize with an Aspect Ratio), it also outputs at that size
+// and builds its 3D projections for that shape instead of 16:9.
 // The resolution the running game was started with (0x0: the game's own).
 void activeRenderResolution(uint32_t* width, uint32_t* height);
+// When the running game's picture is not 16:9: its output size (true). The renderer then draws
+// the HUD (what goes into the display buffers but the full-screen scene) in the largest 16:9
+// rectangle in the middle of it. LPN_HUD_STRETCH=1 leaves it stretched to the whole picture.
+bool hudLayout(uint32_t* outWidth, uint32_t* outHeight);
 
 // The game's frame clock (0xd9ee40) steps the world by a fixed 1/60 s a frame in some scenes
 // (1/30 in cutscenes, 1/20 while loading, 1/60 through flag bit 2 in the title's menus) and by

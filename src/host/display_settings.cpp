@@ -35,6 +35,49 @@ void saveDisplaySettings() {
     if (!writeSettings(kSettingsFile, gSettings)) std::fprintf(stderr, "[display] cannot write %s\n", kSettingsFile);
 }
 
+namespace {
+
+// The game builds its 3D projections for a 16:9 picture whatever size it renders at: the
+// cameras' inline projection builders (f / (16/9) for the x scale, f for y, near and far at
+// +0xa4/+0xa8 of the camera, the matrix stored at +0x170), the calls into the engine's
+// perspective setup (0xe66a60, whose aspect argument these pass as 16/9), and the horizontal
+// field of view a camera works out for culling (2 atan(tan(v/2) * 16/9)). Each of these 16/9
+// floats is read by that one instruction only, so making them the picture's aspect widens the
+// view at the same vertical field of view (Hor+), culling included. The other 16/9 floats the
+// game reads (screen mapping for markers over 3D objects among them) are left at 16:9: the HUD
+// stays a 16:9 picture in the middle (hudLayout), and those still place on it.
+constexpr uint32_t kAspectFloats[] = {
+    0xfb87b4,  // 0x11b48d: projection builder
+    0xfc2d18,  // 0x19482a, 0x194bb1: projection builders (one passes it to 0x2358e0)
+    0xfc3260,  // 0x1ae54f: aspect handed to 0x194250
+    0xfd1708,  // 0x28bf03: horizontal field of view from the vertical one
+    0xfd5914,  // 0x2d2328: aspect argument of 0xe66a60
+    0x108937c, // 0x771518: aspect argument of 0xe66a60
+    0x1097d90, // 0x838c53: projection builder
+    0x109921c, // 0x856901: projection builder
+    0x109ae2c, // 0x8696da: projection builder
+    0x109aecc, // 0x873a81: projection builder
+    0x109c504, // 0x888e1e: projection builder
+};
+constexpr uint32_t k16By9 = 0x3fe38e39; // 16/9 as a float
+
+uint32_t gOutW = 0, gOutH = 0; // the output size when not 16:9 (hudLayout)
+
+bool patchAspect(uint8_t* text, float aspect) {
+    for (uint32_t at : kAspectFloats) {
+        uint32_t v;
+        std::memcpy(&v, text + at, 4);
+        if (v != k16By9) {
+            std::fprintf(stderr, "[display] unexpected eboot data at 0x%x: the 3D view stays 16:9\n", at);
+            return false;
+        }
+    }
+    for (uint32_t at : kAspectFloats) std::memcpy(text + at, &aspect, 4);
+    return true;
+}
+
+} // namespace
+
 bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height) {
     if (!width || !height) return true;
     // The eboot's display setup (0x55d5e0, given argc/argv) stores the render width and height
@@ -61,45 +104,61 @@ bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height) {
         }
     }
     // Above 1080p the game also outputs at that size (its 4K modes do the same), so the window
-    // gets every rendered pixel; at or below it keeps the 1920x1080 output and scales up.
-    const bool bigger = width > 1920 || height > 1080;
+    // gets every rendered pixel; at or below it keeps the 1920x1080 output and scales up. A picture
+    // that is not 16:9 (Aspect Ratio) is output at its own size too, whatever it is: the scene
+    // fills it and the HUD is drawn 16:9 in the middle (hudLayout).
+    bool bigger = width > 1920 || height > 1080;
+    const bool wide = std::fabs(double(width) / height - 16.0 / 9) > 0.02;
+    bool sized = bigger || wide;
+    // 0x55e820 fills in the setup's display size, 1920x1080 packed as width | height << 12
+    // (movl $0x1438780, 0x50(%rdi)): the output size instead.
+    static const uint8_t kSizeWas[] = {0xC7, 0x47, 0x50, 0x80, 0x87, 0x43, 0x01};
+    // The base PS4's video memory setup (0xe7bd30) still caps the display buffers at 1920x1080
+    // (the 1080p frame was then scaled back up to the window). Above 1080p it now keeps the output
+    // size and reserves the extra 100 MB for the buffers, as its PS4 Pro branch does for 4K.
+    struct Bytes {
+        uint32_t at;
+        std::vector<uint8_t> was, now;
+    };
+    static const Bytes kDisplay[] = {
+        // movq $0x2500000, (%rsi): the display pool's size -> 0x8900000
+        {0xe7beb2, {0x48, 0xC7, 0x06, 0x00, 0x00, 0x50, 0x02}, {0x48, 0xC7, 0x06, 0x00, 0x00, 0x90, 0x08}},
+        // jb past the clamp to 1920x1080 -> jmp
+        {0xe7beb9, {0x72, 0x13}, {0xEB, 0x13}},
+    };
+    if (sized) {
+        bool match = width < 4096 && height < 4096 && std::equal(kSizeWas, kSizeWas + 7, text + 0x55e822);
+        if (bigger)
+            for (const Bytes& c : kDisplay) match = match && std::equal(c.was.begin(), c.was.end(), text + c.at);
+        if (!match) {
+            std::fprintf(stderr, "[display] unexpected eboot code at 0x55e822/0xe7beb2: output stays 1920x1080\n");
+            if (wide) return false; // a squashed picture is worse than the game's own
+            sized = bigger = false;
+        }
+    }
+    if (wide && !patchAspect(text, float(double(width) / height))) return false;
     for (const Store& s : kStores) {
-        if (s.output && !bigger) continue;
+        if (s.output && !sized) continue;
         const uint16_t v = uint16_t(s.isWidth ? width : height);
         text[s.at + 3] = uint8_t(v);
         text[s.at + 4] = uint8_t(v >> 8);
     }
-    // The base PS4's video memory setup (0xe7bd30) still caps the display buffers at 1920x1080
-    // (the 1080p frame was then scaled back up to the window). Above 1080p it now keeps the output
-    // size and reserves the extra 100 MB for the buffers, as its PS4 Pro branch does for 4K.
-    if (bigger) {
-        struct Bytes {
-            uint32_t at;
-            std::vector<uint8_t> was, now;
-        };
-        static const Bytes kDisplay[] = {
-            // movq $0x2500000, (%rsi): the display pool's size -> 0x8900000
-            {0xe7beb2, {0x48, 0xC7, 0x06, 0x00, 0x00, 0x50, 0x02}, {0x48, 0xC7, 0x06, 0x00, 0x00, 0x90, 0x08}},
-            // jb past the clamp to 1920x1080 -> jmp
-            {0xe7beb9, {0x72, 0x13}, {0xEB, 0x13}},
-        };
-        // 0x55e820 fills in the setup's display size, 1920x1080 packed as width | height << 12
-        // (movl $0x1438780, 0x50(%rdi)): the output size instead.
-        const uint32_t packed = 0x1000000u | (height & 0xFFF) << 12 | (width & 0xFFF);
-        static const uint8_t kSizeWas[] = {0xC7, 0x47, 0x50, 0x80, 0x87, 0x43, 0x01};
-        bool match = width < 4096 && height < 4096 && std::equal(kSizeWas, kSizeWas + 7, text + 0x55e822);
-        for (const Bytes& c : kDisplay) match = match && std::equal(c.was.begin(), c.was.end(), text + c.at);
-        if (match) {
+    if (sized) {
+        if (bigger)
             for (const Bytes& c : kDisplay) std::copy(c.now.begin(), c.now.end(), text + c.at);
-            for (int i = 0; i < 4; ++i) text[0x55e825 + i] = uint8_t(packed >> (8 * i));
-        }
-        else
-            std::fprintf(stderr, "[display] unexpected eboot code at 0x55e822/0xe7beb2: display buffers stay 1920x1080\n");
+        const uint32_t packed = 0x1000000u | (height & 0xFFF) << 12 | (width & 0xFFF);
+        for (int i = 0; i < 4; ++i) text[0x55e825 + i] = uint8_t(packed >> (8 * i));
     }
+    if (wide) gOutW = width, gOutH = height;
     gActiveW = width, gActiveH = height;
-    std::fprintf(stderr, "[display] rendering at %ux%u (output %ux%u)\n", width, height, bigger ? width : 1920,
-                 bigger ? height : 1080);
+    std::fprintf(stderr, "[display] rendering at %ux%u (output %ux%u)%s\n", width, height, sized ? width : 1920,
+                 sized ? height : 1080, wide ? ", 3D view widened to match, HUD kept 16:9" : "");
     return true;
+}
+
+bool hudLayout(uint32_t* outWidth, uint32_t* outHeight) {
+    *outWidth = gOutW, *outHeight = gOutH;
+    return gOutW != 0;
 }
 
 void activeRenderResolution(uint32_t* width, uint32_t* height) {

@@ -232,7 +232,9 @@ void drawDisplayMenu(SDL_Renderer* ren) {
     const DisplaySettings& s = displaySettings();
     uint32_t activeW, activeH;
     activeRenderResolution(&activeW, &activeH);
-    const bool restart = activeW != s.width || activeH != s.height;
+    uint32_t wantW, wantH; // with the Aspect Ratio's width
+    renderSize(s, &wantW, &wantH);
+    const bool restart = activeW != wantW || activeH != wantH;
 
     int w = 0, h = 0;
     SDL_GetRendererOutputSize(ren, &w, &h);

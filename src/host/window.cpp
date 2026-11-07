@@ -3,6 +3,7 @@
 #include "host/combo_trace.h"
 #include "host/coverage.h"
 #include "host/display_menu.h"
+#include "host/display_settings.h"
 #include "host/gpu/renderer.h"
 #include "host/hle.h"
 #include "host/profile.h"
@@ -128,8 +129,10 @@ void presenterThread() {
         gEnabled = false;
         return;
     }
+    // 720 rows, as wide as the Aspect Ratio makes the picture.
+    const int winW = int(720 * aspectValue(displaySettings().aspect) + 0.5);
     SDL_Window* win = SDL_CreateWindow("Fist of the North Star: Lost Paradise", SDL_WINDOWPOS_CENTERED,
-                                       SDL_WINDOWPOS_CENTERED, 1280, 720, SDL_WINDOW_RESIZABLE);
+                                       SDL_WINDOWPOS_CENTERED, winW, 720, SDL_WINDOW_RESIZABLE);
     SDL_Renderer* ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC) : nullptr;
     if (!ren) {
         std::fprintf(stderr, "[window] cannot create window: %s\n", SDL_GetError());
@@ -186,7 +189,19 @@ void presenterThread() {
         }
         lock.unlock();
         SDL_RenderClear(ren);
-        if (tex) SDL_RenderCopy(ren, tex, nullptr, nullptr);
+        if (tex) {
+            // The frame keeps its shape (the Aspect Ratio's), with black bars where the window's
+            // differs; within a pixel or two of it, it fills the window.
+            int ww = 0, wh = 0;
+            SDL_GetRendererOutputSize(ren, &ww, &wh);
+            SDL_Rect dst{0, 0, ww, wh};
+            if (texW && texH && ww && wh) {
+                const double fa = double(texW) / texH;
+                if (ww > wh * fa + 2) dst.w = int(wh * fa + 0.5), dst.x = (ww - dst.w) / 2;
+                else if (wh > ww / fa + 2) dst.h = int(ww / fa + 0.5), dst.y = (wh - dst.h) / 2;
+            }
+            SDL_RenderCopy(ren, tex, nullptr, &dst);
+        }
         drawSaveMenu(ren);
         drawFpsCounter(ren);
         drawDisplayMenu(ren);
