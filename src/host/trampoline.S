@@ -4,9 +4,17 @@
 # argument registers, call lpn_on_unimplemented(info, regs) and return its result to the
 # guest as if the import had run.
 
+#ifdef _WIN32
+#define FUNCTION(name)
+#define END(name)
+#else
+#define FUNCTION(name) .type name, @function
+#define END(name) .size name, . - name
+#endif
+
     .text
     .globl lpn_unimplemented_stub
-    .type lpn_unimplemented_stub, @function
+    FUNCTION(lpn_unimplemented_stub)
 lpn_unimplemented_stub:
     push %r9
     push %r8
@@ -26,14 +34,14 @@ lpn_unimplemented_stub:
     pop %r8
     pop %r9
     ret
-    .size lpn_unimplemented_stub, . - lpn_unimplemented_stub
+    END(lpn_unimplemented_stub)
 
 # Shared tail for traced HLE imports (--trace-hle). The trampoline puts its ImportInfo* in
 # %r10. We save every argument register (integer and vector, plus %rax for varargs), call
 # lpn_on_traced(info), which returns the real implementation, and tail-jump to it.
 
     .globl lpn_trace_stub
-    .type lpn_trace_stub, @function
+    FUNCTION(lpn_trace_stub)
 lpn_trace_stub:
     push %rax
     push %r9
@@ -71,6 +79,8 @@ lpn_trace_stub:
     pop %r9
     pop %rax
     jmp *%r11
-    .size lpn_trace_stub, . - lpn_trace_stub
+    END(lpn_trace_stub)
 
+#ifndef _WIN32
     .section .note.GNU-stack, "", @progbits
+#endif

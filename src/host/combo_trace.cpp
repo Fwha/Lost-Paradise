@@ -1,3 +1,14 @@
+
+#ifdef _WIN32
+// Debugging tool built on SIGTRAP breakpoints: Linux only for now.
+#include "host/combo_trace.h"
+
+#include <cstdio>
+
+namespace host::combo_trace {
+void onKey() { std::fprintf(stderr, "[combo] not available on Windows\n"); }
+} // namespace host::combo_trace
+#else
 #include "host/combo_trace.h"
 
 #include "host/kernel.h"
@@ -13,7 +24,7 @@
 #include <thread>
 
 #include <signal.h>
-#include <sys/mman.h>
+#include "host/mman.h"
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -170,3 +181,4 @@ void onKey() {
 }
 
 } // namespace host::combo_trace
+#endif

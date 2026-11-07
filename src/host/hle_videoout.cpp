@@ -468,7 +468,7 @@ void registerVideoOutHle() {
                              "sceVideoOutSetWindowModeMargins", "sceVideoOutCursorEnable", "sceVideoOutCursorDisable",
                              "sceVideoOutCursorSetHotSpot", "sceVideoOutCursorSetImageAddress",
                              "sceVideoOutCursorSetPosition"})
-        registerHle(v, name, reinterpret_cast<void*>(&ok));
+        registerHle(v, name, guestEntry<&ok>());
 }
 
 } // namespace host

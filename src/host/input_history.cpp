@@ -1,3 +1,4 @@
+#include "host/guest_abi.h"
 #include "host/input_history.h"
 
 #include "host/display_settings.h"
@@ -10,7 +11,8 @@
 #include <mutex>
 #include <unordered_map>
 
-#include <sys/mman.h>
+#include "host/mman.h"
+#include "common/compat.h"
 #include <unistd.h>
 
 namespace host {
@@ -43,7 +45,7 @@ template <class T> T& at(uint8_t* p, size_t off) { return *reinterpret_cast<T*>(
 void appendEntry(uint8_t* actor) {
     // The input source fills the live state: vtable +0x68 (source, &state).
     void* source = at<void*>(actor, kSource);
-    auto read = reinterpret_cast<void (*)(void*, void*)>((*reinterpret_cast<void***>(source))[0x68 / 8]);
+    auto read = reinterpret_cast<void (LPN_GUEST*)(void*, void*)>((*reinterpret_cast<void***>(source))[0x68 / 8]);
     read(source, actor + kState);
 
     int next = int8_t(at<uint8_t>(actor, kNext));
@@ -95,7 +97,7 @@ bool patchInputHistory(Module& eboot) {
     gEboot = eboot.base();
     // movabs $appendEntry, %rax; jmp *%rax
     uint8_t jump[12] = {0x48, 0xb8};
-    const uint64_t target = reinterpret_cast<uint64_t>(&appendEntry);
+    const uint64_t target = reinterpret_cast<uint64_t>(guestEntry<&appendEntry>());
     std::memcpy(jump + 2, &target, 8);
     jump[10] = 0xff, jump[11] = 0xe0;
     const uintptr_t page = uintptr_t(sysconf(_SC_PAGESIZE));

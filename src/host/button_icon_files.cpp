@@ -8,6 +8,7 @@
 #include "host/pad_glyphs.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -417,13 +418,13 @@ std::string buttonIconFile(const std::string& path) {
         std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
         o.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
         if (!o) {
-            std::fprintf(stderr, "[button icons] cannot write %s\n", tmp.c_str());
+            std::fprintf(stderr, "[button icons] cannot write %s\n", tmp.string().c_str());
             return result;
         }
     }
     fs::rename(tmp, copy, ec);
     if (ec) {
-        std::fprintf(stderr, "[button icons] cannot write %s: %s\n", copy.c_str(), ec.message().c_str());
+        std::fprintf(stderr, "[button icons] cannot write %s: %s\n", copy.string().c_str(), ec.message().c_str());
         return result;
     }
     return result = copy.string();

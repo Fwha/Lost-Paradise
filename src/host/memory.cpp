@@ -1,6 +1,12 @@
 #include "host/memory.h"
 
-#include <sys/mman.h>
+#include "host/mman.h"
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <linux/falloc.h>
+#include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cerrno>
@@ -17,9 +23,25 @@ uint64_t alignUp(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
 
 } // namespace
 
+#ifndef _WIN32
+int createSharedMemory(const char* name, uint64_t size) {
+    const int fd = memfd_create(name, MFD_CLOEXEC);
+    if (fd >= 0 && ftruncate(fd, off_t(size)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+void releaseSharedMemory(int fd, uint64_t off, uint64_t len) {
+    fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off_t(off), off_t(len));
+}
+#endif
+
 void* guestMap(void* hint, uint64_t len, uint64_t align, int prot, int flags, int fd, uint64_t off) {
     if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) return mmap(hint, len, prot, flags, fd, off);
     if (align < kGuestPage) align = kGuestPage;
+    if (align < kMapGranule) align = kMapGranule; // Windows maps views on 64 KiB boundaries
     len = alignUp(len, kGuestPage);
 
     if (hint && uint64_t(hint) + len <= kGuestEnd) {

@@ -36,9 +36,9 @@ void setFile(Progress* pr, const std::string& file) {
 
 // Copies a file in pieces, so a big one shows progress and can be cancelled.
 void copyFile(const fs::path& from, const fs::path& to, Progress* pr) {
-    std::FILE* in = std::fopen(from.c_str(), "rb");
+    std::FILE* in = std::fopen(from.string().c_str(), "rb");
     if (!in) throw Failed{"cannot read " + from.string() + ": " + std::strerror(errno)};
-    std::FILE* out = std::fopen(to.c_str(), "wb");
+    std::FILE* out = std::fopen(to.string().c_str(), "wb");
     if (!out) {
         std::fclose(in);
         throw Failed{"cannot write " + to.string() + ": " + std::strerror(errno)};

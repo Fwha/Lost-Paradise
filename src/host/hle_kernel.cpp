@@ -209,7 +209,7 @@ uint64_t gameClockNs() {
 void registerKernelHle() {
     HLE("libSceLibcInternalExt", sceLibcHeapGetTraceInfo);
     const char* k = "libkernel";
-    registerHle(k, "__tls_get_addr", reinterpret_cast<void*>(&guestTlsGetAddr));
+    registerHle(k, "__tls_get_addr", guestEntry<&guestTlsGetAddr>());
     HLE_NAMED(k, "__stack_chk_guard", stack_chk_guard);
     HLE_NAMED(k, "__progname", progname);
     HLE_NAMED(k, "__stack_chk_fail", stack_chk_fail);

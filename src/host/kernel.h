@@ -1,6 +1,8 @@
 // Shared state and conventions for the libkernel HLE (hle_kernel/memory/pthread/file.cpp).
 #pragma once
 
+#include "host/guest_abi.h"
+
 #include <cstdint>
 #include <string>
 
@@ -52,6 +54,6 @@ void registerServicesHle();
 } // namespace host
 
 // Registration helper: HLE("libkernel", sceKernelFoo) binds the symbol of that name.
-#define HLE(lib, fn) ::host::registerHle(lib, #fn, reinterpret_cast<void*>(&fn))
+#define HLE(lib, fn) ::host::registerHle(lib, #fn, ::host::guestEntry<&fn>())
 // For PS4 names that clash with the host's libc (mmap, _write, ...).
-#define HLE_NAMED(lib, name, fn) ::host::registerHle(lib, name, reinterpret_cast<void*>(&fn))
+#define HLE_NAMED(lib, name, fn) ::host::registerHle(lib, name, ::host::guestEntry<&fn>())

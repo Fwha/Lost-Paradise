@@ -49,6 +49,28 @@ scripts/fetch-nids.sh aerolib.csv     # import names, needed to run
 
 Optional, for NVIDIA DLSS: run `scripts/fetch-dlss.sh`, then the two build commands again.
 
+### Windows (experimental)
+
+Each push builds a Windows zip: open the commit's **Windows** workflow run on GitHub and download
+`Lost_Paradise-windows` under Artifacts. Unzip it, put the dump in the `game` folder next to
+`Lost Paradise.exe` (the launcher makes the folder on its first start) and press Play; the
+game's log goes to `play.log` in that folder. Releases carry the same zip. Needs Windows 10 1803
+or later and a Vulkan driver. DLSS is Linux only for now.
+
+To build it yourself, in an [MSYS2](https://www.msys2.org) UCRT64 shell:
+
+```sh
+pacman -S --needed zip mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,SDL2,vulkan-headers,vulkan-loader,glslang,zlib}
+cmake -S . -B build -G Ninja && ninja -C build
+scripts/fetch-nids.sh aerolib.csv
+scripts/make-windows-zip.sh           # build/Lost_Paradise-windows.zip
+```
+
+Or cross-compile from Linux with MinGW-w64: `cmake/mingw-w64-x86_64.cmake` is the toolchain file.
+How the port works: the game's code calls ours through System V thunks (`src/host/guest_abi.h`),
+guest memory is built on placeholders (`src/host/mman_win.cpp`), and the thread pointer is a
+TEB slot read through `%gs` (`src/host/tls.cpp`).
+
 ## Run
 
 Lay out an install folder like this, with the dump (the folder with `eboot.bin` and

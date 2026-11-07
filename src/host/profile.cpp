@@ -7,11 +7,19 @@
 #include "host/pm4.h"
 #include "host/videoout.h"
 
-#include <dirent.h>
 #include <pthread.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dirent.h>
 #include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -39,8 +47,10 @@ struct Task {
 };
 
 // Every thread of this process with its CPU time so far, from /proc/self/task/<tid>/stat.
+// (Windows: none yet, so the [cpu] lines show nothing.)
 std::unordered_map<int, Task> readTasks() {
     std::unordered_map<int, Task> out;
+#ifndef _WIN32
     DIR* d = opendir("/proc/self/task");
     if (!d) return out;
     while (dirent* e = readdir(d)) {
@@ -66,12 +76,17 @@ std::unordered_map<int, Task> readTasks() {
         out.emplace(tid, std::move(t));
     }
     closedir(d);
+#endif
     return out;
 }
 
 void sampler() {
     nameThread("lpn-prof");
+#ifdef _WIN32
+    const double hz = 100;
+#else
     const double hz = double(sysconf(_SC_CLK_TCK));
+#endif
     auto before = readTasks();
     auto t0 = std::chrono::steady_clock::now();
     for (;;) {
@@ -114,7 +129,11 @@ std::vector<WaitSlot*> gSlots;
 struct SlotOwner {
     WaitSlot slot;
     SlotOwner() {
+#ifdef _WIN32
+        slot.tid = int(GetCurrentThreadId());
+#else
         slot.tid = int(syscall(SYS_gettid));
+#endif
         std::lock_guard lock(gSlotsMutex);
         gSlots.push_back(&slot);
     }
@@ -125,6 +144,9 @@ struct SlotOwner {
 };
 
 std::string threadName(int tid) {
+#ifdef _WIN32
+    return std::to_string(tid);
+#endif
     char path[64], buf[32] = {};
     std::snprintf(path, sizeof path, "/proc/self/task/%d/comm", tid);
     FILE* f = std::fopen(path, "r");
@@ -269,8 +291,11 @@ namespace {
 // LPN_NO_PIN=1: no affinity set.
 struct Cores {
     bool on = false;
+#ifndef _WIN32
     cpu_set_t recorder, others;
+#endif
 };
+#ifndef _WIN32
 std::string readLine(const std::string& path) {
     std::ifstream f(path);
     std::string line;
@@ -295,6 +320,9 @@ std::vector<int> cpuList(const std::string& s) {
 const Cores& cores() {
     static const Cores c = [] {
         Cores c;
+#ifdef _WIN32
+        return c; // no pinning on Windows yet
+#else
         if (getenv("LPN_NO_PIN")) return c;
         cpu_set_t allowed;
         if (sched_getaffinity(0, sizeof allowed, &allowed)) return c;
@@ -319,21 +347,27 @@ const Cores& cores() {
         std::fprintf(stderr, "[cpu] the recorder runs on CPU %d (%ld MHz), its core's other CPUs idle (LPN_NO_PIN=1: no pinning)\n",
                      best, bestFreq / 1000);
         return c;
+#endif
     }();
     return c;
 }
+#endif
 
 } // namespace
 
 void avoidRecorderCore() {
+#ifndef _WIN32
     if (cores().on) sched_setaffinity(0, sizeof(cpu_set_t), &cores().others);
+#endif
 }
 
 void nameThread(const char* name) {
     pthread_setname_np(pthread_self(), name);
+#ifndef _WIN32
     if (!cores().on) return;
     if (!std::strcmp(name, "lpn-record")) sched_setaffinity(0, sizeof(cpu_set_t), &cores().recorder);
     else avoidRecorderCore(); // also for threads the recorder starts (they inherit its CPU)
+#endif
 }
 
 void mark() {

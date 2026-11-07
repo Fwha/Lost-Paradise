@@ -1,5 +1,7 @@
 // Check for updates: asks GitHub for the repo's latest release and, run from the AppImage,
-// replaces the AppImage with the release's one and starts it again.
+// replaces the AppImage with the release's one and starts it again. On Windows it downloads the
+// release's Windows zip and unpacks it over the install folder (files in use are renamed to
+// .old first, and removed at the next start).
 //
 // The repo is private, so requests carry a GitHub token: $LPN_GITHUB_TOKEN, $GITHUB_TOKEN or
 // $GH_TOKEN, else a github-token file in the install folder, else `gh auth token` (the GitHub CLI's
@@ -30,6 +32,10 @@ UpdateStatus updateStatus();
 bool restartReady();
 // Starts the updated AppImage in this process's place (call once the window is gone).
 void restart(int argc, char** argv);
+// Whether applyUpdate can replace this install (the AppImage, or the Windows folder).
+bool canSelfUpdate();
+// Removes what an update on Windows left behind (the .old files); nothing elsewhere.
+void cleanUpAfterUpdate(const std::string& installDir);
 
 // Whether tag a is a later version than b ("v1.2.0" > "v1.1.9"); a version that is not numbers
 // ("dev", a commit) is older than any release.

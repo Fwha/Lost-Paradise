@@ -1,3 +1,14 @@
+
+#ifdef _WIN32
+// Debugging tool built on SIGTRAP breakpoints: Linux only for now.
+#include "host/coverage.h"
+
+#include <cstdio>
+
+namespace host::coverage {
+void onKey() { std::fprintf(stderr, "[coverage] not available on Windows\n"); }
+} // namespace host::coverage
+#else
 #include "host/coverage.h"
 
 #include "host/kernel.h"
@@ -14,7 +25,7 @@
 #include <vector>
 
 #include <signal.h>
-#include <sys/mman.h>
+#include "host/mman.h"
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -164,3 +175,4 @@ void onKey() {
 }
 
 } // namespace host::coverage
+#endif

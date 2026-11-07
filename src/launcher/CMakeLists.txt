@@ -13,6 +13,13 @@ add_executable(lpn-launcher
 )
 target_link_libraries(lpn-launcher PRIVATE lpn-common pkg SDL2::SDL2)
 target_compile_definitions(lpn-launcher PRIVATE LPN_HAVE_SDL2)
+if(WIN32)
+    # "Lost Paradise.exe": a windowed program (no console), with its icon and manifest.
+    target_sources(lpn-launcher PRIVATE "${PROJECT_SOURCE_DIR}/packaging/windows/launcher.rc")
+    set_target_properties(lpn-launcher PROPERTIES WIN32_EXECUTABLE ON OUTPUT_NAME "Lost Paradise")
+    target_compile_definitions(lpn-launcher PRIVATE SDL_MAIN_HANDLED)
+    target_link_libraries(lpn-launcher PRIVATE comdlg32 shell32 ole32)
+endif()
 target_include_directories(lpn-launcher SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/external/stb"
                            "${PROJECT_SOURCE_DIR}/external/nanosvg")
 

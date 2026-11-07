@@ -3,6 +3,7 @@
 // The eboot and the game's bundled libc/Fios2 modules are mapped into this process and
 // linked against each other; everything they import from the PS4 system libraries is
 // bound to our C++ implementations, or to a logging stub until one exists.
+#include "host/guest_abi.h"
 #include "common/game_dir.h"
 #include "host/crash.h"
 #include "host/display_settings.h"
@@ -166,9 +167,9 @@ int main(int argc, char** argv) {
     }
     host::patchDrawSites(*modules[0]);
 
-    const int32_t fsOffset = host::guestThreadPointerFsOffset();
+    const host::ThreadPointerSlot tpSlot = host::guestThreadPointerSlot();
     for (auto* m : modules) {
-        const size_t n = m->patchThreadPointerReads(fsOffset);
+        const size_t n = m->patchThreadPointerReads(tpSlot.segment, tpSlot.disp);
         std::fprintf(stderr, "[host] %s: %zu thread pointer reads redirected\n", m->name().c_str(), n);
     }
 
@@ -201,16 +202,16 @@ int main(int argc, char** argv) {
     // Start the bundled libraries the way the PS4 loader does: module_start(0, nullptr).
     for (size_t i = 1; i < modules.size(); ++i) {
         std::fprintf(stderr, "[host] starting %s\n", modules[i]->name().c_str());
-        auto start = reinterpret_cast<int (*)(size_t, const void*, void*)>(modules[i]->entry());
+        auto start = reinterpret_cast<int (LPN_GUEST*)(size_t, const void*, void*)>(modules[i]->entry());
         const int r = start(0, nullptr, nullptr);
         std::fprintf(stderr, "[host] %s module_start returned %d\n", modules[i]->name().c_str(), r);
     }
 
-    std::fprintf(stderr, "[host] entering eboot at %s+0x%lx\n", modules[0]->name().c_str(),
-                 modules[0]->entry() - uint64_t(modules[0]->base()));
+    std::fprintf(stderr, "[host] entering eboot at %s+0x%llx\n", modules[0]->name().c_str(),
+                 (unsigned long long)(modules[0]->entry() - uint64_t(modules[0]->base())));
     static EntryParams params{1, 0, {"eboot.bin", nullptr, nullptr}};
-    auto entry = reinterpret_cast<void (*)(EntryParams*, void (*)())>(modules[0]->entry());
-    entry(&params, onGuestExit);
+    auto entry = reinterpret_cast<void (LPN_GUEST*)(EntryParams*, void (LPN_GUEST*)())>(modules[0]->entry());
+    entry(&params, reinterpret_cast<void (LPN_GUEST*)()>(host::guestEntry<&onGuestExit>()));
     std::fprintf(stderr, "[host] eboot entry returned\n");
     return 0;
 }

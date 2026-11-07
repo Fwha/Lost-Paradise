@@ -1,6 +1,7 @@
 // System services the game expects but that have no PC meaning, or only a small one:
 // user accounts, controller, save data, system dialogs, trophies, PlayGo, networking,
 // clocks, audio pacing and zlib. Each answers the way an offline console would.
+#include "common/compat.h"
 #include "host/hle.h"
 #include "common/game_dir.h"
 #include "host/kernel.h"
@@ -305,7 +306,7 @@ int32_t sceSaveDataDirNameSearch(const void*, DirNameSearchResult* r) {
     for (const auto& e : fs::directory_iterator(saveRoot(), ec)) {
         if (!e.is_directory()) continue;
         if (r->dirNames && hits < r->dirNamesNum)
-            std::snprintf(r->dirNames[hits], 32, "%s", e.path().filename().c_str());
+            std::snprintf(r->dirNames[hits], 32, "%s", e.path().filename().string().c_str());
         ++hits;
     }
     r->hitNum = hits;
@@ -493,9 +494,7 @@ int32_t sceRtcSetTick(RtcDateTime* d, const uint64_t* tick) {
 }
 int64_t utcOffsetMicros() {
     const time_t now = time(nullptr);
-    std::tm local{};
-    localtime_r(&now, &local);
-    return int64_t(local.tm_gmtoff) * 1000000;
+    return int64_t(lpnUtcOffset(now)) * 1000000;
 }
 int32_t sceRtcConvertUtcToLocalTime(const uint64_t* utc, uint64_t* local) {
     return *local = *utc + utcOffsetMicros(), 0;
@@ -727,7 +726,7 @@ int32_t sceKernelConvertUtcToLocaltime(int64_t utc, int64_t* local, void* tz, in
     std::tm t{};
     const time_t secs = time_t(utc);
     localtime_r(&secs, &t);
-    if (local) *local = utc + t.tm_gmtoff;
+    if (local) *local = utc + lpnUtcOffset(secs);
     if (tz) std::memset(tz, 0, 8);
     if (dst) *dst = t.tm_isdst > 0 ? 3600 : 0;
     return 0;
@@ -755,11 +754,11 @@ void prepareSaveFolder() {
         for (const auto& p : old) {
             const fs::path dest = to / p.filename();
             if (fs::exists(dest, ec)) {
-                std::fprintf(stderr, "[savedata] %s left in place: %s already has one\n", p.filename().c_str(), kGameId);
+                std::fprintf(stderr, "[savedata] %s left in place: %s already has one\n", p.filename().string().c_str(), kGameId);
                 continue;
             }
             fs::rename(p, dest, ec);
-            std::fprintf(stderr, "[savedata] moved %s into %s/%s\n", p.filename().c_str(), kGameId,
+            std::fprintf(stderr, "[savedata] moved %s into %s/%s\n", p.filename().string().c_str(), kGameId,
                          ec ? (" failed: " + ec.message()).c_str() : "");
         }
     }
@@ -770,8 +769,8 @@ void prepareSaveFolder() {
 void setAudioEnabled(bool on) { gAudioEnabled = on; }
 
 void registerServicesHle() {
-    void* zero = reinterpret_cast<void*>(&ok);
-    void* positive = reinterpret_cast<void*>(&one);
+    void* zero = guestEntry<&ok>();
+    void* positive = guestEntry<&one>();
 
     const char* us = "libSceUserService";
     HLE(us, sceUserServiceGetInitialUser);
@@ -816,8 +815,8 @@ void registerServicesHle() {
     HLE(sd, sceSaveDataSaveIcon);
     regs(sd, {"sceSaveDataInitialize3", "sceSaveDataTerminate"}, zero);
 
-    void* finished = reinterpret_cast<void*>(&dialogFinished);
-    void* resultOk = reinterpret_cast<void*>(&dialogResultOk);
+    void* finished = guestEntry<&dialogFinished>();
+    void* resultOk = guestEntry<&dialogResultOk>();
     regs("libSceCommonDialog", {"sceCommonDialogInitialize"}, zero);
     const char* md = "libSceMsgDialog";
     regs(md, {"sceMsgDialogInitialize", "sceMsgDialogTerminate"}, zero);
@@ -832,10 +831,10 @@ void registerServicesHle() {
          {"sceSaveDataDialogInitialize", "sceSaveDataDialogTerminate", "sceSaveDataDialogProgressBarSetValue"},
          zero);
     HLE(sdd, sceSaveDataDialogOpen);
-    regs(sdd, {"sceSaveDataDialogUpdateStatus"}, reinterpret_cast<void*>(&saveDataDialogStatus));
-    regs(sdd, {"sceSaveDataDialogClose"}, reinterpret_cast<void*>(&saveDataDialogClose));
+    regs(sdd, {"sceSaveDataDialogUpdateStatus"}, guestEntry<&saveDataDialogStatus>());
+    regs(sdd, {"sceSaveDataDialogClose"}, guestEntry<&saveDataDialogClose>());
     regs(sdd, {"sceSaveDataDialogIsReadyToDisplay"}, positive);
-    regs(sdd, {"sceSaveDataDialogGetResult"}, reinterpret_cast<void*>(&saveDataDialogResult));
+    regs(sdd, {"sceSaveDataDialogGetResult"}, guestEntry<&saveDataDialogResult>());
     const char* ime = "libSceImeDialog";
     regs(ime, {"sceImeDialogInit", "sceImeDialogTerm", "sceImeDialogGetPanelSize"}, zero);
     regs(ime, {"sceImeDialogGetStatus"}, finished);
@@ -899,7 +898,7 @@ void registerServicesHle() {
     HLE(z, sceZlibGetResult);
     regs(z, {"sceZlibInitialize", "sceZlibFinalize"}, zero);
 
-    regs("libSceDiscMap", {"sceDiscMapIsRequestOnHDD", "fJgP+wqifno"}, reinterpret_cast<void*>(&discMapNoBitmap));
+    regs("libSceDiscMap", {"sceDiscMapIsRequestOnHDD", "fJgP+wqifno"}, guestEntry<&discMapNoBitmap>());
 
     HLE("libkernel", sceKernelConvertUtcToLocaltime);
     HLE_NAMED("libkernel", "getrusage", getrusage_);

@@ -1,0 +1,3 @@
+// lpn-host.exe: the game window's icon and the manifest.
+1 ICON "lost-paradise.ico"
+1 24 "app.manifest"

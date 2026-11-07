@@ -6,10 +6,7 @@
 #include "host/kernel.h"
 #include "host/memory.h"
 
-#include <fcntl.h>
-#include <linux/falloc.h>
-#include <sys/mman.h>
-#include <unistd.h>
+#include "host/mman.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -48,8 +45,8 @@ int hostProt(int32_t prot) {
 
 int directFd() {
     if (gDirectFd < 0) {
-        gDirectFd = memfd_create("ps4-direct-memory", MFD_CLOEXEC);
-        if (gDirectFd < 0 || ftruncate(gDirectFd, kDirectMemorySize + kOverflowSize) != 0) {
+        gDirectFd = createSharedMemory("ps4-direct-memory", kDirectMemorySize + kOverflowSize);
+        if (gDirectFd < 0) {
             std::perror("[memory] cannot create direct memory backing");
             std::abort();
         }
@@ -67,6 +64,7 @@ int32_t sceKernelAllocateDirectMemory(int64_t searchStart, int64_t searchEnd, ui
                                       int32_t /*memoryType*/, int64_t* physOut) {
     if (!physOut || len == 0 || (len & (kPage - 1))) return sceError(ps4errno::kEINVAL);
     if (align < kPage) align = kPage;
+    if (align < kMapGranule) align = kMapGranule; // Windows maps views at 64 KiB offsets
     std::lock_guard lock(gMutex);
     auto find = [&](uint64_t from) {
         uint64_t candidate = alignUp(from, align);
@@ -80,12 +78,12 @@ int32_t sceKernelAllocateDirectMemory(int64_t searchStart, int64_t searchEnd, ui
     if (candidate + len > uint64_t(searchEnd) || candidate + len > kDirectMemorySize) {
         candidate = find(kDirectMemorySize);
         if (candidate + len <= kDirectMemorySize + kOverflowSize) {
-            std::fprintf(stderr, "[memory] 0x%lx bytes of direct memory placed past the budget\n", len);
+            std::fprintf(stderr, "[memory] 0x%llx bytes of direct memory placed past the budget\n", (unsigned long long)len);
             gAllocated[candidate] = len;
             *physOut = int64_t(candidate);
             return 0;
         }
-        std::fprintf(stderr, "[memory] direct memory exhausted (0x%lx bytes requested)\n", len);
+        std::fprintf(stderr, "[memory] direct memory exhausted (0x%llx bytes requested)\n", (unsigned long long)len);
         return sceError(ps4errno::kEAGAIN);
     }
     gAllocated[candidate] = len;
@@ -99,7 +97,7 @@ int32_t sceKernelReleaseDirectMemory(int64_t start, uint64_t len) {
     if (it == gAllocated.end()) return sceError(ps4errno::kENOENT);
     if (it->second != len) std::fprintf(stderr, "[memory] partial direct memory release not supported\n");
     gAllocated.erase(it);
-    fallocate(directFd(), FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, start, len);
+    releaseSharedMemory(directFd(), uint64_t(start), len);
     return 0;
 }
 

@@ -1,3 +1,4 @@
+#include "host/guest_abi.h"
 #include "host/display_settings.h"
 
 #include "host/kernel.h"
@@ -15,7 +16,8 @@
 #include <string>
 #include <vector>
 
-#include <sys/mman.h>
+#include "host/mman.h"
+#include "common/compat.h"
 #include <unistd.h>
 
 namespace host {
@@ -312,7 +314,7 @@ extern "C" uint32_t stepNs(uint32_t measured) {
 
 CodePatch stepPatch() {
     std::vector<uint8_t> now = {0x89, 0xc7, 0x48, 0xb8};
-    const uint64_t fn = reinterpret_cast<uint64_t>(&stepNs);
+    const uint64_t fn = reinterpret_cast<uint64_t>(guestEntry<&stepNs>());
     for (int i = 0; i < 8; ++i) now.push_back(uint8_t(fn >> (8 * i)));
     const uint8_t tail[] = {0xff, 0xd0, 0x89, 0xc1, 0xc4, 0xc1, 0x7a, 0x10, 0x86, 0x88, 0, 0, 0, 0xe9};
     now.insert(now.end(), std::begin(tail), std::end(tail));
@@ -338,12 +340,12 @@ uint64_t pushRequest(uint8_t* stack, uint32_t value, uintptr_t caller) {
         std::fprintf(stderr, "[step] request 0x%x from eboot+0x%lx at flip %llu\n", value,
                      (unsigned long)(caller - uintptr_t(gEbootText)), (unsigned long long)flipCount());
     if (value & 0x7fffffff) return 0;
-    auto wake = reinterpret_cast<uint64_t (*)(void*)>(gEbootText + kWake);
+    auto wake = reinterpret_cast<uint64_t (LPN_GUEST*)(void*)>(gEbootText + kWake);
     return wake(*reinterpret_cast<void**>(gEbootText + kWakeArg));
 }
 
 extern "C" uint64_t pushStep(uint8_t* stack, uint32_t index) {
-    const uintptr_t caller = uintptr_t(__builtin_return_address(0));
+    const uintptr_t caller = uintptr_t(LPN_GUEST_RETURN_ADDRESS());
     if (caller - uintptr_t(gEbootText) == kTitleStepCaller) {
         gTitleAlive = true;
         if (!gTitleSeen.exchange(true) && gSettings.skipIntro)
@@ -353,7 +355,7 @@ extern "C" uint64_t pushStep(uint8_t* stack, uint32_t index) {
 }
 
 extern "C" void popStep(uint8_t* stack) {
-    const uintptr_t at = uintptr_t(__builtin_return_address(0)) - uintptr_t(gEbootText);
+    const uintptr_t at = uintptr_t(LPN_GUEST_RETURN_ADDRESS()) - uintptr_t(gEbootText);
     int32_t& n = *reinterpret_cast<int32_t*>(stack + 0x98);
     reinterpret_cast<uint32_t*>(stack + 0x9c)[n] = 0xffffffffu;
     ++n;
@@ -364,7 +366,7 @@ extern "C" void popStep(uint8_t* stack) {
 }
 
 extern "C" uint64_t pushMeasured(uint8_t* stack, uint32_t index) {
-    return pushRequest(stack, index ? index | 0x80000000u : 0, uintptr_t(__builtin_return_address(0)));
+    return pushRequest(stack, index ? index | 0x80000000u : 0, uintptr_t(LPN_GUEST_RETURN_ADDRESS()));
 }
 
 void jumpTo(uint32_t at, const void* fn) {
@@ -408,9 +410,9 @@ bool prepareFrameClock(Module& eboot) {
     if (std::memcmp(gEbootText + kPushStep, kPushWas, sizeof kPushWas) == 0 &&
         std::memcmp(gEbootText + kPushMeasured, kPushWas, sizeof kPushWas) == 0 &&
         std::memcmp(gEbootText + kPopStep, kPopWas, sizeof kPopWas) == 0) {
-        jumpTo(kPushStep, reinterpret_cast<const void*>(&pushStep));
-        jumpTo(kPushMeasured, reinterpret_cast<const void*>(&pushMeasured));
-        jumpTo(kPopStep, reinterpret_cast<const void*>(&popStep));
+        jumpTo(kPushStep, guestHook<&pushStep>());
+        jumpTo(kPushMeasured, guestHook<&pushMeasured>());
+        jumpTo(kPopStep, guestHook<&popStep>());
         gStepHooks = true;
     }
     return true;

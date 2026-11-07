@@ -35,7 +35,7 @@ public:
 
     // Rewrite every `mov reg, fs:[0]` so the guest reads its own thread pointer instead of
     // glibc's. Returns the number of instructions patched.
-    size_t patchThreadPointerReads(int32_t fsOffset);
+    size_t patchThreadPointerReads(uint8_t segment, int32_t disp);
 
     // Apply final page permissions (code RX, RELRO R, data RW).
     bool protect(std::string* error);

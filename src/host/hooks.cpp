@@ -3,7 +3,8 @@
 #include <cstdio>
 #include <cstring>
 
-#include <sys/mman.h>
+#include "host/mman.h"
+#include "common/compat.h"
 #include <unistd.h>
 
 namespace host {
