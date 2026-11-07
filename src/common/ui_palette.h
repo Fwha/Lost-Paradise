@@ -3,13 +3,13 @@
 // changing the accent here changes it everywhere.
 //
 // LPN_UI_ACCENT picks one of the looks below at build time (cmake -DLPN_UI_ACCENT=1 ...);
-// 0, soft silver, is the default.
+// 2, steel blue, is the default.
 #pragma once
 
 #include <cstdint>
 
 #ifndef LPN_UI_ACCENT
-#define LPN_UI_ACCENT 0
+#define LPN_UI_ACCENT 2
 #endif
 
 namespace ui {
