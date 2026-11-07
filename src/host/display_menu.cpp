@@ -1,8 +1,11 @@
 #include "host/display_menu.h"
 
+#include "common/ui_palette.h"
+
 #include "host/display_settings.h"
 #include "host/gpu/renderer.h"
 #include "host/hle.h"
+#include "host/rounded.h"
 #include "host/save_menu.h"
 #include "host/videoout.h"
 
@@ -36,10 +39,21 @@ std::string fitText(const std::string& s, int size, int maxW) { return menuFitTe
 void fill(SDL_Renderer* ren, int x, int y, int w, int h, Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255) {
     menuFill(ren, x, y, w, h, r, g, b, a);
 }
-void outline(SDL_Renderer* ren, int x, int y, int w, int h, int t, Uint8 r, Uint8 g, Uint8 b) {
-    menuOutline(ren, x, y, w, h, t, r, g, b);
-}
 void color(SDL_Renderer* ren, Uint8 r, Uint8 g, Uint8 b) { SDL_SetRenderDrawColor(ren, r, g, b, 255); }
+void fill(SDL_Renderer* ren, int x, int y, int w, int h, ui::Rgb c) { fill(ren, x, y, w, h, c.r, c.g, c.b); }
+void color(SDL_Renderer* ren, ui::Rgb c) { color(ren, c.r, c.g, c.b); }
+SDL_Color sdl(ui::Rgb c) { return {c.r, c.g, c.b, 255}; }
+// Rounded versions of fill and outline (rounded.h); radius r.
+void fillR(SDL_Renderer* ren, int x, int y, int w, int h, int r, Uint8 cr, Uint8 cg, Uint8 cb, Uint8 a = 255,
+           unsigned corners = ui::kAll) {
+    ui::fillRounded(ren, x, y, w, h, r, {cr, cg, cb, a}, corners);
+}
+void fillR(SDL_Renderer* ren, int x, int y, int w, int h, int r, ui::Rgb c, unsigned corners = ui::kAll) {
+    ui::fillRounded(ren, x, y, w, h, r, sdl(c), corners);
+}
+void outlineR(SDL_Renderer* ren, int x, int y, int w, int h, int r, int t, ui::Rgb c) {
+    ui::outlineRounded(ren, x, y, w, h, r, t, sdl(c));
+}
 
 std::mutex gM;
 int gRow = 0;         // 0 window mode, 1 resolution, 2 fps, 3 fps counter, 4 exit game
@@ -239,9 +253,9 @@ void drawDisplayMenu(SDL_Renderer* ren) {
     const int x0 = (w - panelW) / 2, y0 = (h - panelH) / 2;
 
     // Panel and header.
-    fill(ren, x0, y0, panelW, panelH, 16, 16, 22, 242);
-    fill(ren, x0, y0, panelW, headH, 26, 24, 30, 255);
-    fill(ren, x0, y0 + headH - U(2), panelW, U(2), 200, 170, 90);
+    fillR(ren, x0, y0, panelW, panelH, U(10), 16, 16, 22, 242);
+    fillR(ren, x0, y0, panelW, headH, U(10), 26, 24, 30, 255, ui::kTop);
+    fill(ren, x0, y0 + headH - U(2), panelW, U(2), ui::kAccent.fill);
     color(ren, 245, 240, 228);
     text(ren, x0 + pad, y0 + (headH - U(30)) / 2, U(30), "Display Settings", true);
     const std::string active = "Rendering at " + resLabel(activeW, activeH);
@@ -256,10 +270,10 @@ void drawDisplayMenu(SDL_Renderer* ren) {
     for (int r = 0; r < kRows; ++r) {
         const bool sel = r == gRow;
         if (sel) {
-            fill(ren, rx, y, rw, rowH, 58, 47, 24);
-            outline(ren, rx, y, rw, rowH, U(2), 214, 182, 98);
+            fillR(ren, rx, y, rw, rowH, U(6), ui::kAccent.tint);
+            outlineR(ren, rx, y, rw, rowH, U(6), U(2), ui::kAccent.line);
         } else {
-            fill(ren, rx, y, rw, rowH, 30, 30, 38);
+            fillR(ren, rx, y, rw, rowH, U(6), 30, 30, 38);
         }
         if (r == 4) color(ren, sel ? 255 : 230, sel ? 150 : 128, sel ? 130 : 110);
         else color(ren, 245, 240, 228);
@@ -268,36 +282,36 @@ void drawDisplayMenu(SDL_Renderer* ren) {
         if (r == 3) {
             // On or off: a switch.
             const int tw = U(48), th = U(24), tx = rx + rw - U(16) - tw, ty = y + (rowH - th) / 2;
-            if (s.fpsCounter) fill(ren, tx, ty, tw, th, 200, 170, 90);
-            else fill(ren, tx, ty, tw, th, 58, 58, 66);
+            if (s.fpsCounter) fillR(ren, tx, ty, tw, th, th / 2, ui::kAccent.fill);
+            else fillR(ren, tx, ty, tw, th, th / 2, 58, 58, 66);
             const int k = th - U(6);
-            fill(ren, s.fpsCounter ? tx + tw - U(3) - k : tx + U(3), ty + U(3), k, k, 245, 240, 228);
-            color(ren, s.fpsCounter ? 214 : 150, s.fpsCounter ? 182 : 146, s.fpsCounter ? 98 : 138);
+            fillR(ren, s.fpsCounter ? tx + tw - U(3) - k : tx + U(3), ty + U(3), k, k, k / 2, 245, 240, 228);
+            color(ren, s.fpsCounter ? ui::kAccent.line : ui::Rgb{150, 146, 138});
             text(ren, tx - U(12) - textW(values[3], vs), y + (rowH - vs) / 2, vs, values[3]);
         } else if (r < 3) {
             const int bh = rowH - U(14), by = y + (rowH - bh) / 2;
-            fill(ren, boxX, by, boxW, bh, 12, 12, 18);
-            outline(ren, boxX, by, boxW, bh, U(1), sel ? 214 : 80, sel ? 182 : 78, sel ? 98 : 88);
-            color(ren, 214, 182, 98);
+            fillR(ren, boxX, by, boxW, bh, U(5), 12, 12, 18);
+            outlineR(ren, boxX, by, boxW, bh, U(5), U(1), sel ? ui::kAccent.line : ui::Rgb{80, 78, 88});
+            color(ren, ui::kAccent.line);
             const int as = U(12);
             text(ren, boxX + U(12), y + (rowH - vs) / 2, vs, fitText(values[r], vs, boxW - U(36) - as));
             arrow(ren, boxX + boxW - U(12) - as / 2, y + rowH / 2, as,
-                  sel ? SDL_Color{214, 182, 98, 255} : SDL_Color{150, 146, 138, 255}, sel && gList);
+                  sel ? sdl(ui::kAccent.line) : SDL_Color{150, 146, 138, 255}, sel && gList);
         }
         y += rowH + gap;
         if (!sel || !gList) continue;
 
         // The drop-down, under its row, lined up with the value box.
         const int cur = r == 0 ? int(s.window) : r == 1 ? resIndex(s.width, s.height) : fpsIndex(s.fps);
-        fill(ren, boxX, y - gap, boxW, listRows * itemH + U(2), 12, 12, 18);
-        outline(ren, boxX, y - gap, boxW, listRows * itemH + U(2), U(1), 214, 182, 98);
+        fillR(ren, boxX, y - gap, boxW, listRows * itemH + U(2), U(5), 12, 12, 18);
+        outlineR(ren, boxX, y - gap, boxW, listRows * itemH + U(2), U(5), U(1), ui::kAccent.line);
         for (int i = 0; i < listRows; ++i) {
             const int iy = y - gap + U(1) + i * itemH;
             if (i == gItem) {
-                fill(ren, boxX + U(1), iy, boxW - U(2), itemH, 200, 170, 90);
-                color(ren, 24, 20, 12);
+                fillR(ren, boxX + U(1), iy, boxW - U(2), itemH, U(4), ui::kAccent.fill);
+                color(ren, ui::kAccent.on);
             } else if (i == cur) {
-                color(ren, 214, 182, 98);
+                color(ren, ui::kAccent.line);
             } else {
                 color(ren, 225, 220, 208);
             }
@@ -312,7 +326,7 @@ void drawDisplayMenu(SDL_Renderer* ren) {
     }
 
     // Controls, as the save menu shows them.
-    fill(ren, x0, y0 + panelH - hintH, panelW, hintH, 10, 10, 14, 255);
+    fillR(ren, x0, y0 + panelH - hintH, panelW, hintH, U(10), 10, 10, 14, 255, ui::kBottom);
     const int hs = U(15), hy = y0 + panelH - hintH + (hintH - hs) / 2;
     int hx = x0 + pad;
     const bool usePad = menuControllerAttached();
@@ -364,7 +378,7 @@ void drawFpsCounter(SDL_Renderer* ren) {
     fill(ren, bx, by, bw, bh, 0, 0, 0, 170);
     color(ren, 245, 240, 228);
     text(ren, bx + U(8), by + U(5), ns, num, true);
-    color(ren, 214, 182, 98);
+    color(ren, ui::kAccent.line);
     text(ren, bx + U(8) + nw, by + U(5) + ns - us - U(1), us, unit, true);
     SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
 }

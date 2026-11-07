@@ -7,7 +7,9 @@
 // Play replaces the launcher with lpn-host, its log going to play.log. Check for updates: updater.h.
 #include "common/game_dir.h"
 #include "common/settings_file.h"
+#include "common/ui_palette.h"
 #include "host/menu_font.h"
+#include "host/rounded.h"
 #include "launcher/updater.h"
 
 #include <SDL.h>
@@ -145,13 +147,21 @@ SDL_Texture* gArt = nullptr; // the game's own key art (sce_sys/pic1.png), when 
 int gArtW = 0, gArtH = 0;
 
 void color(Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255) { SDL_SetRenderDrawColor(gRen, r, g, b, a); }
+void color(ui::Rgb c, Uint8 a = 255) { color(c.r, c.g, c.b, a); }
 void fill(int x, int y, int w, int h) {
     SDL_Rect r{x, y, w, h};
     SDL_RenderFillRect(gRen, &r);
 }
-void outline(int x, int y, int w, int h, int t) {
-    fill(x, y, w, t), fill(x, y + h - t, w, t), fill(x, y, t, h), fill(x + w - t, y, t, h);
+// Rounded versions of fill and outline (rounded.h) in the current colour; radius r.
+SDL_Color drawColor() {
+    SDL_Color c;
+    SDL_GetRenderDrawColor(gRen, &c.r, &c.g, &c.b, &c.a);
+    return c;
 }
+void fillR(int x, int y, int w, int h, int r, unsigned corners = ui::kAll) {
+    ui::fillRounded(gRen, x, y, w, h, r, drawColor(), corners);
+}
+void outlineR(int x, int y, int w, int h, int r, int t) { ui::outlineRounded(gRen, x, y, w, h, r, t, drawColor()); }
 void text(int x, int y, int size, const std::string& s, bool bold = false) { font::draw(gRen, x, y, size, s, bold); }
 void textCentered(int cx, int y, int size, const std::string& s, bool bold = false) {
     text(cx - font::width(s, size, bold) / 2, y, size, s, bold);
@@ -225,13 +235,13 @@ const Box kBack{kW / 2 + 12, kPanel.y + kPanel.h + 20, 200, 48};
 const Box kDefaults{kW / 2 - 212, kPanel.y + kPanel.h + 20, 200, 48};
 
 void button(const Box& b, const std::string& label, bool focus, bool primary, bool enabled = true) {
-    if (primary && enabled) color(focus ? 236 : 214, focus ? 204 : 182, focus ? 120 : 98, 255);
+    if (primary && enabled) color(focus ? ui::kAccent.bright : ui::kAccent.line);
     else color(0, 0, 0, focus ? 200 : 150);
-    fill(b.x, b.y, b.w, b.h);
-    color(214, 182, 98, enabled ? 255 : 90);
-    outline(b.x, b.y, b.w, b.h, focus ? 3 : 1);
+    fillR(b.x, b.y, b.w, b.h, 8);
+    color(ui::kAccent.line, enabled ? 255 : 90);
+    outlineR(b.x, b.y, b.w, b.h, 8, focus ? 3 : 1);
     const int size = b.h * 9 / 20;
-    if (primary && enabled) color(20, 14, 8);
+    if (primary && enabled) color(ui::kAccent.on);
     else color(245, 240, 228, enabled ? 255 : 110);
     textCentered(b.x + b.w / 2, b.y + (b.h - size) / 2, size, label, true);
 }
@@ -239,10 +249,10 @@ void button(const Box& b, const std::string& label, bool focus, bool primary, bo
 void checkbox(const Box& b, const std::string& label, bool on, bool focus) {
     const int s = b.h - 6;
     color(0, 0, 0, 170);
-    fill(b.x, b.y + 3, s, s);
-    color(214, 182, 98);
-    outline(b.x, b.y + 3, s, s, focus ? 3 : 2);
-    if (on) fill(b.x + 6, b.y + 9, s - 12, s - 12);
+    fillR(b.x, b.y + 3, s, s, 6);
+    color(ui::kAccent.line);
+    outlineR(b.x, b.y + 3, s, s, 6, focus ? 3 : 2);
+    if (on) fillR(b.x + 6, b.y + 9, s - 12, s - 12, 3);
     color(245, 240, 228);
     text(b.x + s + 12, b.y + (b.h - 20) / 2, 20, label, focus);
 }
@@ -283,7 +293,7 @@ void drawMain(int focus) {
     const std::string fitted = font::fit(line, 16, 520);
     const int lw = font::width(fitted, 16);
     color(0, 0, 0, 160);
-    fill(kUpdate.x + kUpdate.w - lw - 12, kUpdate.y + kUpdate.h + 8, lw + 12, 24);
+    fillR(kUpdate.x + kUpdate.w - lw - 12, kUpdate.y + kUpdate.h + 8, lw + 12, 24, 6);
     color(245, 240, 228, 230);
     text(kUpdate.x + kUpdate.w - lw - 6, kUpdate.y + kUpdate.h + 12, 16, fitted);
     if (!gStatus.empty()) {
@@ -296,25 +306,25 @@ void drawMain(int focus) {
 void drawSettings(int focus) {
     drawBackground(true);
     color(10, 8, 6, 225);
-    fill(kPanel.x, kPanel.y, kPanel.w, kPanel.h);
-    color(214, 182, 98);
-    outline(kPanel.x, kPanel.y, kPanel.w, kPanel.h, 1);
+    fillR(kPanel.x, kPanel.y, kPanel.w, kPanel.h, 12);
+    color(ui::kAccent.line);
+    outlineR(kPanel.x, kPanel.y, kPanel.w, kPanel.h, 12, 1);
     color(245, 240, 228);
     text(kPanel.x + 28, kPanel.y + 22, 30, "PC Settings", true);
-    color(214, 182, 98);
+    color(ui::kAccent.line);
     fill(kPanel.x + 28, kPanel.y + 62, kPanel.w - 56, 2);
     for (int r = 0; r < kRowCount; ++r) {
         const Box b = rowBox(r);
         if (focus == r) {
-            color(214, 182, 98, 60);
-            fill(b.x, b.y, b.w, b.h);
-            color(214, 182, 98);
-            fill(b.x, b.y, 4, b.h);
+            color(ui::kAccent.line, 60);
+            fillR(b.x, b.y, b.w, b.h, 6);
+            color(ui::kAccent.line);
+            fillR(b.x, b.y, 4, b.h, 2);
         }
         color(245, 240, 228);
         text(b.x + 18, b.y + (b.h - 22) / 2, 22, kRows[r].label, focus == r);
         const Box l = arrowBox(r, false), rr = arrowBox(r, true);
-        color(214, 182, 98);
+        color(ui::kAccent.line);
         textCentered(l.x + l.w / 2, l.y + (l.h - 24) / 2, 24, "<", true);
         textCentered(rr.x + rr.w / 2, rr.y + (rr.h - 24) / 2, 24, ">", true);
         color(245, 240, 228);
@@ -325,7 +335,18 @@ void drawSettings(int focus) {
         color(200, 192, 176);
         std::string d = kRows[focus].description;
         if (focus == 1 || focus == 4) d += " Takes effect at the next start.";
-        text(kPanel.x + 28, kPanel.y + kPanel.h - 46, 17, font::fit(d, 17, kPanel.w - 56));
+        // Up to two lines, broken between words.
+        const int maxW = kPanel.w - 56;
+        std::string first = d, rest;
+        while (font::width(first, 17) > maxW) {
+            const size_t sp = first.rfind(' ');
+            if (sp == std::string::npos) break;
+            rest = first.substr(sp + 1) + (rest.empty() ? "" : " " + rest);
+            first.resize(sp);
+        }
+        const int y = kPanel.y + kPanel.h - (rest.empty() ? 46 : 60);
+        text(kPanel.x + 28, y, 17, font::fit(first, 17, maxW));
+        if (!rest.empty()) text(kPanel.x + 28, y + 23, 17, font::fit(rest, 17, maxW));
     }
     button(kDefaults, "Defaults", focus == kRowCount, false);
     button(kBack, "Back", focus == kRowCount + 1, false);
