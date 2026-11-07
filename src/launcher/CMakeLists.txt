@@ -8,11 +8,13 @@ add_executable(lpn-launcher
     main.cpp
     updater.cpp
     ../host/menu_font.cpp
+    ../host/pad_glyphs.cpp
     ../host/stb_impl.cpp
 )
 target_link_libraries(lpn-launcher PRIVATE lpn-common SDL2::SDL2)
 target_compile_definitions(lpn-launcher PRIVATE LPN_HAVE_SDL2)
-target_include_directories(lpn-launcher SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/external/stb")
+target_include_directories(lpn-launcher SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/external/stb"
+                           "${PROJECT_SOURCE_DIR}/external/nanosvg")
 
 # The version Check for updates compares with the latest release's tag: the release workflow
 # passes the tag, else git describe.

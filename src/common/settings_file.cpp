@@ -13,6 +13,7 @@ const char* modeKey(WindowMode m) {
 }
 
 const char* const kDlssKeys[kDlssModes] = {"off", "dlaa", "quality", "balanced", "performance"};
+const char* const kButtonIconKeys[kButtonIconChoices] = {"playstation", "xbox", "switch", "auto"};
 
 } // namespace
 
@@ -47,6 +48,9 @@ void readSettings(const std::string& path, DisplaySettings& s) {
                 if (!std::strcmp(value, kDlssKeys[i])) s.dlss = DlssMode(i);
         } else if (!std::strcmp(key, "skip_intro")) {
             s.skipIntro = !std::strcmp(value, "on");
+        } else if (!std::strcmp(key, "button_icons")) {
+            for (int i = 0; i < kButtonIconChoices; ++i)
+                if (!std::strcmp(value, kButtonIconKeys[i])) s.buttonIcons = ButtonIcons(i);
         }
     }
     std::fclose(f);
@@ -63,6 +67,7 @@ bool writeSettings(const std::string& path, const DisplaySettings& s) {
     std::fprintf(f, "fps_counter = %s\n", s.fpsCounter ? "on" : "off");
     std::fprintf(f, "dlss = %s\n", kDlssKeys[int(s.dlss)]);
     std::fprintf(f, "skip_intro = %s\n", s.skipIntro ? "on" : "off");
+    std::fprintf(f, "button_icons = %s\n", kButtonIconKeys[int(s.buttonIcons)]);
     return std::fclose(f) == 0;
 }
 

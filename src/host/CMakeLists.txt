@@ -33,6 +33,8 @@ add_executable(lpn-host
     gpu/vk.cpp
     window.cpp
     save_menu.cpp
+    pad_glyphs.cpp
+    button_icon_files.cpp
     menu_font.cpp
     stb_impl.cpp
     display_menu.cpp
@@ -46,6 +48,8 @@ find_package(Vulkan REQUIRED)
 target_link_libraries(lpn-host PRIVATE lpn-common ps4elf gcn formats ZLIB::ZLIB Vulkan::Vulkan)
 # stb_truetype and stb_image (public domain, external/stb) for the menu font and save icons.
 target_include_directories(lpn-host SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/external/stb")
+# nanosvg (zlib, external/nanosvg) draws the controller button icons (pad_glyphs.cpp).
+target_include_directories(lpn-host SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/external/nanosvg")
 # The guest TLS slot must sit at a fixed offset from %fs, which the initial-exec model gives.
 target_compile_options(lpn-host PRIVATE -ftls-model=initial-exec)
 # Vulkan structs are initialised as {sType} and the rest zeroed.

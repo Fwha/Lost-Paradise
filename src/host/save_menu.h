@@ -42,7 +42,8 @@ int menuTextW(const std::string& s, int size, bool bold = false);
 std::string menuFitText(const std::string& s, int size, int maxW, bool bold = false);
 void menuFill(SDL_Renderer* ren, int x, int y, int w, int h, Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255);
 void menuOutline(SDL_Renderer* ren, int x, int y, int w, int h, int t, Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255);
-// A PlayStation face button in a size x size box (the game's own icon when it can be read).
+// A face button in a size x size box, named as on a PlayStation pad (Cross is SDL's A) and drawn
+// in the Button Icons setting's style (pad_glyphs.h; the game's own icon for PlayStation).
 enum class MenuPad { Cross, Circle, Square };
 void menuPadIcon(SDL_Renderer* ren, int x, int y, int size, MenuPad b);
 // True when the control hints should show pad buttons rather than keys (LPN_MENU_BUTTONS).

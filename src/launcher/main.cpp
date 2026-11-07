@@ -9,6 +9,7 @@
 #include "common/settings_file.h"
 #include "common/ui_palette.h"
 #include "host/menu_font.h"
+#include "host/pad_glyphs.h"
 #include "host/rounded.h"
 #include "launcher/updater.h"
 
@@ -91,6 +92,7 @@ const Row kRows[] = {
     {"FPS Counter", "Show the frame rate in the top right corner of the screen."},
     {"DLSS", "NVIDIA DLAA: DLSS anti-aliasing in place of the game's. Needs an RTX card; Off on other GPUs."},
     {"Skip Intro Logos", "Go straight to the title screen when the game starts."},
+    {"Button Icons", "Which controller's buttons to show. Auto matches your controller. Takes effect at the next start."},
 };
 constexpr int kRowCount = int(sizeof kRows / sizeof kRows[0]);
 
@@ -113,7 +115,8 @@ std::string valueName(int row) {
     case 2: return gS.fps ? std::to_string(gS.fps) : "Uncapped";
     case 3: return gS.fpsCounter ? "On" : "Off";
     case 4: return gS.dlss != host::DlssMode::Off ? "DLAA" : "Off";
-    default: return gS.skipIntro ? "On" : "Off";
+    case 5: return gS.skipIntro ? "On" : "Off";
+    default: return host::kButtonIconNames[int(gS.buttonIcons)];
     }
 }
 
@@ -136,7 +139,8 @@ void stepValue(int row, int d) {
     }
     case 3: gS.fpsCounter = !gS.fpsCounter; break;
     case 4: gS.dlss = gS.dlss == host::DlssMode::Off ? host::DlssMode::Dlaa : host::DlssMode::Off; break;
-    default: gS.skipIntro = !gS.skipIntro; break;
+    case 5: gS.skipIntro = !gS.skipIntro; break;
+    default: gS.buttonIcons = host::ButtonIcons(wrap(int(gS.buttonIcons) + d, host::kButtonIconChoices)); break;
     }
     save();
 }
@@ -225,7 +229,7 @@ const Box kSkip{40, kH - 64, 300, 32};
 const Box kUpdate{kW - 260, 24, 236, 40};
 // Settings screen
 const Box kPanel{176, 64, kW - 352, 470};
-constexpr int kRowY0 = 140, kRowH = 52;
+constexpr int kRowY0 = 136, kRowH = 46;
 Box rowBox(int r) { return {kPanel.x + 24, kRowY0 + r * kRowH, kPanel.w - 48, kRowH - 6}; }
 Box arrowBox(int r, bool right) {
     const Box b = rowBox(r);
@@ -255,6 +259,32 @@ void checkbox(const Box& b, const std::string& label, bool on, bool focus) {
     if (on) fillR(b.x + 6, b.y + 9, s - 12, s - 12, 3);
     color(245, 240, 228);
     text(b.x + s + 12, b.y + (b.h - 20) / 2, 20, label, focus);
+}
+
+// With a controller plugged in (or LPN_MENU_BUTTONS=pad), its Select and Back buttons at (x, y),
+// as the Button Icons setting draws them.
+void padHints(int x, int y, const char* backLabel) {
+    if (const char* e = std::getenv("LPN_MENU_BUTTONS"); e && !std::strcmp(e, "keys")) return;
+    bool pad = false;
+    for (int i = 0; i < SDL_NumJoysticks(); ++i) pad = pad || SDL_IsGameController(i);
+    if (const char* e = std::getenv("LPN_MENU_BUTTONS"); e && !std::strcmp(e, "pad")) pad = true;
+    if (!pad) return;
+    const host::PadStyle style = host::padStyle(gS.buttonIcons);
+    const std::pair<SDL_GameControllerButton, const char*> hints[] = {{SDL_CONTROLLER_BUTTON_A, "Select"},
+                                                                     {SDL_CONTROLLER_BUTTON_B, backLabel}};
+    constexpr int kIcon = 28, kText = 18;
+    int w = 12;
+    for (const auto& h : hints) w += kIcon + 8 + font::width(h.second, kText) + 20;
+    color(0, 0, 0, 160);
+    fillR(x, y, w - 8, kIcon + 12, 8);
+    x += 12;
+    for (const auto& h : hints) {
+        host::drawPadGlyph(gRen, x, y + 6, kIcon, style, h.first);
+        x += kIcon + 8;
+        color(225, 220, 208);
+        text(x, y + 6 + (kIcon - kText) / 2, kText, h.second);
+        x += font::width(h.second, kText) + 20;
+    }
 }
 
 std::string gStatus; // why Play cannot start, or a launch error
@@ -296,6 +326,7 @@ void drawMain(int focus) {
     fillR(kUpdate.x + kUpdate.w - lw - 12, kUpdate.y + kUpdate.h + 8, lw + 12, 24, 6);
     color(245, 240, 228, 230);
     text(kUpdate.x + kUpdate.w - lw - 6, kUpdate.y + kUpdate.h + 12, 16, fitted);
+    padHints(40, 24, "Quit");
     if (!gStatus.empty()) {
         color(245, 240, 228, 220);
         const std::string s = font::fit(gStatus, 17, kW - 420);
@@ -350,6 +381,7 @@ void drawSettings(int focus) {
     }
     button(kDefaults, "Defaults", focus == kRowCount, false);
     button(kBack, "Back", focus == kRowCount + 1, false);
+    padHints(40, kBack.y + (kBack.h - 40) / 2, "Back");
 }
 
 // Play: hand over to lpn-host in the install folder, the log to play.log, as launch.sh does.
