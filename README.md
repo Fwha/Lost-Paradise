@@ -84,14 +84,22 @@ it draws until the title screen.
 **Check for updates** (top right) asks GitHub for the latest release. From the AppImage, a newer
 one is downloaded over it and started; a build from source is told to pull and rebuild. 
 
-The **gear** (bottom right) opens **Tools**. **Unpack a .pkg** extracts a PS4 package into the game
-folder, as `game/<title ID>` (`-UPDATE` for a patch, `-DLC` for add-on content): pick it with the
-desktop's file chooser (zenity or kdialog) or drop it on the window. It works with fake PKGs (fpkg,
-made with the homebrew tools' published keys) and refuses a retail PKG, whose files are encrypted
-with keys only a PS4 has. It never writes over a folder that is already there. The same from a
-terminal: `build/src/pkg/lpn-pkg extract <file.pkg> [game folder]` (`lpn-pkg info` shows what a
-package is). The extractor (`src/pkg`) is written from the format's documentation, with no code
-from GPL tools such as shadPS4's old extractor.
+The **gear** (bottom right) opens **Tools**:
+- **Unpack a .pkg** extracts a PS4 package into the game folder as `game/<title ID>`. Pick it with
+  the desktop's file chooser (zenity or kdialog) or drop it on the window.
+- **Apply an update or DLC**, from a .pkg or from a folder that is already unpacked, adds it to the
+  game with the same title ID. An update makes a new version, `game/<title ID>-v<version>`: a copy
+  of the game made of hard links (no extra room for the files the update leaves alone) with the
+  update's files over it, so the game as it was stays too. DLC goes into
+  `game/<title ID>-DLC/<label>` (lpn-host does not load DLC yet).
+
+With more than one version in `game/`, **Play** asks which one to start.
+
+Packages: fake PKGs (fpkg, made with the homebrew tools' published keys) work; a retail PKG is
+refused, as its files are encrypted with keys only a PS4 has. Nothing already in `game/` is
+written over. The same from a terminal: `build/src/pkg/lpn-pkg info|extract|install <file.pkg>` and
+`lpn-pkg apply <folder>`. The extractor (`src/pkg`) is written from the format's documentation, with
+no code from GPL tools such as shadPS4's old extractor.
 
 ### launch.sh
 

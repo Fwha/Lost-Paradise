@@ -14,6 +14,7 @@
 #include "host/pad_glyphs.h"
 #include "host/rounded.h"
 #include "launcher/updater.h"
+#include "pkg/install.h"
 #include "pkg/pkg.h"
 
 #include <SDL.h>
@@ -259,9 +260,14 @@ Box arrowBox(int r, bool right) {
 const Box kBack{kW / 2 + 12, kPanel.y + kPanel.h + 20, 200, 48};
 const Box kDefaults{kW / 2 - 212, kPanel.y + kPanel.h + 20, 200, 48};
 // Tools screen
-const Box kToolsPanel{226, 84, kW - 452, 420};
-const Box kChoose{kToolsPanel.x + 28, kToolsPanel.y + 214, 280, 48};
+const Box kToolsPanel{226, 52, kW - 452, 476};
+const Box kToolButtons[3] = {{kToolsPanel.x + 28, kToolsPanel.y + 140, 260, 44},  // unpack a .pkg
+                             {kToolsPanel.x + 28, kToolsPanel.y + 266, 260, 44},  // update/DLC from a .pkg
+                             {kToolsPanel.x + 308, kToolsPanel.y + 266, 260, 44}}; // update/DLC from a folder
 const Box kToolsBack{kW / 2 - 100, kToolsPanel.y + kToolsPanel.h + 20, 200, 48};
+// Version screen (Play with more than one game version in game/): rows as in Settings
+constexpr int kMaxVersions = 8;
+const Box kVersionsBack{kW / 2 - 100, kPanel.y + kPanel.h + 20, 200, 48};
 
 void button(const Box& b, const std::string& label, bool focus, bool primary, bool enabled = true) {
     if (primary && enabled) color(focus ? ui::kAccent.bright : ui::kAccent.line);
@@ -404,15 +410,15 @@ bool tryPlay() {
     return canPlay() && !gGameDir.empty();
 }
 
-// Unpacking a .pkg (Tools): the file chooser and the extraction run on a thread of their own,
-// sharing one of these with the window.
+// Tools jobs (unpacking a .pkg, applying an update or DLC): the file chooser and the work run on
+// a thread of their own, sharing one of these with the window.
 struct Unpack {
     enum State { Idle, Choosing, Working, Finished };
     std::atomic<int> state{Idle};
+    int button = 0; // the Tools button that started it (it shows Cancel)
     pkg::Progress progress;
     std::mutex mutex;
     std::string message; // the result, or why the chooser could not open
-    std::string folder;  // game/<folder> being made
     bool ok = false;
 };
 std::shared_ptr<Unpack> gUnpack = std::make_shared<Unpack>();
@@ -422,9 +428,9 @@ bool unpackBusy() {
     return s == Unpack::Choosing || s == Unpack::Working;
 }
 
-// The desktop's file chooser: zenity (GNOME and most others), else kdialog (KDE). Empty when
-// cancelled, or with err set when there is no chooser.
-std::string chooseFile(std::string& err) {
+// The desktop's file chooser: zenity (GNOME and most others), else kdialog (KDE); a .pkg file or
+// a folder. Empty when cancelled, or with err set when there is no chooser.
+std::string choosePath(bool folder, std::string& err) {
     const char* home = std::getenv("HOME");
     const std::string start = home && *home ? std::string(home) + "/" : "./";
     auto quote = [](const std::string& s) {
@@ -434,13 +440,17 @@ std::string chooseFile(std::string& err) {
     };
     std::string cmd;
     if (std::system("command -v zenity >/dev/null 2>&1") == 0)
-        cmd = "zenity --file-selection --title='Choose a .pkg file' --filename=" + quote(start) +
-              " --file-filter='PS4 packages (*.pkg) | *.pkg *.PKG' --file-filter='All files | *' 2>/dev/null";
+        cmd = folder ? "zenity --file-selection --directory --title='Choose an unpacked update or DLC folder' --filename=" +
+                           quote(start) + " 2>/dev/null"
+                     : "zenity --file-selection --title='Choose a .pkg file' --filename=" + quote(start) +
+                           " --file-filter='PS4 packages (*.pkg) | *.pkg *.PKG' --file-filter='All files | *' 2>/dev/null";
     else if (std::system("command -v kdialog >/dev/null 2>&1") == 0)
-        cmd = "kdialog --title 'Choose a .pkg file' --getopenfilename " + quote(start) +
-              " 'PS4 packages (*.pkg *.PKG)' 2>/dev/null";
+        cmd = folder ? "kdialog --title 'Choose an unpacked update or DLC folder' --getexistingdirectory " + quote(start) +
+                           " 2>/dev/null"
+                     : "kdialog --title 'Choose a .pkg file' --getopenfilename " + quote(start) +
+                           " 'PS4 packages (*.pkg *.PKG)' 2>/dev/null";
     else {
-        err = "No file chooser found (zenity or kdialog): drop the .pkg file on this window instead";
+        err = "No file chooser found (zenity or kdialog): drop the .pkg file or folder on this window instead";
         return {};
     }
     std::FILE* f = popen(cmd.c_str(), "r");
@@ -456,14 +466,17 @@ std::string chooseFile(std::string& err) {
     return out;
 }
 
-// Unpacks path (or the file the chooser picks, when empty) into game/<title ID>.
-void startUnpack(std::string path) {
+// Runs a Tools job on path: a .pkg is unpacked (a game) or applied (an update or DLC), a folder
+// is applied as an unpacked update or DLC. An empty path asks the chooser for one (a folder
+// when folder is set). button: the Tools button that started it.
+void startJob(std::string path, bool folder, int button) {
     if (unpackBusy()) return;
     auto u = std::make_shared<Unpack>();
     u->state = path.empty() ? Unpack::Choosing : Unpack::Working;
+    u->button = button;
     gUnpack = u;
     const fs::path games = gInstall / host::kGameFolder;
-    std::thread([u, path, games]() mutable {
+    std::thread([u, path, folder, games]() mutable {
         auto finish = [&](bool ok, const std::string& message) {
             {
                 std::lock_guard lock(u->mutex);
@@ -471,9 +484,9 @@ void startUnpack(std::string path) {
             }
             u->state = Unpack::Finished;
         };
-        std::string err;
+        std::string err, message;
         if (path.empty()) {
-            path = chooseFile(err);
+            path = choosePath(folder, err);
             if (path.empty()) {
                 if (err.empty()) u->state = Unpack::Idle;
                 else finish(false, err);
@@ -481,19 +494,15 @@ void startUnpack(std::string path) {
             }
             u->state = Unpack::Working;
         }
-        pkg::Info info;
-        if (!pkg::readInfo(path, info, err)) return finish(false, "Cannot unpack " + fs::path(path).filename().string() + ": " + err);
-        const std::string folder = pkg::folderName(info);
-        {
-            std::lock_guard lock(u->mutex);
-            u->folder = folder;
-        }
-        std::fprintf(stderr, "[launcher] unpacking %s (%s) into %s\n", path.c_str(), info.contentId.c_str(),
-                     (games / folder).c_str());
-        if (pkg::extract(path, (games / folder).string(), &u->progress, err))
-            return finish(true, "Unpacked " + (info.title.empty() ? info.titleId : info.title) + " into game/" + folder);
-        std::fprintf(stderr, "[launcher] unpacking failed: %s\n", err.c_str());
-        finish(false, err == "cancelled" ? "Unpacking cancelled" : "Cannot unpack: " + err);
+        std::error_code ec;
+        const bool isDir = fs::is_directory(path, ec);
+        std::fprintf(stderr, "[launcher] %s %s\n", isDir ? "applying" : "unpacking", path.c_str());
+        const bool ok = isDir ? pkg::applyFolder(path, games.string(), false, &u->progress, message, err)
+                              : pkg::installPkg(path, games.string(), &u->progress, message, err);
+        if (ok) return finish(true, message);
+        std::fprintf(stderr, "[launcher] failed: %s\n", err.c_str());
+        const std::string name = fs::path(path).filename().string();
+        finish(false, err == "cancelled" ? "Cancelled" : "Cannot use " + name + ": " + err);
     }).detach();
 }
 
@@ -526,7 +535,12 @@ void drawMain(int focus) {
     std::string status = gStatus;
     if (gUnpack->state == Unpack::Working) {
         const uint64_t total = gUnpack->progress.total, done = gUnpack->progress.done;
-        status = "Unpacking .pkg: " + std::to_string(total ? int(done * 100 / total) : 0) + "%";
+        std::string step;
+        {
+            std::lock_guard lock(gUnpack->progress.mutex);
+            step = gUnpack->progress.step;
+        }
+        status = (step.empty() ? std::string("Working") : step) + ": " + std::to_string(total ? int(done * 100 / total) : 0) + "%";
     }
     if (!status.empty()) {
         color(245, 240, 228, 220);
@@ -546,39 +560,43 @@ void drawTools(int focus) {
     text(p.x + 28, p.y + 22, 30, "Tools", true);
     color(ui::kAccent.line);
     fill(p.x + 28, p.y + 62, p.w - 56, 2);
-    color(245, 240, 228);
-    text(p.x + 28, p.y + 88, 22, "Unpack a .pkg", true);
-    color(200, 192, 176);
-    int y = p.y + 124;
-    for (const std::string& l :
-         wrap("Extracts .pkg file", 17, p.w - 56))
-        text(p.x + 28, y, 17, l), y += 23;
 
     const std::shared_ptr<Unpack> u = gUnpack;
     const int state = u->state;
-    const char* label = state == Unpack::Working ? "Cancel" : state == Unpack::Choosing ? "Choosing..." : "Choose .pkg file";
-    button(kChoose, label, focus == 0, state != Unpack::Working, state != Unpack::Choosing);
-    if (state == Unpack::Idle || state == Unpack::Finished) {
+    const bool busy = state == Unpack::Choosing || state == Unpack::Working;
+    const char* labels[3] = {"Choose .pkg file", "From .pkg file", "From folder"};
+    const char* headings[2] = {"Unpack a .pkg", "Apply an update or DLC"};
+    const char* lines[2] = {"Extracts .pkg file", "Adds it to the game version it is for"};
+    for (int s = 0; s < 2; ++s) {
+        const int y = kToolButtons[s == 0 ? 0 : 1].y;
+        color(245, 240, 228);
+        text(p.x + 28, y - 62, 22, headings[s], true);
         color(200, 192, 176);
-        text(kChoose.x + kChoose.w + 20, kChoose.y + (kChoose.h - 17) / 2, 17, "or drop one on this window");
+        text(p.x + 28, y - 32, 17, lines[s]);
+    }
+    for (int b = 0; b < 3; ++b) {
+        const bool mine = busy && u->button == b;
+        const char* label = mine ? (state == Unpack::Working ? "Cancel" : "Choosing...") : labels[b];
+        button(kToolButtons[b], label, focus == b, false, !busy || (mine && state == Unpack::Working));
+    }
+    if (!busy) {
+        color(200, 192, 176);
+        const Box& b = kToolButtons[0];
+        text(b.x + b.w + 20, b.y + (b.h - 17) / 2, 17, "or drop a .pkg or folder on this window");
     }
 
     const int x = p.x + 28, w = p.w - 56;
-    y = kChoose.y + kChoose.h + 30;
+    int y = kToolButtons[1].y + kToolButtons[1].h + 26;
     if (state == Unpack::Working) {
         const uint64_t total = u->progress.total, done = u->progress.done;
-        const int pct = total ? int(done * 100 / total) : 0;
-        std::string folder, file;
-        {
-            std::lock_guard lock(u->mutex);
-            folder = u->folder;
-        }
+        const int pct = total ? int(std::min<uint64_t>(100, done * 100 / total)) : 0;
+        std::string step, file;
         {
             std::lock_guard lock(u->progress.mutex);
-            file = u->progress.file;
+            step = u->progress.step, file = u->progress.file;
         }
         color(245, 240, 228);
-        text(x, y, 19, "Unpacking into game/" + folder + ": " + std::to_string(pct) + "%", true);
+        text(x, y, 19, font::fit((step.empty() ? std::string("Working") : step) + ": " + std::to_string(pct) + "%", 19, w, true), true);
         color(0, 0, 0, 170);
         fillR(x, y + 32, w, 14, 7);
         color(ui::kAccent.fill);
@@ -596,10 +614,52 @@ void drawTools(int focus) {
         }
         if (ok) color(ui::kAccent.bright);
         else color(245, 240, 228);
-        for (const std::string& l : wrap(message, 18, w)) text(x, y, 18, font::fit(l, 18, w)), y += 25;
+        int n = 0;
+        for (const std::string& l : wrap(message, 18, w))
+            if (n++ < 4) text(x, y, 18, font::fit(l, 18, w)), y += 25;
     }
-    button(kToolsBack, "Back", focus == 1, false);
+    button(kToolsBack, "Back", focus == 3, false);
     padHints(40, kToolsBack.y + (kToolsBack.h - 40) / 2, "Back");
+}
+
+// Which game version to play, when game/ holds more than one.
+std::vector<host::GameVersion> gVersions;
+
+void drawVersions(int focus) {
+    drawBackground(true);
+    color(10, 8, 6, 225);
+    fillR(kPanel.x, kPanel.y, kPanel.w, kPanel.h, 12);
+    color(ui::kAccent.line);
+    outlineR(kPanel.x, kPanel.y, kPanel.w, kPanel.h, 12, 1);
+    color(245, 240, 228);
+    text(kPanel.x + 28, kPanel.y + 22, 30, "Choose a version", true);
+    color(ui::kAccent.line);
+    fill(kPanel.x + 28, kPanel.y + 62, kPanel.w - 56, 2);
+    const int n = std::min<int>(int(gVersions.size()), kMaxVersions);
+    for (int r = 0; r < n; ++r) {
+        const host::GameVersion& g = gVersions[size_t(r)];
+        const Box b = rowBox(r);
+        if (focus == r) {
+            color(ui::kAccent.line, 60);
+            fillR(b.x, b.y, b.w, b.h, 6);
+            color(ui::kAccent.line);
+            fillR(b.x, b.y, 4, b.h, 2);
+        }
+        std::string right = g.version.empty() ? std::string() : "Version " + g.version;
+        if (g.category.rfind("gp", 0) == 0) right += right.empty() ? "Updated" : " (updated)";
+        const int rw = font::width(right, 20);
+        color(245, 240, 228);
+        text(b.x + 18, b.y + (b.h - 22) / 2, 22, font::fit(g.name, 22, b.w - rw - 60, focus == r), focus == r);
+        color(200, 192, 176);
+        text(b.x + b.w - 18 - rw, b.y + (b.h - 20) / 2, 20, right);
+    }
+    if (focus < n && !gVersions[size_t(focus)].title.empty()) {
+        color(200, 192, 176);
+        text(kPanel.x + 28, kPanel.y + kPanel.h - 46, 17,
+             font::fit(gVersions[size_t(focus)].title + "  -  game/" + gVersions[size_t(focus)].name, 17, kPanel.w - 56));
+    }
+    button(kVersionsBack, "Back", focus == n, false);
+    padHints(40, kBack.y + (kBack.h - 40) / 2, "Back");
 }
 
 void drawSettings(int focus) {
@@ -705,29 +765,54 @@ int main(int argc, char** argv) {
     loadArt(win);
     SDL_GameController* pad = nullptr;
 
-    enum Screen { Main, Settings, Tools } screen = Main;
+    enum Screen { Main, Settings, Tools, Versions } screen = Main;
     // main: 0 play, 1 settings, 2 skip, 3 update, 4 tools; settings: rows, defaults, back;
-    // tools: 0 choose (or cancel), 1 back
+    // tools: 0 unpack, 1 update from .pkg, 2 update from folder, 3 back; versions: rows, back
     int focus = canPlay() ? 0 : 1;
-    // For docs: "main.bmp", "settings:x.bmp" or "tools:x.bmp" (LPN_LAUNCHER_UNPACK=<file.pkg> to show one unpacking).
+    // For docs: "main.bmp", "settings:x.bmp", "tools:x.bmp" or "versions:x.bmp"
+    // (LPN_LAUNCHER_UNPACK=<file.pkg or folder> to show one being used).
     const char* shot = std::getenv("LPN_LAUNCHER_SCREENSHOT");
     if (shot && !std::strncmp(shot, "settings:", 9)) screen = Settings, focus = 0, shot += 9;
     if (shot && !std::strncmp(shot, "tools:", 6)) screen = Tools, focus = 0, shot += 6;
-    if (const char* p = std::getenv("LPN_LAUNCHER_UNPACK"); p && *p) screen = Tools, focus = 0, startUnpack(p);
-    auto chooseOrCancel = [&] {
-        if (gUnpack->state == Unpack::Working) gUnpack->progress.cancel = true;
-        else startUnpack({});
+    if (shot && !std::strncmp(shot, "versions:", 9))
+        screen = Versions, focus = 0, shot += 9, gVersions = host::findGames(gInstall.string());
+    if (const char* p = std::getenv("LPN_LAUNCHER_UNPACK"); p && *p) screen = Tools, focus = 0, startJob(p, false, 0);
+    auto versionCount = [] { return std::min<int>(int(gVersions.size()), kMaxVersions); };
+    auto toolButton = [&](int b) {
+        if (unpackBusy()) {
+            if (gUnpack->button == b && gUnpack->state == Unpack::Working) gUnpack->progress.cancel = true;
+        } else {
+            startJob({}, b == 2, b);
+        }
+    };
+    // Play: straight in with one game version, else the version screen.
+    auto play_ = [&]() -> bool {
+        if (!tryPlay()) return false;
+        gVersions = host::findGames(gInstall.string());
+        if (gVersions.size() < 2) return true;
+        screen = Versions, focus = 0;
+        for (int i = 0; i < versionCount(); ++i)
+            if (gVersions[size_t(i)].dir == gGameDir) focus = i;
+        return false;
+    };
+    auto pickVersion = [&](int i) -> bool {
+        if (i < 0 || i >= versionCount()) return false;
+        gGameDir = gVersions[size_t(i)].dir;
+        return true;
     };
     auto confirm = [&]() -> bool {
         if (screen == Main) {
-            if (focus == 0 && canPlay()) return tryPlay();
+            if (focus == 0 && canPlay()) return play_();
             if (focus == 1) screen = Settings, focus = 0;
             if (focus == 2) gS.skipIntro = !gS.skipIntro, save();
             if (focus == 3) updateButton();
             if (focus == 4) screen = Tools, focus = 0;
         } else if (screen == Tools) {
-            if (focus == 0) chooseOrCancel();
+            if (focus < 3) toolButton(focus);
             else screen = Main, focus = 4;
+        } else if (screen == Versions) {
+            if (focus < versionCount()) return pickVersion(focus);
+            screen = Main, focus = 0;
         } else if (focus < kRowCount) stepValue(focus, +1);
         else if (focus == kRowCount) gS = DisplaySettings{}, save();
         else screen = Main, focus = 1;
@@ -736,9 +821,10 @@ int main(int argc, char** argv) {
     auto back = [&] {
         if (screen == Settings) screen = Main, focus = 1;
         else if (screen == Tools) screen = Main, focus = 4;
+        else if (screen == Versions) screen = Main, focus = 0;
     };
     auto move = [&](int d) {
-        const int n = screen == Settings ? kRowCount + 2 : screen == Tools ? 2 : 5;
+        const int n = screen == Settings ? kRowCount + 2 : screen == Tools ? 4 : screen == Versions ? versionCount() + 1 : 5;
         focus = ((focus + d) % n + n) % n;
         if (screen == Main && focus == 0 && !canPlay()) focus = (focus + d + n) % n;
     };
@@ -757,7 +843,9 @@ int main(int argc, char** argv) {
             else if (e.type == SDL_DROPFILE) {
                 const std::string path = e.drop.file;
                 SDL_free(e.drop.file);
-                if (isPkg(path) && !unpackBusy()) screen = Tools, focus = 0, startUnpack(path);
+                std::error_code ec;
+                const bool dir = fs::is_directory(path, ec);
+                if ((isPkg(path) || dir) && !unpackBusy()) screen = Tools, focus = dir ? 2 : 0, startJob(path, dir, dir ? 2 : 0);
             }
             else if (e.type == SDL_MOUSEMOTION) {
                 const int x = e.motion.x, y = e.motion.y;
@@ -768,8 +856,13 @@ int main(int argc, char** argv) {
                     else if (kUpdate.in(x, y)) focus = 3;
                     else if (kGear.in(x, y)) focus = 4;
                 } else if (screen == Tools) {
-                    if (kChoose.in(x, y)) focus = 0;
-                    else if (kToolsBack.in(x, y)) focus = 1;
+                    for (int b = 0; b < 3; ++b)
+                        if (kToolButtons[b].in(x, y)) focus = b;
+                    if (kToolsBack.in(x, y)) focus = 3;
+                } else if (screen == Versions) {
+                    for (int r = 0; r < versionCount(); ++r)
+                        if (rowBox(r).in(x, y)) focus = r;
+                    if (kVersionsBack.in(x, y)) focus = versionCount();
                 } else {
                     for (int r = 0; r < kRowCount; ++r)
                         if (rowBox(r).in(x, y)) focus = r;
@@ -779,14 +872,19 @@ int main(int argc, char** argv) {
             } else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
                 const int x = e.button.x, y = e.button.y;
                 if (screen == Main) {
-                    if (kPlay.in(x, y) && canPlay()) start = tryPlay();
+                    if (kPlay.in(x, y) && canPlay()) start = play_();
                     else if (kSettings.in(x, y)) screen = Settings, focus = 0;
                     else if (kSkip.in(x, y)) gS.skipIntro = !gS.skipIntro, save();
                     else if (kUpdate.in(x, y)) updateButton();
                     else if (kGear.in(x, y)) screen = Tools, focus = 0;
                 } else if (screen == Tools) {
-                    if (kChoose.in(x, y)) chooseOrCancel();
-                    else if (kToolsBack.in(x, y)) screen = Main, focus = 4;
+                    for (int b = 0; b < 3; ++b)
+                        if (kToolButtons[b].in(x, y)) toolButton(b);
+                    if (kToolsBack.in(x, y)) screen = Main, focus = 4;
+                } else if (screen == Versions) {
+                    for (int r = 0; r < versionCount(); ++r)
+                        if (rowBox(r).in(x, y)) start = pickVersion(r);
+                    if (kVersionsBack.in(x, y)) screen = Main, focus = 0;
                 } else {
                     for (int r = 0; r < kRowCount; ++r)
                         if (rowBox(r).in(x, y)) stepValue(r, arrowBox(r, false).in(x, y) ? -1 : +1);
@@ -829,7 +927,7 @@ int main(int argc, char** argv) {
             }
         }
         if (!run) break;
-        // A .pkg just unpacked: the game may be there now.
+        // A Tools job just finished: the game, or a new version of it, may be there now.
         if (gUnpack->state == Unpack::Finished && seen != gUnpack.get()) {
             seen = gUnpack.get();
             findFiles();
@@ -844,6 +942,7 @@ int main(int argc, char** argv) {
         }
         if (screen == Settings) drawSettings(focus);
         else if (screen == Tools) drawTools(focus);
+        else if (screen == Versions) drawVersions(focus);
         else drawMain(focus);
         if (shot) {
             // Read back what was drawn and save it, then quit (for screenshots in docs and tests).

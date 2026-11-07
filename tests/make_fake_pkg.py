@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Makes a small fake PKG for pkg_extract_test, and the folder lpn-pkg should extract from it.
 
-    make_fake_pkg.py <src/pkg/keys.h> <out.pkg> <expected folder>
+    make_fake_pkg.py <src/pkg/keys.h> <out.pkg> <expected folder> [game|update|dlc]
 
 The PKG is laid out as fpkg tools make them: entry keys and an image key sealed with the fake
 keys, and an encrypted, signed outer PFS image whose uroot holds a compressed (PFSC) inner
@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 keys_h, out_pkg, expected = sys.argv[1:4]
+kind = sys.argv[4] if len(sys.argv) > 4 else "game"
 src = open(keys_h).read()
 
 
@@ -44,6 +45,10 @@ files = {
     "data/noise.bin": rbytes(70000),  # does not compress: stored blocks
     "data/deep/x.txt": b"hello\n",
 }
+if kind == "update":  # what the update changes, and a file it adds
+    files = {"eboot.bin": b"\x7fELF patched eboot " * 200, "data/patch/new.bin": rbytes(3000)}
+elif kind == "dlc":
+    files = {"costume/kenshiro.dat": rbytes(9000)}
 
 
 def pfs_image(blocksize, signed, files_tree, compressed_inos=()):
@@ -191,8 +196,13 @@ def sfo(pairs):
     return b"\0PSF" + struct.pack("<IIII", 0x101, kt, kt + len(keys), len(pairs)) + ents + keys + data
 
 
-content_id = "UP0700-CUSA12776_00-HOKUTOGAAPP00000"
-param = sfo([("CATEGORY", "gd"), ("TITLE", "Test Game"), ("TITLE_ID", "CUSA12776")])
+content_id, category, title, ver = {
+    "game": ("UP0700-CUSA12776_00-HOKUTOGAAPP00000", "gd", "Test Game", "01.00"),
+    "update": ("UP0700-CUSA12776_00-HOKUTOGAAPP00000", "gp", "Test Game", "01.05"),
+    "dlc": ("UP0700-CUSA12776_00-HOKUTOGADLC00001", "ac", "Test Costume", "01.00"),
+}[kind]
+param = sfo([("APP_VER", ver), ("CATEGORY", category), ("CONTENT_ID", content_id), ("TITLE", title),
+             ("TITLE_ID", "CUSA12776")])
 icon = b"\x89PNG fake icon" * 10
 license_info = rbytes(48)
 dk3 = rbytes(32)

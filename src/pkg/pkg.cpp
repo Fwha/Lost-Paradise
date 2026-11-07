@@ -563,53 +563,62 @@ bool extract(const std::string& path, const std::string& outDir, Progress* pr, s
     }
     try {
         Package p(path);
-        // The PFS image: its header is not encrypted, the rest is when its mode says so.
-        ImageSource img(p.file, p.pfsOffset);
-        uint8_t h[0x400];
-        img.read(0, h, sizeof h);
-        uint16_t mode;
-        uint32_t bs;
-        Pfs::header(h, mode, bs);
-        if (mode & 4) {
-            if (!p.info.fake)
-                throw Error{"this is a retail PKG: its files are encrypted with keys only a PS4 has. "
-                            "Use a fake PKG (fpkg) or a dump of the game folder"};
-            std::vector<uint8_t> ek = p.ekpfs();
-            if (ek.size() != 32) throw Error{"the PKG's image key does not open with the fake keys"};
-            const uint8_t* seed = h + 0x370;
-            // Newer images (pfs flags bit 61) key with HMAC(EKPFS, seed) in place of EKPFS.
-            if (p.pfsFlags & 0x2000000000000000ull) {
-                const crypto::Digest k = crypto::hmacSha256(ek.data(), ek.size(), seed, 16);
-                ek.assign(k.begin(), k.end());
-            }
-            uint8_t msg[20] = {1, 0, 0, 0};
-            std::memcpy(msg + 4, seed, 16);
-            const crypto::Digest key = crypto::hmacSha256(ek.data(), ek.size(), msg, sizeof msg);
-            img.setKeys(key.data() + 16, key.data(), bs / 0x1000);
-        }
-        Pfs outer(img);
-        Pfs::Node uroot = outer.uroot();
-        // The game's files: the compressed inner image pfs_image.dat when there is one, else
-        // the outer image's own files.
+        // The PFS image: its header is not encrypted, the rest is when its mode says so. A PKG
+        // without one (DLC that is only a licence) has just its sce_sys entries.
+        std::unique_ptr<ImageSource> imgP;
+        std::unique_ptr<Pfs> outerP, inner;
         std::unique_ptr<Source> innerSrc;
-        std::unique_ptr<Pfs> inner;
-        for (const Pfs::Node& c : uroot.children)
-            if (!c.dir && c.name == "pfs_image.dat") {
-                innerSrc = outer.open(c.ino);
-                if (outer.inode(c.ino).flags & 1) innerSrc = std::make_unique<PfscSource>(std::move(innerSrc));
+        Pfs* game = nullptr;
+        Pfs::Node uroot;
+        if (p.pfsSize) {
+            imgP = std::make_unique<ImageSource>(p.file, p.pfsOffset);
+            ImageSource& img = *imgP;
+            uint8_t h[0x400];
+            img.read(0, h, sizeof h);
+            uint16_t mode;
+            uint32_t bs;
+            Pfs::header(h, mode, bs);
+            if (mode & 4) {
+                if (!p.info.fake)
+                    throw Error{"this is a retail PKG: its files are encrypted with keys only a PS4 has. "
+                                "Use a fake PKG (fpkg) or a dump of the game folder"};
+                std::vector<uint8_t> ek = p.ekpfs();
+                if (ek.size() != 32) throw Error{"the PKG's image key does not open with the fake keys"};
+                const uint8_t* seed = h + 0x370;
+                // Newer images (pfs flags bit 61) key with HMAC(EKPFS, seed) in place of EKPFS.
+                if (p.pfsFlags & 0x2000000000000000ull) {
+                    const crypto::Digest k = crypto::hmacSha256(ek.data(), ek.size(), seed, 16);
+                    ek.assign(k.begin(), k.end());
+                }
+                uint8_t msg[20] = {1, 0, 0, 0};
+                std::memcpy(msg + 4, seed, 16);
+                const crypto::Digest key = crypto::hmacSha256(ek.data(), ek.size(), msg, sizeof msg);
+                img.setKeys(key.data() + 16, key.data(), bs / 0x1000);
             }
-        Pfs* game = &outer;
-        if (innerSrc) {
-            inner = std::make_unique<Pfs>(*innerSrc);
-            uroot = inner->uroot();
-            game = inner.get();
+            outerP = std::make_unique<Pfs>(img);
+            Pfs& outer = *outerP;
+            uroot = outer.uroot();
+            // The game's files: the compressed inner image pfs_image.dat when there is one, else
+            // the outer image's own files.
+            for (const Pfs::Node& c : uroot.children)
+                if (!c.dir && c.name == "pfs_image.dat") {
+                    innerSrc = outer.open(c.ino);
+                    if (outer.inode(c.ino).flags & 1) innerSrc = std::make_unique<PfscSource>(std::move(innerSrc));
+                }
+            game = &outer;
+            if (innerSrc) {
+                inner = std::make_unique<Pfs>(*innerSrc);
+                uroot = inner->uroot();
+                game = inner.get();
+            }
         }
-        if (pr) pr->total = totalSize(*game, uroot), pr->done = 0;
+        if (pr) pr->total = game ? totalSize(*game, uroot) : 0, pr->done = 0;
 
         fs::remove_all(part, ec); // a folder left by an earlier extraction that stopped
         std::vector<uint8_t> buf(1 << 20);
         try {
-            extractDir(*game, uroot, part, "", pr, buf);
+            if (game) extractDir(*game, uroot, part, "", pr, buf);
+            fs::create_directories(part);
             // The entries' sce_sys files (param.sfo, icon0.png, ...), but not the keys and digests.
             for (const Entry& e : p.entries) {
                 if (e.id < 0x400) continue;

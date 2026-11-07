@@ -29,6 +29,7 @@ struct Progress {
     std::atomic<bool> cancel{false};
     std::mutex mutex;
     std::string file; // the file being written, relative to the output folder
+    std::string step; // what is being done: "Unpacking", "Applying the update", ...
 };
 
 // Reads the header and entries; false with err saying why (not a PKG, unreadable).
