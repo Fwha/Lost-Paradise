@@ -58,12 +58,26 @@ constexpr uint32_t kAspectFloats[] = {
     0x109ae2c, // 0x8696da: projection builder
     0x109aecc, // 0x873a81: projection builder
     0x109c504, // 0x888e1e: projection builder
+    0xfdc588,  // 0x2ff84c: per-object projection behind the characters' shadows (with 9/16 below)
 };
+// And 9/16 where the same code takes the inverse.
+constexpr uint32_t kInverseAspectFloats[] = {
+    0xfdc590, // 0x2ff8ab
+};
+constexpr uint32_t k9By16 = 0x3f100000;
 constexpr uint32_t k16By9 = 0x3fe38e39; // 16/9 as a float
 
 uint32_t gOutW = 0, gOutH = 0; // the output size when not 16:9 (hudLayout)
 
 bool patchAspect(uint8_t* text, float aspect) {
+    for (uint32_t at : kInverseAspectFloats) {
+        uint32_t v;
+        std::memcpy(&v, text + at, 4);
+        if (v != k9By16) {
+            std::fprintf(stderr, "[display] unexpected eboot data at 0x%x: the 3D view stays 16:9\n", at);
+            return false;
+        }
+    }
     for (uint32_t at : kAspectFloats) {
         uint32_t v;
         std::memcpy(&v, text + at, 4);
@@ -73,6 +87,8 @@ bool patchAspect(uint8_t* text, float aspect) {
         }
     }
     for (uint32_t at : kAspectFloats) std::memcpy(text + at, &aspect, 4);
+    const float inverse = 1 / aspect;
+    for (uint32_t at : kInverseAspectFloats) std::memcpy(text + at, &inverse, 4);
     return true;
 }
 
