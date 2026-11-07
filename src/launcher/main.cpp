@@ -9,6 +9,7 @@
 #include "common/settings_file.h"
 #include "common/ui_palette.h"
 #include "host/menu_font.h"
+#include "host/rounded.h"
 #include "launcher/updater.h"
 
 #include <SDL.h>
@@ -151,9 +152,16 @@ void fill(int x, int y, int w, int h) {
     SDL_Rect r{x, y, w, h};
     SDL_RenderFillRect(gRen, &r);
 }
-void outline(int x, int y, int w, int h, int t) {
-    fill(x, y, w, t), fill(x, y + h - t, w, t), fill(x, y, t, h), fill(x + w - t, y, t, h);
+// Rounded versions of fill and outline (rounded.h) in the current colour; radius r.
+SDL_Color drawColor() {
+    SDL_Color c;
+    SDL_GetRenderDrawColor(gRen, &c.r, &c.g, &c.b, &c.a);
+    return c;
 }
+void fillR(int x, int y, int w, int h, int r, unsigned corners = ui::kAll) {
+    ui::fillRounded(gRen, x, y, w, h, r, drawColor(), corners);
+}
+void outlineR(int x, int y, int w, int h, int r, int t) { ui::outlineRounded(gRen, x, y, w, h, r, t, drawColor()); }
 void text(int x, int y, int size, const std::string& s, bool bold = false) { font::draw(gRen, x, y, size, s, bold); }
 void textCentered(int cx, int y, int size, const std::string& s, bool bold = false) {
     text(cx - font::width(s, size, bold) / 2, y, size, s, bold);
@@ -229,9 +237,9 @@ const Box kDefaults{kW / 2 - 212, kPanel.y + kPanel.h + 20, 200, 48};
 void button(const Box& b, const std::string& label, bool focus, bool primary, bool enabled = true) {
     if (primary && enabled) color(focus ? ui::kAccent.bright : ui::kAccent.line);
     else color(0, 0, 0, focus ? 200 : 150);
-    fill(b.x, b.y, b.w, b.h);
+    fillR(b.x, b.y, b.w, b.h, 8);
     color(ui::kAccent.line, enabled ? 255 : 90);
-    outline(b.x, b.y, b.w, b.h, focus ? 3 : 1);
+    outlineR(b.x, b.y, b.w, b.h, 8, focus ? 3 : 1);
     const int size = b.h * 9 / 20;
     if (primary && enabled) color(ui::kAccent.on);
     else color(245, 240, 228, enabled ? 255 : 110);
@@ -241,10 +249,10 @@ void button(const Box& b, const std::string& label, bool focus, bool primary, bo
 void checkbox(const Box& b, const std::string& label, bool on, bool focus) {
     const int s = b.h - 6;
     color(0, 0, 0, 170);
-    fill(b.x, b.y + 3, s, s);
+    fillR(b.x, b.y + 3, s, s, 6);
     color(ui::kAccent.line);
-    outline(b.x, b.y + 3, s, s, focus ? 3 : 2);
-    if (on) fill(b.x + 6, b.y + 9, s - 12, s - 12);
+    outlineR(b.x, b.y + 3, s, s, 6, focus ? 3 : 2);
+    if (on) fillR(b.x + 6, b.y + 9, s - 12, s - 12, 3);
     color(245, 240, 228);
     text(b.x + s + 12, b.y + (b.h - 20) / 2, 20, label, focus);
 }
@@ -285,7 +293,7 @@ void drawMain(int focus) {
     const std::string fitted = font::fit(line, 16, 520);
     const int lw = font::width(fitted, 16);
     color(0, 0, 0, 160);
-    fill(kUpdate.x + kUpdate.w - lw - 12, kUpdate.y + kUpdate.h + 8, lw + 12, 24);
+    fillR(kUpdate.x + kUpdate.w - lw - 12, kUpdate.y + kUpdate.h + 8, lw + 12, 24, 6);
     color(245, 240, 228, 230);
     text(kUpdate.x + kUpdate.w - lw - 6, kUpdate.y + kUpdate.h + 12, 16, fitted);
     if (!gStatus.empty()) {
@@ -298,9 +306,9 @@ void drawMain(int focus) {
 void drawSettings(int focus) {
     drawBackground(true);
     color(10, 8, 6, 225);
-    fill(kPanel.x, kPanel.y, kPanel.w, kPanel.h);
+    fillR(kPanel.x, kPanel.y, kPanel.w, kPanel.h, 12);
     color(ui::kAccent.line);
-    outline(kPanel.x, kPanel.y, kPanel.w, kPanel.h, 1);
+    outlineR(kPanel.x, kPanel.y, kPanel.w, kPanel.h, 12, 1);
     color(245, 240, 228);
     text(kPanel.x + 28, kPanel.y + 22, 30, "PC Settings", true);
     color(ui::kAccent.line);
@@ -309,9 +317,9 @@ void drawSettings(int focus) {
         const Box b = rowBox(r);
         if (focus == r) {
             color(ui::kAccent.line, 60);
-            fill(b.x, b.y, b.w, b.h);
+            fillR(b.x, b.y, b.w, b.h, 6);
             color(ui::kAccent.line);
-            fill(b.x, b.y, 4, b.h);
+            fillR(b.x, b.y, 4, b.h, 2);
         }
         color(245, 240, 228);
         text(b.x + 18, b.y + (b.h - 22) / 2, 22, kRows[r].label, focus == r);

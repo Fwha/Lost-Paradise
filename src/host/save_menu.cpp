@@ -5,6 +5,7 @@
 #include "formats/par.h"
 #include "host/kernel.h"
 #include "host/menu_font.h"
+#include "host/rounded.h"
 
 #ifdef LPN_HAVE_SDL2
 #include <stb_image.h>
@@ -376,8 +377,21 @@ void outline(SDL_Renderer* ren, int x, int y, int w, int h, int t, Uint8 r, Uint
 }
 void color(SDL_Renderer* ren, Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255) { SDL_SetRenderDrawColor(ren, r, g, b, a); }
 void fill(SDL_Renderer* ren, int x, int y, int w, int h, ui::Rgb c) { fill(ren, x, y, w, h, c.r, c.g, c.b); }
-void outline(SDL_Renderer* ren, int x, int y, int w, int h, int t, ui::Rgb c) { outline(ren, x, y, w, h, t, c.r, c.g, c.b); }
 void color(SDL_Renderer* ren, ui::Rgb c) { color(ren, c.r, c.g, c.b); }
+// Rounded versions of fill and outline (rounded.h); radius r.
+void fillR(SDL_Renderer* ren, int x, int y, int w, int h, int r, Uint8 cr, Uint8 cg, Uint8 cb, Uint8 a = 255,
+           unsigned corners = ui::kAll) {
+    ui::fillRounded(ren, x, y, w, h, r, {cr, cg, cb, a}, corners);
+}
+void fillR(SDL_Renderer* ren, int x, int y, int w, int h, int r, ui::Rgb c, unsigned corners = ui::kAll) {
+    ui::fillRounded(ren, x, y, w, h, r, {c.r, c.g, c.b, 255}, corners);
+}
+void outlineR(SDL_Renderer* ren, int x, int y, int w, int h, int r, int t, Uint8 cr, Uint8 cg, Uint8 cb) {
+    ui::outlineRounded(ren, x, y, w, h, r, t, {cr, cg, cb, 255});
+}
+void outlineR(SDL_Renderer* ren, int x, int y, int w, int h, int r, int t, ui::Rgb c) {
+    outlineR(ren, x, y, w, h, r, t, c.r, c.g, c.b);
+}
 
 // PlayStation face-button icons, drawn as shapes: a dark disc with the cross, circle or square on it.
 enum class Pad { Cross, Circle, Square };
@@ -620,8 +634,8 @@ void drawSaveMenu(SDL_Renderer* ren) {
     const int x0 = (w - panelW) / 2, y0 = (h - panelH) / 2;
 
     // Panel and header.
-    fill(ren, x0, y0, panelW, panelH, 16, 16, 22, 242);
-    fill(ren, x0, y0, panelW, headH, 26, 24, 30, 255);
+    fillR(ren, x0, y0, panelW, panelH, U(10), 16, 16, 22, 242);
+    fillR(ren, x0, y0, panelW, headH, U(10), 26, 24, 30, 255, ui::kTop);
     fill(ren, x0, y0 + headH - U(2), panelW, U(2), ui::kAccent.fill);
     const char* title = gKind == SaveMenuKind::Save ? "Save Game" : gKind == SaveMenuKind::Load ? "Load Game" : "Delete Save";
     color(ren, 245, 240, 228);
@@ -647,10 +661,10 @@ void drawSaveMenu(SDL_Renderer* ren) {
         const bool sel = idx == gCursor;
         const int ry = listY + i * (rowH + gap);
         if (sel) {
-            fill(ren, listX, ry, rowW, rowH, ui::kAccent.tint);
-            outline(ren, listX, ry, rowW, rowH, U(2), ui::kAccent.line);
+            fillR(ren, listX, ry, rowW, rowH, U(6), ui::kAccent.tint);
+            outlineR(ren, listX, ry, rowW, rowH, U(6), U(2), ui::kAccent.line);
         } else {
-            fill(ren, listX, ry, rowW, rowH, 30, 30, 38);
+            fillR(ren, listX, ry, rowW, rowH, U(6), 30, 30, 38);
         }
 
         // Thumbnail: the save's icon (or the game's), fitted into a 16:9 box, number on its corner.
@@ -702,7 +716,7 @@ void drawSaveMenu(SDL_Renderer* ren) {
         text(ren, cx, ry + U(12), U(24), fitText(head, U(24), cw - (tagW ? tagW + U(10) : 0), true), true);
         if (!tag.empty()) {
             const int gx = listX + rowW - U(12) - tagW, gy = ry + U(14);
-            fill(ren, gx, gy, tagW, tagS + U(8), ui::kAccent.fill);
+            fillR(ren, gx, gy, tagW, tagS + U(8), U(4), ui::kAccent.fill);
             color(ren, ui::kAccent.on);
             text(ren, gx + U(7), gy + U(4), tagS, tag, true);
         }
@@ -748,10 +762,10 @@ void drawSaveMenu(SDL_Renderer* ren) {
         for (size_t i = 0; i < items.size(); ++i) {
             const int iw = std::max(U(90), textW(items[i], bs) + U(28));
             if (int(i) == sel) {
-                fill(ren, x, byy, iw, bh, ui::kAccent.fill);
+                fillR(ren, x, byy, iw, bh, U(6), ui::kAccent.fill);
                 color(ren, ui::kAccent.on);
             } else {
-                outline(ren, x, byy, iw, bh, U(1), 110, 104, 92);
+                outlineR(ren, x, byy, iw, bh, U(6), U(1), 110, 104, 92);
                 color(ren, 225, 220, 208);
             }
             text(ren, x + (iw - textW(items[i], bs)) / 2, byy + U(7), bs, items[i]);
@@ -763,7 +777,7 @@ void drawSaveMenu(SDL_Renderer* ren) {
     }
 
     // Controls.
-    fill(ren, x0, y0 + panelH - hintH, panelW, hintH, 10, 10, 14, 255);
+    fillR(ren, x0, y0 + panelH - hintH, panelW, hintH, U(10), 10, 10, 14, 255, ui::kBottom);
     // With a controller plugged in: its buttons (cross, circle, square, as SDL's A, B and X are on
     // a DualSense); otherwise the keys.
     const int hs = U(15), hy = y0 + panelH - hintH + (hintH - hs) / 2;
