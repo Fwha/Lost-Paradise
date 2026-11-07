@@ -301,7 +301,7 @@ bool patchTitleMenuLayout(uint8_t* s, size_t size) {
     static const uint8_t kRect37[] = {0x3f, 0x7a, 0x80, 0x00, 0, 0, 0, 0, 0x3f, 0x80, 0, 0, 0x3d, 0x30, 0, 0};
     static const uint8_t kRect28[] = {0x3a, 0x80, 0, 0, 0x3f, 0x0d, 0x80, 0, 0x3f, 0x08, 0x40, 0, 0x3f, 0x24, 0x80, 0};
     // Frame k -> record k: NG/CO, CONTINUE, ENDLESS EDEN, DOWNLOAD INFO, REMINISCE, SETTINGS,
-    // NEW GAME (a kind's frame: 0 -> 7, clamped to the last; 1..6 -> 0..5; 7 -> 6).
+    // NEW GAME (a kind's frame: (kind - 1) * the slot's step, clamped to 0..1; 0 -> the last).
     static const uint8_t kList[kOldList] = {
         0x00, 0x00, 0x00, 0x08, 0x00, 0x01, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x0c, 0x00, 0x03, 0x00, 0x0e,
         0x00, 0x04, 0x00, 0x10, 0x00, 0x05, 0x00, 0x12, 0x00, 0x06, 0x00, 0x14, 0xff, 0xff, 0x00, 0x00,
@@ -346,6 +346,10 @@ bool patchTitleMenuLayout(uint8_t* s, size_t size) {
         uint8_t* slot = s + kSlots + kSlotStride * i;
         putBe16(slot + 4, kFrames);
         putBe32(slot + 8, off);
+        // The slot's step: a kind's frame is found at (kind - 1) * step, clamped to 0..1, and the
+        // game's 1/6 put both NEW GAME (kind 0, clamped to 1) and kind 7 (6/6) on frame 6.
+        // With 1/7, kind 7 is 6/7 (frame 6, the label) and NEW GAME stays at 1 (frame 7).
+        putBeFloat(slot + 12, 1.0f / (kFrames - 1));
     }
     return true;
 }
