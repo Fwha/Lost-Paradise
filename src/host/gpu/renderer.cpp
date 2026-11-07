@@ -1908,20 +1908,26 @@ private:
         }
         return at;
     }
-    // Aspect Ratio: the ambient occlusion pass gets its view rays as constants (2/w, -2/h, -1, 1,
-    // tan x, tan y, -1, 0), its pixel size right but tan x worked out for 16:9 by code not found
-    // (ghost shadows beside characters at 21:9). In draw data with that layout, tan x is made to
-    // match the pixel size's shape.
+    // Aspect Ratio: the ambient occlusion pass gets its view rays as constants, a pixel size quad
+    // (s/w, -s/h, -1, 1) with s 1 or 2 and a tan quad (tan x, tan y, -1, 0), in either order. The
+    // pixel size is right but tan x is worked out for 16:9 by code not found (ghost shadows at
+    // 21:9). Where both quads sit side by side, tan x is made to match the pixel size's shape.
     static void fixViewRays(uint8_t* p, size_t bytes) {
         float* f = reinterpret_cast<float*>(p);
         const size_t n = bytes / 4;
-        for (size_t i = gcn::data::kSmrd; i + 8 <= n; ++i) {
-            if (f[i + 2] != -1.0f || f[i + 3] != 1.0f || f[i + 6] != -1.0f) continue;
-            if (!(f[i] > 0) || !(f[i + 1] < 0) || !(f[i + 4] > 0) || !(f[i + 5] > 0)) continue;
-            if (std::fabs(f[i + 4] / f[i + 5] - 16.0f / 9) > 1e-3f) continue;
-            const float aspect = -f[i + 1] / f[i]; // (2/h) / (2/w)
-            if (std::fabs(aspect - 16.0f / 9) < 0.02f) continue;
-            f[i + 4] = f[i + 5] * aspect;
+        auto pixel = [&](size_t i) {
+            return f[i] > 0 && f[i + 1] < 0 && f[i + 2] == -1.0f && f[i + 3] == 1.0f;
+        };
+        auto tan = [&](size_t i) {
+            return f[i] > 0 && f[i + 1] > 0 && f[i + 2] == -1.0f && f[i + 3] == 0.0f &&
+                   std::fabs(f[i] / f[i + 1] - 16.0f / 9) < 1e-3f;
+        };
+        for (size_t i = gcn::data::kSmrd; i + 4 <= n; ++i) {
+            if (!pixel(i)) continue;
+            const float aspect = -f[i + 1] / f[i]; // (s/h) / (s/w)
+            if (std::fabs(aspect - 16.0f / 9) < 0.02f || aspect < 1.0f || aspect > 4.0f) continue;
+            if (i + 8 <= n && tan(i + 4)) f[i + 4] = f[i + 5] * aspect;
+            if (i >= gcn::data::kSmrd + 4 && tan(i - 4)) f[i - 4] = f[i - 3] * aspect;
         }
     }
 
