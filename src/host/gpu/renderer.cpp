@@ -6359,7 +6359,10 @@ void main() {
         clip(r.ctx[reg::kGenericScissorTl], r.ctx[reg::kGenericScissorBr]);
         clip(r.ctx[reg::kWindowScissorTl], r.ctx[reg::kWindowScissorBr]);
         if ((r.ctx[0x292] >> 1) & 1) clip(r.ctx[reg::kVportScissorTl], r.ctx[reg::kVportScissorBr]);
-        if (hudMode) { // the HUD's clipping (the minimap's, say) moves with it
+        // The HUD's clipping (the minimap's, say) moves with it. Clipping to the whole picture stays
+        // so: in the 16:9 rectangle it cut off glows reaching past it (the minimap's).
+        const bool whole = x0 == 0 && y0 == 0 && x1 >= int32_t(h.outW) && y1 >= int32_t(h.outH);
+        if (hudMode && !whole) {
             if (hudMode == 1) x0 = int32_t(std::floor(h.x + x0 * h.sx)), x1 = int32_t(std::ceil(h.x + x1 * h.sx));
             y0 = int32_t(std::floor(h.y + y0 * h.sy)), y1 = int32_t(std::ceil(h.y + y1 * h.sy));
             x1 = std::min<int32_t>(x1, int32_t(width)), y1 = std::min<int32_t>(y1, int32_t(height));
