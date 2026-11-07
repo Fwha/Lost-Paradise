@@ -10,6 +10,10 @@ add_executable(game_dir_test game_dir_test.cpp)
 target_link_libraries(game_dir_test PRIVATE lpn-common)
 add_test(NAME game_dir_test COMMAND game_dir_test)
 
+add_executable(elf_test elf_test.cpp)
+target_link_libraries(elf_test PRIVATE ps4elf)
+add_test(NAME elf_test COMMAND elf_test)
+
 add_executable(pkg_test pkg_test.cpp)
 target_link_libraries(pkg_test PRIVATE pkg)
 add_test(NAME pkg_test COMMAND pkg_test)
