@@ -335,7 +335,18 @@ void drawSettings(int focus) {
         color(200, 192, 176);
         std::string d = kRows[focus].description;
         if (focus == 1 || focus == 4) d += " Takes effect at the next start.";
-        text(kPanel.x + 28, kPanel.y + kPanel.h - 46, 17, font::fit(d, 17, kPanel.w - 56));
+        // Up to two lines, broken between words.
+        const int maxW = kPanel.w - 56;
+        std::string first = d, rest;
+        while (font::width(first, 17) > maxW) {
+            const size_t sp = first.rfind(' ');
+            if (sp == std::string::npos) break;
+            rest = first.substr(sp + 1) + (rest.empty() ? "" : " " + rest);
+            first.resize(sp);
+        }
+        const int y = kPanel.y + kPanel.h - (rest.empty() ? 46 : 60);
+        text(kPanel.x + 28, y, 17, font::fit(first, 17, maxW));
+        if (!rest.empty()) text(kPanel.x + 28, y + 23, 17, font::fit(rest, 17, maxW));
     }
     button(kDefaults, "Defaults", focus == kRowCount, false);
     button(kBack, "Back", focus == kRowCount + 1, false);
