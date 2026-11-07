@@ -301,7 +301,7 @@ bool patchTitleMenuLayout(uint8_t* s, size_t size) {
     static const uint8_t kRect37[] = {0x3f, 0x7a, 0x80, 0x00, 0, 0, 0, 0, 0x3f, 0x80, 0, 0, 0x3d, 0x30, 0, 0};
     static const uint8_t kRect28[] = {0x3a, 0x80, 0, 0, 0x3f, 0x0d, 0x80, 0, 0x3f, 0x08, 0x40, 0, 0x3f, 0x24, 0x80, 0};
     // Frame k -> record k: NG/CO, CONTINUE, ENDLESS EDEN, DOWNLOAD INFO, REMINISCE, SETTINGS,
-    // NEW GAME (a kind's frame: 0 -> 7, clamped to the last; 1..6 -> 0..5; 7 -> 6).
+    // NEW GAME (a kind's frame, from the table at 0x1ff42d0: 0 -> 7 (the last), 1..6 -> 0..5, 7 -> 6).
     static const uint8_t kList[kOldList] = {
         0x00, 0x00, 0x00, 0x08, 0x00, 0x01, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x0c, 0x00, 0x03, 0x00, 0x0e,
         0x00, 0x04, 0x00, 0x10, 0x00, 0x05, 0x00, 0x12, 0x00, 0x06, 0x00, 0x14, 0xff, 0xff, 0x00, 0x00,
@@ -344,8 +344,13 @@ bool patchTitleMenuLayout(uint8_t* s, size_t size) {
         const uint32_t off = uint32_t(i < kMaxItems - 1 ? kLists + kNewList * i : kSpare);
         std::memcpy(s + off, list, kNewList);
         uint8_t* slot = s + kSlots + kSlotStride * i;
+        // The row's frame comes from the game's table at 0x1ff42d0 (kind 0, NEW GAME: 7; kind k:
+        // k - 1) and is clamped to the slot's last frame (+2) and its reciprocal (+12). Left at 6
+        // and 1/6, NEW GAME showed frame 6, the PC SETTINGS label.
+        putBe16(slot + 2, kFrames - 1);
         putBe16(slot + 4, kFrames);
         putBe32(slot + 8, off);
+        putBeFloat(slot + 12, 1.0f / (kFrames - 1));
     }
     return true;
 }

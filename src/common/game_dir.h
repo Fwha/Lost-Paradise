@@ -1,0 +1,16 @@
+// Where the game goes: a game/ folder in the install folder (beside launch.sh or the launcher
+// AppImage), holding the dump's folder, e.g. game/CUSA12776 with eboot.bin and sce_module/ in it.
+#pragma once
+
+#include <string>
+
+namespace host {
+
+constexpr const char* kGameFolder = "game";
+constexpr const char* kGameId = "CUSA12776"; // the version the host's patches are written for
+
+// The dump under <installDir>/game: game/CUSA12776 when it holds an eboot.bin, else the first
+// other folder there that does. Empty when there is none.
+std::string findGameDir(const std::string& installDir);
+
+} // namespace host

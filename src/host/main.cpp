@@ -3,6 +3,7 @@
 // The eboot and the game's bundled libc/Fios2 modules are mapped into this process and
 // linked against each other; everything they import from the PS4 system libraries is
 // bound to our C++ implementations, or to a logging stub until one exists.
+#include "common/game_dir.h"
 #include "host/crash.h"
 #include "host/display_settings.h"
 #include "host/input_history.h"
@@ -35,7 +36,8 @@ namespace {
 
 int usage() {
     std::fprintf(stderr,
-                 "usage: lpn-host <CUSA12776 dir> --nids <aerolib.csv> [options]\n"
+                 "usage: lpn-host [<CUSA12776 dir>] --nids <aerolib.csv> [options]\n"
+                 "  the game folder defaults to game/CUSA12776 (or another dump in game/) here\n"
                  "  --headless     no window (and no sound)\n"
                  "  --no-audio     no sound\n"
                  "  --trace-files  log every file the game opens\n"
@@ -103,7 +105,16 @@ int main(int argc, char** argv) {
         else if (argv[i][0] != '-' && gameDir.empty()) gameDir = argv[i];
         else return usage();
     }
-    if (gameDir.empty() || nidPath.empty()) return usage();
+    if (nidPath.empty()) return usage();
+    if (gameDir.empty()) {
+        gameDir = host::findGameDir(".");
+        if (gameDir.empty()) {
+            std::fprintf(stderr, "error: game not found: put the dump (the folder with eboot.bin) in %s/%s\n",
+                         fs::current_path().string().c_str(), host::kGameFolder);
+            return 1;
+        }
+        std::fprintf(stderr, "[host] game: %s\n", gameDir.c_str());
+    }
 
     std::string error;
     ps4elf::NidDb nids;

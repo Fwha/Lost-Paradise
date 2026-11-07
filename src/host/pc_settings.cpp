@@ -34,6 +34,13 @@ void dlssChoose(int i) {
     saveDisplaySettings();
 }
 
+std::vector<std::string> onOff() { return {"Off", "On"}; }
+int skipIntroValue() { return displaySettings().skipIntro ? 1 : 0; }
+void skipIntroChoose(int i) {
+    displaySettings().skipIntro = i != 0;
+    saveDisplaySettings();
+}
+
 } // namespace
 
 const std::vector<PcSetting>& pcSettings() {
@@ -46,6 +53,8 @@ const std::vector<PcSetting>& pcSettings() {
         {"DLSS",
          "NVIDIA DLAA: DLSS anti-aliasing in place of the game's. Needs an RTX card; Off on other GPUs.",
          &dlssChoices, &dlssValue, &dlssChoose},
+        {"Skip Intro Logos", "Go straight to the title screen when the game starts. Takes effect at the next start.",
+         &onOff, &skipIntroValue, &skipIntroChoose},
         display<4>("Exit Game", "Close the game. Progress since your last save is lost."),
     };
     return settings;

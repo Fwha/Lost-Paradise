@@ -1,0 +1,32 @@
+# Pushing a tag such as v0.2.0 builds the launcher AppImage and publishes it as that release,
+# which the launcher's Check for updates then offers (src/launcher/updater.h).
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  appimage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ libvulkan-dev glslang-dev libsdl2-dev zlib1g-dev
+      - name: Import names and DLSS SDK
+        run: |
+          scripts/fetch-nids.sh aerolib.csv
+          scripts/fetch-dlss.sh
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DLPN_VERSION="${GITHUB_REF_NAME}"
+          ninja -C build
+          ctest --test-dir build --output-on-failure
+      - name: AppImage
+        run: scripts/make-appimage.sh
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" build/Lost_Paradise-x86_64.AppImage --title "${GITHUB_REF_NAME}" --generate-notes
