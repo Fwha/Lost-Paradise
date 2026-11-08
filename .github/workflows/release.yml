@@ -44,6 +44,8 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
+          # The runner's own MSYS2 (C:\msys64): downloading the installer has failed with 504s.
+          release: false
           update: true
           install: >-
             zip
