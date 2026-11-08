@@ -181,8 +181,10 @@ std::string curl(std::vector<std::string> args, int* code) {
         args.insert(args.begin(), {"-H", std::string("@") + hdr});
     }
 #endif
-    args.insert(args.begin(), {"curl", "-sSL", "--connect-timeout", "15", "-w", "\n%{http_code}", "-H",
-                               "X-GitHub-Api-Version: 2022-11-28"});
+    // --retry: GitHub sometimes answers 5xx for a moment (e.g. while a release is being published);
+    // curl retries those (and 408/429) with backoff before giving up.
+    args.insert(args.begin(), {"curl", "-sSL", "--connect-timeout", "15", "--retry", "3", "-w", "\n%{http_code}",
+                               "-H", "X-GitHub-Api-Version: 2022-11-28"});
     bool ok;
     std::string out = run(args, &ok);
 #ifdef _WIN32
@@ -203,6 +205,7 @@ std::string httpError(int code) {
         return token().empty() ? "Cannot see the repo: sign in with `gh auth login` or put a token in github-token"
                                : "No release yet";
     if (code == 403 || code == 429) return "GitHub is limiting requests: try again later";
+    if (code >= 500) return "GitHub is having trouble (" + std::to_string(code) + "): try again in a minute";
     return "GitHub answered " + std::to_string(code);
 }
 
