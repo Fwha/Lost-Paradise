@@ -83,10 +83,6 @@ Lost Paradise/
   launch.sh                or Lost_Paradise-x86_64.AppImage
 ```
 
-The US (CUSA12776) and EU (CUSA12781, with its v1.09 update) releases run the same game code, so
-every patch works on both. The eboot and modules may be plain ELF files or fake-signed SELF files
-(as the EU dump comes): the host unwraps those itself. Encrypted SELFs need decrypting first.
-
 Saves go to `lpn-data/savedata/<title ID>` (one folder per version, e.g. `CUSA12776`, read from
 the dump's `sce_sys/param.sfo`), the PC settings to `lpn-display.ini` and the log to `play.log`, all
 in that folder. Saves from before the split are moved into `lpn-data/savedata/CUSA12776` on the
