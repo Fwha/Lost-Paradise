@@ -6300,33 +6300,42 @@ void main() {
     // A HUD draw covering the HUD's whole layout from side to side: the game's vignette, its top and
     // bottom shading, the pause screen's dimming, the title's backdrop. Squeezed into 16:9 they left
     // bands at the sides (21:9); they are stretched across the whole picture instead.
-    static bool hudWide(const gcn::Program& vs, const gcn::Program*, const DrawCall& d) {
+    // Textured ones (an image, not a gradient) only when they cover the layout's height too and are
+    // few rectangles: the title menu's animated highlights, reaching across it now and then, jumped
+    // between the two mappings.
+    static bool hudWide(const gcn::Program& vs, const gcn::Program* ps, const DrawCall& d) {
         if (d.count > 256 || vs.buffers.empty()) return false;
+        bool textured = false;
+        for (const gcn::Program* p : {&vs, ps})
+            if (p)
+                for (const auto& t : p->images) textured = textured || !t.storage;
+        if (textured && d.count > 32) return false;
         // The layout's width, from the draw data's (2/w, -2/h, -1, 1); else the game's 1280x720.
         auto at = [&](size_t i) {
             float v;
             std::memcpy(&v, &vs.data[i], 4);
             return v;
         };
-        float layoutW = 0;
+        float layoutW = 0, layoutH = 0;
         for (size_t i = gcn::data::kSmrd; i + 4 <= vs.data.size(); ++i)
             if (at(i) > 0 && at(i + 1) < 0 && at(i + 2) == -1.0f && at(i + 3) == 1.0f) {
-                layoutW = 2 / at(i);
+                layoutW = 2 / at(i), layoutH = -2 / at(i + 1);
                 break;
             }
-        if (layoutW < 256) layoutW = 1280;
+        if (layoutW < 256) layoutW = 1280, layoutH = 720;
         const auto& b = vs.buffers[0]; // the positions (x, y first)
         const uint32_t n = b.numRecords(), stride = b.stride();
         if (!b.known || stride < 8 || !n || n > 256) return false;
         std::vector<uint8_t> bytes(size_t(stride) * n);
         if (!readGuest(b.base(), bytes.data(), bytes.size())) return false;
-        float lo = INFINITY, hi = -INFINITY;
+        float lo = INFINITY, hi = -INFINITY, top = INFINITY, bottom = -INFINITY;
         for (uint32_t i = 0; i < n; ++i) {
-            float x;
-            std::memcpy(&x, &bytes[size_t(i) * stride], 4);
-            if (!std::isfinite(x)) return false;
-            lo = std::min(lo, x), hi = std::max(hi, x);
+            float p[2];
+            std::memcpy(p, &bytes[size_t(i) * stride], 8);
+            if (!std::isfinite(p[0]) || !std::isfinite(p[1])) return false;
+            lo = std::min(lo, p[0]), hi = std::max(hi, p[0]), top = std::min(top, p[1]), bottom = std::max(bottom, p[1]);
         }
+        if (textured && !(top < 2.5f && bottom > layoutH - 2.5f)) return false;
         return lo < 2.5f && hi > layoutW - 2.5f && hi - lo < 4 * layoutW;
     }
     // A copy of the scene laid out as 16:9 at the picture's width, from the top: one rectangle
