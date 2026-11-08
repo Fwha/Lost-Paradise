@@ -51,7 +51,8 @@ namespace {
 constexpr uint32_t kAspectFloats[] = {
     0xfb87b4,  // 0x11b48d: projection builder
     0xfc2d18,  // 0x19482a, 0x194bb1: projection builders (one passes it to 0x2358e0)
-    0xfc3260,  // 0x1ae54f: aspect handed to 0x194250
+    0xfc2cf8,  // 0x194240: aspect handed to 0x194250 by the base camera update (most camera classes)
+    0xfc3260,  // 0x1ae54f: aspect handed to 0x194250 by the update the other camera classes override it with
     0xfd1708,  // 0x28bf03: horizontal field of view from the vertical one
     0xfd5914,  // 0x2d2328: aspect argument of 0xe66a60
     0x108937c, // 0x771518: aspect argument of 0xe66a60
