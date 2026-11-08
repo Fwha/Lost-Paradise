@@ -19,6 +19,9 @@
 #include "host/mman.h"
 #include "common/compat.h"
 #include <unistd.h>
+#ifdef __linux__
+#include <fcntl.h>
+#endif
 
 namespace host {
 
@@ -189,11 +192,14 @@ void logCameras(const std::string& path) {
     if (!gEbootBase) return;
     std::FILE* maps = std::fopen("/proc/self/maps", "r");
     std::FILE* out = std::fopen(path.c_str(), "w");
-    if (!maps || !out) {
+    const int mem = ::open("/proc/self/mem", O_RDONLY);
+    if (!maps || !out || mem < 0) {
         if (maps) std::fclose(maps);
         if (out) std::fclose(out);
+        if (mem >= 0) ::close(mem);
         return;
     }
+    std::vector<uint8_t> buf(1 << 20);
     const uintptr_t lo = uintptr_t(gEbootBase), hi = lo + gEbootSize;
     auto inEboot = [&](uint64_t v) { return v >= lo && v < hi; };
     std::fprintf(out, "object vtable update x y y/x fov(deg)\n");
@@ -205,25 +211,33 @@ void logCameras(const std::string& path) {
         if (std::sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) continue;
         if (perms[0] != 'r' || perms[1] != 'w' || std::strstr(line, "[stack") || std::strstr(line, "[vvar")) continue;
         if (end - start > (16ull << 30)) continue;
-        for (uintptr_t a = (start + 0x170 + 15) & ~uintptr_t(15); a + 32 <= end && found < 200; a += 16) {
-            const float* f = reinterpret_cast<const float*>(a);
-            if (!(f[0] > 0.05f && f[0] < 20 && f[5] > 0.05f && f[5] < 20)) continue;
-            if (f[1] != 0 || f[2] != 0 || f[3] != 0 || f[4] != 0 || f[6] != 0 || f[7] != 0) continue;
-            const uintptr_t obj = a - 0x170;
-            if (obj < start) continue;
-            uint64_t vt, first, update;
-            std::memcpy(&vt, reinterpret_cast<const void*>(obj), 8);
-            if (!inEboot(vt) || vt + 0x1d8 > hi) continue;
-            std::memcpy(&first, reinterpret_cast<const void*>(vt), 8);
-            std::memcpy(&update, reinterpret_cast<const void*>(vt + 0x1d0), 8);
-            if (!inEboot(first) || !inEboot(update)) continue;
-            float fov;
-            std::memcpy(&fov, reinterpret_cast<const void*>(obj + 0xac), 4);
-            std::fprintf(out, "%#lx %#lx %#lx %.4f %.4f %.4f %.2f\n", (unsigned long)obj, (unsigned long)(vt - lo),
-                         (unsigned long)(update - lo), f[0], f[5], f[5] / f[0], fov * 57.29578f);
-            ++found;
+        // Read through /proc/self/mem: some mappings fault when touched (SIGBUS past a shared
+        // file's end), which a read there turns into an error instead.
+        constexpr size_t kChunk = 1 << 20;
+        for (uintptr_t c = start; c < end && found < 200; c += kChunk) {
+            const size_t len = std::min<size_t>(kChunk, end - c);
+            if (::pread(mem, buf.data(), len, off_t(c)) != ssize_t(len)) // page by page, zeros where unreadable
+                for (size_t pg = 0; pg < len; pg += 4096)
+                    if (::pread(mem, buf.data() + pg, 4096, off_t(c + pg)) != 4096) std::memset(buf.data() + pg, 0, 4096);
+            for (size_t i = 0x170; i + 32 <= len && found < 200; i += 16) {
+                const float* f = reinterpret_cast<const float*>(buf.data() + i);
+                if (!(f[0] > 0.05f && f[0] < 20 && f[5] > 0.05f && f[5] < 20)) continue;
+                if (f[1] != 0 || f[2] != 0 || f[3] != 0 || f[4] != 0 || f[6] != 0 || f[7] != 0) continue;
+                uint64_t vt, first, update;
+                float fov;
+                std::memcpy(&vt, buf.data() + i - 0x170, 8);
+                std::memcpy(&fov, buf.data() + i - 0x170 + 0xac, 4);
+                if (!inEboot(vt) || vt + 0x1d8 > hi) continue;
+                if (::pread(mem, &first, 8, off_t(vt)) != 8 || ::pread(mem, &update, 8, off_t(vt + 0x1d0)) != 8) continue;
+                if (!inEboot(first) || !inEboot(update)) continue;
+                std::fprintf(out, "%#lx %#lx %#lx %.4f %.4f %.4f %.2f\n", (unsigned long)(c + i - 0x170),
+                             (unsigned long)(vt - lo), (unsigned long)(update - lo), f[0], f[5], f[5] / f[0],
+                             fov * 57.29578f);
+                ++found;
+            }
         }
     }
+    ::close(mem);
     std::fclose(maps);
     std::fclose(out);
     std::fprintf(stderr, "[capture] %d cameras -> %s\n", found, path.c_str());
