@@ -220,7 +220,7 @@ void registerGnmHle() {
     HLE(g, sceGnmGetOffChipTessellationBufferSize);
 
     // Packet writers not translated yet (other shader stages, markers, waits): NOP-filled.
-    for (const char* name : {"sceGnmDrawIndexIndirectCountMulti", "sceGnmDrawIndexMultiInstanced", "sceGnmDrawIndirectCountMulti", "sceGnmDispatchIndirectOnMec", "sceGnmSetEmbeddedPsShader", "sceGnmSetEmbeddedVsShader", "sceGnmSetEsShader", "sceGnmSetGsShader", "sceGnmSetHsShader", "sceGnmSetLsShader", "sceGnmUpdateGsShader", "sceGnmUpdateHsShader", "sceGnmInsertPushMarker", "sceGnmInsertPopMarker", "sceGnmInsertSetMarker", "sceGnmInsertPushColorMarker", "sceGnmInsertSetColorMarker", "sceGnmInsertThreadTraceMarker", "sceGnmInsertDingDongMarker", "sceGnmInsertWaitFlipDone", "sceGnmComputeWaitOnAddress", "sceGnmComputeWaitSemaphore"})
+    for (const char* name : {"sceGnmDrawIndexIndirectCountMulti", "sceGnmDrawIndexMultiInstanced", "sceGnmDrawIndirectCountMulti", "sceGnmDispatchIndirectOnMec", "sceGnmSetEmbeddedPsShader", "sceGnmSetEmbeddedVsShader", "sceGnmSetHsShader", "sceGnmSetLsShader", "sceGnmUpdateHsShader", "sceGnmInsertPushMarker", "sceGnmInsertPopMarker", "sceGnmInsertSetMarker", "sceGnmInsertPushColorMarker", "sceGnmInsertSetColorMarker", "sceGnmInsertThreadTraceMarker", "sceGnmInsertDingDongMarker", "sceGnmInsertWaitFlipDone", "sceGnmComputeWaitOnAddress", "sceGnmComputeWaitSemaphore"})
         registerHle(g, name, guestEntry<&writesNop>());
     // Default-state writers return how many dwords they wrote; writing none is valid.
     for (const char* name : {"sceGnmDrawInitDefaultHardwareState350", "sceGnmDrawInitToDefaultContextState400",

@@ -39,7 +39,18 @@ std::atomic<uint64_t> gFrame{0};
 const uint64_t gTraceFrame = getenv("LPN_PM4_TRACE") ? std::strtoull(getenv("LPN_PM4_TRACE"), nullptr, 0) : ~0ull;
 std::vector<DrawListener*> gListeners;
 
+// VGT_SHADER_STAGES_EN.GS_EN: the draw runs export (ES), geometry (GS) and copy (VS) shaders.
+bool geometryShaderDraw(const DrawCall& d) {
+    return d.kind < DrawCall::kDispatch && (tRegs->ctx[ctx::kVgtShaderStagesEn] & (1u << 5));
+}
+
 void draw(const DrawCall& d, Pm4Stats* st) {
+    if (geometryShaderDraw(d)) {
+        if (tDry) return;
+        st->draws++;
+        for (DrawListener* l : gListeners) l->onGeometryShaderDraw(d, *tRegs);
+        return;
+    }
     if (tDry) {
         for (DrawListener* l : gListeners) l->onAnalyzeDraw(d, *tRegs);
         return;

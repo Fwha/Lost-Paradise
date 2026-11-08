@@ -971,6 +971,60 @@ public:
         run.clear();
     }
 
+    // Geometry shader pipeline draws (export + geometry + copy shaders) are not rendered yet. The
+    // game draws some gore with them (the head bursting in some heat actions): drawn as a plain VS
+    // draw they showed the previous mesh. F12 captures save what is needed to translate them:
+    // the three shaders, both register files, and the memory their user data points to.
+    void onGeometryShaderDraw(const DrawCall& d, const GpuRegs& r) override {
+        const uint64_t es = shaderAddress(r, gpu::sh::kSpiShaderPgmLoEs), gs = shaderAddress(r, gpu::sh::kSpiShaderPgmLoGs),
+                       vs = shaderAddress(r, gpu::sh::kSpiShaderPgmLoVs);
+        warnOnce("geometry shader draws are not rendered yet (es 0x" + hex(es) + " gs 0x" + hex(gs) + " copy vs 0x" + hex(vs) + ")");
+        std::lock_guard lock(m_);
+        if (frame_ != traceFrame_ || traceDir_.empty()) return;
+        const uint64_t n = ++gsDrawIndex_;
+        std::fprintf(traceOut_,
+                     "[trace] gs draw %" PRIu64 " (after draw #%" PRIu64 ") es 0x%" PRIx64 " gs 0x%" PRIx64 " copy vs 0x%" PRIx64
+                     " ps 0x%" PRIx64 " count %u kind %d index 0x%" PRIx64 "+%u %s prim %u instances %u stages 0x%x gs mode 0x%x"
+                     " out prim %u max vert out %u esgs item %u gsvs item %u vert item %u (skipped)\n",
+                     n, drawIndex_, es, gs, vs, shaderAddress(r, gpu::sh::kSpiShaderPgmLoPs), d.count, int(d.kind), d.indexAddr,
+                     d.indexOffset, r.indexType ? "u32" : "u16", r.uconfig[gpu::uconfig::kVgtPrimitiveType], r.numInstances,
+                     r.ctx[gpu::ctx::kVgtShaderStagesEn], r.ctx[gpu::ctx::kVgtGsMode], r.ctx[gpu::ctx::kVgtGsOutPrimType],
+                     r.ctx[gpu::ctx::kVgtGsMaxVertOut], r.ctx[gpu::ctx::kVgtEsgsRingItemsize], r.ctx[gpu::ctx::kVgtGsvsRingItemsize],
+                     r.ctx[gpu::ctx::kVgtGsVertItemsize]);
+        auto save = [&](const std::string& name, const void* data, size_t size) {
+            if (!captured_.insert(name).second) return;
+            if (FILE* f = std::fopen((traceDir_ + name).c_str(), "wb")) {
+                std::fwrite(data, 1, size, f);
+                std::fclose(f);
+            }
+        };
+        const std::string tag = "gsdraw-" + std::to_string(n);
+        save(tag + "-ctx.bin", r.ctx, sizeof(r.ctx));
+        save(tag + "-sh.bin", r.sh, sizeof(r.sh));
+        save(tag + "-uconfig.bin", r.uconfig, 0x400 * 4);
+        std::vector<uint8_t> bytes(64 << 10);
+        for (const auto& [stage, addr] : {std::pair{"es", es}, {"gs", gs}, {"vs", vs}}) {
+            size_t size = bytes.size();
+            while (size >= 4096 && !readGuest(addr, bytes.data(), size)) size /= 2;
+            if (size >= 4096) save(std::string(stage) + "-" + hex(addr) + ".bin", bytes.data(), size);
+        }
+        // What the user data points to (descriptor tables, constants): 4 KB at each address.
+        for (uint32_t base : {gpu::sh::kSpiShaderUserDataEs, gpu::sh::kSpiShaderUserDataGs, gpu::sh::kSpiShaderUserDataVs})
+            for (uint32_t i = 0; i + 1 < 16; ++i) {
+                const uint64_t a = r.sh[base + i] | uint64_t(r.sh[base + i + 1] & 0xFFFF) << 32;
+                if (a < (1ull << 32) || (a & 3)) continue;
+                bytes.resize(4096);
+                if (readGuest(a, bytes.data(), bytes.size())) save("mem-" + hex(a) + ".bin", bytes.data(), bytes.size());
+                bytes.resize(64 << 10);
+            }
+        if (d.kind == DrawCall::kIndexed) {
+            const size_t isz = r.indexType ? 4 : 2, size = size_t(d.indexOffset + d.count) * isz;
+            bytes.resize(size);
+            if (size <= (1u << 20) && readGuest(d.indexAddr, bytes.data(), size)) save(tag + "-indices.bin", bytes.data(), size);
+        }
+    }
+    uint64_t gsDrawIndex_ = 0;
+
     void onDraw(const DrawCall& d, const GpuRegs& r) override {
         // Analyses are taken, and handed back, a run at a time: a lock per draw was 4% of the
         // recorder at 6,000 draws a frame.
