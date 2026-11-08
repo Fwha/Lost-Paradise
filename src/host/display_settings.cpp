@@ -97,7 +97,13 @@ bool patchAspect(uint8_t* text, float aspect) {
 
 } // namespace
 
+namespace {
+const uint8_t* gEbootBase = nullptr;
+size_t gEbootSize = 0;
+} // namespace
+
 bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height) {
+    gEbootBase = eboot.base(), gEbootSize = eboot.size();
     if (!width || !height) return true;
     // The eboot's display setup (0x55d5e0, given argc/argv) stores the render width and height
     // (0x239d5ec/ee) and the output size (0x239d5f0/f2) as 16-bit values: 1600x896 on a base
@@ -173,6 +179,57 @@ bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height) {
     std::fprintf(stderr, "[display] rendering at %ux%u (output %ux%u)%s\n", width, height, sized ? width : 1920,
                  sized ? height : 1080, wide ? ", 3D view widened to match, HUD kept 16:9" : "");
     return true;
+}
+
+// The game's cameras keep their projection at +0x170 as rows (x, 0, 0, 0) and (0, y, 0, 0), with
+// the vertical field of view at +0xac and the update the camera classes override at vtable +0x1d0
+// (0x194240 or 0x1ae520 for most). Every live one is listed: which class draws a scene.
+void logCameras(const std::string& path) {
+#ifdef __linux__
+    if (!gEbootBase) return;
+    std::FILE* maps = std::fopen("/proc/self/maps", "r");
+    std::FILE* out = std::fopen(path.c_str(), "w");
+    if (!maps || !out) {
+        if (maps) std::fclose(maps);
+        if (out) std::fclose(out);
+        return;
+    }
+    const uintptr_t lo = uintptr_t(gEbootBase), hi = lo + gEbootSize;
+    auto inEboot = [&](uint64_t v) { return v >= lo && v < hi; };
+    std::fprintf(out, "object vtable update x y y/x fov(deg)\n");
+    char line[512];
+    int found = 0;
+    while (std::fgets(line, sizeof line, maps) && found < 200) {
+        unsigned long start, end;
+        char perms[8] = {};
+        if (std::sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) continue;
+        if (perms[0] != 'r' || perms[1] != 'w' || std::strstr(line, "[stack") || std::strstr(line, "[vvar")) continue;
+        if (end - start > (16ull << 30)) continue;
+        for (uintptr_t a = (start + 0x170 + 15) & ~uintptr_t(15); a + 32 <= end && found < 200; a += 16) {
+            const float* f = reinterpret_cast<const float*>(a);
+            if (!(f[0] > 0.05f && f[0] < 20 && f[5] > 0.05f && f[5] < 20)) continue;
+            if (f[1] != 0 || f[2] != 0 || f[3] != 0 || f[4] != 0 || f[6] != 0 || f[7] != 0) continue;
+            const uintptr_t obj = a - 0x170;
+            if (obj < start) continue;
+            uint64_t vt, first, update;
+            std::memcpy(&vt, reinterpret_cast<const void*>(obj), 8);
+            if (!inEboot(vt) || vt + 0x1d8 > hi) continue;
+            std::memcpy(&first, reinterpret_cast<const void*>(vt), 8);
+            std::memcpy(&update, reinterpret_cast<const void*>(vt + 0x1d0), 8);
+            if (!inEboot(first) || !inEboot(update)) continue;
+            float fov;
+            std::memcpy(&fov, reinterpret_cast<const void*>(obj + 0xac), 4);
+            std::fprintf(out, "%#lx %#lx %#lx %.4f %.4f %.4f %.2f\n", (unsigned long)obj, (unsigned long)(vt - lo),
+                         (unsigned long)(update - lo), f[0], f[5], f[5] / f[0], fov * 57.29578f);
+            ++found;
+        }
+    }
+    std::fclose(maps);
+    std::fclose(out);
+    std::fprintf(stderr, "[capture] %d cameras -> %s\n", found, path.c_str());
+#else
+    (void)path;
+#endif
 }
 
 bool hudLayout(uint32_t* outWidth, uint32_t* outHeight) {
