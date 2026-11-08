@@ -1,10 +1,10 @@
 # lost-paradise-native
 
-Runs *Fist of the North Star: Lost Paradise* (PS4, CUSA12776 or CUSA12781) natively on Linux. A C++ host loads
+Runs *Fist of the North Star: Lost Paradise* (PS4, CUSA12776 or CUSA12781) natively on Linux and Windows. A C++ host loads
 the game's original x86-64 code, answers its PS4 system calls itself, and recompiles its GPU
 shaders to Vulkan.
 
-Did all my testing on CachyOS.
+Did all my testing on CachyOS and Windows 11.
 PC Specs:
 4070 ti SUPER
 i7 12700k
