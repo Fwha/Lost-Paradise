@@ -5973,7 +5973,10 @@ void main() {
             return miss(kFastResources);
         }
         // Aspect Ratio: HUD shading drawn wider than the HUD (see hudDraw) takes a full draw.
-        if (f.hud && (hudWide(a.vs, a.psm ? &a.ps : nullptr, d) ? 2 : 1) != f.hud) return miss(kFastResources);
+        if ((f.hud == 1 || f.hud == 2) && (hudWide(a.vs, a.psm ? &a.ps : nullptr, d) ? 2 : 1) != f.hud)
+            return miss(kFastResources);
+        // The scene copy laid out 16:9 (sceneCopy16x9) is told apart by its vertices: a full draw.
+        if (hud().on && (f.hud == 3) != (d.count == 3 && sceneCopy16x9(a.vs))) return miss(kFastResources);
         VkBuffer indexBuffer = VK_NULL_HANDLE;
         VkDeviceSize indexOffset = 0;
         if (d.kind == DrawCall::kIndexed) {
@@ -6272,7 +6275,8 @@ void main() {
                 for (const auto& t : p->images) textured = textured || !t.storage;
         const bool fill = prim == 17 && d.count == 3 && !textured;
         const bool isHud = !hasDepth && (display || layer) && sceneW == 0 && !fill;
-        const uint8_t mode = !isHud ? 0 : hudWide(vs, ps, d) ? 2 : 1;
+        uint8_t mode = !isHud ? 0 : hudWide(vs, ps, d) ? 2 : 1;
+        if (!hasDepth && sceneW && prim == 17 && sceneCopy16x9(vs)) mode = 3;
         if (hudLog_) {
             std::lock_guard lock(hudLogMutex_);
             const uint64_t vsAddr = vs.launch.entry, psAddr = ps ? ps->launch.entry : 0;
@@ -6284,7 +6288,10 @@ void main() {
                                      " prim %u count %u vte 0x%x: %s%s\n",
                              frame_, target, display ? " (display)" : "", layer ? " (HUD buffer)" : "",
                              hasDepth ? " with depth" : "", vsAddr, psAddr, prim, d.count, r.ctx[reg::kPaClVteCntl],
-                             mode == 2 ? "HUD shading, full width" : isHud ? "HUD, 16:9 in the middle" : "full picture",
+                             mode == 3   ? "scene copy laid out 16:9, height fitted"
+                             : mode == 2 ? "HUD shading, full width"
+                             : isHud     ? "HUD, 16:9 in the middle"
+                                         : "full picture",
                              samples.empty() ? "" : ("; samples" + samples).c_str());
             }
         }
@@ -6324,6 +6331,29 @@ void main() {
             lo = std::min(lo, x), hi = std::max(hi, x);
         }
         return lo < 0.5f && hi > layoutW - 0.5f && hi - lo < 4 * layoutW;
+    }
+    // A copy of the scene laid out as 16:9 at the picture's width, from the top: one rectangle
+    // (RECTLIST) from (0, 0) to (W, W * 9 / 16) in pixels. The pause screen's background is drawn
+    // so: at 21:9 it ran past the bottom, the scene zoomed in and cut off at the top and bottom (#69).
+    // Its height is fitted to the picture's (hudDraw's mode 3).
+    static bool sceneCopy16x9(const gcn::Program& vs) {
+        const Hud& h = hud();
+        const double layoutH = h.outW * 9.0 / 16;
+        if (std::fabs(layoutH - h.outH) < 1 || vs.buffers.empty()) return false;
+        const auto& b = vs.buffers[0]; // the positions (x, y first)
+        const uint32_t n = b.numRecords(), stride = b.stride();
+        if (!b.known || stride < 8 || n != 3) return false;
+        uint8_t bytes[3 * 64];
+        if (stride > 64 || !readGuest(b.base(), bytes, size_t(stride) * n)) return false;
+        float x0 = INFINITY, x1 = -INFINITY, y0 = INFINITY, y1 = -INFINITY;
+        for (uint32_t i = 0; i < n; ++i) {
+            float p[2];
+            std::memcpy(p, &bytes[size_t(i) * stride], 8);
+            if (!std::isfinite(p[0]) || !std::isfinite(p[1])) return false;
+            x0 = std::min(x0, p[0]), x1 = std::max(x1, p[0]), y0 = std::min(y0, p[1]), y1 = std::max(y1, p[1]);
+        }
+        return std::fabs(x0) < 0.5f && std::fabs(y0) < 0.5f && std::fabs(x1 - float(h.outW)) < 1.5f &&
+               std::fabs(y1 - float(layoutH)) < 1.5f;
     }
     std::mutex hudMutex_;
     std::unordered_set<uint64_t> sceneTargets_, hudLayers_;
@@ -6367,8 +6397,12 @@ void main() {
             const float add = s - 1 + 2 * (o + (s - 1) * vx) / vw;
             scale *= s, offset = offset * s + add;
         };
-        if (mode == 1) fit(t[0], t[2], h.sx, h.x, vp.x, vp.width);
-        fit(t[1], t[3], h.sy, h.y, vp.y, vp.height);
+        if (mode == 3) { // sceneCopy16x9: from the top, the 16:9 layout's height to the picture's
+            fit(t[1], t[3], float(h.outH / (h.outW * 9.0 / 16)), 0, vp.y, vp.height);
+        } else {
+            if (mode == 1) fit(t[0], t[2], h.sx, h.x, vp.x, vp.width);
+            fit(t[1], t[3], h.sy, h.y, vp.y, vp.height);
+        }
         std::memcpy(&vs.data[gcn::data::kPosTransform], t, sizeof t);
     }
 
@@ -6410,7 +6444,7 @@ void main() {
             const float w = h.outW * h.sx, margin = w * 0.06f;
             x0 = std::max<int32_t>(0, int32_t(std::floor(h.x - margin)));
             x1 = std::min<int32_t>(int32_t(width), int32_t(std::ceil(h.x + w + margin)));
-        } else if (hudMode && !whole) {
+        } else if ((hudMode == 1 || hudMode == 2) && !whole) {
             if (hudMode == 1) x0 = int32_t(std::floor(h.x + x0 * h.sx)), x1 = int32_t(std::ceil(h.x + x1 * h.sx));
             y0 = int32_t(std::floor(h.y + y0 * h.sy)), y1 = int32_t(std::ceil(h.y + y1 * h.sy));
             x1 = std::min<int32_t>(x1, int32_t(width)), y1 = std::min<int32_t>(y1, int32_t(height));
