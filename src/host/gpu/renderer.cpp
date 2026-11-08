@@ -5972,7 +5972,7 @@ void main() {
             if (R().prof_.on) ++R().prof_.fastRes[why];
             return miss(kFastResources);
         }
-        // Aspect Ratio: HUD shading drawn wider than the HUD (see hudDraw) takes a full draw.
+        // Aspect Ratio: a HUD backdrop drawn across the whole picture (see hudWide) takes a full draw.
         if ((f.hud == 1 || f.hud == 2) && (hudWide(a.vs, a.psm ? &a.ps : nullptr, d) ? 2 : 1) != f.hud)
             return miss(kFastResources);
         // The scene copy laid out 16:9 (sceneCopy16x9) is told apart by its vertices: a full draw.
@@ -6193,12 +6193,12 @@ void main() {
             if (const char* e = getenv("LPN_HUD_STRETCH"); e && std::strcmp(e, "0") != 0) return k;
             k.on = true;
             k.aspect = double(k.outW) / k.outH;
-            // The game lays the HUD out at the picture's width, 16:9 and from the top: at 21:9 it runs
-            // past the bottom (the minimap was cut off). That 16:9 layout is scaled into the largest
-            // 16:9 rectangle in the middle, alike in x and y.
-            const double scale = std::min(1.0, k.outH * 16.0 / 9 / k.outW);
-            const double w = k.outW * scale, h = k.outW * 9.0 / 16 * scale;
-            k.sx = k.sy = float(scale);
+            // The game lays the HUD out over the whole picture (1280x720 stretched to it), into its
+            // HUD buffer, and copies that to the display as 16:9 at the picture's width, from the top
+            // (sceneCopy16x9, fitted to the picture since). The layout is squeezed into the largest
+            // 16:9 rectangle in the middle.
+            const double w = std::min<double>(k.outW, k.outH * 16.0 / 9), h = std::min<double>(k.outH, k.outW * 9.0 / 16);
+            k.sx = float(w / k.outW), k.sy = float(h / k.outH);
             k.x = float((k.outW - w) / 2), k.y = float((k.outH - h) / 2);
             std::fprintf(stderr, "[hud] HUD drawn %.0fx%.0f at %.0f,%.0f of the %ux%u picture\n", w, h, k.x, k.y, k.outW, k.outH);
             return k;
@@ -6230,8 +6230,8 @@ void main() {
     // display buffers' draws sample that no draw with a depth buffer renders into (the scene's
     // targets have those). Draws into it, and into the display buffers, are HUD but for the ones
     // sampling a picture-shaped render target (the scene being copied in, post-processing).
-    // 0: drawn as it is, 1: the HUD (into the 16:9 rectangle), 2: HUD shading wider than the HUD
-    // (stretched across the whole picture, only its height fitted).
+    // 0: drawn as it is, 1: the HUD (into the 16:9 rectangle), 2: a HUD backdrop (hudWide:
+    // stretched across the whole picture, only its height fitted), 3: sceneCopy16x9.
     uint8_t hudDraw(const DrawRegs& r, bool hasDepth, const gcn::Program& vs, const gcn::Program* ps, const DrawCall& d,
                     uint32_t prim, uint32_t width, uint32_t height) {
         const Hud& h = hud();
@@ -6289,7 +6289,7 @@ void main() {
                              frame_, target, display ? " (display)" : "", layer ? " (HUD buffer)" : "",
                              hasDepth ? " with depth" : "", vsAddr, psAddr, prim, d.count, r.ctx[reg::kPaClVteCntl],
                              mode == 3   ? "scene copy laid out 16:9, height fitted"
-                             : mode == 2 ? "HUD shading, full width"
+                             : mode == 2 ? "HUD backdrop, full width"
                              : isHud     ? "HUD, 16:9 in the middle"
                                          : "full picture",
                              samples.empty() ? "" : ("; samples" + samples).c_str());
@@ -6297,15 +6297,12 @@ void main() {
         }
         return mode;
     }
-    // An untextured HUD draw reaching past both sides of the HUD's layout: the game's vignette and
-    // its top and bottom shading, which squeezed into 16:9 left a band at the sides (21:9).
-    static bool hudWide(const gcn::Program& vs, const gcn::Program* ps, const DrawCall& d) {
+    // A HUD draw covering the HUD's whole layout from side to side: the game's vignette, its top and
+    // bottom shading, the pause screen's dimming, the title's backdrop. Squeezed into 16:9 they left
+    // bands at the sides (21:9); they are stretched across the whole picture instead.
+    static bool hudWide(const gcn::Program& vs, const gcn::Program*, const DrawCall& d) {
         if (d.count > 256 || vs.buffers.empty()) return false;
-        for (const gcn::Program* p : {&vs, ps})
-            if (p)
-                for (const auto& t : p->images)
-                    if (!t.storage) return false;
-        // The layout's width, from the draw data's (2/w, -2/h, -1, 1).
+        // The layout's width, from the draw data's (2/w, -2/h, -1, 1); else the game's 1280x720.
         auto at = [&](size_t i) {
             float v;
             std::memcpy(&v, &vs.data[i], 4);
@@ -6317,7 +6314,7 @@ void main() {
                 layoutW = 2 / at(i);
                 break;
             }
-        if (layoutW < 256) return false;
+        if (layoutW < 256) layoutW = 1280;
         const auto& b = vs.buffers[0]; // the positions (x, y first)
         const uint32_t n = b.numRecords(), stride = b.stride();
         if (!b.known || stride < 8 || !n || n > 256) return false;
@@ -6330,7 +6327,7 @@ void main() {
             if (!std::isfinite(x)) return false;
             lo = std::min(lo, x), hi = std::max(hi, x);
         }
-        return lo < 0.5f && hi > layoutW - 0.5f && hi - lo < 4 * layoutW;
+        return lo < 2.5f && hi > layoutW - 2.5f && hi - lo < 4 * layoutW;
     }
     // A copy of the scene laid out as 16:9 at the picture's width, from the top: one rectangle
     // (RECTLIST) from (0, 0) to (W, W * 9 / 16) in pixels. The pause screen's background is drawn
