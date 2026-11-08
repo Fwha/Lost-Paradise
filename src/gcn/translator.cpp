@@ -700,8 +700,15 @@ vec3 cubeDir(vec3 c) {
         switch (op) {
         // VOP2
         case 256: { // v_cndmask_b32
+            // VOP3 input modifiers apply to the selected bits (compilers write a select between x
+            // and -x as one v_cndmask with neg on the second source: atan2's sign fix-up).
+            auto mod = [&](std::string v, uint32_t bit) {
+                if (abs & bit) v = "(" + v + " & 0x7fffffffu)";
+                if (neg & bit) v = "(" + v + " ^ 0x80000000u)";
+                return v;
+            };
             const std::string mask = vop3 ? src(s2) : sreg(kVcc);
-            ures("(" + mask + " & 1u) != 0u ? " + b + " : " + a);
+            ures("(" + mask + " & 1u) != 0u ? " + mod(b, 2) + " : " + mod(a, 1));
             break;
         }
         case 257: writeS(dst, a); break; // v_readlane_b32 (lane-local)
