@@ -17,6 +17,7 @@ IoCounters& io();
 bool on();
 double seconds(); // since the host started
 void nameThread(const char* name); // shown in the [cpu] lines; 15 characters at most
+void lowerThreadPriority(); // the calling thread yields to the game's (background work)
 // Keeps the calling thread (and threads it starts) off the core set aside for the recorder
 // (see nameThread); every thread but the recorder starts so, from main.
 void avoidRecorderCore();

@@ -17,6 +17,7 @@
 #else
 #include <dirent.h>
 #include <sched.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -367,6 +368,14 @@ void nameThread(const char* name) {
     if (!cores().on) return;
     if (!std::strcmp(name, "lpn-record")) sched_setaffinity(0, sizeof(cpu_set_t), &cores().recorder);
     else avoidRecorderCore(); // also for threads the recorder starts (they inherit its CPU)
+#endif
+}
+
+void lowerThreadPriority() {
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#else
+    setpriority(PRIO_PROCESS, id_t(syscall(SYS_gettid)), 10); // a thread's own nice value on Linux
 #endif
 }
 
