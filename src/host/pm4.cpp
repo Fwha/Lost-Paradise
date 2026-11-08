@@ -4,7 +4,6 @@
 #include "host/profile.h"
 
 #include <atomic>
-#include <bit>
 #include <chrono>
 #include <cstdarg>
 #include <condition_variable>
@@ -40,28 +39,11 @@ std::atomic<uint64_t> gFrame{0};
 const uint64_t gTraceFrame = getenv("LPN_PM4_TRACE") ? std::strtoull(getenv("LPN_PM4_TRACE"), nullptr, 0) : ~0ull;
 std::vector<DrawListener*> gListeners;
 
-// Occlusion queries. Gnm brackets the tested draws with PIXEL_PIPE_STAT_DUMP events (0x39) that
-// write each depth block's 64-bit z-pass count, bit 63 marking it written, to a begin and an end
-// slot 16 bytes apart per block; PIXEL_PIPE_STAT_CONTROL (0x38) before them enables the blocks
-// (8 on a base PS4, 16 on Pro). Samples are not counted: block 0's counter advances by 64 for
-// every draw, so a query that wrapped any draw reads as visible and an empty one as hidden.
-// Unanswered, the counts never got their bit 63, so the game never saw a result.
-uint64_t gZPassCount = 0;   // the recorder thread's
-uint32_t gQueryBlocks = 8;  // depth blocks enabled by the last PIXEL_PIPE_STAT_CONTROL
-
-void zPassDump(uint64_t addr) {
-    auto* dst = reinterpret_cast<volatile uint64_t*>(addr);
-    for (uint32_t i = 0; i < gQueryBlocks; ++i) dst[2 * i] = (1ull << 63) | (i == 0 ? gZPassCount : 0);
-    for (DrawListener* l : gListeners) l->onMemoryWrite(addr, uint64_t(gQueryBlocks) * 16 - 8);
-    for (DrawListener* l : gListeners) l->onCpWrite(addr, uint64_t(gQueryBlocks) * 16 - 8);
-}
-
 void draw(const DrawCall& d, Pm4Stats* st) {
     if (tDry) {
         for (DrawListener* l : gListeners) l->onAnalyzeDraw(d, *tRegs);
         return;
     }
-    if (d.kind < DrawCall::kDispatch) gZPassCount += 64;
     (d.kind >= DrawCall::kDispatch ? st->dispatches : st->draws)++;
     for (DrawListener* l : gListeners) {
         if (inlineAnalysis()) {
@@ -319,13 +301,6 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
                 if (gFrame == gTraceFrame)
                     std::fprintf(stderr, "[pm4] event 0x%x%s 0x%x%08x\n", b[0] & 0x3F, count >= 2 ? " addr" : "",
                                  count >= 2 ? b[2] : 0, count >= 2 ? b[1] : 0);
-                if (tDry) break;
-                if ((b[0] & 0x3F) == 0x38 && count >= 2) { // PIXEL_PIPE_STAT_CONTROL: enabled blocks from bit 11
-                    const uint32_t n = uint32_t(std::popcount((b[1] >> 11) & 0xFFFFu));
-                    gQueryBlocks = n ? n : 8;
-                } else if ((b[0] & 0x3F) == 0x39 && count >= 2) { // PIXEL_PIPE_STAT_DUMP
-                    zPassDump(address(b[1] & ~7u, b[2]));
-                }
                 break;
             case kOpIndirectBuffer:
             case kOpIndirectBufferConst:
