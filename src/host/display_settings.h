@@ -6,6 +6,7 @@
 #include "common/settings_file.h"
 
 #include <cstdint>
+#include <string>
 
 namespace host {
 
@@ -27,6 +28,8 @@ void activeRenderResolution(uint32_t* width, uint32_t* height);
 // the HUD (what goes into the display buffers but the full-screen scene) in the largest 16:9
 // rectangle in the middle of it. LPN_HUD_STRETCH=1 leaves it stretched to the whole picture.
 bool hudLayout(uint32_t* outWidth, uint32_t* outHeight);
+// F12: the game's live cameras (class, projection scales, field of view) into a text file.
+void logCameras(const std::string& path);
 
 // The game's frame clock (0xd9ee40) steps the world by a fixed 1/60 s a frame in some scenes
 // (1/30 in cutscenes, 1/20 while loading, 1/60 through flag bit 2 in the title's menus) and by

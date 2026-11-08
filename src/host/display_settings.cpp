@@ -19,6 +19,9 @@
 #include "host/mman.h"
 #include "common/compat.h"
 #include <unistd.h>
+#ifdef __linux__
+#include <fcntl.h>
+#endif
 
 namespace host {
 
@@ -51,7 +54,8 @@ namespace {
 constexpr uint32_t kAspectFloats[] = {
     0xfb87b4,  // 0x11b48d: projection builder
     0xfc2d18,  // 0x19482a, 0x194bb1: projection builders (one passes it to 0x2358e0)
-    0xfc3260,  // 0x1ae54f: aspect handed to 0x194250
+    0xfc2cf8,  // 0x194240: aspect handed to 0x194250 by the base camera update (most camera classes)
+    0xfc3260,  // 0x1ae54f: aspect handed to 0x194250 by the update the other camera classes override it with
     0xfd1708,  // 0x28bf03: horizontal field of view from the vertical one
     0xfd5914,  // 0x2d2328: aspect argument of 0xe66a60
     0x108937c, // 0x771518: aspect argument of 0xe66a60
@@ -96,7 +100,13 @@ bool patchAspect(uint8_t* text, float aspect) {
 
 } // namespace
 
+namespace {
+const uint8_t* gEbootBase = nullptr;
+size_t gEbootSize = 0;
+} // namespace
+
 bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height) {
+    gEbootBase = eboot.base(), gEbootSize = eboot.size();
     if (!width || !height) return true;
     // The eboot's display setup (0x55d5e0, given argc/argv) stores the render width and height
     // (0x239d5ec/ee) and the output size (0x239d5f0/f2) as 16-bit values: 1600x896 on a base
@@ -172,6 +182,68 @@ bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height) {
     std::fprintf(stderr, "[display] rendering at %ux%u (output %ux%u)%s\n", width, height, sized ? width : 1920,
                  sized ? height : 1080, wide ? ", 3D view widened to match, HUD kept 16:9" : "");
     return true;
+}
+
+// The game's cameras keep their projection at +0x170 as rows (x, 0, 0, 0) and (0, y, 0, 0), with
+// the vertical field of view at +0xac and the update the camera classes override at vtable +0x1d0
+// (0x194240 or 0x1ae520 for most). Every live one is listed: which class draws a scene.
+void logCameras(const std::string& path) {
+#ifdef __linux__
+    if (!gEbootBase) return;
+    std::FILE* maps = std::fopen("/proc/self/maps", "r");
+    std::FILE* out = std::fopen(path.c_str(), "w");
+    const int mem = ::open("/proc/self/mem", O_RDONLY);
+    if (!maps || !out || mem < 0) {
+        if (maps) std::fclose(maps);
+        if (out) std::fclose(out);
+        if (mem >= 0) ::close(mem);
+        return;
+    }
+    std::vector<uint8_t> buf(1 << 20);
+    const uintptr_t lo = uintptr_t(gEbootBase), hi = lo + gEbootSize;
+    auto inEboot = [&](uint64_t v) { return v >= lo && v < hi; };
+    std::fprintf(out, "object vtable update x y y/x fov(deg)\n");
+    char line[512];
+    int found = 0;
+    while (std::fgets(line, sizeof line, maps) && found < 200) {
+        unsigned long start, end;
+        char perms[8] = {};
+        if (std::sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) continue;
+        if (perms[0] != 'r' || perms[1] != 'w' || std::strstr(line, "[stack") || std::strstr(line, "[vvar")) continue;
+        if (end - start > (16ull << 30)) continue;
+        // Read through /proc/self/mem: some mappings fault when touched (SIGBUS past a shared
+        // file's end), which a read there turns into an error instead.
+        constexpr size_t kChunk = 1 << 20;
+        for (uintptr_t c = start; c < end && found < 200; c += kChunk) {
+            const size_t len = std::min<size_t>(kChunk, end - c);
+            if (::pread(mem, buf.data(), len, off_t(c)) != ssize_t(len)) // page by page, zeros where unreadable
+                for (size_t pg = 0; pg < len; pg += 4096)
+                    if (::pread(mem, buf.data() + pg, 4096, off_t(c + pg)) != 4096) std::memset(buf.data() + pg, 0, 4096);
+            for (size_t i = 0x170; i + 32 <= len && found < 200; i += 16) {
+                const float* f = reinterpret_cast<const float*>(buf.data() + i);
+                if (!(f[0] > 0.05f && f[0] < 20 && f[5] > 0.05f && f[5] < 20)) continue;
+                if (f[1] != 0 || f[2] != 0 || f[3] != 0 || f[4] != 0 || f[6] != 0 || f[7] != 0) continue;
+                uint64_t vt, first, update;
+                float fov;
+                std::memcpy(&vt, buf.data() + i - 0x170, 8);
+                std::memcpy(&fov, buf.data() + i - 0x170 + 0xac, 4);
+                if (!inEboot(vt) || vt + 0x1d8 > hi) continue;
+                if (::pread(mem, &first, 8, off_t(vt)) != 8 || ::pread(mem, &update, 8, off_t(vt + 0x1d0)) != 8) continue;
+                if (!inEboot(first) || !inEboot(update)) continue;
+                std::fprintf(out, "%#lx %#lx %#lx %.4f %.4f %.4f %.2f\n", (unsigned long)(c + i - 0x170),
+                             (unsigned long)(vt - lo), (unsigned long)(update - lo), f[0], f[5], f[5] / f[0],
+                             fov * 57.29578f);
+                ++found;
+            }
+        }
+    }
+    ::close(mem);
+    std::fclose(maps);
+    std::fclose(out);
+    std::fprintf(stderr, "[capture] %d cameras -> %s\n", found, path.c_str());
+#else
+    (void)path;
+#endif
 }
 
 bool hudLayout(uint32_t* outWidth, uint32_t* outHeight) {

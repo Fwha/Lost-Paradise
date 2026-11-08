@@ -159,6 +159,7 @@ void showFrame(Shown& s) {
         std::filesystem::create_directories(dir, ec);
         writeScreenshot(frame, dir + "/screenshot.ppm");
         std::fprintf(stderr, "[capture] flip %" PRIu64 " -> %s (tracing the next frame)\n", n, dir.c_str());
+        logCameras(dir + "/cameras.txt");
         render::captureNextFrame(dir);
     }
     static const uint64_t shotsFrom = getenv("LPN_SCREENSHOTS_FROM") ? std::strtoull(getenv("LPN_SCREENSHOTS_FROM"), nullptr, 0) : 0;
