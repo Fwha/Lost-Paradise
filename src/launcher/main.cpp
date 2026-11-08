@@ -415,13 +415,21 @@ void padHints(int x, int y, const char* backLabel) {
 
 std::string gStatus; // why Play cannot start, or a launch error
 
-// Play stays pressable while only the game is missing: pressing it looks again (tryPlay).
+// Play stays pressable while only the game is missing: pressing it looks again (tryPlay), and
+// opens the no-game dialog when there is still none.
 bool canPlay() { return !gHost.empty() && !gNids.empty(); }
 
+constexpr const char* kNoGame = "No game in the '/game' folder, please place your game in the '/game' folder";
+bool gNoGameDialog = false; // shown on Play with an empty game folder
+const Box kDialog{kW / 2 - 280, kH / 2 - 120, 560, 240};
+const Box kDialogOk{kW / 2 - 90, kDialog.y + kDialog.h - 72, 180, 48};
+
+// The game folder, for showing where it is.
+std::string gameFolderPath() { return (gInstall / host::kGameFolder).string(); }
+
 void refreshStatus() {
-    if (gGameDir.empty())
-        gStatus = "Game not found. Please place in the game folder then press Play";
-    else if (gHost.empty()) gStatus = "lpn-host not found beside the launcher";
+    // A missing game has its own notice in the middle of the main screen (drawNoGame).
+    if (gHost.empty()) gStatus = "lpn-host not found beside the launcher";
     else if (gNids.empty()) gStatus = "aerolib.csv not found (scripts/fetch-nids.sh)";
     else gStatus.clear();
 }
@@ -561,6 +569,40 @@ bool isPkg(const std::string& p) {
     return ext == ".pkg";
 }
 
+// The main screen's notice while game/ holds no game: there is no art behind it then.
+void drawNoGame() {
+    const int w = 620, x = (kW - w) / 2, y = 150;
+    color(10, 8, 6, 225);
+    fillR(x, y, w, 160, 12);
+    color(ui::kAccent.line);
+    outlineR(x, y, w, 160, 12, 1);
+    color(245, 240, 228);
+    textCentered(kW / 2, y + 24, 26, "No game found", true);
+    int ty = y + 66;
+    for (const std::string& l : wrap(kNoGame, 18, w - 56)) textCentered(kW / 2, ty, 18, l), ty += 25;
+    color(200, 192, 176);
+    textCentered(kW / 2, y + 160 - 34, 15, font::fit(gameFolderPath(), 15, w - 56));
+}
+
+// The dialog Play opens with an empty game folder, over whichever screen is drawn.
+void drawNoGameDialog() {
+    SDL_SetRenderDrawBlendMode(gRen, SDL_BLENDMODE_BLEND);
+    color(0, 0, 0, 170);
+    fill(0, 0, kW, kH);
+    const Box& d = kDialog;
+    color(10, 8, 6, 245);
+    fillR(d.x, d.y, d.w, d.h, 12);
+    color(ui::kAccent.line);
+    outlineR(d.x, d.y, d.w, d.h, 12, 1);
+    color(245, 240, 228);
+    text(d.x + 28, d.y + 22, 24, "No game found", true);
+    int y = d.y + 64;
+    for (const std::string& l : wrap(kNoGame, 18, d.w - 56)) text(d.x + 28, y, 18, l), y += 25;
+    color(200, 192, 176);
+    text(d.x + 28, y + 6, 15, font::fit(gameFolderPath(), 15, d.w - 56));
+    button(kDialogOk, "OK", true, true);
+}
+
 void drawMain(int focus) {
     drawBackground(false);
     button(kPlay, "Play", focus == 0, true, canPlay());
@@ -591,6 +633,7 @@ void drawMain(int focus) {
         }
         status = (step.empty() ? std::string("Working") : step) + ": " + std::to_string(total ? int(done * 100 / total) : 0) + "%";
     }
+    if (gGameDir.empty() && gUnpack->state != Unpack::Working) drawNoGame();
     if (!status.empty()) {
         color(245, 240, 228, 220);
         const std::string s = font::fit(status, 17, kGear.x - 16 - 380);
@@ -854,6 +897,7 @@ int main(int argc, char** argv) {
     if (shot && !std::strncmp(shot, "tools:", 6)) screen = Tools, focus = 0, shot += 6;
     if (shot && !std::strncmp(shot, "versions:", 9))
         screen = Versions, focus = 0, shot += 9, gVersions = host::findGames(gInstall.string());
+    if (shot && !std::strncmp(shot, "nogame:", 7)) gNoGameDialog = true, focus = 0, shot += 7;
     if (const char* p = std::getenv("LPN_LAUNCHER_UNPACK"); p && *p) screen = Tools, focus = 0, startJob(p, false, 0);
     auto versionCount = [] { return std::min<int>(int(gVersions.size()), kMaxVersions); };
     auto toolButton = [&](int b) {
@@ -865,7 +909,10 @@ int main(int argc, char** argv) {
     };
     // Play: straight in with one game version, else the version screen.
     auto play_ = [&]() -> bool {
-        if (!tryPlay()) return false;
+        if (!tryPlay()) {
+            if (gGameDir.empty() && canPlay()) gNoGameDialog = true;
+            return false;
+        }
         gVersions = host::findGames(gInstall.string());
         if (gVersions.size() < 2) return true;
         screen = Versions, focus = 0;
@@ -918,12 +965,26 @@ int main(int argc, char** argv) {
                 host::readSettings(host::kSettingsFile, gS);
             }
             else if (e.type == SDL_CONTROLLERDEVICEADDED && !pad) pad = SDL_GameControllerOpen(e.cdevice.which);
+            else if (gNoGameDialog && e.type != SDL_DROPFILE) {
+                // The dialog takes the input until it is closed: OK, Enter, Escape, A or B.
+                if (e.type == SDL_MOUSEBUTTONDOWN && (e.button.button == SDL_BUTTON_RIGHT || kDialogOk.in(e.button.x, e.button.y)))
+                    gNoGameDialog = false;
+                else if (e.type == SDL_KEYDOWN) {
+                    const SDL_Keycode k = e.key.keysym.sym;
+                    if (k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_SPACE || k == SDLK_ESCAPE || k == SDLK_BACKSPACE)
+                        gNoGameDialog = false;
+                } else if (e.type == SDL_CONTROLLERBUTTONDOWN) {
+                    const int b = e.cbutton.button;
+                    if (b == SDL_CONTROLLER_BUTTON_A || b == SDL_CONTROLLER_BUTTON_B || b == SDL_CONTROLLER_BUTTON_START)
+                        gNoGameDialog = false;
+                }
+            }
             else if (e.type == SDL_DROPFILE) {
                 const std::string path = e.drop.file;
                 SDL_free(e.drop.file);
                 std::error_code ec;
                 const bool dir = fs::is_directory(path, ec);
-                if ((isPkg(path) || dir) && !unpackBusy()) screen = Tools, focus = dir ? 2 : 0, startJob(path, dir, dir ? 2 : 0);
+                if ((isPkg(path) || dir) && !unpackBusy()) gNoGameDialog = false, screen = Tools, focus = dir ? 2 : 0, startJob(path, dir, dir ? 2 : 0);
             }
             else if (e.type == SDL_MOUSEMOTION) {
                 const int x = e.motion.x, y = e.motion.y;
@@ -1022,6 +1083,7 @@ int main(int argc, char** argv) {
         else if (screen == Tools) drawTools(focus);
         else if (screen == Versions) drawVersions(focus);
         else drawMain(focus);
+        if (gNoGameDialog) drawNoGameDialog();
         if (shot) {
             // Read back what was drawn and save it, then quit (for screenshots in docs and tests).
             SDL_Surface* s = SDL_CreateRGBSurfaceWithFormat(0, kW, kH, 32, SDL_PIXELFORMAT_ARGB8888);
