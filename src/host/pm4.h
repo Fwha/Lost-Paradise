@@ -46,6 +46,9 @@ class DrawListener {
 public:
     virtual ~DrawListener() = default;
     virtual void onDraw(const DrawCall& draw, const GpuRegs& regs) = 0;
+    // A draw through the geometry shader pipeline (export, geometry and copy shaders), which is
+    // not rendered yet: it gets this instead of onDraw (and no analysis).
+    virtual void onGeometryShaderDraw(const DrawCall&, const GpuRegs&) {}
     virtual void onSubmitEnd() {} // a submission's command buffers have all been processed
     virtual void onFrameEnd() {}
     // Runs `fn` once the GPU work handed over so far has finished, for fences and interrupts

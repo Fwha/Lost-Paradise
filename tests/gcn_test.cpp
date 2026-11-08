@@ -164,6 +164,7 @@ int main() {
         0xd8d48055, 0x03000000, // ds_swizzle_b32 v3, v0 offset0:85 offset1:128 (lane 1 of each quad)
         0xd2ec0a02, 0x02020300, // v_mad_u64_u32 v[2:3], s[10:11], v0, v1, 0
         0x7e081c84,             // v_cvt_off_f32_i4 v4, 4
+        0xd2000006, 0x41aa0f07, // v_cndmask_b32 v6, v7, -v7, vcc (a gauge shader's atan2 sign)
         0xbf810000,             // s_endpgm
     };
     gcn::LaunchState ml = l;
@@ -175,6 +176,7 @@ int main() {
     const gcn::Translation mt = gcn::translate(gcn::analyze(ml, readMisc), 0);
     if (!mt.warnings.empty() || mt.glsl.find("subgroupQuadBroadcast(v0, 1u)") == std::string::npos ||
         mt.glsl.find("umulExtended(v0, v1") == std::string::npos ||
+        mt.glsl.find("(vcc_lo & 1u) != 0u ? (v7 ^ 0x80000000u) : v7") == std::string::npos ||
         gcn::compileGlsl(mt.glsl, gcn::GlslStage::Fragment, &error).empty()) {
         std::fprintf(stderr, "lane/wide ops: %zu warnings (%s)\n%s\n%s\n", mt.warnings.size(),
                      mt.warnings.empty() ? "" : mt.warnings[0].c_str(), error.c_str(), mt.glsl.c_str());

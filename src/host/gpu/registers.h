@@ -46,6 +46,7 @@ constexpr uint32_t kSpiShaderPgmLoPs = 0x08, kSpiShaderPgmRsrc1Ps = 0x0A, kSpiSh
 constexpr uint32_t kSpiShaderPgmLoVs = 0x48, kSpiShaderPgmRsrc1Vs = 0x4A, kSpiShaderUserDataVs = 0x4C;
 constexpr uint32_t kSpiShaderPgmLoGs = 0x88, kSpiShaderPgmLoEs = 0xC8, kSpiShaderPgmLoHs = 0x108,
                    kSpiShaderPgmLoLs = 0x148;
+constexpr uint32_t kSpiShaderUserDataGs = 0x8C, kSpiShaderUserDataEs = 0xCC;
 constexpr uint32_t kComputeNumThreadX = 0x207, kComputePgmLo = 0x20C, kComputePgmRsrc1 = 0x212,
                    kComputeUserData = 0x240;
 } // namespace sh
@@ -63,6 +64,10 @@ constexpr uint32_t kCbBlend0Control = 0x1E0;
 constexpr uint32_t kDbDepthControl = 0x200, kCbColorControl = 0x202, kDbShaderControl = 0x203;
 constexpr uint32_t kPaSuScModeCntl = 0x205, kPaClVsOutCntl = 0x207;
 constexpr uint32_t kVgtShaderStagesEn = 0x2D5;
+// Geometry shader pipeline.
+constexpr uint32_t kVgtGsMode = 0x290, kVgtGsvsRingOffset1 = 0x298, kVgtGsOutPrimType = 0x29B,
+                   kVgtEsgsRingItemsize = 0x2AB, kVgtGsvsRingItemsize = 0x2AC, kVgtGsMaxVertOut = 0x2CE,
+                   kVgtGsVertItemsize = 0x2D7, kVgtGsInstanceCnt = 0x2E4, kVgtStrmoutConfig = 0x2E5;
 constexpr uint32_t kIaMultiVgtParam = 0x2AA;
 constexpr uint32_t kCbColor0Base = 0x318; // 15 regs per render target, 8 targets
 constexpr uint32_t kCbColorStride = 0xF;

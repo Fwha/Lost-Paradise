@@ -111,6 +111,12 @@ struct PsStageRegisters {
 struct CsStageRegisters {
     uint32_t pgmLo, pgmHi, rsrc1, rsrc2, numThreadX, numThreadY, numThreadZ;
 };
+struct EsStageRegisters {
+    uint32_t pgmLo, pgmHi, rsrc1, rsrc2;
+};
+struct GsStageRegisters {
+    uint32_t pgmLo, pgmHi, rsrc1, rsrc2, strmoutConfig, outPrimType, instanceCnt;
+};
 
 // A fetch-shader modifier replaces the VGPR/SGPR counts in RSRC1.
 uint32_t applyModifier(uint32_t rsrc1, uint32_t modifier) {
@@ -130,6 +136,32 @@ int32_t sceGnmSetVsShader(uint32_t* cmd, uint32_t size, const VsStageRegisters* 
 }
 int32_t sceGnmUpdateVsShader(uint32_t* cmd, uint32_t size, const VsStageRegisters* vs, uint32_t modifier) {
     return sceGnmSetVsShader(cmd, size, vs, modifier);
+}
+
+// The export shader (ES) of a geometry shader pipeline: a vertex shader writing the ES-GS ring.
+int32_t sceGnmSetEsShader(uint32_t* cmd, uint32_t size, const EsStageRegisters* es, uint32_t modifier) {
+    Writer w(cmd, size);
+    if (es) {
+        w.sh(sh::kSpiShaderPgmLoEs, es->pgmLo, es->pgmHi);
+        w.sh(sh::kSpiShaderPgmLoEs + 2, applyModifier(es->rsrc1, modifier), es->rsrc2);
+    }
+    return w.finish(__func__);
+}
+// The geometry shader (GS): reads the ES-GS ring, writes the GS-VS ring that the copy shader (a
+// VS, set with sceGnmSetVsShader) turns into vertices.
+int32_t sceGnmSetGsShader(uint32_t* cmd, uint32_t size, const GsStageRegisters* gs) {
+    Writer w(cmd, size);
+    if (gs) {
+        w.sh(sh::kSpiShaderPgmLoGs, gs->pgmLo, gs->pgmHi);
+        w.sh(sh::kSpiShaderPgmLoGs + 2, gs->rsrc1, gs->rsrc2);
+        w.ctx(ctx::kVgtStrmoutConfig, gs->strmoutConfig);
+        w.ctx(ctx::kVgtGsOutPrimType, gs->outPrimType);
+        w.ctx(ctx::kVgtGsInstanceCnt, gs->instanceCnt);
+    }
+    return w.finish(__func__);
+}
+int32_t sceGnmUpdateGsShader(uint32_t* cmd, uint32_t size, const GsStageRegisters* gs) {
+    return sceGnmSetGsShader(cmd, size, gs);
 }
 
 int32_t sceGnmSetPsShader350(uint32_t* cmd, uint32_t size, const PsStageRegisters* ps) {
@@ -191,6 +223,9 @@ void registerGnmPacketHle() {
     HLE(g, sceGnmDispatchIndirect);
     HLE(g, sceGnmSetVsShader);
     HLE(g, sceGnmUpdateVsShader);
+    HLE(g, sceGnmSetEsShader);
+    HLE(g, sceGnmSetGsShader);
+    HLE(g, sceGnmUpdateGsShader);
     HLE(g, sceGnmSetPsShader350);
     HLE(g, sceGnmUpdatePsShader350);
     HLE(g, sceGnmSetCsShaderWithModifier);
