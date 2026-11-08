@@ -108,7 +108,7 @@ one is downloaded over it and started; a build from source is told to pull and r
 
 The **gear** (bottom right) opens **Tools**:
 - **Unpack a .pkg** extracts a PS4 package into the game folder as `game/<title ID>`. Pick it with
-  the desktop's file chooser (zenity or kdialog) or drop it on the window.
+  the desktop's file chooser or drop it on the window.
 - **Apply an update or DLC**, from a .pkg or from a folder that is already unpacked, adds it to the
   game with the same title ID. An update makes a new version, `game/<title ID>-v<version>`: a copy
   of the game made of hard links (no extra room for the files the update leaves alone) with the
@@ -116,12 +116,6 @@ The **gear** (bottom right) opens **Tools**:
   `game/<title ID>-DLC/<label>` (lpn-host does not load DLC yet).
 
 With more than one version in `game/`, **Play** asks which one to start.
-
-Packages: fake PKGs (fpkg, made with the homebrew tools' published keys) work; a retail PKG is
-refused, as its files are encrypted with keys only a PS4 has. Nothing already in `game/` is
-written over. The same from a terminal: `build/src/pkg/lpn-pkg info|extract|install <file.pkg>` and
-`lpn-pkg apply <folder>`. The extractor (`src/pkg`) is written from the format's documentation, with
-no code from GPL tools such as shadPS4's old extractor.
 
 ### launch.sh
 
