@@ -2743,7 +2743,8 @@ private:
         VkPipelineLayout layout = VK_NULL_HANDLE;
         std::shared_ptr<BuiltPipeline> out;
         std::string record; // appended to pipelines.list once built, unless it came from there
-        bool prebuild = false; // from pipelines.list: vs and ps are its own, destroyed after
+        bool prebuild = false; // from pipelines.list: vs and ps are shared, held by keep
+        std::shared_ptr<void> keep; // a startup build's shader modules, destroyed with the last job using them
     };
     static constexpr uint32_t kRecordVersion = 1;
 
@@ -2910,6 +2911,7 @@ private:
                     PipelineJob j = std::move(*it);
                     q->erase(it);
                     jobs_.push_front(std::move(j));
+                    buildCv_.notify_one(); // workers that skip startup builds were not woken for it
                     return;
                 }
     }
@@ -2922,14 +2924,19 @@ private:
         }
         if (syncPipelines_) return;
         const unsigned n = std::clamp(std::thread::hardware_concurrency() >= 8 ? std::thread::hardware_concurrency() - 4 : 2u, 2u, 16u);
+        // The startup builds (thousands, every run) on every worker took the CPU from the game for
+        // the first minute or so, slow even with every pipeline in the driver's cache: only a
+        // quarter of the workers take them, at a lower priority. Draws' pipelines go to any worker.
+        const unsigned background = std::max(1u, n / 4);
         for (unsigned i = 0; i < n; ++i)
-            std::thread([this] {
+            std::thread([this, takesBackground = i < background] {
                 profile::nameThread("lpn-pipeline");
+                if (takesBackground) profile::lowerThreadPriority();
                 for (;;) {
                     PipelineJob j;
                     {
                         std::unique_lock lock(buildMutex_);
-                        buildCv_.wait(lock, [&] { return !jobs_.empty() || !backgroundJobs_.empty(); });
+                        buildCv_.wait(lock, [&] { return !jobs_.empty() || (takesBackground && !backgroundJobs_.empty()); });
                         auto& q = jobs_.empty() ? backgroundJobs_ : jobs_;
                         j = std::move(q.front());
                         q.pop_front();
@@ -2950,7 +2957,9 @@ private:
             // hurry()); the startup builds after all of them.
             (urgent ? jobs_ : backgroundJobs_).push_back(std::move(j));
         }
-        buildCv_.notify_one();
+        // notify_one could wake a worker that skips startup builds and leave them waiting.
+        if (urgent) buildCv_.notify_one();
+        else buildCv_.notify_all();
     }
 
     void runJob(PipelineJob& j) {
@@ -2960,8 +2969,8 @@ private:
         j.out->ready.notify_all();
         ++newPipelines_;
         if (j.prebuild) {
-            vkDestroyShaderModule(vk_.device, j.vs, nullptr);
-            if (j.ps) vkDestroyShaderModule(vk_.device, j.ps, nullptr);
+            j.keep.reset();
+            if (prebuildLeft_.fetch_sub(1) == 1) reportPrebuildDone();
         } else if (j.out->pipeline && pipelineList_) {
             std::lock_guard lock(listMutex_);
             const uint32_t n = uint32_t(j.record.size());
@@ -2982,9 +2991,30 @@ private:
         return vkCreateShaderModule(vk_.device, &ci, nullptr, &m) == VK_SUCCESS ? m : VK_NULL_HANDLE;
     }
 
+    void reportPrebuildDone() {
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - prebuildStart_).count();
+        std::fprintf(stderr, "[gpu] startup builds done: %zu pipelines in %.1f s\n", prebuildCount_, s);
+    }
+    std::atomic<size_t> prebuildLeft_{1}; // startup builds not done, plus 1 while they are being queued
+    size_t prebuildCount_ = 0;
+    std::chrono::steady_clock::time_point prebuildStart_;
+
     // Queues every pipeline in pipelines.list (newest first) for the workers.
     void prebuildPipelines() {
         profile::nameThread("lpn-prebuild");
+        profile::lowerThreadPriority();
+        prebuildStart_ = std::chrono::steady_clock::now();
+        // Each shader's module once, shared by its pipelines (one per pipeline read and created
+        // ~16000 modules for ~8000 pipelines, 11 s into the run before the last was queued).
+        std::unordered_map<std::string, std::shared_ptr<VkShaderModule_T>> modules;
+        auto shared = [&](const std::string& name) -> std::shared_ptr<VkShaderModule_T> {
+            if (name.empty()) return nullptr;
+            auto [it, fresh] = modules.try_emplace(name);
+            if (fresh)
+                if (VkShaderModule m = loadModule(name))
+                    it->second = std::shared_ptr<VkShaderModule_T>(m, [dev = vk_.device](VkShaderModule m) { vkDestroyShaderModule(dev, m, nullptr); });
+            return it->second;
+        };
         std::vector<std::string> records;
         if (FILE* f = std::fopen(pipelineListPath_.c_str(), "rb")) {
             uint32_t n;
@@ -3016,30 +3046,30 @@ private:
             PipelineJob j;
             j.state = s;
             j.prebuild = true;
-            j.vs = loadModule(vsName);
-            j.ps = loadModule(psName);
-            if (!j.vs || (!psName.empty() && !j.ps)) {
-                if (j.vs) vkDestroyShaderModule(vk_.device, j.vs, nullptr);
-                if (j.ps) vkDestroyShaderModule(vk_.device, j.ps, nullptr);
-                continue;
-            }
+            auto vs = shared(vsName), ps = shared(psName);
+            if (!vs || (!psName.empty() && !ps)) continue;
+            j.vs = vs.get();
+            j.ps = ps.get();
+            j.keep = std::make_shared<std::pair<decltype(vs), decltype(ps)>>(std::move(vs), std::move(ps));
             j.layout = layout(bindings).pipeline;
             j.geom = geometryFor(s);
             {
                 std::lock_guard lock(buildMutex_);
                 auto& slot = built_[*r];
-                if (slot) { // a draw got there first
-                    vkDestroyShaderModule(vk_.device, j.vs, nullptr);
-                    if (j.ps) vkDestroyShaderModule(vk_.device, j.ps, nullptr);
-                    continue;
-                }
+                if (slot) continue; // a draw got there first
                 slot = j.out = std::make_shared<BuiltPipeline>();
             }
+            ++prebuildLeft_;
             queueJob(std::move(j), false);
             ++queued;
         }
-        std::fprintf(stderr, "[gpu] building %zu pipelines from earlier runs (%zu shaders translated again)\n", queued,
-                     retranslated_);
+        modules.clear(); // each module now lives as long as its last job
+        prebuildCount_ = queued;
+        std::fprintf(stderr, "[gpu] building %zu pipelines from earlier runs (%zu shaders translated again, queued in %.1f s)\n",
+                     queued, retranslated_,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - prebuildStart_).count());
+        if (prebuildLeft_.fetch_sub(1) == 1 && queued) reportPrebuildDone(); // the workers finished them all already
+
         // Keep the list from growing without bound, and its shader names current: rewrite it
         // without duplicates, with today's names.
         if (records.size() > seen.size() + 1024 || renamed) {
