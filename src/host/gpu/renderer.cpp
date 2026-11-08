@@ -5820,6 +5820,7 @@ void main() {
             return miss(2);
         for (VkImage im : f.sampled) // sampling what a draw since has rendered to needs a new pass
             if (std::find(R().drawWritten_.begin(), R().drawWritten_.end(), im) != R().drawWritten_.end()) return miss(3);
+        if (!sameHudMode(f, d, a)) return miss(3);
         uint32_t moved, vsImages = 0, psImages = 0;
         ImageBinding vsImg[32], psImg[32];
         uint32_t psMoved = 0;
@@ -5921,6 +5922,15 @@ void main() {
         ++R().prof_.fastSwitches;
         return true;
     }
+    // Aspect Ratio: whether a draw taking a kept draw's state (fastDraw, switchDraw) is mapped as that
+    // one was (hudDraw's mode): its position transform comes along. The title menu's text, on the
+    // backdrop's shaders, was drawn across the whole picture now and then.
+    bool sameHudMode(const FastDraw& f, const DrawCall& d, const DrawAnalysis& a) {
+        if (!hud().on) return true;
+        if ((f.hud == 3) != (d.count == 3 && sceneCopy16x9(a.vs))) return false;
+        if (f.hud == 1 || f.hud == 2) return (hudWide(a.vs, a.psm ? &a.ps : nullptr, d) ? 2 : 1) == f.hud;
+        return true;
+    }
     bool fastDraw(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a, bool prevMergeable) {
         const FastDraw& f = R().fast_;
         auto miss = [&](FastMiss why) {
@@ -5972,11 +5982,7 @@ void main() {
             if (R().prof_.on) ++R().prof_.fastRes[why];
             return miss(kFastResources);
         }
-        // Aspect Ratio: a HUD backdrop drawn across the whole picture (see hudWide) takes a full draw.
-        if ((f.hud == 1 || f.hud == 2) && (hudWide(a.vs, a.psm ? &a.ps : nullptr, d) ? 2 : 1) != f.hud)
-            return miss(kFastResources);
-        // The scene copy laid out 16:9 (sceneCopy16x9) is told apart by its vertices: a full draw.
-        if (hud().on && (f.hud == 3) != (d.count == 3 && sceneCopy16x9(a.vs))) return miss(kFastResources);
+        if (!sameHudMode(f, d, a)) return miss(kFastResources);
         VkBuffer indexBuffer = VK_NULL_HANDLE;
         VkDeviceSize indexOffset = 0;
         if (d.kind == DrawCall::kIndexed) {
