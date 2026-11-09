@@ -95,6 +95,25 @@ build/src/host/lpn-host /path/to/CUSA12776 --nids aerolib.csv
 
 `--data DIR` changes the save folder; `lpn-host` with no arguments lists every option.
 
+### Mods
+
+Put mods in a `mods` folder in the install folder (the launcher makes it). Each folder in `mods`
+is one mod, laid out like the game folder; its files are opened instead of the game's:
+
+```
+Lost Paradise/
+  mods/
+    Red Kenshiro/data/2dpar/sprite_e.par     replaces game/CUSA12776/data/2dpar/sprite_e.par
+    20-HD Desert/data/stage/...
+    _Old Mod/...                             off: the name starts with _ (or .)
+```
+
+Files laid out right in `mods` (`mods/data/...`) work too. When two mods replace the same file,
+the one whose folder name sorts last wins, so number them to set the order. Mods replace whole
+files (a texture inside a `.par` needs the whole `.par`). The log lists the mods found at start,
+and `--trace-files` names the mod each file came from; `--no-mods` plays without them and
+`--mods DIR` reads another folder.
+
 ### Launcher
 
 `scripts/make-appimage.sh "<install folder>"` packs the launcher, `lpn-host` and `aerolib.csv` into

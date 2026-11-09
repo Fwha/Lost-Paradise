@@ -6,6 +6,7 @@
 #include "host/profile.h"
 
 #include "common/compat.h"
+#include "common/mods.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -28,6 +29,18 @@ namespace {
 
 namespace fs = std::filesystem;
 
+ModIndex gMods; // filled by loadMods before the game starts, read only after
+
+// The mod's copy of an /app0 file (rel: the path after /app0), else empty.
+std::string modFile(const std::string& rel) {
+    std::string m = gMods.find(rel);
+    if (!m.empty() && process().traceFiles) {
+        const Mod* mod = gMods.modOf(m);
+        std::fprintf(stderr, "[mods] /app0%s from %s\n", rel.c_str(), mod && !mod->name.empty() ? mod->name.c_str() : "mods/");
+    }
+    return m;
+}
+
 std::string hostPath(const char* guest) {
     const std::string p = guest ? guest : "";
     auto mount = [&](const char* prefix, const std::string& root) -> std::string {
@@ -36,7 +49,10 @@ std::string hostPath(const char* guest) {
         return root + p.substr(n);
     };
     const Process& pr = process();
-    if (auto h = mount("/app0", pr.gameDir); !h.empty()) return buttonIconFile(h);
+    if (auto h = mount("/app0", pr.gameDir); !h.empty()) {
+        if (std::string m = modFile(p.substr(5)); !m.empty()) return buttonIconFile(m);
+        return buttonIconFile(h);
+    }
     if (!pr.saveDir.empty())
         if (auto h = mount("/savedata0", pr.saveDir); !h.empty()) return h;
     for (const char* m : {"/download0", "/savedata0", "/temp0", "/data"})
@@ -263,6 +279,19 @@ int32_t sceKernelCheckReachability(const char* path) {
 }
 
 } // namespace
+
+std::string gameFile(const std::string& rel) {
+    std::string m = gMods.find(rel);
+    return m.empty() ? process().gameDir + "/" + rel : m;
+}
+
+void loadMods(const std::string& modsDir) {
+    gMods.scan(modsDir);
+    if (gMods.mods().empty()) return;
+    std::fprintf(stderr, "[mods] %zu files replaced by %zu mods in %s:\n", gMods.size(), gMods.mods().size(), modsDir.c_str());
+    for (const Mod& m : gMods.mods())
+        std::fprintf(stderr, "[mods]   %s (%zu files)\n", m.name.empty() ? "loose files in mods/" : m.name.c_str(), m.files);
+}
 
 void registerFileHle() {
     const char* k = "libkernel";

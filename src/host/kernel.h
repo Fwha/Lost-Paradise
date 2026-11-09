@@ -48,6 +48,10 @@ void registerKernelHle();
 void registerMemoryHle();
 void registerPthreadHle();
 void registerFileHle();
+// Reads the mods folder (common/mods.h): /app0 files a mod holds open the mod's copy.
+void loadMods(const std::string& modsDir);
+// The host file for rel, a path in the game folder ("data/2dpar/sprite_e.par"): a mod's copy, else the game's.
+std::string gameFile(const std::string& rel);
 void registerGnmHle();
 void registerServicesHle();
 

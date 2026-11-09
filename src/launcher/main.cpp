@@ -8,6 +8,7 @@
 // The gear at the bottom right opens Tools: unpacking a PS4 .pkg into the game folder (pkg/pkg.h),
 // picked with the desktop's file chooser (zenity or kdialog) or dropped on the window.
 #include "common/game_dir.h"
+#include "common/mods.h"
 #include "common/settings_file.h"
 #include "common/ui_palette.h"
 #include "host/menu_font.h"
@@ -93,9 +94,10 @@ std::string firstExisting(std::initializer_list<fs::path> paths) {
 }
 
 void findFiles() {
-    // The game folder is made for the player to put the dump in.
+    // The game folder is made for the player to put the dump in, the mods folder for mods.
     std::error_code ec;
     fs::create_directories(gInstall / host::kGameFolder, ec);
+    fs::create_directories(gInstall / host::kModsFolder, ec);
     gGameDir = host::findGameDir(gInstall.string());
     // In the AppImage: usr/bin/lpn-launcher, lpn-host beside it and usr/share/lost-paradise.
     // In a build tree: build/src/launcher, build/src/host and the repo's aerolib.csv.
