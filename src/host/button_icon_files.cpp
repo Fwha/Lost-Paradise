@@ -358,21 +358,7 @@ std::vector<uint8_t> patchArchive(const std::vector<uint8_t>& par, PadStyle styl
         }
     }
     if (changed.empty()) return {};
-    std::vector<uint8_t> out = par; // ar views par, which stays as it is
-    const uint32_t fileTable = be32(par, 0x1C);
-    for (auto& [k, data] : changed) {
-        out.resize((out.size() + 0x7FF) & ~size_t(0x7FF), 0); // the archives keep files 2 KiB aligned
-        const uint64_t off = out.size();
-        out.insert(out.end(), data.begin(), data.end());
-        const size_t e = fileTable + 32 * k;
-        putBe32(out, e, be32(out, e) & ~0x80000000u); // not compressed
-        putBe32(out, e + 4, uint32_t(data.size()));
-        putBe32(out, e + 8, uint32_t(data.size()));
-        putBe32(out, e + 12, uint32_t(off));
-        putBe32(out, e + 20, uint32_t(off >> 32));
-    }
-    out.resize((out.size() + 0x7FF) & ~size_t(0x7FF), 0);
-    return out;
+    return formats::replaceParFiles(par, changed);
 }
 
 const char* styleKey(PadStyle s) { return s == PadStyle::Xbox ? "xbox" : s == PadStyle::Switch ? "switch" : "playstation"; }

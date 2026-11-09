@@ -17,9 +17,21 @@ std::string modKey(const std::string& rel) {
     return s;
 }
 
+namespace {
+
+// Where the first folder named *.par ends in key (the '/' after it), else npos.
+size_t archiveEnd(const std::string& key) {
+    for (size_t slash = key.find('/'); slash != std::string::npos; slash = key.find('/', slash + 1))
+        if (slash >= 4 && key.compare(slash - 4, 4, ".par") == 0) return slash;
+    return std::string::npos;
+}
+
+} // namespace
+
 void ModIndex::scan(const std::string& modsDir) {
     mods_.clear();
     files_.clear();
+    patches_.clear();
     std::error_code ec;
     if (!fs::is_directory(modsDir, ec)) return;
 
@@ -55,7 +67,10 @@ void ModIndex::scan(const std::string& modsDir) {
             if (!it->is_regular_file(ec)) continue;
             const std::string key = modKey(p.lexically_relative(root).generic_string());
             if (key.empty()) continue;
-            files_[key] = p.string();
+            // In a folder named like an archive (x.par/...): a file to change inside x.par.
+            const size_t a = archiveEnd(key);
+            if (a != std::string::npos) patches_[key.substr(0, a)][key.substr(a + 1)] = p.string();
+            else files_[key] = p.string();
             ++m.files;
         }
         ec.clear();
@@ -67,6 +82,12 @@ std::string ModIndex::find(const std::string& rel) const {
     if (files_.empty()) return {};
     auto it = files_.find(modKey(rel));
     return it == files_.end() ? std::string() : it->second;
+}
+
+const ModIndex::Patches* ModIndex::patches(const std::string& rel) const {
+    if (patches_.empty()) return nullptr;
+    auto it = patches_.find(modKey(rel));
+    return it == patches_.end() ? nullptr : &it->second;
 }
 
 const Mod* ModIndex::modOf(const std::string& hostPath) const {

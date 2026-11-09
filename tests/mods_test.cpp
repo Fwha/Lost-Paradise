@@ -49,6 +49,10 @@ int main() {
     put(mods / "data/stage/desert.par");          // loose
     put(mods / "data/chara/kenshiro.gmd");        // loose, beaten by 10-low
     put(mods / "readme.txt");                     // not a game folder: ignored
+    put(mods / "10-low" / "data/2dpar/ui_e.par/2d_jm_btn.dds");
+    put(mods / "10-low" / "data/2dpar/ui_e.par/inner.par/x.dds");
+    put(mods / "20-high" / "data/2dpar/UI_E.par/2d_jm_btn.dds");
+    put(mods / "20-high" / "data/2dpar/ui_e.par/2d_jm_qte.dds");
 
     host::ModIndex ix;
     ix.scan(mods.string());
@@ -57,6 +61,19 @@ int main() {
     CHECK_EQ(ix.mods()[1].name, std::string("10-low"));
     CHECK_EQ(ix.mods()[2].name, std::string("20-high"));
     CHECK_EQ(ix.size(), size_t(3));
+    CHECK_EQ(ix.archives(), size_t(1));
+
+    // Changes inside an archive: per file, the last mod wins; different files all apply.
+    const host::ModIndex::Patches* pt = ix.patches("/data/2dpar/ui_e.par");
+    CHECK_EQ(pt != nullptr, true);
+    if (pt) {
+        CHECK_EQ(pt->size(), size_t(3));
+        CHECK_EQ(pt->count("2d_jm_btn.dds") && same(pt->at("2d_jm_btn.dds"), mods / "20-high" / "data/2dpar/UI_E.par/2d_jm_btn.dds"), true);
+        CHECK_EQ(pt->count("2d_jm_qte.dds"), size_t(1));
+        CHECK_EQ(pt->count("inner.par/x.dds"), size_t(1));
+    }
+    CHECK_EQ(ix.find("/data/2dpar/ui_e.par"), std::string()); // not a whole-file replacement
+    CHECK_EQ(ix.patches("/data/2dpar/sprite_e.par") == nullptr, true);
 
     // The last mod by name wins, paths match in any case and with a leading / or dots.
     CHECK_EQ(same(ix.find("/data/2dpar/sprite_e.par"), (mods / "20-high" / "Data/2dpar/Sprite_E.par")), true);
