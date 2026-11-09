@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -64,5 +65,16 @@ private:
     std::vector<ParFolder> folders_;
     std::vector<ParFile> files_;
 };
+
+// A copy of par with files replaced (by index into files()): each new file stored, uncompressed,
+// at the end, 2 KiB aligned as the archives keep them, and its entry pointed there.
+std::vector<uint8_t> replaceParFiles(std::span<const uint8_t> par,
+                                     const std::vector<std::pair<size_t, std::vector<uint8_t>>>& changed);
+
+// A copy of par with files changed: changes maps a file's path in the archive, in lower case,
+// to its new contents; "inner.par/x.dds" changes a file inside the archive inner.par in par.
+// Empty when nothing changed. unmatched gets the paths of changes no file in par has.
+std::vector<uint8_t> patchPar(std::span<const uint8_t> par, const std::map<std::string, std::vector<uint8_t>>& changes,
+                              std::vector<std::string>* unmatched, std::string* error);
 
 } // namespace formats

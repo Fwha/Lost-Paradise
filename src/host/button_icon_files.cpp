@@ -358,21 +358,7 @@ std::vector<uint8_t> patchArchive(const std::vector<uint8_t>& par, PadStyle styl
         }
     }
     if (changed.empty()) return {};
-    std::vector<uint8_t> out = par; // ar views par, which stays as it is
-    const uint32_t fileTable = be32(par, 0x1C);
-    for (auto& [k, data] : changed) {
-        out.resize((out.size() + 0x7FF) & ~size_t(0x7FF), 0); // the archives keep files 2 KiB aligned
-        const uint64_t off = out.size();
-        out.insert(out.end(), data.begin(), data.end());
-        const size_t e = fileTable + 32 * k;
-        putBe32(out, e, be32(out, e) & ~0x80000000u); // not compressed
-        putBe32(out, e + 4, uint32_t(data.size()));
-        putBe32(out, e + 8, uint32_t(data.size()));
-        putBe32(out, e + 12, uint32_t(off));
-        putBe32(out, e + 20, uint32_t(off >> 32));
-    }
-    out.resize((out.size() + 0x7FF) & ~size_t(0x7FF), 0);
-    return out;
+    return formats::replaceParFiles(par, changed);
 }
 
 const char* styleKey(PadStyle s) { return s == PadStyle::Xbox ? "xbox" : s == PadStyle::Switch ? "switch" : "playstation"; }
@@ -399,7 +385,14 @@ std::string buttonIconFile(const std::string& path) {
 
     std::error_code ec;
     const fs::path dir = fs::path(process().dataDir) / "button-icons" / (std::string(styleKey(style)) + "-v" + std::to_string(kVersion));
-    const fs::path copy = dir / fs::path(path).filename();
+    // A mod's archive (common/mods.h) gets a copy of its own, named after where it is.
+    std::string name = fs::path(path).filename().string();
+    if (path.compare(0, process().gameDir.size(), process().gameDir) != 0) {
+        char tag[24];
+        std::snprintf(tag, sizeof(tag), "mod-%016llx-", (unsigned long long)std::hash<std::string>{}(path));
+        name = tag + name;
+    }
+    const fs::path copy = dir / name;
     const auto srcTime = fs::last_write_time(path, ec);
     if (!ec && fs::exists(copy, ec) && fs::last_write_time(copy, ec) >= srcTime && !ec) return result = copy.string();
 

@@ -442,7 +442,7 @@ SDL_Texture* buttonSheet(SDL_Renderer* ren) {
     }
     if (gButtonsTried) return gButtons;
     gButtonsTried = true;
-    const std::string path = process().gameDir + "/data/2dpar/sprite_e.par";
+    const std::string path = gameFile("/data/2dpar/sprite_e.par");
     std::ifstream in(path, std::ios::binary);
     std::vector<uint8_t> par(std::istreambuf_iterator<char>(in), {});
     std::string err;

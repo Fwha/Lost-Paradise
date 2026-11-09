@@ -36,7 +36,10 @@ std::string hostPath(const char* guest) {
         return root + p.substr(n);
     };
     const Process& pr = process();
-    if (auto h = mount("/app0", pr.gameDir); !h.empty()) return buttonIconFile(h);
+    if (auto h = mount("/app0", pr.gameDir); !h.empty()) {
+        if (std::string m = modFile(p.substr(5)); !m.empty()) return buttonIconFile(m);
+        return buttonIconFile(h);
+    }
     if (!pr.saveDir.empty())
         if (auto h = mount("/savedata0", pr.saveDir); !h.empty()) return h;
     for (const char* m : {"/download0", "/savedata0", "/temp0", "/data"})

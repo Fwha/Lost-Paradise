@@ -5,6 +5,7 @@
 // bound to our C++ implementations, or to a logging stub until one exists.
 #include "host/guest_abi.h"
 #include "common/game_dir.h"
+#include "common/mods.h"
 #include "host/crash.h"
 #include "host/display_settings.h"
 #include "host/input_history.h"
@@ -60,6 +61,8 @@ int usage() {
                  "  --vblank HZ    display refresh rate (default 59.94; uncapped: the monitor's)\n"
                  "  --fps-cap N    show at most N frames a second, at even intervals (default: the F11 menu's; 0: uncapped)\n"
                  "  --data DIR     host folder for saves and downloads (default ./lpn-data)\n"
+                 "  --mods DIR     folder of mods, replacement game files (default ./mods)\n"
+                 "  --no-mods      play without mods\n"
                  "  --trace-hle N  log each system call's first use, and its first use after frame N\n"
                  "  --strict       stop at the first call to an unimplemented import\n"
                  "  --log-limit N  log the first N calls to each unimplemented import (default 3)\n"
@@ -85,12 +88,14 @@ int main(int argc, char** argv) {
 #endif
     host::profile::avoidRecorderCore(); // inherited by every thread started from here
     host::profile::start();
-    std::string gameDir, nidPath, dataDir = "lpn-data";
+    std::string gameDir, nidPath, dataDir = "lpn-data", modsDir = host::kModsFolder;
     bool listUnimplemented = false, headless = false, gpu = true, computeOnly = false;
     double fpsCap = -1; // -1: the F11 menu's
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--nids") && i + 1 < argc) nidPath = argv[++i];
         else if (!std::strcmp(argv[i], "--data") && i + 1 < argc) dataDir = argv[++i];
+        else if (!std::strcmp(argv[i], "--mods") && i + 1 < argc) modsDir = argv[++i];
+        else if (!std::strcmp(argv[i], "--no-mods")) modsDir.clear();
         else if (!std::strcmp(argv[i], "--strict")) host::hleOptions().abortOnUnimplemented = true;
         else if (!std::strcmp(argv[i], "--trace-hle") && i + 1 < argc) {
             host::hleOptions().traceHle = true;
@@ -162,6 +167,7 @@ int main(int argc, char** argv) {
     host::process().gameDir = fs::absolute(gameDir).string();
     host::process().dataDir = fs::absolute(dataDir).string();
     host::process().titleId = host::gameTitleId(gameDir);
+    if (!modsDir.empty()) host::loadMods(fs::absolute(modsDir).lexically_normal().string());
     host::prepareSaveFolder();
     host::installCrashHandler();
     host::registerBuiltinHle();

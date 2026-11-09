@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -64,8 +65,7 @@ void testSllzKnownStream() {
 }
 
 // Build an archive: root "." with file "a.txt" (raw) and folder "sub" holding "b.bin" (SLLZ).
-std::vector<uint8_t> buildPar() {
-    const auto a = bytesOf("hello");
+std::vector<uint8_t> buildPar(const std::vector<uint8_t>& a = bytesOf("hello")) {
     const auto bPlain = bytesOf(std::string(100, 'x'));
     const auto b = formats::sllzCompress(bPlain);
 
@@ -132,6 +132,46 @@ void testPar() {
     CHECK(!formats::ParArchive::parse(truncated, &err));
 }
 
+std::vector<uint8_t> fileOf(const formats::ParArchive& ar, const std::string& path) {
+    std::vector<uint8_t> out;
+    std::string err;
+    for (const auto& f : ar.files())
+        if (f.path == path) ar.read(f, out, &err);
+    return out;
+}
+
+// Mods' changes inside an archive, and inside the archive in it (a.txt holds one here).
+void testPatchPar() {
+    const auto outer = buildPar(buildPar());
+    const std::map<std::string, std::vector<uint8_t>> changes = {
+        {"sub/b.bin", bytesOf("new b")},
+        {"a.txt/a.txt", bytesOf("HI")},
+        {"a.txt/nope", bytesOf("y")},
+        {"missing.dds", bytesOf("x")},
+    };
+    std::vector<std::string> unmatched;
+    std::string err;
+    const auto out = formats::patchPar(outer, changes, &unmatched, &err);
+    CHECK(!out.empty());
+    CHECK(out.size() % 0x800 == 0);
+    CHECK((unmatched == std::vector<std::string>{"a.txt/nope", "missing.dds"}));
+    auto ar = formats::ParArchive::parse(out, &err);
+    CHECK(ar.has_value());
+    if (!ar) return;
+    CHECK(fileOf(*ar, "sub/b.bin") == bytesOf("new b"));
+    CHECK(!ar->files()[1].compressed);
+    const auto innerBytes = fileOf(*ar, "a.txt");
+    auto inner = formats::ParArchive::parse(innerBytes, &err);
+    CHECK(inner.has_value());
+    if (!inner) return;
+    CHECK(fileOf(*inner, "a.txt") == bytesOf("HI"));
+    CHECK(fileOf(*inner, "sub/b.bin") == bytesOf(std::string(100, 'x')));
+
+    unmatched.clear();
+    CHECK(formats::patchPar(outer, {{"other", bytesOf("z")}}, &unmatched, &err).empty());
+    CHECK(unmatched.size() == 1);
+}
+
 void testGmdVertexLayout() {
     // The three layouts seen in Kenshiro's model, with their declared strides.
     auto a = formats::gmdVertexLayout(0x41fe0ffc3ull, nullptr);
@@ -181,6 +221,7 @@ int main() {
     testSllzRoundTrip();
     testSllzKnownStream();
     testPar();
+    testPatchPar();
     testGmdVertexLayout();
     testGmtSampling();
     testSkeletonMath();

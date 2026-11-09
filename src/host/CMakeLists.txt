@@ -10,6 +10,7 @@ add_executable(lpn-host
     hle_memory.cpp
     hle_pthread.cpp
     hle_file.cpp
+    mod_files.cpp
     hle_videoout.cpp
     hle_gnm.cpp
     hle_gnm_packets.cpp
