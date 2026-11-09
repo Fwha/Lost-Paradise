@@ -2,6 +2,7 @@
 
 #include "common/mods.h"
 
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -21,8 +22,14 @@ int failures = 0;
         }                                                                                           \
     } while (0)
 
-// Same file, whatever the separators (Windows' iterator gives \\, the test writes /).
-bool same(const std::string& a, const fs::path& b) { return !a.empty() && fs::path(a).lexically_normal() == b.lexically_normal(); }
+// Same file, whatever the separators (Windows' iterator gives \\, the test writes /) and, as
+// Windows' folders are not case sensitive (Data/ and data/ are one there), the case.
+std::string lowered(const fs::path& p) {
+    std::string s = p.lexically_normal().generic_string();
+    for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+bool same(const std::string& a, const fs::path& b) { return !a.empty() && lowered(a) == lowered(b); }
 
 void put(const fs::path& p) {
     fs::create_directories(p.parent_path());
