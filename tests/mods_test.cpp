@@ -21,6 +21,9 @@ int failures = 0;
         }                                                                                           \
     } while (0)
 
+// Same file, whatever the separators (Windows' iterator gives \\, the test writes /).
+bool same(const std::string& a, const fs::path& b) { return !a.empty() && fs::path(a).lexically_normal() == b.lexically_normal(); }
+
 void put(const fs::path& p) {
     fs::create_directories(p.parent_path());
     std::ofstream(p) << p.string();
@@ -56,10 +59,10 @@ int main() {
     CHECK_EQ(ix.size(), size_t(3));
 
     // The last mod by name wins, paths match in any case and with a leading / or dots.
-    CHECK_EQ(ix.find("/data/2dpar/sprite_e.par"), (mods / "20-high" / "Data/2dpar/Sprite_E.par").string());
-    CHECK_EQ(ix.find("data/./x/../2dpar/SPRITE_E.PAR"), (mods / "20-high" / "Data/2dpar/Sprite_E.par").string());
-    CHECK_EQ(ix.find("/data/chara/kenshiro.gmd"), (mods / "10-low" / "data/chara/kenshiro.gmd").string());
-    CHECK_EQ(ix.find("/data/stage/desert.par"), (mods / "data/stage/desert.par").string());
+    CHECK_EQ(same(ix.find("/data/2dpar/sprite_e.par"), (mods / "20-high" / "Data/2dpar/Sprite_E.par")), true);
+    CHECK_EQ(same(ix.find("data/./x/../2dpar/SPRITE_E.PAR"), (mods / "20-high" / "Data/2dpar/Sprite_E.par")), true);
+    CHECK_EQ(same(ix.find("/data/chara/kenshiro.gmd"), (mods / "10-low" / "data/chara/kenshiro.gmd")), true);
+    CHECK_EQ(same(ix.find("/data/stage/desert.par"), (mods / "data/stage/desert.par")), true);
     CHECK_EQ(ix.find("/data/sound/bgm.at9"), std::string());
     CHECK_EQ(ix.find("/readme.txt"), std::string());
     CHECK_EQ(ix.find("/data/2dpar"), std::string()); // folders are never replaced
