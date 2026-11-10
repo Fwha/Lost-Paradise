@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <cerrno>
+#include <cstdio>
 
 namespace {
 
@@ -31,6 +32,8 @@ int64_t positioned(int fd, void* buf, size_t n, int64_t off, bool write) {
     if (!ok) {
         const DWORD e = GetLastError();
         if (e == ERROR_HANDLE_EOF) return 0;
+        std::fprintf(stderr, "[file] %s of %llu bytes at offset %lld on fd %d failed: Windows error %lu\n",
+                     write ? "WriteFile" : "ReadFile", (unsigned long long)n, (long long)off, fd, e);
         errno = e == ERROR_ACCESS_DENIED ? EACCES : EIO;
         return -1;
     }
