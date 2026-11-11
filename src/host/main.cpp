@@ -6,6 +6,7 @@
 #include "host/guest_abi.h"
 #include "common/game_dir.h"
 #include "common/mods.h"
+#include "host/cpu_compat.h"
 #include "host/crash.h"
 #include "host/display_settings.h"
 #include "host/input_history.h"
@@ -169,6 +170,7 @@ int main(int argc, char** argv) {
     host::process().titleId = host::gameTitleId(gameDir);
     if (!modsDir.empty()) host::loadMods(fs::absolute(modsDir).lexically_normal().string());
     host::prepareSaveFolder();
+    if (!host::checkCpu()) return 1;
     host::installCrashHandler();
     host::registerBuiltinHle();
     host::layoutStaticTls(modules);
@@ -208,6 +210,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    for (auto* m : modules) host::patchMissingInstructions(*m);
     for (auto* m : modules)
         if (!m->protect(&error)) {
             std::fprintf(stderr, "error: %s\n", error.c_str());
@@ -218,6 +221,7 @@ int main(int argc, char** argv) {
     host::startPresenter(headless);
     if (gpu) host::render::startRenderer(computeOnly);
     std::atexit(host::printUnimplementedSummary);
+    std::atexit(host::printCpuCompatSummary);
 
     // Start the bundled libraries the way the PS4 loader does: module_start(0, nullptr).
     for (size_t i = 1; i < modules.size(); ++i) {

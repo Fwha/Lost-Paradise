@@ -1,5 +1,6 @@
 #include "host/crash.h"
 
+#include "host/cpu_compat.h"
 #include "host/hle.h"
 #include "host/linker.h"
 #include "host/module.h"
@@ -79,6 +80,9 @@ bool isFault(DWORD code) {
 
 LONG CALLBACK onException(EXCEPTION_POINTERS* e) {
     const DWORD code = e->ExceptionRecord->ExceptionCode;
+    // An instruction this CPU lacks (host/cpu_compat.h): run it in software and go on.
+    if (code == EXCEPTION_ILLEGAL_INSTRUCTION && emulateIllegalInstruction(e->ContextRecord))
+        return EXCEPTION_CONTINUE_EXECUTION;
     if ((code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) && tGuard) {
         CONTEXT& c = *e->ContextRecord;
         c.Rsp = (c.Rsp & ~uint64_t(15)) - 8; // as if guardResume had been called
@@ -110,6 +114,8 @@ BOOL WINAPI onConsoleCtrl(DWORD type) {
 thread_local sigjmp_buf* tGuard = nullptr; // set while guarded() runs on this thread
 
 void onFatal(int sig, siginfo_t* info, void* ctx) {
+    // An instruction this CPU lacks (host/cpu_compat.h): run it in software and go on.
+    if (sig == SIGILL && emulateIllegalInstruction(ctx)) return;
     if ((sig == SIGSEGV || sig == SIGBUS) && tGuard) {
         // Entered with sig blocked; sigsetjmp(.., 0) does not restore the mask, so unblock it here.
         sigset_t s;

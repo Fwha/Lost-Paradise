@@ -36,6 +36,13 @@ and known issues.
   play time and controller button hints.
 - **Sound and controllers** through SDL.
 
+## CPU
+
+The game's code runs natively, so the CPU needs AVX (Intel Sandy Bridge, AMD Bulldozer or later).
+It was built for the PS4's AMD Jaguar, which also has BMI1, LZCNT, MOVBE and F16C: on CPUs
+without them (Sandy Bridge and Ivy Bridge, Bulldozer and Piledriver) those instructions run in
+software, slower, and the log says so with `[cpu]` lines. No AVX2 is needed.
+
 ## Build
 
 Needs CMake, Ninja, a C++20 compiler, and the Vulkan, glslang, zlib and SDL2 development packages
@@ -167,6 +174,7 @@ Defaults suit most machines. These environment variables override them:
 | `LPN_ANALYSIS_WORKERS` | 6 on 16+ threads, 3 on 8+, else 1 | Threads that analyse shaders and draws. |
 | `LPN_PROFILE=1` | off | Prints per-frame timings. |
 | `LPN_HUD_STRETCH=1` | off | With a 16:10 or 21:9 aspect ratio, stretch the HUD over the whole picture instead of keeping it 16:9. |
+| `LPN_CPU_EMULATE=1` | off | Runs the game's BMI1, LZCNT, MOVBE and F16C instructions in software even on a CPU that has them (see CPU below), to try that path and count how often it is hit (`[cpu] emulated:` at exit). |
 | `LPN_HUD_LOG=1` | off | Logs which draws are treated as HUD (`[hud]` lines), for reporting HUD problems. |
 
 Example: `LPN_RECORD_THREADS=0 ./launch.sh`
