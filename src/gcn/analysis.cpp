@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <bit>
+#include <bitset>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -1167,16 +1168,42 @@ uint32_t fetchSlotsFromCode(const Program& p, uint64_t site) {
 // The image's dimension as the translation declares it (a T# type: 9 2D, 10 3D, 11 cube, 13 2D
 // array, 8/12 1D). From the T# when the analysis resolved one; for an image it could not (code a
 // launch skips, or a shader compiled before any draw) from the code: a cube if the instruction
-// declares an array (DA), else 2D.
+// declares an array (DA) or its third coordinate comes from a v_cubeid face, else 2D.
 uint32_t imageDimension(const Program& p, const ImageResource& im) {
     if (im.t[0] || im.t[1] || im.t[3]) return im.type();
     auto it = p.code.find(im.pc);
     if (it == p.code.end()) return 9;
-    // A cube is sampled with DA set (its face as the array index); 3D images were never seen
-    // bound (lpn-gcn --boot on a play cache: counting address registers took 154 2D images for
-    // 3D, the registers after the address holding other values), so the rest are 2D.
-    const bool da = (it->second.words[0] >> 14) & 1;
-    return da ? 11 : 9;
+    const Instruction& in = it->second;
+    const uint32_t w = in.words[0], vaddr = in.words[1] & 0xFF;
+    if ((w >> 14) & 1) return 11; // DA: an array, which a cube's face is sampled as
+    // Or the address after s, t (past the opcode's own operands before them) holds a value
+    // computed from a v_cubeid face: followed through the 64 instructions before the sample.
+    uint32_t prefix = 0;
+    if (in.op >= 32 && in.op < 96) {
+        const bool sample = in.op < 64;
+        const uint32_t variant = in.op & 15;
+        static const uint8_t sFlags[16] = {0, 8, 2, 10, 4, 1, 9, 16, 32, 40, 34, 42, 36, 33, 41, 48};
+        static const uint8_t gFlags[16] = {0, 8, 4, 1, 9, 16, 32, 40, 36, 33, 41, 48, 0, 0, 0, 0};
+        const uint8_t f = sample ? sFlags[variant] : gFlags[variant];
+        prefix = (sample ? in.op >= 48 : in.op >= 80) + (f & 1) + ((f >> 5) & 1);
+        if (f & 2) prefix += 4; // derivatives: taken as 2D's
+    }
+    auto from = it;
+    for (int n = 0; n < 64 && from != p.code.begin(); ++n) --from;
+    std::bitset<256> face; // VGPRs holding a value derived from a cube face
+    for (auto at = from; at != it; ++at) {
+        const Instruction& x = at->second;
+        const auto [first, count] = vgprWrites(x);
+        if (!count) continue;
+        bool derived = x.format == Format::VOP3 && x.op == 324; // v_cubeid_f32
+        if (!derived && (x.format == Format::VOP1 || x.format == Format::VOP2 || x.format == Format::VOP3))
+            vgprReads(x, [&](uint32_t v) { derived |= v < 256 && face[v]; });
+        for (uint32_t i = 0; i < count && first + i < 256; ++i) face[first + i] = derived;
+    }
+    const uint32_t third = vaddr + prefix + 2;
+    // 3D images were never seen bound (lpn-gcn --boot on a play cache: counting address
+    // registers written took 154 2D images for 3D), so the rest are 2D.
+    return third < 256 && face[third] ? 11 : 9;
 }
 
 uint32_t bufferWords(const Program& p, const BufferResource& b) {

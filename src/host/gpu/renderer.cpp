@@ -2945,6 +2945,7 @@ private:
         std::shared_ptr<BuiltPipeline> out;
         std::string record; // appended to pipelines.list once built, unless it came from there
         bool prebuild = false; // from pipelines.list: vs and ps are shared, held by keep
+        bool forDraw = false;  // queued urgent, counted in drawBuilds_
         std::shared_ptr<void> keep; // a startup build's shader modules, destroyed with the last job using them
         const Layout* lay = nullptr; // for libraries: its stages' layouts
         std::string vsName, psName;  // for libraries: what they are kept by
@@ -3175,6 +3176,7 @@ private:
             std::lock_guard lock(buildMutex_);
             // A draw's pipelines in the order they were asked for (a waiting draw's goes first, see
             // hurry()); the startup builds after all of them.
+            if (urgent) j.forDraw = true, ++drawBuilds_;
             (urgent ? jobs_ : backgroundJobs_).push_back(std::move(j));
         }
         // notify_one could wake a worker that skips startup builds and leave them waiting.
@@ -3187,6 +3189,7 @@ private:
         j.out->started = true;
         j.out->ready.store(true, std::memory_order_release);
         j.out->ready.notify_all();
+        if (j.forDraw) --drawBuilds_;
         ++newPipelines_;
         if (j.prebuild) {
             j.keep.reset();
@@ -3246,6 +3249,12 @@ private:
         if (bytes.size() >= 4 && gcn::deserialize(bytes.substr(4), p)) buildLibraries(p, name);
     }
     std::atomic<size_t> librariesBuilt_{0};
+    std::atomic<int> drawBuilds_{0}; // pipelines draws wait for, queued or building
+    // Background compiles wait while a draw waits for a pipeline: the CPU is the draw's
+    // (with them competing, the new game's first pipelines took 7.4 s instead of 3.1).
+    void yieldToDraws() {
+        while (drawBuilds_.load() > 0) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
 
     // The boot compile: once the title menu has registered the game's shaders in the engine's
     // tables (see the doc), each is analysed without a draw (gcn::analyzeUnbound), translated,
@@ -3321,6 +3330,31 @@ private:
     void bootCompile() {
         profile::nameThread("lpn-boot-compile");
         profile::lowerThreadPriority();
+        while (warmupAll_.load() && !warmupDone_.load()) std::this_thread::sleep_for(std::chrono::milliseconds(100)); // the startup compile's CPU
+        const unsigned n = std::max(1u, std::thread::hardware_concurrency() / 4);
+        // First the libraries of every shader an earlier run saved (most of them registered ones),
+        // in the background rather than behind the progress screen (0.17 s each, uncached).
+        {
+            std::vector<std::string> names;
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(spirvDir_, ec))
+                if (e.path().extension() == ".gcn") names.push_back(e.path().stem().string());
+            const auto start = std::chrono::steady_clock::now();
+            std::atomic<size_t> next{0};
+            std::vector<std::thread> pool;
+            for (unsigned i = 0; i < n; ++i)
+                pool.emplace_back([&] {
+                    profile::lowerThreadPriority();
+                    for (size_t k; (k = next++) < names.size();) {
+                        yieldToDraws();
+                        warmLibraries(currentShader(names[k]));
+                    }
+                });
+            for (auto& t : pool) t.join();
+            if (!names.empty())
+                std::fprintf(stderr, "[gpu] saved shaders' libraries: %zu shaders in %.1f s (%zu built)\n", names.size(),
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), librariesBuilt_.load());
+        }
         // The tables fill while the title menu loads: wait for them to stop growing.
         std::vector<TableShader> shaders;
         for (size_t last = 0, steady = 0; steady < 6;) {
@@ -3333,11 +3367,11 @@ private:
         std::atomic<size_t> next{0}, compiled{0}, failed{0};
         const size_t before = librariesBuilt_.load();
         std::vector<std::thread> pool;
-        const unsigned n = std::max(1u, std::thread::hardware_concurrency() / 2);
         for (unsigned i = 0; i < n; ++i)
             pool.emplace_back([&] {
                 profile::lowerThreadPriority();
                 for (size_t k; (k = next++) < shaders.size();) {
+                    yieldToDraws();
                     gcn::LaunchState l;
                     uint32_t slots;
                     if (!tableLaunch(shaders[k], l, slots)) {
@@ -3487,14 +3521,14 @@ private:
         for (unsigned i = 0; i < n; ++i)
             pool.emplace_back([&] {
                 for (size_t k; (k = next++) < names.size() && !warmupDone_.load();) {
-                    warmLibraries(currentShader(names[k])); // a draw then only links (stage 4)
+                    currentShader(names[k]);
                     ++warmupTranslated_;
                 }
             });
         for (auto& t : pool) t.join();
-        std::fprintf(stderr, "[gpu] startup compile: %zu shaders translated in %.1f s (%zu SPIR-V compiled, %zu renamed, %zu libraries built)\n",
+        std::fprintf(stderr, "[gpu] startup compile: %zu shaders translated in %.1f s (%zu SPIR-V compiled, %zu renamed)\n",
                      names.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - prebuildStart_).count(),
-                     compiled_.load(), retranslated_.load(), librariesBuilt_.load());
+                     compiled_.load(), retranslated_.load());
     }
 
     void prebuildPipelines() {

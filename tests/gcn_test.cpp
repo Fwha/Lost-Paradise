@@ -421,11 +421,11 @@ int main() {
     }
 
     // An image the analysis cannot resolve (no T#) is declared from its code: a sample that
-    // declares an array (DA, as cube samples do) samples a cube; others a 2D image.
+    // declares an array (DA) or whose third address is a v_cubeid face samples a cube; others a 2D image.
     {
         const std::vector<uint32_t> cubeCode = {
             0xd2880007, 0x040a0300, // v_cubeid_f32 v7, v0, v1, v2
-            0xf0804f00, 0x00400005, // image_sample v[0:3], v5, s[0:7], s[8:11] da
+            0xf0800f00, 0x00400005, // image_sample v[0:3], v5, s[0:7], s[8:11] (v7 a cube face)
             0xf0800f00, 0x00400008, // image_sample v[0:3], v8, s[0:7], s[8:11]
             0xbf810000,             // s_endpgm
         };

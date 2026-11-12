@@ -69,13 +69,16 @@ With pipeline libraries on, a background thread (`bootCompile`, `LPN_BOOT_COMPIL
 off) waits for the vertex and pixel shader tables to stop growing (the title menu fills them),
 then per entry builds a launch from the Gnmx registers, analyses it without a draw
 (`gcn::analyzeUnbound`; a vertex shader's fetch slots from its input semantics), translates and
-compiles it, saves its .gcn, and builds its pre-rasterisation or fragment library. A later run's
-startup compile builds the libraries of every saved .gcn, so in play a draw only links. A drawn
+compiles it, saves its .gcn, and builds its pre-rasterisation or fragment library. Before that
+(after the startup compile) it builds the libraries of every .gcn an earlier run saved, so in play
+a draw only links. It runs on a quarter of the cores at low priority and waits while a draw waits
+for a pipeline: built behind the progress screen, 551 libraries held the game 92 s (0.17 s each
+without the driver's cache), and run beside play at full width they tripled the first hitches. A drawn
 shader whose translation still differs from the boot one is logged once
 (`boot compile missed ...`).
 
 Without a T#, an image's dimension comes from its instruction: a cube when it declares an array
-(DA), else 2D. Counting the address registers written before the sample took 154 of the play
+(DA) or its third address derives from a v_cubeid face, else 2D. Counting the address registers written before the sample took 154 of the play
 cache's 2D images for 3D, and no 3D image was ever bound.
 
 ### The shader tables (measured on the user's PC, 2026-11-12)
