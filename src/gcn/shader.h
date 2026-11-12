@@ -147,6 +147,11 @@ std::string serialize(const Program& program);
 // False when `bytes` is damaged or from a build whose structures differ.
 bool deserialize(const std::string& bytes, Program& program);
 
+// Generic translation (on unless LPN_GENERIC_SHADERS=0): analyze() keeps the scalar branches a
+// launch decided as run-time branches and walks the code they skip too, so launches of a shader
+// that differ only in such flags translate alike (docs/shader-precompile.md, stage 1).
+bool genericTranslation();
+
 // `readCode` fetches instructions, `readData` scalar loads.
 Program analyze(const LaunchState& launch, const ReadMemory& readCode, const ReadMemory& readData);
 inline Program analyze(const LaunchState& launch, const ReadMemory& read) { return analyze(launch, read, read); }

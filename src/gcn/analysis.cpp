@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <type_traits>
 
 namespace gcn {
@@ -58,13 +59,42 @@ public:
 
     Program run() {
         p_.data.assign(data::kSmrd, 0);
-        WorkQueue work{Work{p_.launch.entry, start()}};
         p_.labels.insert(p_.launch.entry);
         unsigned steps = 0;
+        {
+            WorkQueue work{Work{p_.launch.entry, start()}};
+            walk(work, steps);
+        }
+        // Generic: the scalar branches this launch decided are kept as branches, and the code
+        // they skip is walked too (with nothing known, so its resources and loads are left
+        // unresolved; this launch never runs them). Every launch then finds the same code, and
+        // the slots are numbered by address, so launches that differ only in such flags (a
+        // vertex shader turning blocks on with bits of a constant) share one translation.
+        if (generic() && steps < 100000) {
+            speculative_ = true;
+            if (!untaken_.empty()) {
+                WorkQueue work{Work{untaken_[0], State{}}};
+                for (size_t i = 1; i < untaken_.size(); ++i) work.push_back({untaken_[i], State{}});
+                walk(work, steps);
+            }
+            speculative_ = false;
+        }
+        if (steps >= 100000) {
+            warn("analysis did not terminate");
+            p_.trace.clear();
+        }
+        if (generic()) canonicalize();
+        return std::move(p_);
+    }
+
+    // LPN_GENERIC_SHADERS=0: translations specialised to the scalar branches each launch takes.
+    static bool generic() { return genericTranslation(); }
+
+    void walk(WorkQueue& work, unsigned& steps) {
         while (!work.empty() && steps < 100000) {
             Work w = std::move(work.front());
             work.pop_front();
-            p_.trace.push_back({w.pc, {}, true, false});
+            if (!speculative_) p_.trace.push_back({w.pc, {}, true, false});
             while (++steps < 100000) {
                 if (p_.code.count(w.pc)) break; // already walked from here
                 // Read only the instruction's own bytes: the page after a shader's last
@@ -84,16 +114,67 @@ public:
                 const uint64_t next = w.pc + in.size;
                 slot_ = ~0u;
                 const bool more = step(in, w.pc, w.st, next, work);
-                if (!more || !inert(in)) p_.trace.push_back({w.pc, in, false, more, slot_});
+                if (!speculative_ && (!more || !inert(in))) p_.trace.push_back({w.pc, in, false, more, slot_});
                 if (!more) break;
                 w.pc = next;
             }
         }
-        if (steps >= 100000) {
-            warn("analysis did not terminate");
-            p_.trace.clear();
+    }
+
+    // Numbers the scalar-load slots and resources by address rather than by the order this
+    // launch's walk met them, so the translation does not depend on which way it went.
+    void canonicalize() {
+        std::map<uint32_t, uint32_t> slotMap; // old data offset -> new
+        std::vector<uint32_t> data(p_.data.begin(), p_.data.begin() + std::min<size_t>(p_.data.size(), data::kSmrd));
+        data.resize(data::kSmrd, 0);
+        auto move = [&](uint32_t from, unsigned n) {
+            const uint32_t to = uint32_t(data.size());
+            for (unsigned i = 0; i < n; ++i) data.push_back(from + i < p_.data.size() ? p_.data[from + i] : 0);
+            slotMap[from] = to;
+            return to;
+        };
+        static const unsigned kCount[] = {1, 2, 4, 8, 16};
+        for (auto& [pc, at] : p_.smrd) { // by address
+            auto it = p_.code.find(pc);
+            const unsigned n = it != p_.code.end() && (it->second.op & 7) <= 4 ? kCount[it->second.op & 7] : 1;
+            at = move(at, n);
         }
-        return std::move(p_);
+        std::vector<uint32_t> bufOrder(p_.buffers.size()), imgOrder(p_.images.size());
+        for (uint32_t i = 0; i < bufOrder.size(); ++i) bufOrder[i] = i;
+        for (uint32_t i = 0; i < imgOrder.size(); ++i) imgOrder[i] = i;
+        std::stable_sort(bufOrder.begin(), bufOrder.end(), [&](uint32_t a, uint32_t b) { return p_.buffers[a].pc < p_.buffers[b].pc; });
+        std::stable_sort(imgOrder.begin(), imgOrder.end(), [&](uint32_t a, uint32_t b) { return p_.images[a].pc < p_.images[b].pc; });
+        std::vector<uint32_t> bufIndex(bufOrder.size()), imgIndex(imgOrder.size()); // old -> new
+        std::vector<BufferResource> buffers;
+        std::vector<ImageResource> images;
+        for (uint32_t i = 0; i < bufOrder.size(); ++i) {
+            bufIndex[bufOrder[i]] = i;
+            buffers.push_back(p_.buffers[bufOrder[i]]);
+            buffers.back().data = move(buffers.back().data, 4);
+        }
+        for (uint32_t i = 0; i < imgOrder.size(); ++i) {
+            imgIndex[imgOrder[i]] = i;
+            images.push_back(p_.images[imgOrder[i]]);
+            images.back().data = move(images.back().data, 4);
+        }
+        for (auto& t : p_.trace) {
+            if (t.start || t.slot == ~0u) continue;
+            switch (t.in.format) {
+            case Format::SMRD:
+                if (auto it = slotMap.find(t.slot); it != slotMap.end()) t.slot = it->second;
+                break;
+            case Format::MUBUF: case Format::MTBUF:
+                if (t.slot < bufIndex.size()) t.slot = bufIndex[t.slot];
+                break;
+            case Format::MIMG:
+                if (t.slot < imgIndex.size()) t.slot = imgIndex[t.slot];
+                break;
+            default: break;
+            }
+        }
+        p_.data = std::move(data);
+        p_.buffers = std::move(buffers);
+        p_.images = std::move(images);
     }
 
     // Re-evaluates prior_'s trace for this launch; false when the walk would differ. With a plan,
@@ -178,7 +259,7 @@ private:
     }
 
     template <typename... A> void warn(const char* fmt, A... a) {
-        if (prior_) return; // a replay reports nothing new
+        if (prior_ || speculative_) return; // a replay reports nothing new; skipped code is unknown by design
         char b[256];
         std::snprintf(b, sizeof b, fmt, a...);
         p_.warnings.emplace_back(b);
@@ -269,7 +350,16 @@ private:
             case 2: branchTo(target, st, work); return false;
             case 4: case 5: // s_cbranch_scc0/1
                 if (st.sccKnown) {
-                    if (st.scc == (in.op == 5)) {
+                    const bool taken = st.scc == (in.op == 5);
+                    if (!prior_ && generic()) { // the other way is kept and walked afterwards
+                        const uint64_t other = taken ? next : target;
+                        label(target);
+                        label(next);
+                        p_.controlFlow = true;
+                        if (speculative_) work.push_back({other, State{}});
+                        else untaken_.push_back(other);
+                    }
+                    if (taken) {
                         branchTo(target, st, work);
                         return false;
                     }
@@ -643,6 +733,8 @@ private:
     const ReadMemory& readData_;
     const Program* prior_; // replaying this program's trace
     bool diverged_ = false;
+    bool speculative_ = false;          // walking code this launch skips (generic())
+    std::vector<uint64_t> untaken_;     // where the scalar branches this launch decided did not go
     uint32_t slot_ = ~0u; // the stepped instruction's TraceStep::slot
     // Kept per thread: a replay runs for every launch, and these would allocate each time.
     static std::vector<bool>& seenStorage(int i) {
@@ -851,6 +943,14 @@ ReplayStats takeReplayStats() {
     return s;
 }
 
+bool genericTranslation() {
+    static const bool on = [] {
+        const char* e = std::getenv("LPN_GENERIC_SHADERS");
+        return !(e && !std::strcmp(e, "0"));
+    }();
+    return on;
+}
+
 Program analyze(const LaunchState& launch, const ReadMemory& readCode, const ReadMemory& readData) {
     return Analyzer(launch, readCode, readData).run();
 }
@@ -961,7 +1061,13 @@ std::string Program::key() const {
         put(&sel, 4);
     }
     for (const auto& i : images) {
-        const uint32_t shape[] = {i.type(), i.dataFormat(), i.numFormat(), i.dstSel(), i.compare, i.storage};
+        // What the translation reads of an image: the data format and a sampled image's swizzle
+        // only matter to the view, so images that differ in them share a translation.
+        const uint32_t nf = i.numFormat();
+        const uint32_t t = i.type();
+        const uint32_t dim = t == 8 || t == 10 || t == 11 || t == 12 || t == 13 ? t : 9u; // the declared dimension
+        const uint32_t shape[] = {dim, nf == 4 || nf == 5 ? nf : 0u, i.storage ? i.dstSel() : 0u, i.compare,
+                                  i.storage, (i.s[0] >> 15) & 1};
         put(shape, sizeof(shape));
     }
     return k;
