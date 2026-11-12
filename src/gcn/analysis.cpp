@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -249,6 +250,12 @@ private:
         const float one = 1.0f;
         std::memcpy(&p_.data[data::kPosTransform], &one, 4);
         std::memcpy(&p_.data[data::kPosTransform + 1], &one, 4);
+        if (p_.launch.stage == Stage::Pixel && genericTranslation()) { // each MRT's swap (translator: outSwizzle)
+            p_.data[data::kColorSwizzle] = p_.data[data::kColorSwizzle + 1] = 0;
+            for (uint32_t m = 0; m < 8; ++m)
+                p_.data[data::kColorSwizzle + m / 4] |=
+                    (std::min<uint32_t>(p_.launch.colorComps[m], 4) * 4 + (p_.launch.colorSwap[m] & 3)) << ((m % 4) * 8);
+        }
         State st;
         const uint32_t user = p_.launch.userSgprs();
         for (uint32_t i = 0; i < user && i < 16; ++i) {
@@ -943,6 +950,84 @@ ReplayStats takeReplayStats() {
     return s;
 }
 
+namespace {
+// The VGPRs an instruction writes (first, count), for the address look-back below. Loads give their
+// largest size; unknown formats none.
+std::pair<uint32_t, uint32_t> vgprWrites(const Instruction& in) {
+    const uint32_t w = in.words[0], w1 = in.size > 4 ? in.words[1] : 0;
+    switch (in.format) {
+    case Format::VOP1:
+    case Format::VOP2: return {(w >> 17) & 0xFF, 1};
+    case Format::VOP3: return {w & 0xFF, in.op >= 320 && in.op < 368 && (in.op == 361 || in.op == 362) ? 2u : 1u};
+    case Format::VINTRP: return {(w >> 18) & 0xFF, 1};
+    case Format::DS: return {w1 >> 24, 4};
+    case Format::MUBUF:
+    case Format::MTBUF: return {(w1 >> 8) & 0xFF, 4};
+    case Format::MIMG: return {(w1 >> 8) & 0xFF, uint32_t(std::popcount((w >> 8) & 0xFu))};
+    default: return {0, 0};
+    }
+}
+// Whether an instruction reads VGPR v as an ALU source.
+bool readsVgpr(const Instruction& in, uint32_t v) {
+    const uint32_t w = in.words[0], w1 = in.size > 4 ? in.words[1] : 0;
+    const uint32_t code = 256 + v;
+    switch (in.format) {
+    case Format::VOP1: return (w & 0x1FF) == code;
+    case Format::VOP2:
+    case Format::VOPC: return (w & 0x1FF) == code || ((w >> 9) & 0xFF) == v;
+    case Format::VOP3: return (w1 & 0x1FF) == code || ((w1 >> 9) & 0x1FF) == code || ((w1 >> 18) & 0x1FF) == code;
+    default: return false;
+    }
+}
+} // namespace
+
+// The image's dimension as the translation declares it (a T# type: 9 2D, 10 3D, 11 cube, 13 2D
+// array, 8/12 1D). From the T# when the analysis resolved one; for an image it could not (code a
+// launch skips, or a shader compiled before any draw) from the code: how many address registers
+// are written just before the instruction, and whether the last is a v_cubeid face.
+uint32_t imageDimension(const Program& p, const ImageResource& im) {
+    if (im.t[0] || im.t[1] || im.t[3]) return im.type();
+    auto it = p.code.find(im.pc);
+    if (it == p.code.end()) return 9;
+    const Instruction& in = it->second;
+    const uint32_t w = in.words[0], vaddr = in.words[1] & 0xFF;
+    const bool da = (w >> 14) & 1;
+    uint32_t prefix = 0;
+    bool suffix = false; // a LOD or clamp after the coordinates
+    if (in.op >= 32 && in.op < 96) {
+        const bool sample = in.op < 64;
+        const uint32_t variant = in.op & 15;
+        static const uint8_t sFlags[16] = {0, 8, 2, 10, 4, 1, 9, 16, 32, 40, 34, 42, 36, 33, 41, 48};
+        static const uint8_t gFlags[16] = {0, 8, 4, 1, 9, 16, 32, 40, 36, 33, 41, 48, 0, 0, 0, 0};
+        const uint8_t f = sample ? sFlags[variant] : gFlags[variant];
+        prefix = (sample ? in.op >= 48 : in.op >= 80) + (f & 1) + ((f >> 5) & 1);
+        if (f & 2) prefix += 4; // derivatives: taken as 2D's
+        suffix = f & 12;
+    } else if (in.op == 1 || in.op == 9) {
+        suffix = true; // image_load_mip, image_store_mip
+    }
+    const uint32_t third = vaddr + prefix + 2;
+    // The last write of a register in the straight-line code before the instruction, unless
+    // something reads it in between (then it is a value of its own, not an address).
+    auto lastWrite = [&](uint32_t reg) -> const Instruction* {
+        auto at = it;
+        for (int n = 0; n < 48 && at != p.code.begin(); ++n) {
+            --at;
+            if (p.labels.count(std::next(at)->first)) break;
+            const Instruction& x = at->second;
+            if (readsVgpr(x, reg)) return nullptr;
+            const auto [first, count] = vgprWrites(x);
+            if (count && reg >= first && reg < first + count) return &x;
+        }
+        return nullptr;
+    };
+    const Instruction* third_ = lastWrite(third);
+    if (third_ && third_->format == Format::VOP3 && third_->op == 324) return 11; // v_cubeid: a cube face
+    const bool three = suffix ? lastWrite(third + 1) != nullptr && third_ : third_ != nullptr;
+    if (three) return da ? 13 : 10;
+    return 9;
+}
+
 bool genericTranslation() {
     static const bool on = [] {
         const char* e = std::getenv("LPN_GENERIC_SHADERS");
@@ -1045,8 +1130,12 @@ std::string Program::key() const {
         put(&l.colorFormat, 4);
         put(&l.colorUint, 4);
         put(&l.colorSint, 4);
-        put(l.colorSwap, sizeof(l.colorSwap));
-        put(l.colorComps, sizeof(l.colorComps));
+        // Generic: a float target's swap and components reach the shader with the draw.
+        for (int m = 0; m < 8; ++m)
+            if (!genericTranslation() || ((l.colorUint | l.colorSint) >> m) & 1) {
+                put(&l.colorSwap[m], 1);
+                put(&l.colorComps[m], 1);
+            }
         put(&l.depthExport, 1);
     }
     if (l.stage == Stage::Compute) put(l.localSize, sizeof(l.localSize));
@@ -1064,7 +1153,7 @@ std::string Program::key() const {
         // What the translation reads of an image: the data format and a sampled image's swizzle
         // only matter to the view, so images that differ in them share a translation.
         const uint32_t nf = i.numFormat();
-        const uint32_t t = i.type();
+        const uint32_t t = imageDimension(*this, i);
         const uint32_t dim = t == 8 || t == 10 || t == 11 || t == 12 || t == 13 ? t : 9u; // the declared dimension
         const uint32_t shape[] = {dim, nf == 4 || nf == 5 ? nf : 0u, i.storage ? i.dstSel() : 0u, i.compare,
                                   i.storage, (i.s[0] >> 15) & 1};

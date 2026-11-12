@@ -17,6 +17,9 @@
 #include "host/gpu/vk.h"
 #include "host/crash.h"
 #include "host/display_settings.h"
+#include "host/kernel.h"
+#include "host/module.h"
+#include "host/videoout.h"
 #include "host/pm4.h"
 #include "host/profile.h"
 
@@ -3939,7 +3942,7 @@ private:
         if (format == VK_FORMAT_UNDEFINED) {
             // An all-zero T#: an image in code this launch skips (generic translation), bound to
             // the placeholder without a warning.
-            if (t.dataFormat() || addr) warnOnce("texture format " + std::to_string(t.dataFormat()) + "/" + std::to_string(nf) + " unsupported");
+            if (t.dataFormat() || addr || (t.t[3] & 0x0FFFFFFF)) warnOnce("texture format " + std::to_string(t.dataFormat()) + "/" + std::to_string(nf) + " unsupported");
         } else if (GuestTexture* g = guestTexture(t, format)) {
             b.view = view(g->img, format, vt, swz, 0, t.baseLevel(), t.lastLevel() + 1 - std::min(t.baseLevel(), t.lastLevel()));
         }
@@ -4797,7 +4800,12 @@ void main() {
             writes.back().dstBinding = n++;
         }
         for (auto& im : p.images) {
-            const ImageBinding ib = resolveImage(im);
+            // An image the analysis could not resolve (in code this launch skips) is bound to a
+            // placeholder of the dimension the translation declared for it.
+            gcn::ImageResource unresolved;
+            const bool zero = !im.t[0] && !im.t[1] && !im.t[3];
+            if (zero) unresolved = im, unresolved.t[3] = gcn::imageDimension(p, im) << 28;
+            const ImageBinding ib = resolveImage(zero ? unresolved : im);
             if (trace_)
                 std::fprintf(traceOut_, "[trace]   tex 0x%" PRIx64 " %ux%u fmt %u/%u type %u tile %u sel %03o pc 0x%" PRIx64 "%s\n",
                              im.base(), im.width(), im.height(), im.dataFormat(), im.numFormat(), im.type(), im.tileMode(),
@@ -6384,7 +6392,8 @@ void main() {
         if (n != prev.data.size() || n < gcn::data::kSmrd) return false;
         thread_local std::vector<uint8_t> skip;
         skip.assign(n, 0);
-        std::fill_n(&skip[gcn::data::kPosTransform], 4, 1);
+        // A pixel shader's words there are its colour swaps (generic translation), compared.
+        if (cur.launch.stage != gcn::Stage::Pixel) std::fill_n(&skip[gcn::data::kPosTransform], 4, 1);
         for (const auto& b : cur.buffers)
             if (b.data + 4 <= n) std::fill_n(&skip[b.data], 4, 1);
         for (const auto& im : cur.images)
@@ -7343,7 +7352,84 @@ Renderer* gRenderer = nullptr;
 
 } // namespace
 
+// LPN_DUMP_SHADER_TABLES=<flip> (stage 4 of docs/shader-precompile.md): once that many frames
+// have been shown, writes the engine's shader tables to lpn-shader-tables.txt: per table its
+// entry count and, per entry, the shader object's first 0x100 bytes and the code addresses found
+// in it (dwords that, shifted left by 8, point at code followed by an OrbShdr block).
+void dumpShaderTables(uint64_t flip) {
+    while (flipCount() < flip) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    Module* eboot = process().eboot;
+    if (!eboot) return;
+    const uint64_t base = reinterpret_cast<uint64_t>(eboot->base());
+    FILE* f = std::fopen("lpn-shader-tables.txt", "w");
+    if (!f) return;
+    struct Table {
+        const char* name;
+        uint64_t ptr, count;
+    };
+    const Table tables[] = {{"ps", 0x2698148, 0x269815c}, {"vs", 0x2698168, 0x269817c}, {"t3", 0x2698188, 0x269819c},
+                            {"t4", 0x26981a8, 0x26981bc}, {"t5", 0x26981c8, 0x26981dc}, {"cs", 0x26981e8, 0x26981fc}};
+    size_t withCode = 0, entries = 0;
+    for (const Table& t : tables) {
+        uint64_t arr = 0;
+        uint32_t n = 0;
+        uint8_t head[0x20] = {};
+        readGuest(base + t.ptr, &arr, 8);
+        readGuest(base + t.count, &n, 4);
+        readGuest(base + t.ptr, head, sizeof head);
+        std::fprintf(f, "table %s at +0x%" PRIx64 ": array 0x%" PRIx64 " count %u; header", t.name, t.ptr, arr, n);
+        for (uint8_t b : head) std::fprintf(f, " %02x", b);
+        std::fprintf(f, "\n");
+        if (n > 100000) continue;
+        for (uint32_t i = 0; i < n; ++i) {
+            uint64_t obj = 0;
+            if (!readGuest(arr + i * 8ull, &obj, 8) || !obj) continue;
+            ++entries;
+            uint32_t words[64] = {};
+            readGuest(obj, words, sizeof words);
+            std::fprintf(f, "%s[%u] 0x%" PRIx64 ":", t.name, i, obj);
+            for (int w = 0; w < 64; ++w) std::fprintf(f, "%s%08x", w % 8 ? " " : "\n  ", words[w]);
+            bool found = false;
+            // Code addresses: in the object itself, or one pointer away (a Gnmx shader it points at).
+            auto scan = [&](const uint32_t* ws, int count, const char* where) {
+                for (int w = 0; w < count; ++w) {
+                    const uint64_t code = uint64_t(ws[w]) << 8;
+                    if (code < 0x100000 || code >= (1ull << 40)) continue;
+                    uint32_t first = 0;
+                    if (!readGuest(code, &first, 4)) continue;
+                    std::vector<uint8_t> body(0x10000);
+                    size_t got = 0;
+                    while (got < body.size() && readGuest(code + got, body.data() + got, 0x1000)) got += 0x1000;
+                    for (size_t o = 0; o + 7 <= got; o += 4)
+                        if (!std::memcmp(body.data() + o, "OrbShdr", 7)) {
+                            std::fprintf(f, "\n  code %s+0x%x: 0x%" PRIx64 " (%zu bytes)", where, w * 4, code, o);
+                            found = true;
+                            break;
+                        }
+                }
+            };
+            scan(words, 64, "obj");
+            for (int w = 0; w + 1 < 64 && !found; w += 2) {
+                const uint64_t p = words[w] | (uint64_t(words[w + 1]) << 32);
+                uint32_t inner[48] = {};
+                if (p >= 0x100000 && p < (1ull << 40) && (p & 7) == 0 && readGuest(p, inner, sizeof inner)) {
+                    char where[32];
+                    std::snprintf(where, sizeof where, "*(obj+0x%x)", w * 4);
+                    scan(inner, 48, where);
+                }
+            }
+            withCode += found;
+            std::fprintf(f, "\n");
+        }
+    }
+    std::fclose(f);
+    std::fprintf(stderr, "[gpu] shader tables written to lpn-shader-tables.txt: %zu entries, %zu with code found\n", entries,
+                 withCode);
+}
+
 bool startRenderer(bool computeOnly) {
+    if (const char* e = getenv("LPN_DUMP_SHADER_TABLES"); e && *e)
+        std::thread([flip = std::strtoull(e, nullptr, 10)] { dumpShaderTables(flip); }).detach();
     auto* r = new Renderer;
     r->computeOnly_ = computeOnly;
     if (!r->init()) {

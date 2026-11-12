@@ -42,6 +42,25 @@ is part of the shader binary's own registers and so known without a draw.
    shader tables (PS 0x2698148, VS 0x2698168, CS 0x26981e8, counts beside them; see
    render-decomp.md) and compile every entry behind the progress screen.
 
+### The shader tables (measured on the user's PC, 2026-11-12)
+
+All of the game's shaders are registered by the title menu and the tables do not change in play
+(dumped at frame 1500 and in gameplay at 5500 with `LPN_DUMP_SHADER_TABLES=<flip>`). Each table
+header at eboot+addr is: array start, array end, 1, capacity (0x2000), a small id, 0x80; entries are
+pointers to engine objects until the first null. The names in render-decomp.md are swapped:
+
+| eboot+ | Holds | Entries | Gnmx shader at | Register block (from that pointer) |
+|---|---|---|---|---|
+| 0x2698148 | vertex shaders | 818 | *(obj+0x48) | +0x08 PGM_LO, +0x0c PGM_HI, +0x10 RSRC1, +0x14 RSRC2, +0x18 VS_OUT_CONFIG, +0x1c POS_FORMAT, +0x20 PA_CL_VS_OUT_CNTL, +0x24 counts, semantics from +0x28 |
+| 0x2698168 | pixel shaders | 1221 | *(obj+0x68) | +0x08 PGM_LO, +0x0c PGM_HI, +0x10 RSRC1, +0x14 RSRC2, +0x18 Z_FORMAT, +0x1c COL_FORMAT, +0x20 PS_INPUT_ENA, +0x24 PS_INPUT_ADDR, +0x28 PS_IN_CONTROL, +0x2c BARYC_CNTL, +0x30 DB_SHADER_CONTROL, +0x34 CB_SHADER_MASK, semantics from +0x38 |
+| 0x2698188 | multi-stage sets (unconfirmed) | 10 (20 programs) | *(obj+0x68), more at obj+0x44..0x58 | not mapped; never run so far |
+| 0x26981e8 | compute | 2 | *(obj+0x30) | +0x10 RSRC1, +0x14 RSRC2 |
+
+2061 distinct programs in all; the user's cache (all play so far) has run 652, 648 of them from the
+tables (the other 4 are engine-internal clears and copies). RSRC1, RSRC2, PS_INPUT_ENA, COL_FORMAT
+and NUM_INTERP in the tables match every launch seen. A vertex shader's RSRC1 differs at launch in
+its VGPR count and VGPR_COMP_CNT, which the engine raises for the fetch shader.
+
 Each stage ships on its own and stays behind `LPN_GENERIC_SHADERS=1` until the stages after it have
 been played through, so a regression can be compared against the specialised translation.
 

@@ -53,6 +53,7 @@ struct LaunchState {
 namespace data {
 constexpr uint32_t kUserData = 0;     // 16 dwords of user SGPRs
 constexpr uint32_t kPosTransform = 16; // VS: position xy scale, then offset (times w); floats
+constexpr uint32_t kColorSwizzle = 16; // PS, generic translation: per MRT a byte, components * 4 + COMP_SWAP (2 words)
 constexpr uint32_t kSmrd = 20;        // scalar load results follow
 } // namespace data
 
@@ -152,6 +153,10 @@ bool deserialize(const std::string& bytes, Program& program);
 // launch decided as run-time branches and walks the code they skip too, so launches of a shader
 // that differ only in such flags translate alike (docs/shader-precompile.md, stage 1).
 bool genericTranslation();
+
+// The dimension the translation declares image `im` with (a T# type code): the T#'s when it was
+// resolved, else worked out from the code before the instruction.
+uint32_t imageDimension(const Program& program, const ImageResource& im);
 
 // `readCode` fetches instructions, `readData` scalar loads.
 Program analyze(const LaunchState& launch, const ReadMemory& readCode, const ReadMemory& readData);
