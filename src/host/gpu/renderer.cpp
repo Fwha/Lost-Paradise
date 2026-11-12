@@ -3791,7 +3791,7 @@ private:
     }
 
     // ---- pipeline libraries (docs/shader-precompile.md stage 3) ----
-    // With fast-linked graphics pipeline libraries (LPN_GENERIC_SHADERS=1; LPN_PIPELINE_LIBRARIES=0
+    // With fast-linked graphics pipeline libraries (generic translation; LPN_PIPELINE_LIBRARIES=0
     // turns them off) a pipeline is linked from four parts: vertex input (per topology),
     // pre-rasterisation (per vertex shader, with the rect-list geometry shader), fragment shader
     // (per pixel shader) and fragment output (per targets' formats and blend). The shader parts are
