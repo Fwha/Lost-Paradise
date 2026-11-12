@@ -151,7 +151,8 @@ public:
         for (uint32_t i = 0; i < bufOrder.size(); ++i) {
             bufIndex[bufOrder[i]] = i;
             buffers.push_back(p_.buffers[bufOrder[i]]);
-            buffers.back().data = move(buffers.back().data, 4);
+            const BufferResource& b = buffers.back();
+            buffers.back().data = move(b.data, bufferWords(p_, b));
         }
         for (uint32_t i = 0; i < imgOrder.size(); ++i) {
             imgIndex[imgOrder[i]] = i;
@@ -478,6 +479,8 @@ private:
             const bool k = src64(st, s0, in, a64) && a64 != 0;
             set64(st, d, next);
             label(next);
+            if (k && generic() && p_.launch.stage == Stage::Vertex && fetch(pc, a64 & 0xFFFFFFFFFFFFull, st))
+                return true; // pulled in the vertex shader itself; the walk goes on after the call
             if (k) {
                 if (!prior_) p_.calls[pc] = a64 & 0xFFFFFFFFFFFFull;
                 branchTo(a64 & 0xFFFFFFFFFFFFull, st, work);
@@ -691,13 +694,16 @@ private:
             r.nfmt = (r.sharp[3] >> 12) & 7;
             r.store = (in.op >= 4 && in.op <= 7) || (in.op >= 24 && in.op <= 31) || (in.op >= 48 && in.op < 112);
         }
+        const bool dyn = formatInData(in);
         if (prior_) {
             r.data = p_.buffers[found].data;
+            if (dyn && r.data + 4 < p_.data.size()) p_.data[r.data + 4] = r.sharp[3];
             p_.buffers[found] = r;
             return;
         }
         r.data = uint32_t(p_.data.size());
-        p_.data.resize(r.data + 4, 0);
+        p_.data.resize(r.data + (dyn ? 5 : 4), 0);
+        if (dyn) p_.data[r.data + 4] = r.sharp[3];
         p_.buffers.push_back(r);
     }
 
@@ -734,6 +740,120 @@ private:
         r.data = uint32_t(p_.data.size());
         p_.data.resize(r.data + 4, 0);
         p_.images.push_back(r);
+    }
+
+    // ---- vertex fetch (generic translation, stage 2) ----
+
+    // One buffer_load_format of a fetch shader: VGPRs v[4 + 4 * slot] on, from the V# at `sharp`.
+    struct FetchLoad {
+        uint32_t slot = 0, count = 0, index = 0, offset = 0;
+        uint64_t sharp = 0;
+    };
+
+    // Reads the fetch shader at `callee` when it has the shape every one the game makes has had
+    // (s_load_dwordx4 of V#s, buffer_load_format_* idxen of v0-v3 into v[4 + 4k], s_setpc): false
+    // for anything else, which is then walked and inlined as before.
+    bool parseFetch(uint64_t callee, const State& st, std::vector<FetchLoad>& loads) {
+        uint64_t from[128] = {}; // SGPR -> address of the V# an s_load_dwordx4 put there
+        uint64_t pc = callee;
+        for (int n = 0; n < 128; ++n) {
+            uint32_t words[3] = {};
+            if (!readCode_(pc, words, 4)) return false;
+            Instruction in = decode(words, 1);
+            if (in.size > 4) {
+                if (!readCode_(pc, words, in.size)) return false;
+                in = decode(words, in.size / 4);
+            }
+            const uint32_t w = in.words[0], w1 = in.words[1];
+            if (in.format == Format::SOP1 && in.op == 32) return !loads.empty(); // s_setpc_b64: back
+            if (in.format == Format::SOPP && (in.op == 0 || in.op == 12)) { // s_nop, s_waitcnt
+            } else if (in.format == Format::SMRD && in.op == 2 && ((w >> 8) & 1)) { // s_load_dwordx4 imm
+                const uint32_t base = ((w >> 9) & 0x3F) * 2, d = (w >> 15) & 0x7F;
+                if (base + 1 >= 104 || !st.known[base] || !st.known[base + 1] || d + 3 >= 104) return false;
+                const uint64_t addr = ((st.s[base] | (uint64_t(st.s[base + 1] & 0xFFFF) << 32)) & ~3ull) + (w & 0xFF) * 4;
+                for (uint32_t i = 0; i < 4; ++i) from[d + i] = 0;
+                from[d] = addr;
+            } else if (in.format == Format::MUBUF && in.op <= 3) { // buffer_load_format_x..xyzw
+                const bool offen = (w >> 12) & 1, idxen = (w >> 13) & 1, lds = (w >> 16) & 1;
+                const uint32_t vaddr = w1 & 0xFF, vdata = (w1 >> 8) & 0xFF, srsrc = ((w1 >> 16) & 0x1F) * 4, soff = w1 >> 24;
+                const bool tfe = (w1 >> 23) & 1;
+                if (offen || !idxen || lds || tfe || vaddr > 3 || vdata < 4 || vdata % 4 || soff != 128 || !from[srsrc])
+                    return false;
+                FetchLoad l;
+                l.slot = (vdata - 4) / 4;
+                l.count = in.op + 1;
+                l.index = vaddr;
+                l.offset = w & 0xFFF;
+                l.sharp = from[srsrc];
+                if (l.slot >= 16) return false;
+                for (const auto& o : loads)
+                    if (o.slot == l.slot) return false;
+                loads.push_back(l);
+            } else {
+                return false;
+            }
+            pc += in.size;
+        }
+        return false;
+    }
+
+    // The fetch shader a vertex shader calls at `site`, as buffers of the vertex shader: one per
+    // slot of four VGPRs up to the last it loads, each with its V#, then V# word 3 and a control
+    // word (index VGPR, components, offset) in the draw data, so a translation serves every mesh.
+    bool fetch(uint64_t site, uint64_t callee, const State& st) {
+        std::vector<FetchLoad> loads;
+        if (!parseFetch(callee, st, loads)) {
+            if (prior_) diverged_ = true; // this launch's fetch shader is another kind: analyse it anew
+            return prior_ != nullptr;
+        }
+        uint32_t slots = 0;
+        for (const auto& l : loads) slots = std::max(slots, l.slot + 1);
+        std::vector<uint32_t> index; // buffers of the slots, in slot order
+        if (prior_) {
+            if (prior_->fetchSite != site || prior_->fetchSlots != slots) {
+                diverged_ = true;
+                return true;
+            }
+            for (uint32_t i = 0; i < p_.buffers.size(); ++i)
+                if (p_.buffers[i].pc == site) index.push_back(i);
+            if (index.size() != slots) {
+                diverged_ = true;
+                return true;
+            }
+        } else {
+            p_.fetchSite = site;
+            p_.fetchSlots = slots;
+            for (uint32_t k = 0; k < slots; ++k) {
+                BufferResource r;
+                r.pc = site;
+                r.data = uint32_t(p_.data.size());
+                p_.data.resize(r.data + 6, 0);
+                index.push_back(uint32_t(p_.buffers.size()));
+                p_.buffers.push_back(r);
+            }
+        }
+        for (uint32_t k = 0; k < slots; ++k) {
+            BufferResource& r = p_.buffers[index[k]];
+            const FetchLoad* l = nullptr;
+            for (const auto& o : loads)
+                if (o.slot == k) l = &o;
+            const uint32_t at = r.data;
+            r = BufferResource{};
+            r.pc = site;
+            r.data = at;
+            r.known = l && readData_(l->sharp, r.sharp, sizeof r.sharp);
+            if (!r.known) std::memset(r.sharp, 0, sizeof r.sharp);
+            r.dfmt = (r.sharp[3] >> 15) & 0xF;
+            r.nfmt = (r.sharp[3] >> 12) & 7;
+            if (at + 6 > p_.data.size()) {
+                diverged_ = true;
+                return true;
+            }
+            p_.data[at + 4] = r.sharp[3];
+            p_.data[at + 5] = r.known ? l->index | l->count << 2 | l->offset << 8 : 0;
+            if (prior_) seenBuffers_[index[k]] = true;
+        }
+        return true;
     }
 
     const ReadMemory& readCode_;
@@ -1028,6 +1148,21 @@ uint32_t imageDimension(const Program& p, const ImageResource& im) {
     return 9;
 }
 
+uint32_t bufferWords(const Program& p, const BufferResource& b) {
+    if (p.fetchSlots && b.pc == p.fetchSite) return 6;
+    return formatInData(p, b) ? 5 : 4;
+}
+
+bool formatInData(const Instruction& in) {
+    return genericTranslation() && in.format == Format::MUBUF && in.op <= 3; // buffer_load_format_*
+}
+
+bool formatInData(const Program& p, const BufferResource& b) {
+    if (p.fetchSlots && b.pc == p.fetchSite) return true;
+    const auto it = p.code.find(b.pc);
+    return it != p.code.end() && formatInData(it->second);
+}
+
 bool genericTranslation() {
     static const bool on = [] {
         const char* e = std::getenv("LPN_GENERIC_SHADERS");
@@ -1093,8 +1228,9 @@ bool adopt(Program& p, Program& r) {
     // The translation depends on these (see Program::key).
     for (size_t i = 0; i < p.buffers.size(); ++i) {
         const BufferResource &x = p.buffers[i], &y = r.buffers[i];
-        if (x.dfmt != y.dfmt || x.nfmt != y.nfmt || (x.sharp[3] & 0xFFF) != (y.sharp[3] & 0xFFF) || x.known != y.known)
-            return false;
+        if (x.known != y.known) return false;
+        if (formatInData(p, x)) continue; // read from the draw data
+        if (x.dfmt != y.dfmt || x.nfmt != y.nfmt || (x.sharp[3] & 0xFFF) != (y.sharp[3] & 0xFFF)) return false;
     }
     for (size_t i = 0; i < p.images.size(); ++i) {
         const ImageResource &x = p.images[i], &y = r.images[i];
@@ -1139,11 +1275,14 @@ std::string Program::key() const {
         put(&l.depthExport, 1);
     }
     if (l.stage == Stage::Compute) put(l.localSize, sizeof(l.localSize));
+    put(&fetchSite, 8);
+    put(&fetchSlots, 4);
     for (const auto& [pc, in] : code) {
         put(&pc, 8);
         put(in.words, in.size);
     }
     for (const auto& b : buffers) {
+        if (formatInData(*this, b)) continue; // read from the draw data
         put(&b.dfmt, 4);
         put(&b.nfmt, 4);
         const uint32_t sel = b.sharp[3] & 0xFFF;
@@ -1164,7 +1303,7 @@ std::string Program::key() const {
 
 
 namespace {
-constexpr uint32_t kSerialVersion = 1;
+constexpr uint32_t kSerialVersion = 2; // 2: fetch site and slots (1 is read too)
 template <class T> void putPod(std::string& s, const T& v) {
     static_assert(std::is_trivially_copyable_v<T>);
     s.append(reinterpret_cast<const char*>(&v), sizeof v);
@@ -1204,6 +1343,8 @@ std::string serialize(const Program& p) {
     for (const auto& b : p.buffers) putPod(s, b);
     putPod(s, uint32_t(p.images.size()));
     for (const auto& i : p.images) putPod(s, i);
+    putPod(s, p.fetchSite);
+    putPod(s, p.fetchSlots);
     return s;
 }
 
@@ -1211,7 +1352,7 @@ bool deserialize(const std::string& bytes, Program& p) {
     p = Program{};
     Reader r{bytes};
     uint32_t sizes[5];
-    if (!r.get(sizes) || sizes[0] != kSerialVersion || sizes[1] != sizeof(LaunchState) || sizes[2] != sizeof(Instruction) ||
+    if (!r.get(sizes) || (sizes[0] != kSerialVersion && sizes[0] != 1) || sizes[1] != sizeof(LaunchState) || sizes[2] != sizeof(Instruction) ||
         sizes[3] != sizeof(BufferResource) || sizes[4] != sizeof(ImageResource))
         return false;
     uint8_t flags;
@@ -1256,6 +1397,7 @@ bool deserialize(const std::string& bytes, Program& p) {
     p.images.resize(n);
     for (auto& i : p.images)
         if (!r.get(i)) return false;
+    if (sizes[0] >= 2 && (!r.get(p.fetchSite) || !r.get(p.fetchSlots))) return false;
     return r.at == bytes.size();
 }
 

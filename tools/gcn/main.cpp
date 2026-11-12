@@ -255,6 +255,56 @@ int resources(const char* dir) {
     return 0;
 }
 
+// Stage 2 survey: the fetch shaders vertex shaders call, as saved in the cache. Which
+// instructions they use, how many distinct ones each vertex shader meets, and the most common
+// listings, so vertex pulling can be checked to cover them.
+int fetchSurvey(const char* dir) {
+    std::map<std::string, size_t> listings, mnemonics, perVs;
+    std::map<std::string, std::set<std::string>> vsFetches;
+    size_t programs = 0, calling = 0;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        if (e.path().extension() != ".gcn") continue;
+        std::ifstream f(e.path(), std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(f)), {});
+        gcn::Program p;
+        if (bytes.size() < 4 || !gcn::deserialize(bytes.substr(4), p)) continue;
+        if (p.launch.stage != gcn::Stage::Vertex) continue;
+        ++programs;
+        if (p.calls.empty()) continue;
+        ++calling;
+        std::string vsKey;
+        int n = 0;
+        for (auto it = p.code.find(p.launch.entry); it != p.code.end() && n < 24; ++it, ++n)
+            vsKey.append(reinterpret_cast<const char*>(it->second.words), it->second.size);
+        for (const auto& [site, callee] : p.calls) {
+            std::string text;
+            for (auto it = p.code.find(callee); it != p.code.end(); ++it) {
+                text += "    " + gcn::disassemble(it->second, uint32_t(it->first - callee)) + "\n";
+                ++mnemonics[gcn::mnemonic(it->second)];
+                if (it->second.format == gcn::Format::SOP1 && it->second.op == 32) break; // s_setpc
+            }
+            ++listings[text];
+            vsFetches[vsKey].insert(text);
+        }
+    }
+    for (const auto& [k, s] : vsFetches) ++perVs[std::to_string(s.size())];
+    std::printf("%zu vertex programs, %zu call a fetch shader; %zu distinct fetch shaders, %zu distinct vertex shaders\n",
+                programs, calling, listings.size(), vsFetches.size());
+    std::printf("fetch shaders per vertex shader:");
+    for (const auto& [k, c] : perVs) std::printf(" %s:%zu", k.c_str(), c);
+    std::printf("\ninstructions used:\n");
+    for (const auto& [m, c] : mnemonics) std::printf("  %8zu  %s\n", c, m.c_str());
+    std::vector<std::pair<size_t, std::string>> v;
+    for (const auto& [k, c] : listings) v.push_back({c, k});
+    std::sort(v.rbegin(), v.rend());
+    for (size_t i = 0; i < v.size() && i < 12; ++i) std::printf("--- used %zu times\n%s", v[i].first, v[i].second.c_str());
+    // The rarest too: odd patterns (instancing, unusual formats) are what generic code must cover.
+    for (size_t i = v.size() > 12 ? std::max<size_t>(12, v.size() - 6) : v.size(); i < v.size(); ++i)
+        std::printf("--- used %zu times\n%s", v[i].first, v[i].second.c_str());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: lpn-gcn <shader.bin>          disassemble\n"
@@ -262,11 +312,13 @@ int main(int argc, char** argv) {
                              "       lpn-gcn --glsl <shader.bin>...   translate to GLSL and compile\n"
                              "       lpn-gcn --check <shader.bin>...  as --glsl, printing only results\n"
                              "       lpn-gcn --variants <cache dir>   how saved translations of a shader differ\n"
-                             "       lpn-gcn --resources <cache dir>  what draws bound, and what the code alone predicts\n");
+                             "       lpn-gcn --resources <cache dir>  what draws bound, and what the code alone predicts\n"
+                             "       lpn-gcn --fetch <cache dir>      the fetch shaders vertex shaders call\n");
         return 2;
     }
     if (!std::strcmp(argv[1], "--variants") && argc == 3) return variants(argv[2]);
     if (!std::strcmp(argv[1], "--resources") && argc == 3) return resources(argv[2]);
+    if (!std::strcmp(argv[1], "--fetch") && argc == 3) return fetchSurvey(argv[2]);
     if (!std::strcmp(argv[1], "--glsl") || !std::strcmp(argv[1], "--check")) return glsl(argc, argv);
     const bool stats = !std::strcmp(argv[1], "--stats");
     std::map<std::string, std::pair<unsigned, unsigned>> uses; // mnemonic -> (count, shaders)

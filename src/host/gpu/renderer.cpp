@@ -2415,7 +2415,7 @@ private:
         // Generic translations (gcn::genericTranslation) name other SPIR-V than specialised ones
         // and record other pipelines: each kind keeps its own cache, so switching back and forth
         // (LPN_GENERIC_SHADERS) never builds the other kind's pipelines at startup.
-        if (spirvDir_ != "-" && gcn::genericTranslation()) spirvDir_ += "/generic";
+        if (spirvDir_ != "-" && gcn::genericTranslation()) spirvDir_ += "/generic2"; // generic/ held stage 1 programs, whose draw data lacks V# words
         if (spirvDir_ != "-") {
             std::error_code ec;
             std::filesystem::create_directories(spirvDir_, ec);
