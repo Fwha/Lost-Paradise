@@ -62,6 +62,14 @@ screen loop). Addresses are guest addresses and change between runs.
   control word (index VGPR, components, offset) in the draw data; the translation decodes the
   element at run time. Other `buffer_load_format_*` read V# word 3 from the draw data the same way.
   A fetch shader of any other shape is walked and inlined as before.
+  Pipeline libraries (stage 3; with generic translation on a GPU with fast-linked
+  VK_EXT_graphics_pipeline_library, `LPN_PIPELINE_LIBRARIES=0` turns them off): a pipeline is
+  linked from a vertex input part (per topology), a vertex shader part (with the rect-list
+  geometry shader), a pixel shader part and an output part (target formats and blend). The shader
+  parts are compiled once per shader whatever state it is drawn with; cull mode, depth bias enable,
+  depth and stencil state are dynamic, set per draw; linking without link-time optimisation takes a
+  fraction of a millisecond. Pixel shaders then use descriptor set 1, written per draw from pools
+  (only one set can be pushed), and their SPIR-V differs from the monolithic kind's.
   These SPIR-V and pipelines are kept in a `generic2/` subfolder of the cache (`generic/` held
   stage 1 programs, whose draw data lacks those words).
 - **Images without a T#** (in code a launch skips, or a shader compiled before any draw) are declared

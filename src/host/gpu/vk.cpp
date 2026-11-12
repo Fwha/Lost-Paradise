@@ -95,6 +95,8 @@ bool Vk::init(std::string* error) {
     enable.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     hostImport = has(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (hostImport) enable.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    // Pipeline libraries (docs/shader-precompile.md stage 3): checked for the feature below.
+    const bool gplExt = has(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) && has(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
     // DLSS's device extensions, those the driver has (none without an NVIDIA driver).
     const std::vector<std::string> dlssDevice = dlss::deviceExtensions(instance, phys);
     for (const std::string& e : dlssDevice)
@@ -120,9 +122,24 @@ bool Vk::init(std::string* error) {
     VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     VkPhysicalDeviceVulkan12Features have12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan13Features have13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT haveGpl{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
     have.pNext = &have12;
     have12.pNext = &have13;
+    if (gplExt) have13.pNext = &haveGpl;
     vkGetPhysicalDeviceFeatures2(phys, &have);
+    if (gplExt && haveGpl.graphicsPipelineLibrary) {
+        VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &gp;
+        vkGetPhysicalDeviceProperties2(phys, &p2);
+        pipelineLibraries = gp.graphicsPipelineLibraryFastLinking; // linking at draw time is only worth it when fast
+    }
+    if (pipelineLibraries) {
+        enable.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+        enable.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+    }
     if (!have13.dynamicRendering || !have.features.geometryShader) {
         *error = "dynamic rendering and geometry shaders are required";
         return false;
@@ -131,8 +148,14 @@ bool Vk::init(std::string* error) {
     VkPhysicalDeviceFeatures2 want{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     VkPhysicalDeviceVulkan12Features want12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan13Features want13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT wantGpl{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
     want.pNext = &want12;
     want12.pNext = &want13;
+    if (pipelineLibraries) {
+        wantGpl.graphicsPipelineLibrary = VK_TRUE;
+        want13.pNext = &wantGpl;
+    }
     auto& f = want.features;
     const auto& h = have.features;
     f.geometryShader = VK_TRUE;
@@ -188,8 +211,8 @@ bool Vk::init(std::string* error) {
         vkGetPhysicalDeviceProperties2(phys, &p2);
         hostPointerAlignment = hp.minImportedHostPointerAlignment;
     }
-    std::fprintf(stderr, "[gpu] Vulkan device: %s (host memory import %s)\n", props.deviceName,
-                 hostImport ? "yes" : "no");
+    std::fprintf(stderr, "[gpu] Vulkan device: %s (host memory import %s, fast-linked pipeline libraries %s)\n",
+                 props.deviceName, hostImport ? "yes" : "no", pipelineLibraries ? "yes" : "no");
     return true;
 }
 

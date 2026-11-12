@@ -40,7 +40,7 @@ unsigned formatComponents(uint32_t dfmt) {
 
 class Emitter {
 public:
-    Emitter(const Program& p, uint32_t base) : p_(p), base_(base) {
+    Emitter(const Program& p, uint32_t base, uint32_t set) : p_(p), base_(base), set_(set) {
         // Code regions for label(): the entry's, then each callee's in call order.
         regions_.push_back(p.launch.entry);
         for (const auto& [site, callee] : p.calls)
@@ -88,7 +88,7 @@ public:
         if (stage == Stage::Compute)
             g += fmt("layout(local_size_x = %u, local_size_y = %u, local_size_z = %u) in;\n", p_.launch.localSize[0],
                      p_.launch.localSize[1], p_.launch.localSize[2]);
-        g += fmt("layout(std430, set = 0, binding = %u) readonly buffer DrawData { uint D[]; };\n", base_);
+        g += fmt("layout(std430, set = %u, binding = %u) readonly buffer DrawData { uint D[]; };\n", set_, base_);
         g += decls_;
         g += helpers();
         if (needOutSwizzle_)
@@ -320,12 +320,12 @@ private:
         uint32_t binding = base_ + 1;
         for (size_t i = 0; i < p_.buffers.size(); ++i) {
             const auto& b = p_.buffers[i];
-            decls_ += fmt("layout(std430, set = 0, binding = %u) %sbuffer Buf%zu { uint m[]; } buf%zu;\n", binding++,
+            decls_ += fmt("layout(std430, set = %u, binding = %u) %sbuffer Buf%zu { uint m[]; } buf%zu;\n", set_, binding++,
                           b.store ? "" : "readonly ", i, i);
         }
         for (size_t i = 0; i < p_.images.size(); ++i) {
             const auto& im = p_.images[i];
-            decls_ += fmt("layout(set = 0, binding = %u) uniform %s%s img%zu;\n", binding++,
+            decls_ += fmt("layout(set = %u, binding = %u) uniform %s%s img%zu;\n", set_, binding++,
                           im.storage ? "writeonly " : "", imageType(im).c_str(), i);
         }
     }
@@ -1459,7 +1459,7 @@ vec3 cubeDir(vec3 c) {
 
     const Program& p_;
     std::vector<uint64_t> regions_; // code region starts (see label)
-    uint32_t base_;
+    uint32_t base_, set_;
     Translation t_;
     std::string decls_, init_, body_;
     std::set<std::string> regs_;
@@ -1479,8 +1479,8 @@ vec3 cubeDir(vec3 c) {
 
 } // namespace
 
-Translation translate(const Program& program, uint32_t bindingBase) {
-    Translation t = Emitter(program, bindingBase).run();
+Translation translate(const Program& program, uint32_t bindingBase, uint32_t set) {
+    Translation t = Emitter(program, bindingBase, set).run();
     return t;
 }
 

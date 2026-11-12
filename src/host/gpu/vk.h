@@ -18,6 +18,7 @@ struct Vk {
     VkPhysicalDeviceMemoryProperties mem{};
     VkDeviceSize hostPointerAlignment = 4096;
     bool hostImport = false; // VK_EXT_external_memory_host
+    bool pipelineLibraries = false; // VK_EXT_graphics_pipeline_library with fast linking
     PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSet = nullptr;
     PFN_vkGetMemoryHostPointerPropertiesEXT getMemoryHostPointerProperties = nullptr;
 

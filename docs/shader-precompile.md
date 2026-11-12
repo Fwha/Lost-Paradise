@@ -39,7 +39,9 @@ is part of the shader binary's own registers and so known without a draw.
    fetch fills, which the VS's own input semantics fix, so stage 4 can lay out a VS without a mesh.
 3. **No per-state pipelines.** VK_EXT_shader_object (or graphics pipeline libraries) with
    blend, depth/stencil, topology and colour write state dynamic, so a shader pair needs no
-   pipeline build per state.
+   pipeline build per state. Done with fast-linked pipeline libraries (gpu.md): shader objects
+   would need one descriptor layout for every shader, and the renderer pushes descriptors, of
+   which a layout can push only one set; libraries with independent sets take one set per stage.
 4. **Enumerate at boot.** Once the game has loaded its shader archives, read the engine's
    shader tables (PS 0x2698148, VS 0x2698168, CS 0x26981e8, counts beside them; see
    render-decomp.md) and compile every entry behind the progress screen.
