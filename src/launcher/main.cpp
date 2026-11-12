@@ -132,6 +132,7 @@ const Row kRows[] = {
     {"DLSS", "NVIDIA DLAA: DLSS anti-aliasing in place of the game's. Needs an RTX card; Off on other GPUs."},
     {"Skip Intro Logos", "Go straight to the title screen when the game starts."},
     {"Button Icons", "Which controller's buttons to show. Auto matches your controller. Takes effect at the next start."},
+    {"Compile Shaders", "Build every shader seen in earlier runs before the game starts, so they don't stutter in play. In Background: they build while you play."},
 };
 constexpr int kRowCount = int(sizeof kRows / sizeof kRows[0]);
 
@@ -162,7 +163,8 @@ std::string valueName(int row) {
     case 4: return gS.fpsCounter ? "On" : "Off";
     case 5: return gS.dlss != host::DlssMode::Off ? "DLAA" : "Off";
     case 6: return gS.skipIntro ? "On" : "Off";
-    default: return host::kButtonIconNames[int(gS.buttonIcons)];
+    case 7: return host::kButtonIconNames[int(gS.buttonIcons)];
+    default: return gS.precompileShaders ? "At Startup" : "In Background";
     }
 }
 
@@ -187,6 +189,7 @@ void stepValue(int row, int d) {
     case 4: gS.fpsCounter = !gS.fpsCounter; break;
     case 5: gS.dlss = gS.dlss == host::DlssMode::Off ? host::DlssMode::Dlaa : host::DlssMode::Off; break;
     case 6: gS.skipIntro = !gS.skipIntro; break;
+    case 8: gS.precompileShaders = !gS.precompileShaders; break;
     default: gS.buttonIcons = host::ButtonIcons(wrap(int(gS.buttonIcons) + d, host::kButtonIconChoices)); break;
     }
     save();
@@ -277,7 +280,7 @@ const Box kUpdate{kW - 260, 24, 236, 40};
 const Box kGear{kW - 84, kH - 56, 44, 44};
 // Settings screen
 const Box kPanel{176, 64, kW - 352, 470};
-constexpr int kRowY0 = 132, kRowH = 42;
+constexpr int kRowY0 = 134, kRowH = 37;
 Box rowBox(int r) { return {kPanel.x + 24, kRowY0 + r * kRowH, kPanel.w - 48, kRowH - 6}; }
 Box arrowBox(int r, bool right) {
     const Box b = rowBox(r);

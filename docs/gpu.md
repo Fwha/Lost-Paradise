@@ -48,6 +48,13 @@ screen loop). Addresses are guest addresses and change between runs.
 - **SPIR-V cache.** Compiling a shader's GLSL takes ~10 ms and a new attack effect brings dozens,
   so SPIR-V is kept in `~/.cache/lpn-host/spirv` (`LPN_SHADER_CACHE=<dir>`, or `off`), named by
   a hash of the GLSL. Only the first time an effect is seen anywhere hitches.
+- **Startup compile.** With Compile Shaders at Startup (launcher setting, `precompile_shaders` in
+  lpn-display.ini, `LPN_PRECOMPILE=0/1` wins) the game waits behind a progress screen while every
+  saved shader (each `.gcn` in the cache, compute shaders too) is translated with today's
+  translator and its SPIR-V compiled if missing, on every core, and then every pipeline in
+  `pipelines.list` is built by all pipeline workers. Esc, Enter or a pad button starts the game at
+  once; what is left builds in the background on a quarter of the workers, as with the setting off.
+  Shaders never seen in any earlier run are still compiled when first drawn.
 - **Memory.** Guest memory is imported into Vulkan (VK_EXT_external_memory_host), so shader
   buffer reads and writes hit the game's memory directly.
 - **Surfaces.** Render targets and depth buffers are Vulkan images keyed by guest address; a

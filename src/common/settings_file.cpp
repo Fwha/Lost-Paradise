@@ -67,6 +67,8 @@ void readSettings(const std::string& path, DisplaySettings& s) {
         } else if (!std::strcmp(key, "button_icons")) {
             for (int i = 0; i < kButtonIconChoices; ++i)
                 if (!std::strcmp(value, kButtonIconKeys[i])) s.buttonIcons = ButtonIcons(i);
+        } else if (!std::strcmp(key, "precompile_shaders")) {
+            s.precompileShaders = !std::strcmp(value, "on");
         } else if (!std::strcmp(key, "aspect")) {
             for (int i = 0; i < kAspectChoices; ++i)
                 if (!std::strcmp(value, kAspectKeys[i])) s.aspect = AspectRatio(i);
@@ -88,6 +90,7 @@ bool writeSettings(const std::string& path, const DisplaySettings& s) {
     std::fprintf(f, "skip_intro = %s\n", s.skipIntro ? "on" : "off");
     std::fprintf(f, "button_icons = %s\n", kButtonIconKeys[int(s.buttonIcons)]);
     std::fprintf(f, "aspect = %s\n", kAspectKeys[int(s.aspect)]);
+    std::fprintf(f, "precompile_shaders = %s\n", s.precompileShaders ? "on" : "off");
     return std::fclose(f) == 0;
 }
 

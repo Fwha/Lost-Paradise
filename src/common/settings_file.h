@@ -37,6 +37,9 @@ struct DisplaySettings {
     bool skipIntro = false; // fast-forward the boot logos to the title screen
     ButtonIcons buttonIcons = ButtonIcons::PlayStation; // as the game draws its own
     AspectRatio aspect = AspectRatio::Wide16x9;
+    // Build every shader and pipeline the cache knows before the game starts, behind a progress
+    // screen, instead of in the background while it plays (gpu/renderer.cpp).
+    bool precompileShaders = true;
 };
 
 constexpr const char* kSettingsFile = "lpn-display.ini";
