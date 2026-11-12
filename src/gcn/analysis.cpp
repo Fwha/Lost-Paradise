@@ -1230,8 +1230,8 @@ bool formatInData(const Program& p, const BufferResource& b) {
 
 bool genericTranslation() {
     static const bool on = [] {
-        const char* e = std::getenv("LPN_GENERIC_SHADERS");
-        return e && std::strcmp(e, "0") != 0;
+        const char* e = std::getenv("LPN_GENERIC_SHADERS"); // on unless "0"
+        return !e || std::strcmp(e, "0") != 0;
     }();
     return on;
 }

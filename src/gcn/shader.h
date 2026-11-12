@@ -158,8 +158,7 @@ std::string serialize(const Program& program);
 // False when `bytes` is damaged or from a build whose structures differ.
 bool deserialize(const std::string& bytes, Program& program);
 
-// Generic translation (LPN_GENERIC_SHADERS=1; off until every stage has landed, as its cache starts
-// empty): analyze() keeps the scalar branches a
+// Generic translation (the default; LPN_GENERIC_SHADERS=0 turns it off): analyze() keeps the scalar branches a
 // launch decided as run-time branches and walks the code they skip too, so launches of a shader
 // that differ only in such flags translate alike (docs/shader-precompile.md, stage 1).
 bool genericTranslation();

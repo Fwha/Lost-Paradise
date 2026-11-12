@@ -100,8 +100,11 @@ tables (the other 4 are engine-internal clears and copies). RSRC1, RSRC2, PS_INP
 and NUM_INTERP in the tables match every launch seen. A vertex shader's RSRC1 differs at launch in
 its VGPR count and VGPR_COMP_CNT, which the engine raises for the fetch shader.
 
-Each stage ships on its own and stays behind `LPN_GENERIC_SHADERS=1` until the stages after it have
-been played through, so a regression can be compared against the specialised translation.
+Each stage shipped on its own behind `LPN_GENERIC_SHADERS=1`. With all four played through, the
+generic translation and the boot compile are the default; `LPN_GENERIC_SHADERS=0` still gives the
+specialised translation (its own cache folder), to compare a regression against. A few shaders
+whose translation depends on the draw (an image's dimension the code does not show) still compile
+the first time they are drawn.
 
 ## Costs and risks
 
