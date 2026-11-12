@@ -182,16 +182,91 @@ int variants(const char* dir) {
     return 0;
 }
 
+// Stage 1b survey: across the cache's saved programs, what each image, buffer and colour output
+// was at draw time, and whether the code alone predicts it (an image's dimension from the MIMG
+// DA bit and v_cube* instructions, its int-ness from the instruction's data use is not visible,
+// so float is assumed). What the boot-time compile (docs/shader-precompile.md stage 4) can know.
+int resources(const char* dir) {
+    std::map<std::string, size_t> imgs, bufs, mrt, psin;
+    size_t images = 0, predicted = 0, programs = 0;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        if (e.path().extension() != ".gcn") continue;
+        std::ifstream f(e.path(), std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(f)), {});
+        gcn::Program p;
+        if (bytes.size() < 4 || !gcn::deserialize(bytes.substr(4), p)) continue;
+        ++programs;
+        bool cubeOps = false;
+        for (const auto& [pc, in] : p.code)
+            if (in.format == gcn::Format::VOP3 && in.op >= 324 && in.op <= 327) cubeOps = true;
+        const char* stage = p.launch.stage == gcn::Stage::Pixel ? "ps" : p.launch.stage == gcn::Stage::Compute ? "cs" : "vs";
+        for (const auto& im : p.images) {
+            if (!im.t[0] && !im.t[1] && !im.t[3]) continue; // unresolved
+            ++images;
+            auto it = p.code.find(im.pc);
+            const bool da = it != p.code.end() && ((it->second.words[0] >> 14) & 1);
+            const uint32_t t = im.type();
+            const char* real = t == 8 ? "1D" : t == 10 ? "3D" : t == 11 ? "Cube" : t == 12 ? "1DArray" : t == 13 ? "2DArray" : "2D";
+            const char* guess = da ? (cubeOps ? "Cube" : "2DArray") : "2D";
+            const uint32_t nf = im.numFormat();
+            const char* kind = nf == 4 ? "uint" : nf == 5 ? "sint" : "float";
+            const bool ok = !std::strcmp(real, guess) && !std::strcmp(kind, "float");
+            predicted += ok;
+            ++imgs[std::string(stage) + " " + real + " " + kind + (im.storage ? " storage" : "") + (im.compare ? " shadow" : "") +
+                   " (code says " + guess + ")" + (ok ? "" : "  <- mismatch")];
+        }
+        for (const auto& b : p.buffers) {
+            auto it = p.code.find(b.pc);
+            if (it == p.code.end()) continue;
+            const bool mtbuf = it->second.format == gcn::Format::MTBUF;
+            const bool formatted = mtbuf || it->second.op <= 7; // buffer_load/store_format_*
+            if (!formatted) continue;
+            ++bufs[std::string(stage) + (mtbuf ? " tbuffer (format in code)" : " buffer_*_format dfmt ") +
+                   (mtbuf ? "" : std::to_string(b.dfmt) + "/" + std::to_string(b.nfmt) + " sel " + std::to_string(b.sharp[3] & 0xFFF)) +
+                   (p.calls.empty() ? "" : " [fetch]")];
+        }
+        if (p.launch.stage == gcn::Stage::Pixel) {
+            for (int m = 0; m < 8; ++m) {
+                const uint32_t fmt = (p.launch.colorFormat >> (m * 4)) & 0xF;
+                if (!fmt) continue;
+                ++mrt["export fmt " + std::to_string(fmt) + " comps " + std::to_string(p.launch.colorComps[m]) + " swap " +
+                      std::to_string(p.launch.colorSwap[m]) + ((p.launch.colorUint >> m) & 1 ? " uint" : "") +
+                      ((p.launch.colorSint >> m) & 1 ? " sint" : "")];
+            }
+            bool identity = true;
+            for (uint32_t i = 0; i < 32; ++i)
+                if (p.launch.psInputCntl[i] && (p.launch.psInputCntl[i] & 0x3F) != i) identity = false;
+            ++psin[identity ? "PS_INPUT_CNTL: attribute i reads VS output i" : "PS_INPUT_CNTL: remapped"];
+        }
+    }
+    auto print = [](const char* title, const std::map<std::string, size_t>& m) {
+        std::printf("%s\n", title);
+        std::vector<std::pair<size_t, std::string>> v;
+        for (const auto& [k, n] : m) v.push_back({n, k});
+        std::sort(v.rbegin(), v.rend());
+        for (const auto& [n, k] : v) std::printf("  %6zu  %s\n", n, k.c_str());
+    };
+    std::printf("%zu programs; %zu resolved images, %zu predicted from the code alone\n", programs, images, predicted);
+    print("images (stage, dimension, type):", imgs);
+    print("formatted buffer accesses:", bufs);
+    print("pixel shader colour outputs:", mrt);
+    print("pixel shader inputs:", psin);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: lpn-gcn <shader.bin>          disassemble\n"
                              "       lpn-gcn --stats <shader.bin>...  instruction usage across shaders\n"
                              "       lpn-gcn --glsl <shader.bin>...   translate to GLSL and compile\n"
                              "       lpn-gcn --check <shader.bin>...  as --glsl, printing only results\n"
-                             "       lpn-gcn --variants <cache dir>   how saved translations of a shader differ\n");
+                             "       lpn-gcn --variants <cache dir>   how saved translations of a shader differ\n"
+                             "       lpn-gcn --resources <cache dir>  what draws bound, and what the code alone predicts\n");
         return 2;
     }
     if (!std::strcmp(argv[1], "--variants") && argc == 3) return variants(argv[2]);
+    if (!std::strcmp(argv[1], "--resources") && argc == 3) return resources(argv[2]);
     if (!std::strcmp(argv[1], "--glsl") || !std::strcmp(argv[1], "--check")) return glsl(argc, argv);
     const bool stats = !std::strcmp(argv[1], "--stats");
     std::map<std::string, std::pair<unsigned, unsigned>> uses; // mnemonic -> (count, shaders)
