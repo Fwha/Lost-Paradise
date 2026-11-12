@@ -325,6 +325,34 @@ int main() {
         }
     }
 
+    // An image the analysis cannot resolve (no T#) is declared from its code: a sample whose third
+    // address register is a v_cubeid face samples a cube; one with two addresses a 2D image.
+    {
+        const std::vector<uint32_t> cubeCode = {
+            0xd2880007, 0x040a0300, // v_cubeid_f32 v7, v0, v1, v2
+            0xf0800f00, 0x00400005, // image_sample v[0:3], v5, s[0:7], s[8:11]
+            0xf0800f00, 0x00400008, // image_sample v[0:3], v8, s[0:7], s[8:11]
+            0xbf810000,             // s_endpgm
+        };
+        constexpr uint64_t kCode = 0x30000;
+        auto readCube = [&](uint64_t addr, void* dst, size_t size) {
+            if (addr < kCode || addr + size > kCode + cubeCode.size() * 4) return false;
+            std::memcpy(dst, reinterpret_cast<const char*>(cubeCode.data()) + (addr - kCode), size);
+            return true;
+        };
+        gcn::LaunchState cl;
+        cl.stage = gcn::Stage::Compute;
+        cl.entry = kCode;
+        const gcn::Program cp = gcn::analyze(cl, readCube);
+        const std::string glsl = gcn::translate(cp, 0).glsl;
+        if (cp.images.size() != 2 || gcn::imageDimension(cp, cp.images[0]) != 11 || gcn::imageDimension(cp, cp.images[1]) != 9 ||
+            glsl.find("samplerCube img0") == std::string::npos || glsl.find("sampler2D img1") == std::string::npos ||
+            gcn::compileGlsl(glsl, gcn::GlslStage::Compute, &error).empty()) {
+            std::fprintf(stderr, "image dimension from code: %zu images\n%s\n%s\n", cp.images.size(), error.c_str(), glsl.c_str());
+            ++failures;
+        }
+    }
+
     if (failures) std::fprintf(stderr, "%d failure(s)\n", failures);
     return failures ? 1 : 0;
 }

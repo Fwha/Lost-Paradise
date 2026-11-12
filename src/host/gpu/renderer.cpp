@@ -3942,7 +3942,7 @@ private:
         if (format == VK_FORMAT_UNDEFINED) {
             // An all-zero T#: an image in code this launch skips (generic translation), bound to
             // the placeholder without a warning.
-            if (t.dataFormat() || addr) warnOnce("texture format " + std::to_string(t.dataFormat()) + "/" + std::to_string(nf) + " unsupported");
+            if (t.dataFormat() || addr || (t.t[3] & 0x0FFFFFFF)) warnOnce("texture format " + std::to_string(t.dataFormat()) + "/" + std::to_string(nf) + " unsupported");
         } else if (GuestTexture* g = guestTexture(t, format)) {
             b.view = view(g->img, format, vt, swz, 0, t.baseLevel(), t.lastLevel() + 1 - std::min(t.baseLevel(), t.lastLevel()));
         }
@@ -4800,7 +4800,12 @@ void main() {
             writes.back().dstBinding = n++;
         }
         for (auto& im : p.images) {
-            const ImageBinding ib = resolveImage(im);
+            // An image the analysis could not resolve (in code this launch skips) is bound to a
+            // placeholder of the dimension the translation declared for it.
+            gcn::ImageResource unresolved;
+            const bool zero = !im.t[0] && !im.t[1] && !im.t[3];
+            if (zero) unresolved = im, unresolved.t[3] = gcn::imageDimension(p, im) << 28;
+            const ImageBinding ib = resolveImage(zero ? unresolved : im);
             if (trace_)
                 std::fprintf(traceOut_, "[trace]   tex 0x%" PRIx64 " %ux%u fmt %u/%u type %u tile %u sel %03o pc 0x%" PRIx64 "%s\n",
                              im.base(), im.width(), im.height(), im.dataFormat(), im.numFormat(), im.type(), im.tileMode(),
@@ -6387,7 +6392,8 @@ void main() {
         if (n != prev.data.size() || n < gcn::data::kSmrd) return false;
         thread_local std::vector<uint8_t> skip;
         skip.assign(n, 0);
-        std::fill_n(&skip[gcn::data::kPosTransform], 4, 1);
+        // A pixel shader's words there are its colour swaps (generic translation), compared.
+        if (cur.launch.stage != gcn::Stage::Pixel) std::fill_n(&skip[gcn::data::kPosTransform], 4, 1);
         for (const auto& b : cur.buffers)
             if (b.data + 4 <= n) std::fill_n(&skip[b.data], 4, 1);
         for (const auto& im : cur.images)

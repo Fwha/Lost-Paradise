@@ -91,6 +91,16 @@ public:
         g += fmt("layout(std430, set = 0, binding = %u) readonly buffer DrawData { uint D[]; };\n", base_);
         g += decls_;
         g += helpers();
+        if (needOutSwizzle_)
+            g += R"(// Shader components to memory order (CB_COLOR_INFO.COMP_SWAP), by the target's components:
+// code = components * 4 + swap; each entry holds the source component of x, y, z, w in 2 bits.
+const uint kOutSwz[20] = uint[20](0xe4u, 0xe4u, 0xe4u, 0xe4u, 0x00u, 0x55u, 0xaau, 0xffu, 0xe4u, 0xecu, 0xe1u, 0xe3u,
+                                  0xe4u, 0xb4u, 0xc6u, 0x87u, 0xe4u, 0xc6u, 0x1bu, 0x93u);
+vec4 outSwizzle(vec4 v, uint code) {
+    uint t = kOutSwz[min(code, 19u)];
+    return vec4(v[t & 3u], v[(t >> 2) & 3u], v[(t >> 4) & 3u], v[(t >> 6) & 3u]);
+}
+)";
         if (needLane_)
             g += stage == Stage::Compute ? "uint laneId() { return gl_LocalInvocationIndex & 63u; }\n"
                  : stage == Stage::Vertex ? "uint laneId() { return uint(gl_VertexIndex) & 63u; }\n"
@@ -282,7 +292,7 @@ private:
         const char pfx = typePrefix(im);
         if (pfx != ' ') t += pfx;
         t += im.storage ? "image" : "sampler";
-        t += dimName(im.type());
+        t += dimName(imageDimension(p_, im));
         if (im.compare) t += "Shadow";
         return t;
     }
@@ -974,7 +984,13 @@ vec3 cubeDir(vec3 c) {
                 probed_ = true;
                 v = "vec4(probe_, 1.0)";
             }
-            if (std::strcmp(swz, "xyzw")) out(fmt("oC%u = %s(%s).%s;\n", mrt, type, v.c_str(), swz));
+            // Generic: a float target's swap comes with the draw (data::kColorSwizzle), so the
+            // translation does not depend on the render target bound.
+            if (genericTranslation() && !isU && !isS) {
+                needOutSwizzle_ = true;
+                out(fmt("oC%u = outSwizzle(%s, (D[%u] >> %uu) & 0xffu);\n", mrt, v.c_str(), data::kColorSwizzle + mrt / 4,
+                        (mrt % 4) * 8));
+            } else if (std::strcmp(swz, "xyzw")) out(fmt("oC%u = %s(%s).%s;\n", mrt, type, v.c_str(), swz));
             else out(fmt("oC%u = %s(%s);\n", mrt, type, v.c_str()));
             return;
         }
@@ -1152,7 +1168,7 @@ vec3 cubeDir(vec3 c) {
         const bool unorm = ((w >> 12) & 1) || ((im.s[0] >> 15) & 1);
         const uint32_t vaddr = w1 & 0xFF, vdata = (w1 >> 8) & 0xFF;
         const std::string tn = fmt("img%zu", index);
-        const uint32_t type = im.type();
+        const uint32_t type = imageDimension(p_, im);
         unsigned dims = 2;
         bool array = false;
         switch (type) {
@@ -1357,7 +1373,7 @@ vec3 cubeDir(vec3 c) {
     };
     std::set<std::pair<uint64_t, uint64_t>, LoopOrder> loops_; // (head, its backward branch)
     uint32_t loopVars_ = 0;
-    bool needLane_ = false, need64_ = false, needQuad_ = false, depthDeclared_ = false;
+    bool needLane_ = false, need64_ = false, needQuad_ = false, needOutSwizzle_ = false, depthDeclared_ = false;
 };
 
 } // namespace

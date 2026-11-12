@@ -52,8 +52,15 @@ screen loop). Addresses are guest addresses and change between runs.
   resources are numbered by address, not walk order. Launches that differ only in such flags
   (vertex shaders turning blocks on with bits of a constant: up to 60 translations of one shader
   before) then share one translation. Image data formats and sampled images' swizzles are left out
-  of the translation key, since only the view uses them. These SPIR-V and pipelines are kept in a
-  `generic/` subfolder of the cache.
+  of the translation key, since only the view uses them. A float colour target's COMP_SWAP and
+  component count reach the pixel shader in its draw data (`data::kColorSwizzle`, over the words a
+  vertex shader uses for its position transform), so the translation does not depend on the target.
+  These SPIR-V and pipelines are kept in a `generic/` subfolder of the cache.
+- **Images without a T#** (in code a launch skips, or a shader compiled before any draw) are declared
+  from the code: a cube when the third address register is a `v_cubeid` face, 3D (or a 2D array with
+  DA) when a third address is written just before the instruction, else 2D. Over the user's cache
+  this matches the bound T# for 16401 of 16402 images (the other is a 1D T# that a copy shader reads
+  as 2D, which the renderer already does).
 - **SPIR-V cache.** Compiling a shader's GLSL takes ~10 ms and a new attack effect brings dozens,
   so SPIR-V is kept in `~/.cache/lpn-host/spirv` (`LPN_SHADER_CACHE=<dir>`, or `off`), named by
   a hash of the GLSL. Only the first time an effect is seen anywhere hitches.
