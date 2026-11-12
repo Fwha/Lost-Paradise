@@ -33,7 +33,7 @@ struct LaunchState {
     uint32_t rsrc1 = 0, rsrc2 = 0;
     // Vertex
     bool glClipZ = false; // clip space z in [-w, w] rather than [0, w]
-    // Pixel
+    // Pixel (psInputCntl and numInterp for a vertex shader too in the generic translation)
     uint32_t psInputEna = 0;
     uint32_t psInputCntl[32] = {};
     uint32_t numInterp = 0;
@@ -54,7 +54,11 @@ namespace data {
 constexpr uint32_t kUserData = 0;     // 16 dwords of user SGPRs
 constexpr uint32_t kPosTransform = 16; // VS: position xy scale, then offset (times w); floats
 constexpr uint32_t kColorSwizzle = 16; // PS, generic translation: per MRT a byte, components * 4 + COMP_SWAP (2 words)
-constexpr uint32_t kSmrd = 20;        // scalar load results follow
+constexpr uint32_t kClipZ = 20;       // VS, generic translation: 1 when clip space z is [-w, w] (PA_CL_CLIP_CNTL)
+constexpr uint32_t kPsInputMap = 21;  // VS, generic: per pixel shader input a byte, the export it reads, 0xff none (8 words)
+constexpr uint32_t kPsDefaults = 20;  // PS, generic: bit n, input n takes its default; then per input 2 bits of DEFAULT_VAL (2 words)
+// Where scalar load results start: after the words above in the generic translation.
+uint32_t smrd();
 } // namespace data
 
 struct BufferResource {
@@ -159,6 +163,11 @@ bool deserialize(const std::string& bytes, Program& program);
 // launch decided as run-time branches and walks the code they skip too, so launches of a shader
 // that differ only in such flags translate alike (docs/shader-precompile.md, stage 1).
 bool genericTranslation();
+// Generic: fills the draw data words (at `d`) that carry clip z and the vertex to pixel shader
+// linkage: for a vertex shader the pixel shader's inputs (psInputCntl and numInterp, which the
+// renderer sets in its launch too) as a map from input to export, for a pixel shader its inputs'
+// defaults. The translation then numbers pixel shader inputs as their own registers.
+void linkageData(const LaunchState& launch, uint32_t* d);
 
 // Generic translation: a buffer_load_format_* decodes its element by the V#'s word 3 (DATA_FORMAT,
 // NUM_FORMAT, DST_SEL), which the analysis puts in the draw data after the buffer's four words, so
@@ -175,6 +184,13 @@ uint32_t imageDimension(const Program& program, const ImageResource& im);
 // `readCode` fetches instructions, `readData` scalar loads.
 Program analyze(const LaunchState& launch, const ReadMemory& readCode, const ReadMemory& readData);
 inline Program analyze(const LaunchState& launch, const ReadMemory& read) { return analyze(launch, read, read); }
+
+// Generic translation without a draw (docs/shader-precompile.md stage 4): the program as any
+// launch of it translates, with no user data and nothing read but code; a vertex shader's call
+// to its fetch shader takes `fetchSlots` slots (one per four input VGPRs from v4; ~0u: as many as
+// its code reads, see fetchSlotsFromCode).
+Program analyzeUnbound(const LaunchState& launch, const ReadMemory& readCode, uint32_t fetchSlots = ~0u);
+uint32_t fetchSlotsFromCode(const Program& program, uint64_t site);
 
 // Re-evaluates `program` (analysed from the same code and launch registers) for a launch with
 // other user data or memory by replaying its trace. False when a branch would go another way;

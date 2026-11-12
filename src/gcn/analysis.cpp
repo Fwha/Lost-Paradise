@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <bit>
+#include <bitset>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -59,7 +60,7 @@ public:
     }
 
     Program run() {
-        p_.data.assign(data::kSmrd, 0);
+        p_.data.assign(data::smrd(), 0);
         p_.labels.insert(p_.launch.entry);
         unsigned steps = 0;
         {
@@ -126,8 +127,8 @@ public:
     // launch's walk met them, so the translation does not depend on which way it went.
     void canonicalize() {
         std::map<uint32_t, uint32_t> slotMap; // old data offset -> new
-        std::vector<uint32_t> data(p_.data.begin(), p_.data.begin() + std::min<size_t>(p_.data.size(), data::kSmrd));
-        data.resize(data::kSmrd, 0);
+        std::vector<uint32_t> data(p_.data.begin(), p_.data.begin() + std::min<size_t>(p_.data.size(), data::smrd()));
+        data.resize(data::smrd(), 0);
         auto move = [&](uint32_t from, unsigned n) {
             const uint32_t to = uint32_t(data.size());
             for (unsigned i = 0; i < n; ++i) data.push_back(from + i < p_.data.size() ? p_.data[from + i] : 0);
@@ -257,8 +258,9 @@ private:
                 p_.data[data::kColorSwizzle + m / 4] |=
                     (std::min<uint32_t>(p_.launch.colorComps[m], 4) * 4 + (p_.launch.colorSwap[m] & 3)) << ((m % 4) * 8);
         }
+        if (genericTranslation()) linkageData(p_.launch, p_.data.data());
         State st;
-        const uint32_t user = p_.launch.userSgprs();
+        const uint32_t user = unbound_ ? 0 : p_.launch.userSgprs();
         for (uint32_t i = 0; i < user && i < 16; ++i) {
             st.s[i] = p_.launch.userData[i];
             st.known[i] = true;
@@ -481,6 +483,10 @@ private:
             label(next);
             if (k && generic() && p_.launch.stage == Stage::Vertex && fetch(pc, a64 & 0xFFFFFFFFFFFFull, st))
                 return true; // pulled in the vertex shader itself; the walk goes on after the call
+            if (!k && unbound_ && p_.launch.stage == Stage::Vertex && !speculative_ && !p_.fetchSite) {
+                unboundFetch(pc); // its slots as a draw's fetch shader will fill them
+                return true;
+            }
             if (k) {
                 if (!prior_) p_.calls[pc] = a64 & 0xFFFFFFFFFFFFull;
                 branchTo(a64 & 0xFFFFFFFFFFFFull, st, work);
@@ -800,6 +806,20 @@ private:
     // The fetch shader a vertex shader calls at `site`, as buffers of the vertex shader: one per
     // slot of four VGPRs up to the last it loads, each with its V#, then V# word 3 and a control
     // word (index VGPR, components, offset) in the draw data, so a translation serves every mesh.
+    // Without a draw (analyzeUnbound): the fetch slots the vertex shader's inputs take, unresolved.
+    void unboundFetch(uint64_t site) {
+        p_.fetchSite = site;
+        p_.fetchSlots = unboundSlots_;
+        for (uint32_t k = 0; k < unboundSlots_; ++k) {
+            BufferResource r;
+            r.pc = site;
+            r.known = false;
+            r.data = uint32_t(p_.data.size());
+            p_.data.resize(r.data + 6, 0);
+            p_.buffers.push_back(r);
+        }
+    }
+
     bool fetch(uint64_t site, uint64_t callee, const State& st) {
         std::vector<FetchLoad> loads;
         if (!parseFetch(callee, st, loads)) {
@@ -856,6 +876,10 @@ private:
         return true;
     }
 
+public:
+    bool unbound_ = false;      // analyzeUnbound: no user data
+    uint32_t unboundSlots_ = 0; // its fetch slots
+private:
     const ReadMemory& readCode_;
     const ReadMemory& readData_;
     const Program* prior_; // replaying this program's trace
@@ -1071,8 +1095,7 @@ ReplayStats takeReplayStats() {
 }
 
 namespace {
-// The VGPRs an instruction writes (first, count), for the address look-back below. Loads give their
-// largest size; unknown formats none.
+// The VGPRs an instruction writes (first, count). Loads give their largest size; unknown formats none.
 std::pair<uint32_t, uint32_t> vgprWrites(const Instruction& in) {
     const uint32_t w = in.words[0], w1 = in.size > 4 ? in.words[1] : 0;
     switch (in.format) {
@@ -1087,33 +1110,75 @@ std::pair<uint32_t, uint32_t> vgprWrites(const Instruction& in) {
     default: return {0, 0};
     }
 }
-// Whether an instruction reads VGPR v as an ALU source.
-bool readsVgpr(const Instruction& in, uint32_t v) {
+// Every VGPR an instruction reads (a superset: loads' and samples' address ranges at their largest).
+template <class F> void vgprReads(const Instruction& in, F&& f) {
     const uint32_t w = in.words[0], w1 = in.size > 4 ? in.words[1] : 0;
-    const uint32_t code = 256 + v;
+    auto src = [&](uint32_t code) {
+        if (code >= 256 && code < 512) f(code - 256);
+    };
     switch (in.format) {
-    case Format::VOP1: return (w & 0x1FF) == code;
+    case Format::VOP1: src(w & 0x1FF); break;
     case Format::VOP2:
-    case Format::VOPC: return (w & 0x1FF) == code || ((w >> 9) & 0xFF) == v;
-    case Format::VOP3: return (w1 & 0x1FF) == code || ((w1 >> 9) & 0x1FF) == code || ((w1 >> 18) & 0x1FF) == code;
-    default: return false;
+        src(w & 0x1FF), f((w >> 9) & 0xFF);
+        if (in.op == 31 || in.op == 32 || in.op == 33) f((w >> 17) & 0xFF); // v_mac/madmk/madak read vdst
+        break;
+    case Format::VOPC: src(w & 0x1FF), f((w >> 9) & 0xFF); break;
+    case Format::VOP3: src(w1 & 0x1FF), src((w1 >> 9) & 0x1FF), src((w1 >> 18) & 0x1FF); break;
+    case Format::VINTRP: f(w & 0xFF); break;
+    case Format::EXP:
+        for (uint32_t i = 0; i < 4; ++i)
+            if ((w >> i) & 1) f((w1 >> (i * 8)) & 0xFF);
+        break;
+    case Format::MUBUF:
+    case Format::MTBUF: {
+        const bool offen = (w >> 12) & 1, idxen = (w >> 13) & 1;
+        if (offen || idxen) f(w1 & 0xFF);
+        if (offen && idxen) f((w1 & 0xFF) + 1);
+        const bool store = in.format == Format::MTBUF ? in.op >= 4 : (in.op >= 4 && in.op <= 7) || (in.op >= 24 && in.op <= 31);
+        if (store)
+            for (uint32_t i = 0; i < 4; ++i) f(((w1 >> 8) & 0xFF) + i);
+        break;
+    }
+    case Format::MIMG:
+        for (uint32_t i = 0; i < 4; ++i) f((w1 & 0xFF) + i);
+        break;
+    case Format::DS: f(w1 & 0xFF), f((w1 >> 8) & 0xFF), f((w1 >> 16) & 0xFF); break;
+    default: break;
     }
 }
 } // namespace
 
+// The fetch slots a vertex shader's inputs take, from its code: the VGPRs from v4 it reads after
+// the call to its fetch shader before writing them, in slots of four.
+uint32_t fetchSlotsFromCode(const Program& p, uint64_t site) {
+    std::set<uint32_t> written;
+    uint32_t last = 0; // highest input VGPR + 1
+    for (auto it = p.code.upper_bound(site); it != p.code.end(); ++it) {
+        const Instruction& in = it->second;
+        vgprReads(in, [&](uint32_t v) {
+            if (v >= 4 && v < 256 && !written.count(v)) last = std::max(last, v + 1);
+        });
+        const auto [first, count] = vgprWrites(in);
+        if (in.format == Format::VOP3 && in.op < 256) continue; // VOPC in VOP3 form writes SGPRs
+        for (uint32_t i = 0; i < count; ++i) written.insert(first + i);
+    }
+    return last > 4 ? (last - 4 + 3) / 4 : 0;
+}
+
 // The image's dimension as the translation declares it (a T# type: 9 2D, 10 3D, 11 cube, 13 2D
 // array, 8/12 1D). From the T# when the analysis resolved one; for an image it could not (code a
-// launch skips, or a shader compiled before any draw) from the code: how many address registers
-// are written just before the instruction, and whether the last is a v_cubeid face.
+// launch skips, or a shader compiled before any draw) from the code: a cube if the instruction
+// declares an array (DA) or its third coordinate comes from a v_cubeid face, else 2D.
 uint32_t imageDimension(const Program& p, const ImageResource& im) {
     if (im.t[0] || im.t[1] || im.t[3]) return im.type();
     auto it = p.code.find(im.pc);
     if (it == p.code.end()) return 9;
     const Instruction& in = it->second;
     const uint32_t w = in.words[0], vaddr = in.words[1] & 0xFF;
-    const bool da = (w >> 14) & 1;
+    if ((w >> 14) & 1) return 11; // DA: an array, which a cube's face is sampled as
+    // Or the address after s, t (past the opcode's own operands before them) holds a value
+    // computed from a v_cubeid face: followed through the 64 instructions before the sample.
     uint32_t prefix = 0;
-    bool suffix = false; // a LOD or clamp after the coordinates
     if (in.op >= 32 && in.op < 96) {
         const bool sample = in.op < 64;
         const uint32_t variant = in.op & 15;
@@ -1122,29 +1187,29 @@ uint32_t imageDimension(const Program& p, const ImageResource& im) {
         const uint8_t f = sample ? sFlags[variant] : gFlags[variant];
         prefix = (sample ? in.op >= 48 : in.op >= 80) + (f & 1) + ((f >> 5) & 1);
         if (f & 2) prefix += 4; // derivatives: taken as 2D's
-        suffix = f & 12;
-    } else if (in.op == 1 || in.op == 9) {
-        suffix = true; // image_load_mip, image_store_mip
+    }
+    auto from = it;
+    for (int n = 0; n < 64 && from != p.code.begin(); ++n) --from;
+    // VGPRs holding a value derived from a cube face (v_cubeid_f32), and from a face coordinate
+    // (v_cubesc_f32, v_cubetc_f32): a cube's s and t are face coordinates too, which tells it
+    // from a 2D sample whose next register happens to hold another sample's face.
+    std::bitset<256> face, coord;
+    for (auto at = from; at != it; ++at) {
+        const Instruction& x = at->second;
+        const auto [first, count] = vgprWrites(x);
+        if (!count) continue;
+        const bool vop3 = x.format == Format::VOP3;
+        bool f = vop3 && x.op == 324, c = vop3 && (x.op == 325 || x.op == 326);
+        if (!f && !c && (x.format == Format::VOP1 || x.format == Format::VOP2 || vop3))
+            vgprReads(x, [&](uint32_t v) {
+                if (v < 256) f |= face[v], c |= coord[v];
+            });
+        for (uint32_t i = 0; i < count && first + i < 256; ++i) face[first + i] = f, coord[first + i] = c;
     }
     const uint32_t third = vaddr + prefix + 2;
-    // The last write of a register in the straight-line code before the instruction, unless
-    // something reads it in between (then it is a value of its own, not an address).
-    auto lastWrite = [&](uint32_t reg) -> const Instruction* {
-        auto at = it;
-        for (int n = 0; n < 48 && at != p.code.begin(); ++n) {
-            --at;
-            if (p.labels.count(std::next(at)->first)) break;
-            const Instruction& x = at->second;
-            if (readsVgpr(x, reg)) return nullptr;
-            const auto [first, count] = vgprWrites(x);
-            if (count && reg >= first && reg < first + count) return &x;
-        }
-        return nullptr;
-    };
-    const Instruction* third_ = lastWrite(third);
-    if (third_ && third_->format == Format::VOP3 && third_->op == 324) return 11; // v_cubeid: a cube face
-    const bool three = suffix ? lastWrite(third + 1) != nullptr && third_ : third_ != nullptr;
-    if (three) return da ? 13 : 10;
+    if (third < 256 && face[third] && coord[vaddr + prefix]) return 11;
+    // 3D images were never seen bound (lpn-gcn --boot on a play cache: counting address
+    // registers written took 154 2D images for 3D), so the rest are 2D.
     return 9;
 }
 
@@ -1154,7 +1219,7 @@ uint32_t bufferWords(const Program& p, const BufferResource& b) {
 }
 
 bool formatInData(const Instruction& in) {
-    return genericTranslation() && in.format == Format::MUBUF && in.op <= 3; // buffer_load_format_*
+    return genericTranslation() && in.format == Format::MUBUF && in.op <= 7; // buffer_load/store_format_*
 }
 
 bool formatInData(const Program& p, const BufferResource& b) {
@@ -1171,8 +1236,49 @@ bool genericTranslation() {
     return on;
 }
 
+// Generic translation: the draw data words that carry what the translation would otherwise take
+// from the launch (data::kClipZ, kPsInputMap, kPsDefaults).
+void linkageData(const LaunchState& l, uint32_t* d) {
+    if (l.stage == Stage::Vertex) {
+        d[data::kClipZ] = l.glClipZ;
+        for (uint32_t j = 0; j < 32; ++j) {
+            const uint32_t cntl = l.psInputCntl[j];
+            const uint32_t from = j >= l.numInterp || (cntl & 0x20) ? 0xFF : cntl & 0x1F;
+            d[data::kPsInputMap + j / 4] = (d[data::kPsInputMap + j / 4] & ~(0xFFu << (j % 4 * 8))) | from << (j % 4 * 8);
+        }
+    } else if (l.stage == Stage::Pixel) {
+        d[data::kPsDefaults] = d[data::kPsDefaults + 1] = d[data::kPsDefaults + 2] = 0;
+        for (uint32_t j = 0; j < 32; ++j) {
+            const uint32_t cntl = l.psInputCntl[j];
+            if (!(cntl & 0x20)) continue;
+            d[data::kPsDefaults] |= 1u << j;
+            d[data::kPsDefaults + 1 + j / 16] |= ((cntl >> 8) & 3) << (j % 16 * 2);
+        }
+    }
+}
+
+uint32_t data::smrd() {
+    static const uint32_t at = genericTranslation() ? 32 : 20;
+    return at;
+}
+
 Program analyze(const LaunchState& launch, const ReadMemory& readCode, const ReadMemory& readData) {
     return Analyzer(launch, readCode, readData).run();
+}
+
+Program analyzeUnbound(const LaunchState& launch, const ReadMemory& readCode, uint32_t fetchSlots) {
+    static const ReadMemory none = [](uint64_t, void*, size_t) { return false; };
+    auto run = [&](uint32_t slots) {
+        Analyzer a(launch, readCode, none);
+        a.unbound_ = true;
+        a.unboundSlots_ = slots;
+        return a.run();
+    };
+    Program p = run(fetchSlots == ~0u ? 0 : fetchSlots);
+    if (fetchSlots == ~0u && p.fetchSite) // the slots from its code, then walked again with them
+        if (const uint32_t slots = fetchSlotsFromCode(p, p.fetchSite)) p = run(slots);
+    p.trace.clear(); // nothing to replay: every launch is analysed against its own data
+    return p;
 }
 
 bool replay(const Program& p, const LaunchState& launch, const ReadMemory& readData, Program& out) {
@@ -1259,10 +1365,11 @@ std::string Program::key() const {
     put(&l.entry, 8);
     put(&l.rsrc1, 4);
     put(&l.rsrc2, 4);
-    put(&l.glClipZ, 1);
+    // Generic: clip z and the inputs' mapping come with the draw (linkageData).
+    if (!genericTranslation()) put(&l.glClipZ, 1);
     if (l.stage == Stage::Pixel) {
         put(&l.psInputEna, 4);
-        put(l.psInputCntl, sizeof(l.psInputCntl));
+        if (!genericTranslation()) put(l.psInputCntl, sizeof(l.psInputCntl));
         put(&l.colorFormat, 4);
         put(&l.colorUint, 4);
         put(&l.colorSint, 4);

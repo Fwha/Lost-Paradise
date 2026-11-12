@@ -376,12 +376,58 @@ int main() {
         }
     }
 
-    // An image the analysis cannot resolve (no T#) is declared from its code: a sample whose third
-    // address register is a v_cubeid face samples a cube; one with two addresses a 2D image.
+    // Generic translation: the vertex to pixel shader linkage and clip z come with the draw, so a
+    // vertex shader translates alike whichever pixel shader it is drawn with.
+    if (gcn::genericTranslation()) {
+        const std::vector<uint32_t> code = {
+            0xf800020f, 0x03020100, // exp param0 v0 v1 v2 v3
+            0xf800021f, 0x03020100, // exp param1 v0 v1 v2 v3
+            0xf80008cf, 0x03020100, // exp pos0 v0 v1 v2 v3 done
+            0xbf810000,             // s_endpgm
+        };
+        auto read = [&](uint64_t addr, void* dst, size_t size) {
+            if (addr < 0x50000 || addr + size > 0x50000 + code.size() * 4) return false;
+            std::memcpy(dst, reinterpret_cast<const char*>(code.data()) + (addr - 0x50000), size);
+            return true;
+        };
+        gcn::LaunchState a;
+        a.stage = gcn::Stage::Vertex;
+        a.entry = 0x50000;
+        a.numInterp = 3;
+        a.psInputCntl[0] = 1;            // input 0 reads export 1
+        a.psInputCntl[1] = 0;            // input 1 reads export 0
+        a.psInputCntl[2] = 0x20 | 3 << 8; // input 2 is (1, 1, 1, 1)
+        gcn::LaunchState b = a;
+        b.psInputCntl[0] = 0, b.psInputCntl[1] = 1, b.glClipZ = true;
+        const gcn::Program pa = gcn::analyze(a, read), pb = gcn::analyze(b, read);
+        const std::string glsl = gcn::translate(pa, 0).glsl;
+        const uint32_t map = pa.data[gcn::data::kPsInputMap];
+        if (pa.key() != pb.key() || glsl != gcn::translate(pb, 0).glsl || map != 0xFFFF0001u ||
+            pa.data[gcn::data::kClipZ] != 0 || pb.data[gcn::data::kClipZ] != 1 ||
+            gcn::compileGlsl(glsl, gcn::GlslStage::Vertex, &error).empty()) {
+            std::fprintf(stderr, "linkage: keys %s, map %08x\n%s\n%s\n", pa.key() == pb.key() ? "equal" : "differ", map,
+                         error.c_str(), glsl.c_str());
+            ++failures;
+        }
+        gcn::LaunchState ps;
+        ps.stage = gcn::Stage::Pixel;
+        std::memcpy(ps.psInputCntl, a.psInputCntl, sizeof ps.psInputCntl);
+        uint32_t d[32] = {};
+        gcn::linkageData(ps, d);
+        if (d[gcn::data::kPsDefaults] != 4 || d[gcn::data::kPsDefaults + 1] != 3u << 4) {
+            std::fprintf(stderr, "linkage: pixel shader defaults %x %x\n", d[gcn::data::kPsDefaults], d[gcn::data::kPsDefaults + 1]);
+            ++failures;
+        }
+    }
+
+    // An image the analysis cannot resolve (no T#) is declared from its code: a sample that
+    // declares an array (DA) or whose addresses are cube face coordinates and face samples a cube; others 2D.
     {
         const std::vector<uint32_t> cubeCode = {
+            0xd28a0005, 0x040a0300, // v_cubesc_f32 v5, v0, v1, v2
+            0xd28c0006, 0x040a0300, // v_cubetc_f32 v6, v0, v1, v2
             0xd2880007, 0x040a0300, // v_cubeid_f32 v7, v0, v1, v2
-            0xf0800f00, 0x00400005, // image_sample v[0:3], v5, s[0:7], s[8:11]
+            0xf0800f00, 0x00400005, // image_sample v[0:3], v5, s[0:7], s[8:11] (v7 a cube face)
             0xf0800f00, 0x00400008, // image_sample v[0:3], v8, s[0:7], s[8:11]
             0xbf810000,             // s_endpgm
         };

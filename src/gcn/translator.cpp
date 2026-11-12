@@ -101,6 +101,23 @@ vec4 outSwizzle(vec4 v, uint code) {
     return vec4(v[t & 3u], v[(t >> 2) & 3u], v[(t >> 4) & 3u], v[(t >> 6) & 3u]);
 }
 )";
+        if (exports_) { // generic: export n goes to each location whose pixel shader input reads it
+            std::string f = "void vsExport(uint n, vec4 v) {\n";
+            for (uint32_t j = 0; j < exports_; ++j) {
+                g += fmt("layout(location = %u) out vec4 oP%u;\n", j, j);
+                f += fmt("    if (((D[%u] >> %uu) & 0xffu) == n) oP%u = v;\n", data::kPsInputMap + j / 4, j % 4 * 8, j);
+                t_.outputs |= 1u << j;
+            }
+            g += f + "}\n";
+        }
+        if (needPsInput_)
+            g += fmt(R"(// Generic: input a's component c, or its default (SPI_PS_INPUT_CNTL.DEFAULT_VAL) when the draw says so.
+float psInput(uint a, uint c, float v) {
+    if (((D[%u] >> a) & 1u) == 0u) return v;
+    uint d = (D[%u + a / 16u] >> ((a %% 16u) * 2u)) & 3u;
+    return float(c == 3u ? d & 1u : d >> 1);
+}
+)", data::kPsDefaults, data::kPsDefaults + 1);
         if (needFormatDecode_)
             g += R"(// Formatted buffer elements by V# word 3 (DATA_FORMAT 18:15, NUM_FORMAT 14:12, DST_SEL 11:0):
 // dwords each data format spans, and the element decoded from them (sh: byte offset of 8-bit data).
@@ -282,7 +299,9 @@ private:
         switch (l.stage) {
         case Stage::Vertex: {
             init_ += vreg(0) + " = uint(gl_VertexIndex);\n";
-            const uint32_t comps = (l.rsrc1 >> 24) & 3;
+            // Generic: v1-v3 are the instance index whatever VGPR_COMP_CNT says (the engine raises it
+            // for instanced fetch), so the translation does not depend on the draw's RSRC1.
+            const uint32_t comps = genericTranslation() ? 3 : (l.rsrc1 >> 24) & 3;
             if (comps >= 1) init_ += vreg(1) + " = uint(gl_InstanceIndex);\n";
             if (comps >= 2) init_ += vreg(2) + " = uint(gl_InstanceIndex);\n";
             if (comps >= 3) init_ += vreg(3) + " = uint(gl_InstanceIndex);\n";
@@ -948,6 +967,18 @@ vec3 cubeDir(vec3 c) {
         const uint32_t w = in.words[0];
         const uint32_t vdst = (w >> 18) & 0xFF, attr = (w >> 10) & 0x3F, chan = (w >> 8) & 3;
         if (in.op == 0) return; // v_interp_p1_f32: p2 produces the whole interpolated value
+        if (genericTranslation()) {
+            // Input n at location n, which the vertex shader fills from the export the draw's
+            // SPI_PS_INPUT_CNTL names (data::kPsInputMap); a default comes with the draw too.
+            const bool flat = in.op == 2;
+            if (!(t_.inputs & (1u << attr))) {
+                t_.inputs |= 1u << attr;
+                decls_ += fmt("layout(location = %u) %sin vec4 iA%u;\n", attr, flat ? "flat " : "", attr);
+            }
+            needPsInput_ = true;
+            writeV(vdst, fmt("U(psInput(%uu, %uu, iA%u[%u]))", attr, chan, attr, chan));
+            return;
+        }
         const uint32_t cntl = p_.launch.psInputCntl[attr];
         const uint32_t offset = cntl & 0x3F;
         if (offset & 0x20) { // default value
@@ -978,12 +1009,19 @@ vec3 cubeDir(vec3 c) {
             out("gl_Position = " + vec() + ";\n");
             out(fmt("gl_Position.xy = gl_Position.xy * vec2(F(D[%u]), F(D[%u])) + vec2(F(D[%u]), F(D[%u])) * gl_Position.w;\n",
                     data::kPosTransform, data::kPosTransform + 1, data::kPosTransform + 2, data::kPosTransform + 3));
-            if (p_.launch.glClipZ) out("gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;\n");
+            if (genericTranslation()) out(fmt("if (D[%u] != 0u) gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;\n", data::kClipZ));
+            else if (p_.launch.glClipZ) out("gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;\n");
             return;
         }
         if (target >= 13 && target <= 15) return; // misc vectors, clip distances
         if (target >= 32) {
             const uint32_t n = target - 32;
+            if (genericTranslation()) { // to the locations of the pixel shader inputs that read it (see vintrp)
+                exports_ = std::max(exports_, n + 1);
+                const std::string v = compr ? fmt("vec4(unpackHalf2x16(%s), unpackHalf2x16(%s))", vreg(vs[0]).c_str(), vreg(vs[1]).c_str()) : vec();
+                out(fmt("vsExport(%uu, %s);\n", n, v.c_str()));
+                return;
+            }
             if (!(t_.outputs & (1u << n))) {
                 t_.outputs |= 1u << n;
                 decls_ += fmt("layout(location = %u) out vec4 oP%u;\n", n, n);
@@ -1125,7 +1163,8 @@ vec3 cubeDir(vec3 c) {
                 out(fmt("atomicAnd(%s.m[a_ >> 2], ~(%s << (%s)));\n", bn.c_str(), mask, shift));
                 out(fmt("atomicOr(%s.m[a_ >> 2], (%s & %s) << (%s));\n", bn.c_str(), vreg(vdata).c_str(), mask, shift));
             } else {
-                storeFormat(r, bn, vdata, count);
+                if (formatInData(in)) storeFormatDynamic(o, bn, vdata, count);
+                else storeFormat(r, bn, vdata, count);
             }
             out("}\n}\n");
             return;
@@ -1235,6 +1274,18 @@ vec3 cubeDir(vec3 c) {
         out(fmt("uint w2_ = nd_ > 2u ? %s.m[i_ + 2u] : 0u, w3_ = nd_ > 3u ? %s.m[i_ + 3u] : 0u;\n", bn.c_str(), bn.c_str()));
         out("uvec4 v_ = decodeFormat(w0_, w1_, w2_, w3_, (a_ & 3u) * 8u, f_);\n");
         out("r_[0] = v_.x; r_[1] = v_.y; r_[2] = v_.z; r_[3] = v_.w;\n");
+    }
+
+    // Generic translation: the stored element's format from V# word 3 in the draw data (the formats
+    // storeFormat handles: 32-bit components, and unorm 8_8_8_8).
+    void storeFormatDynamic(uint32_t o, const std::string& bn, uint32_t vdata, unsigned count) {
+        out(fmt("uint f_ = D[%u], df_ = (f_ >> 15) & 15u, nf_ = (f_ >> 12) & 7u;\n", o + 4));
+        out("uint nc_ = df_ == 4u ? 1u : df_ == 11u ? 2u : df_ == 13u ? 3u : df_ == 14u ? 4u : 0u;\n");
+        for (unsigned i = 0; i < count; ++i)
+            out(fmt("if (nc_ > %uu) %s.m[(a_ >> 2) + %uu] = %s;\n", i, bn.c_str(), i, vreg(vdata + i).c_str()));
+        std::string v = "vec4(";
+        for (unsigned i = 0; i < 4; ++i) v += (i ? ", " : "") + (i < count ? "F(" + vreg(vdata + i) + ")" : std::string("0.0"));
+        out(fmt("if (df_ == 10u && nf_ == 0u) %s.m[a_ >> 2] = packUnorm4x8(%s));\n", bn.c_str(), v.c_str()));
     }
 
     void storeFormat(const BufferResource& r, const std::string& bn, uint32_t vdata, unsigned count) {
@@ -1474,7 +1525,8 @@ vec3 cubeDir(vec3 c) {
     };
     std::set<std::pair<uint64_t, uint64_t>, LoopOrder> loops_; // (head, its backward branch)
     uint32_t loopVars_ = 0;
-    bool needLane_ = false, need64_ = false, needQuad_ = false, needOutSwizzle_ = false, needFormatDecode_ = false, depthDeclared_ = false;
+    bool needLane_ = false, need64_ = false, needQuad_ = false, needOutSwizzle_ = false, needFormatDecode_ = false, depthDeclared_ = false, needPsInput_ = false;
+    uint32_t exports_ = 0; // generic VS: param exports, one past the highest
 };
 
 } // namespace

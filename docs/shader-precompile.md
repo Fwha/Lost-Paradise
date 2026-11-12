@@ -46,6 +46,41 @@ is part of the shader binary's own registers and so known without a draw.
    shader tables (PS 0x2698148, VS 0x2698168, CS 0x26981e8, counts beside them; see
    render-decomp.md) and compile every entry behind the progress screen.
 
+### What a draw still decided, now draw data
+
+At boot a shader has no draw, so whatever the translation took from the draw's registers rather
+than the shader's own must reach the shader as draw data instead (generic translation, cache
+folder `generic3`):
+
+- **Vertex to pixel shader linkage.** SPI_PS_INPUT_CNTL says which vertex shader export each pixel
+  shader input reads, or that it takes a default. The pixel shader now reads input n at location
+  n; the vertex shader writes each export to every location whose input reads it, by a byte map in
+  its draw data (`data::kPsInputMap`, from the draw's SPI_PS_INPUT_CNTL); a default comes in the
+  pixel shader's draw data (`data::kPsDefaults`). Flat shading comes from the code
+  (v_interp_mov); `lpn-gcn --boot` counts inputs the draw makes flat that the code interpolates.
+- **Clip z** (PA_CL_CLIP_CNTL.DX_CLIP_SPACE_DEF) is a word in the vertex shader's data
+  (`data::kClipZ`).
+
+Scalar load results start after these words (`data::smrd()`, 32 in the generic translation).
+
+### The boot compile
+
+With pipeline libraries on, a background thread (`bootCompile`, `LPN_BOOT_COMPILE=0` turns it
+off) waits for the vertex and pixel shader tables to stop growing (the title menu fills them),
+then per entry builds a launch from the Gnmx registers, analyses it without a draw
+(`gcn::analyzeUnbound`; a vertex shader's fetch slots from its input semantics), translates and
+compiles it, saves its .gcn, and builds its pre-rasterisation or fragment library. Before that
+(after the startup compile) it builds the libraries of every .gcn an earlier run saved, so in play
+a draw only links. It runs on a quarter of the cores at low priority and waits while a draw waits
+for a pipeline: built behind the progress screen, 551 libraries held the game 92 s (0.17 s each
+without the driver's cache), and run beside play at full width they tripled the first hitches. A drawn
+shader whose translation still differs from the boot one is logged once
+(`boot compile missed ...`).
+
+Without a T#, an image's dimension comes from its instruction: a cube when it declares an array
+(DA) or its addresses derive from v_cubesc/v_cubetc coordinates and a v_cubeid face, else 2D. Counting the address registers written before the sample took 154 of the play
+cache's 2D images for 3D, and no 3D image was ever bound.
+
 ### The shader tables (measured on the user's PC, 2026-11-12)
 
 All of the game's shaders are registered by the title menu and the tables do not change in play
