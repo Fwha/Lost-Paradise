@@ -2483,6 +2483,7 @@ private:
         m->module = module(m->translation.glsl, stage);
         m->name = spirvName(m->translation.glsl, stage);
         if (m->module && !rewritten) saveSource(m->name, p, bindingBase);
+        if (libraries_ && !rewritten) checkBootTranslation(p, m->name);
         if (stage == gcn::GlslStage::Fragment) {
             uint8_t code[256];
             if (readGuest(p.launch.entry, code, sizeof code)) m->smaa = smaaRole(fnv(code, sizeof code));
@@ -3163,6 +3164,9 @@ private:
                 }
             }).detach();
         if (prebuild) std::thread([this] { prebuildPipelines(); }).detach();
+        // LPN_BOOT_COMPILE=0 turns the boot compile off.
+        if (const char* e = getenv("LPN_BOOT_COMPILE"); libraries_ && spirvDir_ != "-" && !(e && !std::strcmp(e, "0")))
+            std::thread([this] { bootCompile(); }).detach();
     }
 
     // Draws' pipelines go ahead of the startup builds.
@@ -3207,6 +3211,187 @@ private:
         VkShaderModule m = VK_NULL_HANDLE;
         return vkCreateShaderModule(vk_.device, &ci, nullptr, &m) == VK_SUCCESS ? m : VK_NULL_HANDLE;
     }
+
+    // ---- Stage 4 of docs/shader-precompile.md: every shader before it is drawn ----
+
+    // A program's pipeline libraries (see linkGraphics), built unless a draw or an earlier call
+    // did: the startup compile builds them for every saved vertex and pixel shader, and the boot
+    // compile for every shader the game registers, so a draw only links.
+    void buildLibraries(const gcn::Program& p, const std::string& name) {
+        if (!libraries_ || name.empty() || p.launch.stage == gcn::Stage::Compute) return;
+        const bool vertex = p.launch.stage == gcn::Stage::Vertex;
+        std::vector<VkDescriptorSetLayoutBinding> lb;
+        if (vertex) {
+            addBindings(lb, p, 0, VK_SHADER_STAGE_VERTEX_BIT);
+        } else { // with a vertex shader's draw data, for a graphics layout; only the pixel shader's part keys the library
+            lb.push_back({0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr});
+            addBindings(lb, p, kPsBindingBase, VK_SHADER_STAGE_FRAGMENT_BIT);
+        }
+        const Layout& lay = layout(lb);
+        {
+            std::lock_guard lock(libMutex_);
+            if (libs_.count(vertex ? "pre" + name + "/" + lay.preKey : "frag" + name + "/" + lay.fragKey)) return;
+        }
+        VkShaderModule m = loadModule(name);
+        if (!m) return;
+        if (vertex) preLibrary(name, m, VK_NULL_HANDLE, "", lay);
+        else fragLibrary(name, m, lay);
+        vkDestroyShaderModule(vk_.device, m, nullptr); // a library keeps what it needs
+        ++librariesBuilt_;
+    }
+    void warmLibraries(const std::string& name) {
+        if (!libraries_ || name.empty()) return;
+        const std::string bytes = loadFile(spirvDir_ + "/" + name + ".gcn");
+        gcn::Program p;
+        if (bytes.size() >= 4 && gcn::deserialize(bytes.substr(4), p)) buildLibraries(p, name);
+    }
+    std::atomic<size_t> librariesBuilt_{0};
+
+    // The boot compile: once the title menu has registered the game's shaders in the engine's
+    // tables (see the doc), each is analysed without a draw (gcn::analyzeUnbound), translated,
+    // compiled and saved like a drawn one, and its library built, in the background. A shader
+    // whose translation turns out to depend on its draw after all is translated again when drawn.
+    struct TableShader {
+        gcn::Stage stage;
+        uint64_t gnmx;
+    };
+    std::vector<TableShader> readShaderTables() {
+        std::vector<TableShader> out;
+        Module* eboot = process().eboot;
+        if (!eboot) return out;
+        const uint64_t base = reinterpret_cast<uint64_t>(eboot->base());
+        struct Table {
+            uint64_t at;
+            gcn::Stage stage;
+            uint32_t gnmxAt; // the Gnmx shader's pointer in the engine's object
+        };
+        for (const Table& t : {Table{0x2698148, gcn::Stage::Vertex, 0x48}, Table{0x2698168, gcn::Stage::Pixel, 0x68}}) {
+            uint64_t range[2] = {};
+            if (!readGuest(base + t.at, range, sizeof range) || range[1] < range[0]) continue;
+            const uint64_t n = std::min<uint64_t>((range[1] - range[0]) / 8, 0x4000);
+            for (uint64_t i = 0; i < n; ++i) {
+                uint64_t obj = 0, gnmx = 0;
+                if (!readGuest(range[0] + i * 8, &obj, 8) || !obj) break;
+                if (readGuest(obj + t.gnmxAt, &gnmx, 8) && gnmx) out.push_back({t.stage, gnmx});
+            }
+        }
+        return out;
+    }
+    // A launch from the Gnmx shader's registers (the doc's table); what a draw adds is guessed:
+    // the generic translation takes it from the draw data.
+    // A vertex shader's fetch slots (gcn::Program::fetchSlots) from its input semantics, 4 bytes
+    // each from +0x28 (semantic, VGPR, dwords, 0), their count in the byte at +0x24: one slot per
+    // four VGPRs from v4 up to the last input's. ~0u (from the code) when they do not look right.
+    static bool tableLaunch(const TableShader& t, gcn::LaunchState& l, uint32_t& fetchSlots) {
+        uint32_t r[12] = {}; // from +0x08: PGM_LO, PGM_HI, RSRC1, RSRC2, then the stage's own
+        if (!readGuest(t.gnmx + 8, r, sizeof r)) return false;
+        fetchSlots = ~0u;
+        if (t.stage == gcn::Stage::Vertex) {
+            const uint32_t n = r[7] & 0xFF; // +0x24
+            uint8_t sem[0x18 * 4] = {};
+            if (n && n <= 0x18 && readGuest(t.gnmx + 0x28, sem, n * 4)) {
+                uint32_t end = 0;
+                bool ok = true;
+                for (uint32_t i = 0; i < n; ++i) {
+                    const uint32_t v = sem[i * 4 + 1], size = sem[i * 4 + 2];
+                    ok &= v >= 4 && size >= 1 && size <= 4 && v + size <= 256;
+                    end = std::max(end, v + size);
+                }
+                if (ok) fetchSlots = (end - 4 + 3) / 4;
+            }
+        }
+        l = gcn::LaunchState{};
+        l.stage = t.stage;
+        l.entry = (r[0] | uint64_t(r[1]) << 32) << 8;
+        l.rsrc1 = r[2];
+        l.rsrc2 = r[3];
+        if (t.stage == gcn::Stage::Pixel) {
+            l.colorFormat = r[5];
+            l.psInputEna = r[6];
+            l.numInterp = r[8] & 0x3F;
+            l.depthExport = r[10] & 1;
+            for (uint32_t m = 0; m < 8; ++m) { // integer exports, as to integer targets
+                const uint32_t fmt = (l.colorFormat >> (m * 4)) & 0xF;
+                if (fmt == 7) l.colorUint |= 1u << m;
+                if (fmt == 8) l.colorSint |= 1u << m;
+            }
+        }
+        return l.entry >= 0x100000 && l.entry < (1ull << 40);
+    }
+    void bootCompile() {
+        profile::nameThread("lpn-boot-compile");
+        profile::lowerThreadPriority();
+        // The tables fill while the title menu loads: wait for them to stop growing.
+        std::vector<TableShader> shaders;
+        for (size_t last = 0, steady = 0; steady < 6;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            shaders = readShaderTables();
+            steady = shaders.size() && shaders.size() == last ? steady + 1 : 0;
+            last = shaders.size();
+        }
+        const auto start = std::chrono::steady_clock::now();
+        std::atomic<size_t> next{0}, compiled{0}, failed{0};
+        const size_t before = librariesBuilt_.load();
+        std::vector<std::thread> pool;
+        const unsigned n = std::max(1u, std::thread::hardware_concurrency() / 2);
+        for (unsigned i = 0; i < n; ++i)
+            pool.emplace_back([&] {
+                profile::lowerThreadPriority();
+                for (size_t k; (k = next++) < shaders.size();) {
+                    gcn::LaunchState l;
+                    uint32_t slots;
+                    if (!tableLaunch(shaders[k], l, slots)) {
+                        ++failed;
+                        continue;
+                    }
+                    const gcn::Program p = gcn::analyzeUnbound(l, readGuest, slots);
+                    if (p.code.empty()) {
+                        ++failed;
+                        continue;
+                    }
+                    const uint32_t base = l.stage == gcn::Stage::Pixel ? kPsBindingBase : 0;
+                    const gcn::Translation t = gcn::translate(p, base, descriptorSet(p));
+                    const gcn::GlslStage stage = l.stage == gcn::Stage::Pixel ? gcn::GlslStage::Fragment : gcn::GlslStage::Vertex;
+                    const std::string name = spirvName(t.glsl, stage), path = spirvCachePath(t.glsl, stage);
+                    if (path.empty()) continue;
+                    if (access(path.c_str(), F_OK) != 0) {
+                        std::string error;
+                        const std::vector<uint32_t> spirv = gcn::compileGlsl(t.glsl, stage, &error);
+                        if (spirv.empty()) {
+                            ++failed;
+                            continue;
+                        }
+                        saveSpirv(path, spirv);
+                        ++compiled;
+                    }
+                    saveSource(name, p, base); // the startup compile builds its library in later runs
+                    buildLibraries(p, name);
+                    {
+                        std::lock_guard lock(bootMutex_);
+                        bootNames_.insert(name);
+                        bootEntries_.insert(l.entry);
+                    }
+                }
+            });
+        for (auto& t : pool) t.join();
+        std::fprintf(stderr, "[gpu] boot compile: %zu registered shaders in %.1f s (%zu SPIR-V compiled, %zu libraries built, %zu failed)\n",
+                     shaders.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), compiled.load(),
+                     librariesBuilt_.load() - before, failed.load());
+        bootDone_ = true;
+    }
+    // A drawn shader the boot compile also translated, but otherwise (its translation depends on
+    // the draw after all): logged once per shader, the boot compile's misses to look into.
+    void checkBootTranslation(const gcn::Program& p, const std::string& name) {
+        if (!bootDone_.load() || p.launch.stage == gcn::Stage::Compute) return;
+        std::lock_guard lock(bootMutex_);
+        if (bootNames_.count(name) || !bootEntries_.count(p.launch.entry) || !bootMissed_.insert(p.launch.entry).second) return;
+        std::fprintf(stderr, "[gpu] boot compile missed %s 0x%" PRIx64 ": its draw translates it otherwise\n",
+                     p.launch.stage == gcn::Stage::Pixel ? "ps" : "vs", p.launch.entry);
+    }
+    std::mutex bootMutex_;
+    std::unordered_set<std::string> bootNames_;
+    std::unordered_set<uint64_t> bootEntries_, bootMissed_;
+    std::atomic<bool> bootDone_{false};
 
     void reportPrebuildDone() {
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - prebuildStart_).count();
@@ -3302,14 +3487,14 @@ private:
         for (unsigned i = 0; i < n; ++i)
             pool.emplace_back([&] {
                 for (size_t k; (k = next++) < names.size() && !warmupDone_.load();) {
-                    currentShader(names[k]);
+                    warmLibraries(currentShader(names[k])); // a draw then only links (stage 4)
                     ++warmupTranslated_;
                 }
             });
         for (auto& t : pool) t.join();
-        std::fprintf(stderr, "[gpu] startup compile: %zu shaders translated in %.1f s (%zu SPIR-V compiled, %zu renamed)\n",
+        std::fprintf(stderr, "[gpu] startup compile: %zu shaders translated in %.1f s (%zu SPIR-V compiled, %zu renamed, %zu libraries built)\n",
                      names.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - prebuildStart_).count(),
-                     compiled_.load(), retranslated_.load());
+                     compiled_.load(), retranslated_.load(), librariesBuilt_.load());
     }
 
     void prebuildPipelines() {
@@ -3608,40 +3793,18 @@ private:
         return r == VK_SUCCESS ? p : VK_NULL_HANDLE;
     }
 
-    VkPipeline linkGraphics(const PipelineJob& j) {
-        const GraphicsState& s = j.state;
-        const Layout& lay = *j.lay;
-        VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        switch (s.topology) {
-        case 1: topo = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
-        case 2: topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
-        case 3: topo = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
-        case 5: topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
-        case 6: topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
-        case 19: topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY; break;
-        default: break;
-        }
+    // The pipeline libraries of one shader (see linkGraphics), which the startup compile also
+    // builds for every shader it knows (warmLibrary). `variant` names the geometry shader's input.
+    VkPipeline preLibrary(const std::string& vsName, VkShaderModule vs, VkShaderModule geom, const std::string& variant,
+                          const Layout& lay) {
         VkPipelineRenderingCreateInfo none{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO}; // view mask 0
-
-        const VkPipeline input = library("vi" + std::to_string(topo), [&] {
-            VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-            VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-            ia.topology = topo;
-            VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-            gci.pVertexInputState = &vi;
-            gci.pInputAssemblyState = &ia;
-            return makeLibrary(gci, VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, "vertex input");
-        });
-        const bool rect = s.topology == 17 || s.topology == 19;
-        const std::string preKey = "pre" + j.vsName + (rect ? "/" + std::to_string(s.topology) + "/" + std::to_string(s.vsOutputs) : "") +
-                                   "/" + lay.preKey;
-        const VkPipeline pre = library(preKey, [&] {
+        return library("pre" + vsName + variant + "/" + lay.preKey, [&] {
             VkPipelineShaderStageCreateInfo st[2]{};
             for (auto& i : st) i.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, i.pName = "main";
             st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-            st[0].module = j.vs;
+            st[0].module = vs;
             st[1].stage = VK_SHADER_STAGE_GEOMETRY_BIT;
-            st[1].module = j.geom;
+            st[1].module = geom;
             VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
             vp.viewportCount = 1;
             vp.scissorCount = 1;
@@ -3655,7 +3818,7 @@ private:
             dy.pDynamicStates = dyn;
             VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
             gci.pNext = &none;
-            gci.stageCount = j.geom ? 2 : 1;
+            gci.stageCount = geom ? 2 : 1;
             gci.pStages = st;
             gci.pViewportState = &vp;
             gci.pRasterizationState = &rs;
@@ -3663,10 +3826,13 @@ private:
             gci.layout = lay.pre;
             return makeLibrary(gci, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, "vertex shader");
         });
-        const VkPipeline frag = library("frag" + j.psName + "/" + lay.fragKey, [&] {
+    }
+    VkPipeline fragLibrary(const std::string& psName, VkShaderModule ps, const Layout& lay) {
+        VkPipelineRenderingCreateInfo none{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO}; // view mask 0
+        return library("frag" + psName + "/" + lay.fragKey, [&] {
             VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             st.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-            st.module = j.ps;
+            st.module = ps;
             st.pName = "main";
             VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
             ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -3681,7 +3847,7 @@ private:
             dy.pDynamicStates = dyn;
             VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
             gci.pNext = &none;
-            gci.stageCount = j.ps ? 1 : 0;
+            gci.stageCount = ps ? 1 : 0;
             gci.pStages = &st;
             gci.pMultisampleState = &ms;
             gci.pDepthStencilState = &ds;
@@ -3689,6 +3855,34 @@ private:
             gci.layout = lay.frag;
             return makeLibrary(gci, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, "pixel shader");
         });
+    }
+
+    VkPipeline linkGraphics(const PipelineJob& j) {
+        const GraphicsState& s = j.state;
+        const Layout& lay = *j.lay;
+        VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        switch (s.topology) {
+        case 1: topo = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
+        case 2: topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+        case 3: topo = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
+        case 5: topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
+        case 6: topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
+        case 19: topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY; break;
+        default: break;
+        }
+
+        const VkPipeline input = library("vi" + std::to_string(topo), [&] {
+            VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+            VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+            ia.topology = topo;
+            VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+            gci.pVertexInputState = &vi;
+            gci.pInputAssemblyState = &ia;
+            return makeLibrary(gci, VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, "vertex input");
+        });
+        const bool rect = s.topology == 17 || s.topology == 19;
+        const VkPipeline pre = preLibrary(j.vsName, j.vs, j.geom, rect ? "/" + std::to_string(s.topology) + "/" + std::to_string(s.vsOutputs) : "", lay);
+        const VkPipeline frag = fragLibrary(j.psName, j.ps, lay);
         std::string outKey = "out";
         outKey.append(reinterpret_cast<const char*>(s.colorFormats), sizeof s.colorFormats);
         outKey.append(reinterpret_cast<const char*>(s.blend), sizeof s.blend);

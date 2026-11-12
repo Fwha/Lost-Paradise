@@ -63,6 +63,21 @@ folder `generic3`):
 
 Scalar load results start after these words (`data::smrd()`, 32 in the generic translation).
 
+### The boot compile
+
+With pipeline libraries on, a background thread (`bootCompile`, `LPN_BOOT_COMPILE=0` turns it
+off) waits for the vertex and pixel shader tables to stop growing (the title menu fills them),
+then per entry builds a launch from the Gnmx registers, analyses it without a draw
+(`gcn::analyzeUnbound`; a vertex shader's fetch slots from its input semantics), translates and
+compiles it, saves its .gcn, and builds its pre-rasterisation or fragment library. A later run's
+startup compile builds the libraries of every saved .gcn, so in play a draw only links. A drawn
+shader whose translation still differs from the boot one is logged once
+(`boot compile missed ...`).
+
+Without a T#, an image's dimension comes from its instruction: a cube when it declares an array
+(DA), else 2D. Counting the address registers written before the sample took 154 of the play
+cache's 2D images for 3D, and no 3D image was ever bound.
+
 ### The shader tables (measured on the user's PC, 2026-11-12)
 
 All of the game's shaders are registered by the title menu and the tables do not change in play
