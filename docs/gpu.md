@@ -45,6 +45,15 @@ screen loop). Addresses are guest addresses and change between runs.
   up to 32 resource-format shapes (one material shader with BC1 or BC3 textures), so a launch
   replays one trace and then only compares formats. Reuse is checked against the hash of the
   exact code bytes, not whole pages: a shader's last page often holds data that changes.
+- **Generic translation** (`LPN_GENERIC_SHADERS=1`; off by default until the later stages of
+  shader-precompile.md land, since its cache starts empty). Scalar branches a launch decides
+  stay run-time branches in the GLSL and the code they skip is walked too, with nothing known, so
+  its loads and resources are left unresolved (that launch never runs them). Scalar-load slots and
+  resources are numbered by address, not walk order. Launches that differ only in such flags
+  (vertex shaders turning blocks on with bits of a constant: up to 60 translations of one shader
+  before) then share one translation. Image data formats and sampled images' swizzles are left out
+  of the translation key, since only the view uses them. These SPIR-V and pipelines are kept in a
+  `generic/` subfolder of the cache.
 - **SPIR-V cache.** Compiling a shader's GLSL takes ~10 ms and a new attack effect brings dozens,
   so SPIR-V is kept in `~/.cache/lpn-host/spirv` (`LPN_SHADER_CACHE=<dir>`, or `off`), named by
   a hash of the GLSL. Only the first time an effect is seen anywhere hitches.

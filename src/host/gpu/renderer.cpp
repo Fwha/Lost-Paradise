@@ -2409,6 +2409,10 @@ private:
         else if (env && *env) spirvDir_ = env;
         else if (const std::string c = host::userCacheDir(); !c.empty()) spirvDir_ = c + "/lpn-host/spirv";
         else spirvDir_ = "-";
+        // Generic translations (gcn::genericTranslation) name other SPIR-V than specialised ones
+        // and record other pipelines: each kind keeps its own cache, so switching back and forth
+        // (LPN_GENERIC_SHADERS) never builds the other kind's pipelines at startup.
+        if (spirvDir_ != "-" && gcn::genericTranslation()) spirvDir_ += "/generic";
         if (spirvDir_ != "-") {
             std::error_code ec;
             std::filesystem::create_directories(spirvDir_, ec);
@@ -3933,7 +3937,9 @@ private:
             return b;
         }
         if (format == VK_FORMAT_UNDEFINED) {
-            warnOnce("texture format " + std::to_string(t.dataFormat()) + "/" + std::to_string(nf) + " unsupported");
+            // An all-zero T#: an image in code this launch skips (generic translation), bound to
+            // the placeholder without a warning.
+            if (t.dataFormat() || addr) warnOnce("texture format " + std::to_string(t.dataFormat()) + "/" + std::to_string(nf) + " unsupported");
         } else if (GuestTexture* g = guestTexture(t, format)) {
             b.view = view(g->img, format, vt, swz, 0, t.baseLevel(), t.lastLevel() + 1 - std::min(t.baseLevel(), t.lastLevel()));
         }

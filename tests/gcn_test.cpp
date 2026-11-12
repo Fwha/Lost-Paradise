@@ -284,6 +284,47 @@ int main() {
         ++failures;
     }
 
+    // Generic translation: a block switched on by a bit of a constant (as the game's vertex
+    // shaders do) stays a run-time branch, so launches with the bit set and clear share one
+    // translation, and each still gets its own constant in the draw data.
+    if (gcn::genericTranslation()) {
+        const std::vector<uint32_t> flagCode = {
+            0xc20a0500, // s_buffer_load_dword s20, s[4:7], 0x0
+            0x87158114, // s_and_b32 s21, s20, 1
+            0xbf840001, // s_cbranch_scc0 +1
+            0x7e0002f2, // v_mov_b32 v0, 1.0
+            0xbf810000, // s_endpgm
+        };
+        constexpr uint64_t kCode = 0x10000, kConst = 0x20000;
+        uint32_t flag = 0;
+        auto readFlag = [&](uint64_t addr, void* dst, size_t size) {
+            if (addr >= kCode && addr + size <= kCode + flagCode.size() * 4) {
+                std::memcpy(dst, reinterpret_cast<const char*>(flagCode.data()) + (addr - kCode), size);
+                return true;
+            }
+            if (addr == kConst && size == 4) return std::memcpy(dst, &flag, 4), true;
+            return false;
+        };
+        gcn::LaunchState fl;
+        fl.stage = gcn::Stage::Compute;
+        fl.entry = kCode;
+        fl.rsrc2 = 8 << 1;
+        fl.userData[4] = uint32_t(kConst);
+        fl.userData[6] = 16; // num_records: bytes
+        flag = 1;
+        const gcn::Program on = gcn::analyze(fl, readFlag);
+        flag = 0;
+        const gcn::Program off = gcn::analyze(fl, readFlag);
+        const std::string onGlsl = gcn::translate(on, 0).glsl, offGlsl = gcn::translate(off, 0).glsl;
+        const uint32_t slot = on.smrd.count(kCode) ? on.smrd.at(kCode) : 0;
+        if (on.code.size() != 5 || off.code.size() != 5 || on.key() != off.key() || onGlsl != offGlsl || !slot ||
+            on.data[slot] != 1 || off.data[slot] != 0 || gcn::compileGlsl(onGlsl, gcn::GlslStage::Compute, &error).empty()) {
+            std::fprintf(stderr, "flag branch: %zu/%zu instructions, keys %s\n%s\n%s\n", on.code.size(), off.code.size(),
+                         on.key() == off.key() ? "equal" : "differ", error.c_str(), onGlsl.c_str());
+            ++failures;
+        }
+    }
+
     if (failures) std::fprintf(stderr, "%d failure(s)\n", failures);
     return failures ? 1 : 0;
 }

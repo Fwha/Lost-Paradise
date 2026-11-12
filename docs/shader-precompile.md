@@ -42,7 +42,7 @@ is part of the shader binary's own registers and so known without a draw.
    shader tables (PS 0x2698148, VS 0x2698168, CS 0x26981e8, counts beside them; see
    render-decomp.md) and compile every entry behind the progress screen.
 
-Each stage ships on its own and keeps the old path behind `LPN_GENERIC_SHADERS=0` until it has
+Each stage ships on its own and stays behind `LPN_GENERIC_SHADERS=1` until the stages after it have
 been played through, so a regression can be compared against the specialised translation.
 
 ## Costs and risks
