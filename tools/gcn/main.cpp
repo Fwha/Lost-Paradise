@@ -305,6 +305,87 @@ int fetchSurvey(const char* dir) {
     return 0;
 }
 
+// Stage 4 check: how many of the cache's saved generic programs a translation made without their
+// draw (analyzeUnbound, as the boot compile will) reproduces exactly, and what differs in the rest.
+int bootSurvey(const char* dir) {
+    std::map<std::string, size_t> total, same, why;
+    std::map<std::string, std::string> example;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        if (e.path().extension() != ".gcn") continue;
+        std::ifstream f(e.path(), std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(f)), {});
+        gcn::Program p;
+        if (bytes.size() < 4 || !gcn::deserialize(bytes.substr(4), p)) continue;
+        uint32_t base;
+        std::memcpy(&base, bytes.data(), 4);
+        const char* stage = p.launch.stage == gcn::Stage::Pixel ? "ps" : p.launch.stage == gcn::Stage::Compute ? "cs" : "vs";
+        const uint32_t set = p.launch.stage == gcn::Stage::Pixel ? 1 : 0;
+        gcn::LaunchState l = p.launch; // what the shader's own registers say; the rest guessed
+        std::memset(l.userData, 0, sizeof l.userData);
+        std::memset(l.colorSwap, 0, sizeof l.colorSwap);
+        std::memset(l.colorComps, 0, sizeof l.colorComps);
+        l.colorUint = l.colorSint = 0;
+        for (uint32_t m = 0; m < 8; ++m) {
+            const uint32_t fmt = (l.colorFormat >> (m * 4)) & 0xF;
+            if (fmt == 7) l.colorUint |= 1u << m;
+            if (fmt == 8) l.colorSint |= 1u << m;
+        }
+        for (uint32_t i = 0; i < 32; ++i) l.psInputCntl[i] = i;
+        auto read = [&](uint64_t addr, void* dst, size_t n) {
+            auto it = p.code.find(addr);
+            if (it == p.code.end() || n > it->second.size) return false;
+            std::memcpy(dst, it->second.words, n);
+            return true;
+        };
+        const gcn::Program b = gcn::analyzeUnbound(l, read, p.fetchSlots);
+        const std::string want = gcn::translate(p, base, set).glsl, got = gcn::translate(b, base, set).glsl;
+        ++total[stage];
+        if (want == got) {
+            ++same[stage];
+            continue;
+        }
+        std::vector<std::string> reasons;
+        if (p.launch.stage == gcn::Stage::Pixel) {
+            bool identity = true;
+            for (uint32_t i = 0; i < 32; ++i)
+                if (p.launch.psInputCntl[i] && p.launch.psInputCntl[i] != i) identity = false;
+            if (!identity) reasons.push_back("PS input mapping");
+            if (p.launch.colorUint != l.colorUint || p.launch.colorSint != l.colorSint) reasons.push_back("int MRT guess");
+        }
+        if (p.code.size() != b.code.size()) reasons.push_back("code walked");
+        if (p.buffers.size() != b.buffers.size()) reasons.push_back("buffer count");
+        if (p.images.size() != b.images.size()) reasons.push_back("image count");
+        else
+            for (size_t i = 0; i < p.images.size(); ++i) {
+                const uint32_t nf = p.images[i].numFormat();
+                if (nf == 4 || nf == 5) { reasons.push_back("int image"); break; }
+                if (gcn::imageDimension(p, p.images[i]) != gcn::imageDimension(b, b.images[i])) { reasons.push_back("image dimension"); break; }
+            }
+        if (p.smrd.size() != b.smrd.size()) reasons.push_back("scalar loads");
+        if (p.launch.glClipZ) reasons.push_back("clip z");
+        std::string r = stage;
+        for (const auto& x : reasons) r += ", " + x;
+        if (reasons.empty()) {
+            size_t i = 0;
+            while (i < want.size() && i < got.size() && want[i] == got[i]) ++i;
+            const size_t ls = want.rfind('\n', i) + 1, le = want.find('\n', i), gs = got.rfind('\n', i) + 1, ge = got.find('\n', i);
+            r += ", other";
+            if (!example.count(r)) example[r] = "draw: " + want.substr(ls, le - ls) + "\n      boot: " + got.substr(gs, ge - gs);
+        }
+        ++why[r];
+    }
+    for (const auto& [st, n] : total) std::printf("%s: %zu of %zu translate the same without their draw\n", st.c_str(), same[st], n);
+    std::vector<std::pair<size_t, std::string>> v;
+    for (const auto& [k, n] : why) v.push_back({n, k});
+    std::sort(v.rbegin(), v.rend());
+    for (const auto& [n, k] : v) {
+        std::printf("  %6zu  %s\n", n, k.c_str());
+        if (example.count(k)) std::printf("      %s\n", example[k].c_str());
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: lpn-gcn <shader.bin>          disassemble\n"
@@ -313,12 +394,14 @@ int main(int argc, char** argv) {
                              "       lpn-gcn --check <shader.bin>...  as --glsl, printing only results\n"
                              "       lpn-gcn --variants <cache dir>   how saved translations of a shader differ\n"
                              "       lpn-gcn --resources <cache dir>  what draws bound, and what the code alone predicts\n"
-                             "       lpn-gcn --fetch <cache dir>      the fetch shaders vertex shaders call\n");
+                             "       lpn-gcn --fetch <cache dir>      the fetch shaders vertex shaders call\n"
+                             "       lpn-gcn --boot <cache dir>       which generic programs translate alike without a draw\n");
         return 2;
     }
     if (!std::strcmp(argv[1], "--variants") && argc == 3) return variants(argv[2]);
     if (!std::strcmp(argv[1], "--resources") && argc == 3) return resources(argv[2]);
     if (!std::strcmp(argv[1], "--fetch") && argc == 3) return fetchSurvey(argv[2]);
+    if (!std::strcmp(argv[1], "--boot") && argc == 3) return bootSurvey(argv[2]);
     if (!std::strcmp(argv[1], "--glsl") || !std::strcmp(argv[1], "--check")) return glsl(argc, argv);
     const bool stats = !std::strcmp(argv[1], "--stats");
     std::map<std::string, std::pair<unsigned, unsigned>> uses; // mnemonic -> (count, shaders)

@@ -282,7 +282,9 @@ private:
         switch (l.stage) {
         case Stage::Vertex: {
             init_ += vreg(0) + " = uint(gl_VertexIndex);\n";
-            const uint32_t comps = (l.rsrc1 >> 24) & 3;
+            // Generic: v1-v3 are the instance index whatever VGPR_COMP_CNT says (the engine raises it
+            // for instanced fetch), so the translation does not depend on the draw's RSRC1.
+            const uint32_t comps = genericTranslation() ? 3 : (l.rsrc1 >> 24) & 3;
             if (comps >= 1) init_ += vreg(1) + " = uint(gl_InstanceIndex);\n";
             if (comps >= 2) init_ += vreg(2) + " = uint(gl_InstanceIndex);\n";
             if (comps >= 3) init_ += vreg(3) + " = uint(gl_InstanceIndex);\n";

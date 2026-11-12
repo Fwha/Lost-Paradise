@@ -258,7 +258,7 @@ private:
                     (std::min<uint32_t>(p_.launch.colorComps[m], 4) * 4 + (p_.launch.colorSwap[m] & 3)) << ((m % 4) * 8);
         }
         State st;
-        const uint32_t user = p_.launch.userSgprs();
+        const uint32_t user = unbound_ ? 0 : p_.launch.userSgprs();
         for (uint32_t i = 0; i < user && i < 16; ++i) {
             st.s[i] = p_.launch.userData[i];
             st.known[i] = true;
@@ -481,6 +481,10 @@ private:
             label(next);
             if (k && generic() && p_.launch.stage == Stage::Vertex && fetch(pc, a64 & 0xFFFFFFFFFFFFull, st))
                 return true; // pulled in the vertex shader itself; the walk goes on after the call
+            if (!k && unbound_ && p_.launch.stage == Stage::Vertex && !speculative_ && !p_.fetchSlots) {
+                unboundFetch(pc); // its slots as a draw's fetch shader will fill them
+                return true;
+            }
             if (k) {
                 if (!prior_) p_.calls[pc] = a64 & 0xFFFFFFFFFFFFull;
                 branchTo(a64 & 0xFFFFFFFFFFFFull, st, work);
@@ -800,6 +804,20 @@ private:
     // The fetch shader a vertex shader calls at `site`, as buffers of the vertex shader: one per
     // slot of four VGPRs up to the last it loads, each with its V#, then V# word 3 and a control
     // word (index VGPR, components, offset) in the draw data, so a translation serves every mesh.
+    // Without a draw (analyzeUnbound): the fetch slots the vertex shader's inputs take, unresolved.
+    void unboundFetch(uint64_t site) {
+        p_.fetchSite = site;
+        p_.fetchSlots = unboundSlots_;
+        for (uint32_t k = 0; k < unboundSlots_; ++k) {
+            BufferResource r;
+            r.pc = site;
+            r.known = false;
+            r.data = uint32_t(p_.data.size());
+            p_.data.resize(r.data + 6, 0);
+            p_.buffers.push_back(r);
+        }
+    }
+
     bool fetch(uint64_t site, uint64_t callee, const State& st) {
         std::vector<FetchLoad> loads;
         if (!parseFetch(callee, st, loads)) {
@@ -856,6 +874,10 @@ private:
         return true;
     }
 
+public:
+    bool unbound_ = false;      // analyzeUnbound: no user data
+    uint32_t unboundSlots_ = 0; // its fetch slots
+private:
     const ReadMemory& readCode_;
     const ReadMemory& readData_;
     const Program* prior_; // replaying this program's trace
@@ -1173,6 +1195,16 @@ bool genericTranslation() {
 
 Program analyze(const LaunchState& launch, const ReadMemory& readCode, const ReadMemory& readData) {
     return Analyzer(launch, readCode, readData).run();
+}
+
+Program analyzeUnbound(const LaunchState& launch, const ReadMemory& readCode, uint32_t fetchSlots) {
+    static const ReadMemory none = [](uint64_t, void*, size_t) { return false; };
+    Analyzer a(launch, readCode, none);
+    a.unbound_ = true;
+    a.unboundSlots_ = fetchSlots;
+    Program p = a.run();
+    p.trace.clear(); // nothing to replay: every launch is analysed against its own data
+    return p;
 }
 
 bool replay(const Program& p, const LaunchState& launch, const ReadMemory& readData, Program& out) {
