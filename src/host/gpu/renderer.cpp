@@ -3937,7 +3937,9 @@ private:
             return b;
         }
         if (format == VK_FORMAT_UNDEFINED) {
-            warnOnce("texture format " + std::to_string(t.dataFormat()) + "/" + std::to_string(nf) + " unsupported");
+            // An all-zero T#: an image in code this launch skips (generic translation), bound to
+            // the placeholder without a warning.
+            if (t.dataFormat() || addr) warnOnce("texture format " + std::to_string(t.dataFormat()) + "/" + std::to_string(nf) + " unsupported");
         } else if (GuestTexture* g = guestTexture(t, format)) {
             b.view = view(g->img, format, vt, swz, 0, t.baseLevel(), t.lastLevel() + 1 - std::min(t.baseLevel(), t.lastLevel()));
         }
