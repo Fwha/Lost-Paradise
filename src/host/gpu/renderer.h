@@ -2,6 +2,7 @@
 // processor, with shaders recompiled from GCN.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -35,6 +36,18 @@ bool gpuDone(uint64_t mark);
 
 // Traces the next frame (as LPN_GPU_TRACE does) into `dir`: trace.txt and every render target.
 void captureNextFrame(const std::string& dir);
+
+// Compile Shaders at Startup: while the game waits for every saved shader and recorded pipeline
+// to be built, the window shows this progress (phase 1 translating shaders, 2 building
+// pipelines; 0 before either has a count). False when nothing is being waited for.
+struct WarmupProgress {
+    int phase = 0;
+    size_t done = 0, total = 0;
+    double seconds = 0;
+};
+bool warmupProgress(WarmupProgress& p);
+// Starts the game now; what is left builds in the background as when the setting is off.
+void skipWarmup();
 
 // Before exiting: writes the driver's pipeline cache, so pipelines made since the last periodic
 // save are not compiled again next run.

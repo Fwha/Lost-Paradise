@@ -2467,12 +2467,24 @@ public:
 private:
     void writePipelineCache() {
         {
+            // Workers may still be adding pipelines (closing the window during the startup compile):
+            // the cache can outgrow the size just asked for, and the read then gives VK_INCOMPLETE.
+            // Ask again with room to spare instead of saving nothing.
             size_t n = 0;
             std::vector<char> data;
-            if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, nullptr) == VK_SUCCESS && n) {
+            for (int tries = 0; tries < 8; ++tries) {
+                if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, nullptr) != VK_SUCCESS || !n) {
+                    n = 0;
+                    break;
+                }
+                n += n / 8;
                 data.resize(n);
-                if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, data.data()) != VK_SUCCESS) n = 0;
+                const VkResult r = vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, data.data());
+                if (r == VK_SUCCESS) break;
+                n = 0;
+                if (r != VK_INCOMPLETE) break;
             }
+            if (!n) std::fprintf(stderr, "[gpu] pipeline cache not saved: the driver gave no data\n");
             const std::string tmp = pipelineCachePath_ + ".tmp" + std::to_string(getpid());
             if (n)
                 if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
@@ -2535,12 +2547,22 @@ private:
     }
 
     // The name the shader recorded as `name` has with today's translator: translated again from
-    // its .gcn (and its SPIR-V compiled if new), or `name` itself without one. Prebuild thread only.
+    // its .gcn (and its SPIR-V compiled if new or lost), or `name` itself without one. Any thread:
+    // the startup compile translates on every core (translateAll).
     std::unordered_map<std::string, std::string> currentNames_;
+    std::mutex namesMutex_;
     std::string currentShader(const std::string& name) {
         if (name.empty() || spirvDir_ == "-") return name;
-        if (auto it = currentNames_.find(name); it != currentNames_.end()) return it->second;
-        std::string& out = currentNames_[name] = name;
+        {
+            std::lock_guard lock(namesMutex_);
+            if (auto it = currentNames_.find(name); it != currentNames_.end()) return it->second;
+        }
+        const std::string now = translateSaved(name);
+        std::lock_guard lock(namesMutex_);
+        return currentNames_.emplace(name, now).first->second;
+    }
+    std::string translateSaved(const std::string& name) {
+        const std::string out = name;
         const std::string bytes = loadFile(spirvDir_ + "/" + name + ".gcn");
         gcn::Program p;
         uint32_t bindingBase;
@@ -2551,19 +2573,20 @@ private:
                                      : p.launch.stage == gcn::Stage::Compute ? gcn::GlslStage::Compute
                                                                              : gcn::GlslStage::Vertex;
         const std::string now = spirvName(t.glsl, stage);
-        if (now == name) return out;
         const std::string path = spirvCachePath(t.glsl, stage);
-        if (loadSpirv(path).empty()) {
+        if (access(path.c_str(), F_OK) != 0 || (now != name && loadSpirv(path).empty())) { // compiled again if lost too
             std::string error;
             const std::vector<uint32_t> spirv = gcn::compileGlsl(t.glsl, stage, &error);
             if (spirv.empty()) return out;
             saveSpirv(path, spirv);
+            ++compiled_;
         }
+        if (now == name) return out;
         if (access((spirvDir_ + "/" + now + ".gcn").c_str(), F_OK) != 0) saveFile(spirvDir_ + "/" + now + ".gcn", bytes.data(), bytes.size());
         ++retranslated_;
-        return out = now;
+        return now;
     }
-    size_t retranslated_ = 0;
+    std::atomic<size_t> retranslated_{0}, compiled_{0};
 
     static std::string hex(uint64_t v) {
         char b[24];
@@ -2922,6 +2945,14 @@ private:
             pipelineListPath_ = spirvDir_ + "/pipelines.list";
             pipelineList_ = std::fopen(pipelineListPath_.c_str(), "ab");
         }
+        // Compile Shaders at Startup (lpn-display.ini precompile_shaders, LPN_PRECOMPILE=0/1 wins):
+        // the game waits behind a progress screen while every saved shader is translated and every
+        // recorded pipeline built, on all cores, instead of them being built under the game.
+        const char* pc = getenv("LPN_PRECOMPILE");
+        const char* pb = getenv("LPN_PREBUILD");
+        const bool prebuild = !pipelineListPath_.empty() && !(pb && !std::strcmp(pb, "0"));
+        warmupAll_ = prebuild && !syncPipelines_ && !computeOnly_ &&
+                     (pc ? std::strcmp(pc, "0") != 0 : displaySettings().precompileShaders);
         if (syncPipelines_) return;
         const unsigned n = std::clamp(std::thread::hardware_concurrency() >= 8 ? std::thread::hardware_concurrency() - 4 : 2u, 2u, 16u);
         // The startup builds (thousands, every run) on every worker took the CPU from the game for
@@ -2936,7 +2967,10 @@ private:
                     PipelineJob j;
                     {
                         std::unique_lock lock(buildMutex_);
-                        buildCv_.wait(lock, [&] { return !jobs_.empty() || (takesBackground && !backgroundJobs_.empty()); });
+                        // While the game waits for the startup compile, every worker takes its builds.
+                        buildCv_.wait(lock, [&] {
+                            return !jobs_.empty() || ((takesBackground || warmupAll_.load()) && !backgroundJobs_.empty());
+                        });
                         auto& q = jobs_.empty() ? backgroundJobs_ : jobs_;
                         j = std::move(q.front());
                         q.pop_front();
@@ -2945,8 +2979,7 @@ private:
                     runJob(j);
                 }
             }).detach();
-        const char* pb = getenv("LPN_PREBUILD");
-        if (!pipelineListPath_.empty() && !(pb && !std::strcmp(pb, "0"))) std::thread([this] { prebuildPipelines(); }).detach();
+        if (prebuild) std::thread([this] { prebuildPipelines(); }).detach();
     }
 
     // Draws' pipelines go ahead of the startup builds.
@@ -2970,6 +3003,7 @@ private:
         ++newPipelines_;
         if (j.prebuild) {
             j.keep.reset();
+            ++warmupBuilt_;
             if (prebuildLeft_.fetch_sub(1) == 1) reportPrebuildDone();
         } else if (j.out->pipeline && pipelineList_) {
             std::lock_guard lock(listMutex_);
@@ -2994,15 +3028,111 @@ private:
     void reportPrebuildDone() {
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - prebuildStart_).count();
         std::fprintf(stderr, "[gpu] startup builds done: %zu pipelines in %.1f s\n", prebuildCount_, s);
+        finishWarmup();
     }
+
+    // ---- the startup compile (Compile Shaders at Startup) ----
+    std::atomic<bool> warmupAll_{false}; // the game waits for the startup builds, which every worker takes
+    std::atomic<int> warmupPhase_{0};     // 0 reading the lists, 1 translating shaders, 2 building pipelines
+    std::atomic<size_t> warmupTranslated_{0}, warmupShaders_{0}, warmupBuilt_{0}, warmupQueued_{0}, warmupExpected_{0};
+    std::atomic<bool> warmupDone_{false};
+    std::chrono::steady_clock::time_point warmupStart_ = std::chrono::steady_clock::now();
+    std::mutex warmupMutex_;
+    std::condition_variable warmupCv_;
+
+    void finishWarmup() {
+        {
+            std::lock_guard lock(warmupMutex_);
+            warmupDone_ = true;
+        }
+        warmupCv_.notify_all();
+    }
+
+  public:
+    bool warmupProgress(WarmupProgress& p) {
+        if (!warmupAll_.load() || warmupDone_.load()) return false;
+        p.phase = warmupPhase_.load();
+        if (p.phase == 2) p.done = warmupBuilt_.load(), p.total = std::max(warmupQueued_.load(), warmupExpected_.load());
+        else p.done = warmupTranslated_.load(), p.total = warmupShaders_.load();
+        p.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - warmupStart_).count();
+        return true;
+    }
+    void skipWarmup() {
+        if (!warmupAll_.load() || warmupDone_.load()) return;
+        std::fprintf(stderr, "[gpu] startup compile skipped: the rest builds in the background\n");
+        finishWarmup();
+    }
+    // The game starts once the startup compile is done (or skipped); the builds left go back to
+    // a quarter of the workers.
+    void waitForWarmup() {
+        if (!warmupAll_.load()) return;
+        auto last = std::chrono::steady_clock::now();
+        std::unique_lock lock(warmupMutex_);
+        while (!warmupCv_.wait_for(lock, std::chrono::seconds(2), [&] { return warmupDone_.load(); })) {
+            WarmupProgress p;
+            lock.unlock();
+            if (warmupProgress(p) && std::chrono::steady_clock::now() - last >= std::chrono::seconds(2)) {
+                std::fprintf(stderr, "[gpu] compiling shaders: %s %zu/%zu (%.0f s)\n",
+                             p.phase == 2 ? "pipelines" : "shaders", p.done, p.total, p.seconds);
+                last = std::chrono::steady_clock::now();
+            }
+            lock.lock();
+        }
+        lock.unlock();
+        std::fprintf(stderr, "[gpu] startup compile finished in %.1f s: %zu shaders (%zu compiled), %zu of %zu pipelines\n",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - warmupStart_).count(),
+                     warmupShaders_.load(), compiled_.load(), warmupBuilt_.load(), warmupQueued_.load());
+        warmupAll_ = false;
+    }
+
+  private:
     std::atomic<size_t> prebuildLeft_{1}; // startup builds not done, plus 1 while they are being queued
     size_t prebuildCount_ = 0;
     std::chrono::steady_clock::time_point prebuildStart_;
 
     // Queues every pipeline in pipelines.list (newest first) for the workers.
+    // The startup compile's first step, on every core: each shader the cache holds (the recorded
+    // pipelines' and every other saved program, compute shaders among them) translated with
+    // today's translator and its SPIR-V compiled if missing, so neither happens during play.
+    void translateAll(const std::vector<std::string>& records) {
+        warmupPhase_ = 1;
+        std::vector<std::string> names;
+        {
+            std::unordered_set<std::string> seen;
+            for (const auto& r : records) {
+                GraphicsState s;
+                std::string vs, ps;
+                std::vector<VkDescriptorSetLayoutBinding> bindings;
+                if (!parseRecord(r, s, vs, ps, bindings)) continue;
+                for (auto* n : {&vs, &ps})
+                    if (!n->empty() && seen.insert(*n).second) names.push_back(*n);
+            }
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(spirvDir_, ec))
+                if (e.path().extension() == ".gcn" && seen.insert(e.path().stem().string()).second)
+                    names.push_back(e.path().stem().string());
+        }
+        warmupShaders_ = names.size();
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> pool;
+        const unsigned n = std::max(1u, std::thread::hardware_concurrency());
+        for (unsigned i = 0; i < n; ++i)
+            pool.emplace_back([&] {
+                for (size_t k; (k = next++) < names.size() && !warmupDone_.load();) {
+                    currentShader(names[k]);
+                    ++warmupTranslated_;
+                }
+            });
+        for (auto& t : pool) t.join();
+        std::fprintf(stderr, "[gpu] startup compile: %zu shaders translated in %.1f s (%zu SPIR-V compiled, %zu renamed)\n",
+                     names.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - prebuildStart_).count(),
+                     compiled_.load(), retranslated_.load());
+    }
+
     void prebuildPipelines() {
         profile::nameThread("lpn-prebuild");
-        profile::lowerThreadPriority();
+        const bool warmup = warmupAll_.load();
+        if (!warmup) profile::lowerThreadPriority();
         prebuildStart_ = std::chrono::steady_clock::now();
         // Each shader's module once, shared by its pipelines (one per pipeline read and created
         // ~16000 modules for ~8000 pipelines, 11 s into the run before the last was queued).
@@ -3026,6 +3156,12 @@ private:
             }
             std::fclose(f);
         }
+        if (warmup) translateAll(records);
+        if (warmup) { // the bar's total from the start, not growing as builds are queued
+            std::unordered_set<std::string> distinct(records.begin(), records.end());
+            warmupExpected_ = distinct.size();
+        }
+        warmupPhase_ = 2;
         std::unordered_set<std::string> seen;
         size_t queued = 0, renamed = 0;
         for (auto r = records.rbegin(); r != records.rend(); ++r) {
@@ -3060,15 +3196,20 @@ private:
                 slot = j.out = std::make_shared<BuiltPipeline>();
             }
             ++prebuildLeft_;
+            ++warmupQueued_;
             queueJob(std::move(j), false);
             ++queued;
         }
         modules.clear(); // each module now lives as long as its last job
+        warmupExpected_ = 0; // queued is the total now
         prebuildCount_ = queued;
         std::fprintf(stderr, "[gpu] building %zu pipelines from earlier runs (%zu shaders translated again, queued in %.1f s)\n",
-                     queued, retranslated_,
+                     queued, retranslated_.load(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - prebuildStart_).count());
-        if (prebuildLeft_.fetch_sub(1) == 1 && queued) reportPrebuildDone(); // the workers finished them all already
+        if (prebuildLeft_.fetch_sub(1) == 1) { // the workers finished them all already
+            if (queued) reportPrebuildDone();
+            else finishWarmup();
+        }
 
         // Keep the list from growing without bound, and its shader names current: rewrite it
         // without duplicates, with today's names.
@@ -7205,7 +7346,14 @@ bool startRenderer(bool computeOnly) {
     }
     gRenderer = r;
     addDrawListener(r);
+    r->waitForWarmup();
     return true;
+}
+
+bool warmupProgress(WarmupProgress& p) { return gRenderer && gRenderer->warmupProgress(p); }
+
+void skipWarmup() {
+    if (gRenderer) gRenderer->skipWarmup();
 }
 
 bool queueDisplayCopy(uint64_t address, uint32_t width, uint32_t height, DisplayCopy& c) {

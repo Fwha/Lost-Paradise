@@ -156,6 +156,14 @@ void presenterThread() {
                 render::saveCaches();
                 std::_Exit(0);
             }
+            if (render::WarmupProgress w; render::warmupProgress(w)) { // the startup compile's screen
+                const bool key = e.type == SDL_KEYDOWN && !e.key.repeat &&
+                                 (e.key.keysym.scancode == SDL_SCANCODE_ESCAPE || e.key.keysym.scancode == SDL_SCANCODE_RETURN);
+                const bool pad = e.type == SDL_CONTROLLERBUTTONDOWN &&
+                                 (e.cbutton.button == SDL_CONTROLLER_BUTTON_A || e.cbutton.button == SDL_CONTROLLER_BUTTON_B ||
+                                  e.cbutton.button == SDL_CONTROLLER_BUTTON_START);
+                if (key || pad) render::skipWarmup();
+            }
             if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F12 && !e.key.repeat) requestCapture();
             if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F10 && !e.key.repeat) profile::mark();
             if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F9 && !e.key.repeat) coverage::onKey();
@@ -201,6 +209,10 @@ void presenterThread() {
                 else if (wh > ww / fa + 2) dst.h = int(ww / fa + 0.5), dst.y = (wh - dst.h) / 2;
             }
             SDL_RenderCopy(ren, tex, nullptr, &dst);
+        }
+        if (drawShaderWarmup(ren)) {
+            SDL_RenderPresent(ren);
+            continue;
         }
         drawSaveMenu(ren);
         drawFpsCounter(ren);

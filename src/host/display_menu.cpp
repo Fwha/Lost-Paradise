@@ -385,6 +385,44 @@ void drawFpsCounter(SDL_Renderer* ren) {
     SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
 }
 
+bool drawShaderWarmup(SDL_Renderer* ren) {
+    render::WarmupProgress p;
+    if (!render::warmupProgress(p)) return false;
+    int w = 0, h = 0;
+    SDL_GetRendererOutputSize(ren, &w, &h);
+    const float u = std::max(0.5f, h / 720.0f); // 1 at 720p
+    auto U = [u](float v) { return std::max(1, int(std::lround(v * u))); };
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    fill(ren, 0, 0, w, h, 6, 6, 8);
+    const int panelW = std::min(w - U(32), U(560)), panelH = U(188);
+    const int x0 = (w - panelW) / 2, y0 = (h - panelH) / 2, pad = U(28);
+    fillR(ren, x0, y0, panelW, panelH, U(10), 16, 16, 22, 242);
+    outlineR(ren, x0, y0, panelW, panelH, U(10), 1, ui::kAccent.line);
+    color(ren, 245, 240, 228);
+    text(ren, x0 + pad, y0 + U(22), U(26), "Compiling shaders", true);
+    const std::string step = p.phase == 2 ? "Building pipelines" : p.phase == 1 ? "Translating shaders" : "Reading the shader cache";
+    const std::string count = p.total ? std::to_string(p.done) + " / " + std::to_string(p.total) : std::string();
+    color(ren, 200, 192, 176);
+    text(ren, x0 + pad, y0 + U(66), U(18), step);
+    text(ren, x0 + panelW - pad - textW(count, U(18)), y0 + U(66), U(18), count);
+    // The bar: each step fills it once.
+    const int bx = x0 + pad, by = y0 + U(98), bw = panelW - 2 * pad, bh = U(12);
+    fillR(ren, bx, by, bw, bh, bh / 2, 40, 40, 48);
+    if (p.total) {
+        const int fw = int(double(bw) * std::min(p.done, p.total) / p.total);
+        if (fw > 0) fillR(ren, bx, by, std::max(fw, bh), bh, bh / 2, ui::kAccent.fill);
+    }
+    color(ren, 150, 146, 138);
+    const int secs = int(p.seconds);
+    const std::string elapsed = std::to_string(secs / 60) + (secs % 60 < 10 ? ":0" : ":") + std::to_string(secs % 60);
+    const int ew = textW(elapsed, U(15));
+    text(ren, bx + bw - ew, y0 + U(130), U(15), elapsed);
+    text(ren, bx, y0 + U(130), U(15), fitText("Everything seen in earlier runs, so play doesn't stutter", U(15), bw - ew - U(12)));
+    text(ren, bx, y0 + U(152), U(15), fitText("Esc or Enter: start now, the rest builds in the background", U(15), bw));
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+    return true;
+}
+
 namespace {
 std::vector<std::pair<int, int>> gQueued; // setDisplayOption's (row, choice), under gM
 
