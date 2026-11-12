@@ -44,6 +44,25 @@ void describeStack(const uint64_t* sp) {
         }
 }
 
+// Crashes whose cause is known, with what the player can do about it.
+void explainKnownCrash(uint64_t rip) {
+    Module* m = findModule(rip);
+    if (!m || m->name() != "eboot.bin") return;
+    switch (rip - uint64_t(m->base())) {
+    case 0xab460:
+        // The startup step at 0x55dad0 loads data/shader/sh_devil_ps4.par and sh_ptc_ps4.par
+        // (0x9da660), then mars_shader_ps4.par. If either fails it returns without an error and
+        // without creating the object at eboot+0x247e9e0, which the first frame then reads.
+        std::fprintf(stderr,
+                     "[crash] the game could not load its shader archives (data/shader/sh_devil_ps4.par,\n"
+                     "        sh_ptc_ps4.par or mars_shader_ps4.par) and stopped on its first frame. Check\n"
+                     "        that those files are in the dump and complete, and that the game is updated\n"
+                     "        to 1.08 (US) or 1.09 (EU): apply the update with the launcher's Tools.\n"
+                     "        Any [file] lines above this say which read failed.\n");
+        break;
+    }
+}
+
 #ifdef _WIN32
 
 // The plain register jump buffer of __builtin_setjmp: the exception handler sends the faulting
@@ -68,6 +87,7 @@ void report(EXCEPTION_POINTERS* e) {
     };
     for (const auto& g : regs) describe(g.name, g.v);
     describeStack(reinterpret_cast<const uint64_t*>(c.Rsp));
+    explainKnownCrash(c.Rip);
     std::fflush(stderr);
 }
 
@@ -129,6 +149,7 @@ void onFatal(int sig, siginfo_t* info, void* ctx) {
     };
     for (const auto& r : regs) describe(r.name, g[r.reg]);
     describeStack(reinterpret_cast<const uint64_t*>(g[REG_RSP]));
+    explainKnownCrash(g[REG_RIP]);
     _exit(128 + sig);
 }
 

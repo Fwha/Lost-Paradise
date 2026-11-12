@@ -162,10 +162,21 @@ void ioStat(int64_t got, uint64_t ns) {
 uint64_t nowNs() {
     return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
+// Failed reads are logged (the first 20): the game often only notices much later, if at all.
+void logReadError(const char* what, int32_t fd, uint64_t n, int64_t off) {
+    const int e = errno;
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 20)
+        std::fprintf(stderr, "[file] %s of %llu bytes at offset %lld (fd %d) failed: %s\n", what, (unsigned long long)n,
+                     (long long)off, fd, std::strerror(e));
+    errno = e;
+}
 int64_t sceKernelRead(int32_t fd, void* buf, uint64_t n) {
     WaitLog w{"file read", -1, __builtin_frame_address(0)};
     const uint64_t t0 = nowNs();
-    const int64_t r = check64(::read(fd, buf, n));
+    const int64_t got = ::read(fd, buf, n);
+    if (got < 0) logReadError("read", fd, n, -1);
+    const int64_t r = check64(got);
     ioStat(r, nowNs() - t0);
     return r;
 }
@@ -176,7 +187,9 @@ int64_t sceKernelWrite(int32_t fd, const void* buf, uint64_t n) {
 int64_t sceKernelPread(int32_t fd, void* buf, uint64_t n, int64_t off) {
     WaitLog w{"file read", -1, __builtin_frame_address(0)};
     const uint64_t t0 = nowNs();
-    const int64_t r = check64(::pread(fd, buf, n, off));
+    const int64_t got = ::pread(fd, buf, n, off);
+    if (got < 0) logReadError("pread", fd, n, off);
+    const int64_t r = check64(got);
     ioStat(r, nowNs() - t0);
     return r;
 }
