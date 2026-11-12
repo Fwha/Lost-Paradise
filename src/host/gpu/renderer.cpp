@@ -2484,6 +2484,7 @@ private:
                 n = 0;
                 if (r != VK_INCOMPLETE) break;
             }
+            if (!n) std::fprintf(stderr, "[gpu] pipeline cache not saved: the driver gave no data\n");
             const std::string tmp = pipelineCachePath_ + ".tmp" + std::to_string(getpid());
             if (n)
                 if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
