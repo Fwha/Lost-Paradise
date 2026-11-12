@@ -2411,7 +2411,7 @@ private:
         else spirvDir_ = "-";
         // Generic translations (gcn::genericTranslation) name other SPIR-V than specialised ones
         // and record other pipelines: each kind keeps its own cache, so switching back and forth
-        // (LPN_GENERIC_SHADERS=0) never builds the other kind's pipelines at startup.
+        // (LPN_GENERIC_SHADERS) never builds the other kind's pipelines at startup.
         if (spirvDir_ != "-" && gcn::genericTranslation()) spirvDir_ += "/generic";
         if (spirvDir_ != "-") {
             std::error_code ec;

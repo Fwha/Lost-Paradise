@@ -287,7 +287,7 @@ int main() {
     // Generic translation: a block switched on by a bit of a constant (as the game's vertex
     // shaders do) stays a run-time branch, so launches with the bit set and clear share one
     // translation, and each still gets its own constant in the draw data.
-    {
+    if (gcn::genericTranslation()) {
         const std::vector<uint32_t> flagCode = {
             0xc20a0500, // s_buffer_load_dword s20, s[4:7], 0x0
             0x87158114, // s_and_b32 s21, s20, 1

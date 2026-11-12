@@ -45,7 +45,8 @@ screen loop). Addresses are guest addresses and change between runs.
   up to 32 resource-format shapes (one material shader with BC1 or BC3 textures), so a launch
   replays one trace and then only compares formats. Reuse is checked against the hash of the
   exact code bytes, not whole pages: a shader's last page often holds data that changes.
-- **Generic translation** (`LPN_GENERIC_SHADERS=0` turns it off). Scalar branches a launch decides
+- **Generic translation** (`LPN_GENERIC_SHADERS=1`; off by default until the later stages of
+  shader-precompile.md land, since its cache starts empty). Scalar branches a launch decides
   stay run-time branches in the GLSL and the code they skip is walked too, with nothing known, so
   its loads and resources are left unresolved (that launch never runs them). Scalar-load slots and
   resources are numbered by address, not walk order. Launches that differ only in such flags

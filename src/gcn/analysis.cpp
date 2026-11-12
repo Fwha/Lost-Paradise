@@ -946,7 +946,7 @@ ReplayStats takeReplayStats() {
 bool genericTranslation() {
     static const bool on = [] {
         const char* e = std::getenv("LPN_GENERIC_SHADERS");
-        return !(e && !std::strcmp(e, "0"));
+        return e && std::strcmp(e, "0") != 0;
     }();
     return on;
 }
