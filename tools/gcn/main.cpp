@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <set>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -73,14 +75,123 @@ int glsl(int argc, char** argv) {
 
 } // namespace
 
+// How the shader cache's saved programs (<name>.gcn beside each SPIR-V) differ between
+// translations of the same shader: for each input a translation depends on, how many shaders
+// have more than one value of it. What a draw-independent translation has to make dynamic first.
+int variants(const char* dir) {
+    struct Group {
+        std::vector<gcn::Program> progs;
+    };
+    std::map<std::string, Group> groups; // stage + entry-relative code bytes of the entry region
+    size_t files = 0, bad = 0;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        if (e.path().extension() != ".gcn") continue;
+        std::ifstream f(e.path(), std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(f)), {});
+        gcn::Program p;
+        if (bytes.size() < 4 || !gcn::deserialize(bytes.substr(4), p)) {
+            ++bad;
+            continue;
+        }
+        ++files;
+        // Same shader: same stage and same instructions at the same offsets from the entry, up to
+        // the end of the code the walk found (other walks of it find more or less).
+        std::string key(1, char(p.launch.stage));
+        int n = 0;
+        for (auto it = p.code.find(p.launch.entry); it != p.code.end() && n < 24; ++it, ++n)
+            key.append(reinterpret_cast<const char*>(it->second.words), it->second.size);
+        key += std::to_string(p.launch.rsrc1) + "/" + std::to_string(p.launch.rsrc2);
+        groups[key].progs.push_back(std::move(p));
+    }
+    std::map<std::string, size_t> differs; // input -> shaders with more than one value
+    std::map<std::string, size_t> extra;   // input -> translations beyond one per shader it explains
+    size_t multi = 0, translations = 0;
+    for (auto& [k, g] : groups) {
+        translations += g.progs.size();
+        if (g.progs.size() < 2) continue;
+        ++multi;
+        auto count = [&](const char* name, auto&& field) {
+            std::set<std::string> vals;
+            for (const auto& p : g.progs) vals.insert(field(p));
+            if (vals.size() > 1) ++differs[name], extra[name] += vals.size() - 1;
+        };
+        auto bytesOf = [](const void* d, size_t n) { return std::string(static_cast<const char*>(d), n); };
+        count("code walked (scalar branches)", [&](const gcn::Program& p) {
+            std::string s;
+            for (const auto& [pc, in] : p.code) s += std::to_string(pc - p.launch.entry) + ",";
+            return s;
+        });
+        count("fetch shader calls", [&](const gcn::Program& p) {
+            std::string s;
+            for (const auto& [site, callee] : p.calls) s += std::to_string(callee) + ",";
+            return s;
+        });
+        count("PS input mapping", [&](const gcn::Program& p) { return bytesOf(p.launch.psInputCntl, sizeof p.launch.psInputCntl); });
+        count("PS input enable", [&](const gcn::Program& p) { return std::to_string(p.launch.psInputEna); });
+        count("MRT export formats", [&](const gcn::Program& p) { return std::to_string(p.launch.colorFormat); });
+        count("MRT int/uint", [&](const gcn::Program& p) { return std::to_string(p.launch.colorUint) + "/" + std::to_string(p.launch.colorSint); });
+        count("MRT swap/components", [&](const gcn::Program& p) {
+            return bytesOf(p.launch.colorSwap, sizeof p.launch.colorSwap) + bytesOf(p.launch.colorComps, sizeof p.launch.colorComps);
+        });
+        count("depth export", [&](const gcn::Program& p) { return std::to_string(p.launch.depthExport); });
+        count("clip z", [&](const gcn::Program& p) { return std::to_string(p.launch.glClipZ); });
+        count("image dimension/shadow", [&](const gcn::Program& p) {
+            std::string s;
+            for (const auto& i : p.images) s += std::to_string(i.type()) + (i.compare ? "c" : "") + (i.storage ? "s" : "") + ",";
+            return s;
+        });
+        count("image number format (float/int/uint)", [&](const gcn::Program& p) {
+            std::string s;
+            for (const auto& i : p.images) s += std::to_string(i.numFormat() == 4 ? 4 : i.numFormat() == 5 ? 5 : 0) + ",";
+            return s;
+        });
+        count("image data format", [&](const gcn::Program& p) {
+            std::string s;
+            for (const auto& i : p.images) s += std::to_string(i.dataFormat()) + ",";
+            return s;
+        });
+        count("image swizzle", [&](const gcn::Program& p) {
+            std::string s;
+            for (const auto& i : p.images) s += std::to_string(i.dstSel()) + ",";
+            return s;
+        });
+        count("buffer formats", [&](const gcn::Program& p) {
+            std::string s;
+            for (const auto& b : p.buffers) s += std::to_string(b.dfmt) + "/" + std::to_string(b.nfmt) + ",";
+            return s;
+        });
+        count("buffer swizzle", [&](const gcn::Program& p) {
+            std::string s;
+            for (const auto& b : p.buffers) s += std::to_string(b.sharp[3] & 0xFFF) + ",";
+            return s;
+        });
+    }
+    std::printf("%zu saved programs (%zu unreadable), %zu distinct shaders, %zu with more than one translation\n",
+                files, bad, groups.size(), multi);
+    std::printf("%-40s %8s %12s\n", "input that differs", "shaders", "extra transl.");
+    std::vector<std::pair<size_t, std::string>> order;
+    for (const auto& [name, n] : differs) order.push_back({n, name});
+    std::sort(order.rbegin(), order.rend());
+    for (const auto& [n, name] : order) std::printf("%-40s %8zu %12zu\n", name.c_str(), n, extra[name]);
+    std::map<size_t, size_t> hist;
+    for (const auto& [k, g] : groups) ++hist[g.progs.size()];
+    std::printf("translations per shader:");
+    for (const auto& [n, c] : hist) std::printf(" %zux%zu", c, n);
+    std::printf("\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: lpn-gcn <shader.bin>          disassemble\n"
                              "       lpn-gcn --stats <shader.bin>...  instruction usage across shaders\n"
                              "       lpn-gcn --glsl <shader.bin>...   translate to GLSL and compile\n"
-                             "       lpn-gcn --check <shader.bin>...  as --glsl, printing only results\n");
+                             "       lpn-gcn --check <shader.bin>...  as --glsl, printing only results\n"
+                             "       lpn-gcn --variants <cache dir>   how saved translations of a shader differ\n");
         return 2;
     }
+    if (!std::strcmp(argv[1], "--variants") && argc == 3) return variants(argv[2]);
     if (!std::strcmp(argv[1], "--glsl") || !std::strcmp(argv[1], "--check")) return glsl(argc, argv);
     const bool stats = !std::strcmp(argv[1], "--stats");
     std::map<std::string, std::pair<unsigned, unsigned>> uses; // mnemonic -> (count, shaders)
