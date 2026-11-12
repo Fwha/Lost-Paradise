@@ -325,6 +325,57 @@ int main() {
         }
     }
 
+    // Generic translation: a vertex shader's fetch shader is pulled in the vertex shader, its
+    // format and components read from the draw data, so meshes with other vertex layouts (here
+    // float4 and float3 positions, loaded as xyzw and xyz) share one translation.
+    if (gcn::genericTranslation()) {
+        const std::vector<uint32_t> vsCode = {
+            0xbe802100,             // s_swappc_b64 s[0:1], s[0:1]
+            0xf80008cf, 0x07060504, // exp pos0 v4 v5 v6 v7 done
+            0xbf810000,             // s_endpgm
+        };
+        std::vector<uint32_t> fetchCode = {
+            0xc0840300,             // s_load_dwordx4 s[8:11], s[2:3], 0x0
+            0xbf8c007f,             // s_waitcnt lgkmcnt(0)
+            0xe00c2000, 0x80020400, // buffer_load_format_xyzw v4, v0, s[8:11], 0 idxen
+            0xbe802000,             // s_setpc_b64 s[0:1]
+        };
+        constexpr uint64_t kVs = 0x40000, kFetch = 0x41000, kTable = 0x42000, kVerts = 0x43000;
+        uint32_t vsharp[4] = {uint32_t(kVerts), 16u << 16, 3, 0xFAC | 7 << 12 | 14 << 15};
+        auto readFetch = [&](uint64_t addr, void* dst, size_t size) {
+            auto from = [&](uint64_t base, const void* src, size_t bytes) {
+                if (addr < base || addr + size > base + bytes) return false;
+                std::memcpy(dst, static_cast<const char*>(src) + (addr - base), size);
+                return true;
+            };
+            return from(kVs, vsCode.data(), vsCode.size() * 4) || from(kFetch, fetchCode.data(), fetchCode.size() * 4) ||
+                   from(kTable, vsharp, sizeof vsharp);
+        };
+        gcn::LaunchState vl;
+        vl.stage = gcn::Stage::Vertex;
+        vl.entry = kVs;
+        vl.rsrc2 = 4 << 1;
+        vl.userData[0] = uint32_t(kFetch);
+        vl.userData[2] = uint32_t(kTable);
+        gcn::Program four = gcn::analyze(vl, readFetch);
+        fetchCode[2] = 0xe0082000; // buffer_load_format_xyz
+        vsharp[3] = 0xFAC | 7 << 12 | 13 << 15;
+        const gcn::Program three = gcn::analyze(vl, readFetch);
+        const std::string glsl = gcn::translate(four, 0).glsl;
+        const auto ctl = [](const gcn::Program& p) { return p.buffers.empty() ? 0u : p.data[p.buffers[0].data + 5]; };
+        const auto word3 = [](const gcn::Program& p) { return p.buffers.empty() ? 0u : p.data[p.buffers[0].data + 4]; };
+        const bool refreshed = gcn::refresh(four, vl, readFetch); // the float4 program, re-targeted to the float3 mesh
+        if (four.fetchSlots != 1 || !four.calls.empty() || four.buffers.size() != 1 || three.key() != gcn::analyze(vl, readFetch).key() ||
+            four.key() != three.key() || glsl != gcn::translate(three, 0).glsl || ctl(three) != (3u << 2) ||
+            word3(three) != vsharp[3] || !refreshed || ctl(four) != ctl(three) || word3(four) != vsharp[3] ||
+            gcn::compileGlsl(glsl, gcn::GlslStage::Vertex, &error).empty()) {
+            std::fprintf(stderr, "vertex fetch: %u slots, %zu calls, %zu buffers, keys %s, ctl %x, refresh %d\n%s\n%s\n",
+                         four.fetchSlots, four.calls.size(), four.buffers.size(), four.key() == three.key() ? "equal" : "differ",
+                         ctl(three), refreshed, error.c_str(), glsl.c_str());
+            ++failures;
+        }
+    }
+
     // An image the analysis cannot resolve (no T#) is declared from its code: a sample whose third
     // address register is a v_cubeid face samples a cube; one with two addresses a 2D image.
     {

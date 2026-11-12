@@ -55,7 +55,15 @@ screen loop). Addresses are guest addresses and change between runs.
   of the translation key, since only the view uses them. A float colour target's COMP_SWAP and
   component count reach the pixel shader in its draw data (`data::kColorSwizzle`, over the words a
   vertex shader uses for its position transform), so the translation does not depend on the target.
-  These SPIR-V and pipelines are kept in a `generic/` subfolder of the cache.
+  Vertex fetch (stage 2): the fetch shader a vertex shader calls is not inlined. Every one the game
+  makes (75 in the user's cache) is only `s_load_dwordx4` of V#s, `buffer_load_format_*` idxen of v0
+  or v3 into v[4 + 4k], and `s_setpc`, so the analysis reads it at each launch and gives the vertex
+  shader one buffer per slot of four VGPRs, with V# word 3 (data and number format, swizzle) and a
+  control word (index VGPR, components, offset) in the draw data; the translation decodes the
+  element at run time. Other `buffer_load_format_*` read V# word 3 from the draw data the same way.
+  A fetch shader of any other shape is walked and inlined as before.
+  These SPIR-V and pipelines are kept in a `generic2/` subfolder of the cache (`generic/` held
+  stage 1 programs, whose draw data lacks those words).
 - **Images without a T#** (in code a launch skips, or a shader compiled before any draw) are declared
   from the code: a cube when the third address register is a `v_cubeid` face, 3D (or a 2D array with
   DA) when a third address is written just before the instruction, else 2D. Over the user's cache

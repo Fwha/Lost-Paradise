@@ -64,6 +64,7 @@ struct BufferResource {
     bool store = false;
     bool known = true; // false when the V# could not be evaluated at draw time
     uint32_t data = 0; // dword offset in draw data: byte offset in binding, stride, num_records, size
+                       // (then V# word 3 when formatInData())
     uint64_t base() const { return sharp[0] | (uint64_t(sharp[1] & 0xFFF) << 32); }
     uint32_t stride() const { return (sharp[1] >> 16) & 0x3FFF; }
     uint32_t numRecords() const { return sharp[2]; }
@@ -117,6 +118,11 @@ struct Program {
     std::map<uint64_t, Instruction> code;
     std::set<uint64_t> labels; // addresses control can reach other than by falling through
     std::map<uint64_t, uint64_t> calls; // s_swappc_b64 site -> resolved callee
+    // Generic translation: the s_swappc_b64 to the fetch shader, pulled in the vertex shader instead
+    // (its callee is not walked): `fetchSlots` buffers with pc == fetchSite, one per four VGPRs from
+    // v4, whose draw data is the four words, V# word 3, then index VGPR | components << 2 | offset << 8.
+    uint64_t fetchSite = 0;
+    uint32_t fetchSlots = 0;
     bool controlFlow = false;
     bool writesExec = false;
     std::map<uint64_t, uint32_t> smrd; // pc -> dword offset of its result in `data`
@@ -153,6 +159,14 @@ bool deserialize(const std::string& bytes, Program& program);
 // launch decided as run-time branches and walks the code they skip too, so launches of a shader
 // that differ only in such flags translate alike (docs/shader-precompile.md, stage 1).
 bool genericTranslation();
+
+// Generic translation: a buffer_load_format_* decodes its element by the V#'s word 3 (DATA_FORMAT,
+// NUM_FORMAT, DST_SEL), which the analysis puts in the draw data after the buffer's four words, so
+// one translation of a vertex shader serves every mesh layout (stage 2).
+bool formatInData(const Instruction& in);
+bool formatInData(const Program& program, const BufferResource& b);
+// Draw data dwords of buffer `b`: 4, 5 with V# word 3, 6 for a vertex fetch slot.
+uint32_t bufferWords(const Program& program, const BufferResource& b);
 
 // The dimension the translation declares image `im` with (a T# type code): the T#'s when it was
 // resolved, else worked out from the code before the instruction.

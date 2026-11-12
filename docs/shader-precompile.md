@@ -34,7 +34,9 @@ is part of the shader binary's own registers and so known without a draw.
    input mapping are read from the draw data. Output types follow SPI_SHADER_COL_FORMAT (the
    shader's own register): 16-bit int exports declare integer outputs, everything else float.
 2. **Vertex pulling.** Translate the fetch shader's typed loads as a generic formatted load whose
-   format comes from the draw data, so one VS translation serves every mesh layout.
+   format comes from the draw data, so one VS translation serves every mesh layout. Done (see
+   gpu.md, generic translation): the translation depends only on how many slots of four VGPRs the
+   fetch fills, which the VS's own input semantics fix, so stage 4 can lay out a VS without a mesh.
 3. **No per-state pipelines.** VK_EXT_shader_object (or graphics pipeline libraries) with
    blend, depth/stencil, topology and colour write state dynamic, so a shader pair needs no
    pipeline build per state.

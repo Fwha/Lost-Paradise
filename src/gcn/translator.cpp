@@ -101,6 +101,63 @@ vec4 outSwizzle(vec4 v, uint code) {
     return vec4(v[t & 3u], v[(t >> 2) & 3u], v[(t >> 4) & 3u], v[(t >> 6) & 3u]);
 }
 )";
+        if (needFormatDecode_)
+            g += R"(// Formatted buffer elements by V# word 3 (DATA_FORMAT 18:15, NUM_FORMAT 14:12, DST_SEL 11:0):
+// dwords each data format spans, and the element decoded from them (sh: byte offset of 8-bit data).
+const uint kFormatDwords[16] = uint[16](0u, 1u, 1u, 1u, 1u, 1u, 0u, 0u, 1u, 1u, 1u, 2u, 2u, 3u, 4u, 0u);
+uint formatConvert(uint raw, uint bits, uint nfmt) {
+    if (bits == 32u) return raw;
+    float maxv = float((1u << bits) - 1u), halfv = float((1u << (bits - 1u)) - 1u);
+    int sx = bitfieldExtract(int(raw), 0, int(bits));
+    switch (nfmt) {
+    case 0u: return U(float(raw) / maxv);
+    case 1u: return U(max(float(sx) / halfv, -1.0));
+    case 2u: return U(float(raw));
+    case 3u: return U(float(sx));
+    case 5u: return uint(sx);
+    case 7u: return bits == 16u ? U(unpackHalf2x16(raw).x) : raw;
+    default: return raw;
+    }
+}
+uvec4 decodeFormat(uint w0, uint w1, uint w2, uint w3, uint sh, uint word3) {
+    uint dfmt = (word3 >> 15) & 15u, nfmt = (word3 >> 12) & 7u;
+    uint one = nfmt == 4u || nfmt == 5u ? 1u : 0x3f800000u;
+    uint e[4] = uint[4](0u, 0u, 0u, one);
+    uint x = w0 >> sh;
+    switch (dfmt) {
+    case 4u: e[0] = w0; break;
+    case 11u: e[0] = w0; e[1] = w1; break;
+    case 13u: e[0] = w0; e[1] = w1; e[2] = w2; break;
+    case 14u: e[0] = w0; e[1] = w1; e[2] = w2; e[3] = w3; break;
+    case 2u: e[0] = formatConvert(w0 & 0xffffu, 16u, nfmt); break;
+    case 5u: e[0] = formatConvert(w0 & 0xffffu, 16u, nfmt); e[1] = formatConvert(w0 >> 16, 16u, nfmt); break;
+    case 12u:
+        e[0] = formatConvert(w0 & 0xffffu, 16u, nfmt); e[1] = formatConvert(w0 >> 16, 16u, nfmt);
+        e[2] = formatConvert(w1 & 0xffffu, 16u, nfmt); e[3] = formatConvert(w1 >> 16, 16u, nfmt);
+        break;
+    case 1u: e[0] = formatConvert(x & 0xffu, 8u, nfmt); break;
+    case 3u: e[0] = formatConvert(x & 0xffu, 8u, nfmt); e[1] = formatConvert((x >> 8) & 0xffu, 8u, nfmt); break;
+    case 10u:
+        e[0] = formatConvert(x & 0xffu, 8u, nfmt); e[1] = formatConvert((x >> 8) & 0xffu, 8u, nfmt);
+        e[2] = formatConvert((x >> 16) & 0xffu, 8u, nfmt); e[3] = formatConvert(x >> 24, 8u, nfmt);
+        break;
+    case 8u: case 9u:
+        e[0] = formatConvert(w0 & 0x3ffu, 10u, nfmt); e[1] = formatConvert((w0 >> 10) & 0x3ffu, 10u, nfmt);
+        e[2] = formatConvert((w0 >> 20) & 0x3ffu, 10u, nfmt);
+        e[3] = nfmt == 0u ? U(float(w0 >> 30) / 3.0) : w0 >> 30;
+        break;
+    default: break;
+    }
+    uint sel = word3 & 0xfffu;
+    if (sel == 0u) return uvec4(e[0], e[1], e[2], e[3]);
+    uvec4 r = uvec4(0u);
+    for (int i = 0; i < 4; ++i) {
+        uint s = (sel >> (i * 3)) & 7u;
+        r[i] = s >= 4u ? e[s - 4u] : s == 1u ? one : 0u;
+    }
+    return r;
+}
+)";
         if (needLane_)
             g += stage == Stage::Compute ? "uint laneId() { return gl_LocalInvocationIndex & 63u; }\n"
                  : stage == Stage::Vertex ? "uint laneId() { return uint(gl_VertexIndex) & 63u; }\n"
@@ -503,6 +560,10 @@ vec3 cubeDir(vec3 c) {
         case 32: out(p_.controlFlow ? "pc = " + a + "; break;\n" : "return;\n"); break; // s_setpc_b64
         case 33: { // s_swappc_b64
             writeS64(d, label(next_), hex(uint32_t(next_ >> 32)));
+            if (p_.fetchSlots && pc_ == p_.fetchSite) {
+                fetch();
+                break;
+            }
             auto call = p_.calls.find(pc_);
             if (call != p_.calls.end()) out("pc = " + label(call->second) + "; break;\n");
             break;
@@ -1080,7 +1141,7 @@ vec3 cubeDir(vec3 c) {
         case kS8: out(fmt("r_[0] = uint(bitfieldExtract(int(%s.m[a_ >> 2]), int((a_ & 3u) * 8u), 8));\n", bn.c_str())); break;
         case kU16: out(fmt("r_[0] = (%s.m[a_ >> 2] >> ((a_ & 2u) * 8u)) & 0xffffu;\n", bn.c_str())); break;
         case kS16: out(fmt("r_[0] = uint(bitfieldExtract(int(%s.m[a_ >> 2]), int((a_ & 2u) * 8u), 16));\n", bn.c_str())); break;
-        case kFormat: loadFormat(r, bn); break;
+        case kFormat: formatInData(in) ? loadFormatDynamic(o, bn) : loadFormat(r, bn); break;
         }
         out("}\n");
         for (unsigned i = 0; i < count; ++i) writeV(vdata + i, fmt("r_[%u]", i));
@@ -1134,6 +1195,46 @@ vec3 cubeDir(vec3 c) {
             else if (s == 0 && sel != 0) out(fmt("r_[%d] = 0u;\n", i));
             else if (sel == 0) out(fmt("r_[%d] = e_[%d];\n", i, i));
         }
+    }
+
+    // Generic translation: the fetch shader's loads, each slot's from its draw data (index VGPR,
+    // components, offset, V#), so one translation serves every mesh layout the shader is drawn with.
+    void fetch() {
+        uint32_t k = 0;
+        for (size_t index = 0; index < p_.buffers.size(); ++index) {
+            const BufferResource& r = p_.buffers[index];
+            if (r.pc != p_.fetchSite) continue;
+            const std::string bn = fmt("buf%zu", index);
+            const uint32_t o = r.data, v = 4 + 4 * k++;
+            out(fmt("{ // vertex fetch into v%u\n", v));
+            out(fmt("uint c_ = D[%u], n_ = (c_ >> 2) & 7u, s_ = c_ & 3u;\n", o + 5));
+            out("if (n_ != 0u) {\n");
+            out(fmt("uint base_ = D[%u], stride_ = D[%u], nrec_ = D[%u], size_ = D[%u];\n", o, o + 1, o + 2, o + 3));
+            out("uint idx_ = s_ == 0u ? " + vreg(0) + " : s_ == 1u ? " + vreg(1) + " : s_ == 2u ? " + vreg(2) + " : " +
+                vreg(3) + ";\n");
+            out("uint off_ = c_ >> 8;\n");
+            out("uint a_ = base_ + idx_ * stride_ + off_;\n");
+            out("bool in_ = (stride_ != 0u ? idx_ < nrec_ : off_ < nrec_) && a_ < size_;\n");
+            out("uint r_[4] = uint[4](0u, 0u, 0u, 0u);\n");
+            out("if (in_) {\n");
+            loadFormatDynamic(o, bn);
+            out("}\n");
+            for (uint32_t i = 0; i < 4; ++i) {
+                if (i) out(fmt("if (n_ > %uu) ", i));
+                writeV(v + i, fmt("r_[%u]", i));
+            }
+            out("}\n}\n");
+        }
+    }
+
+    // Generic translation: the element format and swizzle come from V# word 3 in the draw data.
+    void loadFormatDynamic(uint32_t o, const std::string& bn) {
+        needFormatDecode_ = true;
+        out(fmt("uint f_ = D[%u], nd_ = kFormatDwords[(f_ >> 15) & 15u], i_ = a_ >> 2;\n", o + 4));
+        out(fmt("uint w0_ = nd_ > 0u ? %s.m[i_] : 0u, w1_ = nd_ > 1u ? %s.m[i_ + 1u] : 0u;\n", bn.c_str(), bn.c_str()));
+        out(fmt("uint w2_ = nd_ > 2u ? %s.m[i_ + 2u] : 0u, w3_ = nd_ > 3u ? %s.m[i_ + 3u] : 0u;\n", bn.c_str(), bn.c_str()));
+        out("uvec4 v_ = decodeFormat(w0_, w1_, w2_, w3_, (a_ & 3u) * 8u, f_);\n");
+        out("r_[0] = v_.x; r_[1] = v_.y; r_[2] = v_.z; r_[3] = v_.w;\n");
     }
 
     void storeFormat(const BufferResource& r, const std::string& bn, uint32_t vdata, unsigned count) {
@@ -1373,7 +1474,7 @@ vec3 cubeDir(vec3 c) {
     };
     std::set<std::pair<uint64_t, uint64_t>, LoopOrder> loops_; // (head, its backward branch)
     uint32_t loopVars_ = 0;
-    bool needLane_ = false, need64_ = false, needQuad_ = false, needOutSwizzle_ = false, depthDeclared_ = false;
+    bool needLane_ = false, need64_ = false, needQuad_ = false, needOutSwizzle_ = false, needFormatDecode_ = false, depthDeclared_ = false;
 };
 
 } // namespace
