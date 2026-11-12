@@ -2467,11 +2467,22 @@ public:
 private:
     void writePipelineCache() {
         {
+            // Workers may still be adding pipelines (closing the window during the startup compile):
+            // the cache can outgrow the size just asked for, and the read then gives VK_INCOMPLETE.
+            // Ask again with room to spare instead of saving nothing.
             size_t n = 0;
             std::vector<char> data;
-            if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, nullptr) == VK_SUCCESS && n) {
+            for (int tries = 0; tries < 8; ++tries) {
+                if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, nullptr) != VK_SUCCESS || !n) {
+                    n = 0;
+                    break;
+                }
+                n += n / 8;
                 data.resize(n);
-                if (vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, data.data()) != VK_SUCCESS) n = 0;
+                const VkResult r = vkGetPipelineCacheData(vk_.device, pipelineCache_, &n, data.data());
+                if (r == VK_SUCCESS) break;
+                n = 0;
+                if (r != VK_INCOMPLETE) break;
             }
             const std::string tmp = pipelineCachePath_ + ".tmp" + std::to_string(getpid());
             if (n)
@@ -3022,7 +3033,7 @@ private:
     // ---- the startup compile (Compile Shaders at Startup) ----
     std::atomic<bool> warmupAll_{false}; // the game waits for the startup builds, which every worker takes
     std::atomic<int> warmupPhase_{0};     // 0 reading the lists, 1 translating shaders, 2 building pipelines
-    std::atomic<size_t> warmupTranslated_{0}, warmupShaders_{0}, warmupBuilt_{0}, warmupQueued_{0};
+    std::atomic<size_t> warmupTranslated_{0}, warmupShaders_{0}, warmupBuilt_{0}, warmupQueued_{0}, warmupExpected_{0};
     std::atomic<bool> warmupDone_{false};
     std::chrono::steady_clock::time_point warmupStart_ = std::chrono::steady_clock::now();
     std::mutex warmupMutex_;
@@ -3040,7 +3051,7 @@ private:
     bool warmupProgress(WarmupProgress& p) {
         if (!warmupAll_.load() || warmupDone_.load()) return false;
         p.phase = warmupPhase_.load();
-        if (p.phase == 2) p.done = warmupBuilt_.load(), p.total = warmupQueued_.load();
+        if (p.phase == 2) p.done = warmupBuilt_.load(), p.total = std::max(warmupQueued_.load(), warmupExpected_.load());
         else p.done = warmupTranslated_.load(), p.total = warmupShaders_.load();
         p.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - warmupStart_).count();
         return true;
@@ -3145,6 +3156,10 @@ private:
             std::fclose(f);
         }
         if (warmup) translateAll(records);
+        if (warmup) { // the bar's total from the start, not growing as builds are queued
+            std::unordered_set<std::string> distinct(records.begin(), records.end());
+            warmupExpected_ = distinct.size();
+        }
         warmupPhase_ = 2;
         std::unordered_set<std::string> seen;
         size_t queued = 0, renamed = 0;
@@ -3185,6 +3200,7 @@ private:
             ++queued;
         }
         modules.clear(); // each module now lives as long as its last job
+        warmupExpected_ = 0; // queued is the total now
         prebuildCount_ = queued;
         std::fprintf(stderr, "[gpu] building %zu pipelines from earlier runs (%zu shaders translated again, queued in %.1f s)\n",
                      queued, retranslated_.load(),
