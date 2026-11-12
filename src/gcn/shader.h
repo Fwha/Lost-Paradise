@@ -204,8 +204,9 @@ struct Translation {
     std::vector<std::string> warnings;
 };
 
-// Bindings: draw data at `bindingBase`, then one per buffer, then one per image.
-Translation translate(const Program& program, uint32_t bindingBase);
+// Bindings: draw data at `bindingBase`, then one per buffer, then one per image, all in
+// descriptor set `set` (pixel shaders use set 1 when the renderer links pipeline libraries).
+Translation translate(const Program& program, uint32_t bindingBase, uint32_t set = 0);
 
 // GLSL to SPIR-V (glslang). Returns an empty vector and fills `error` on failure.
 enum class GlslStage { Vertex, Geometry, Fragment, Compute };

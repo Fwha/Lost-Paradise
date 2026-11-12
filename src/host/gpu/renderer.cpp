@@ -728,6 +728,11 @@ public:
             return false;
         }
         dlss::init(vk_);
+        { // pipeline libraries: with generic translations (docs/shader-precompile.md stage 3)
+            const char* e = getenv("LPN_PIPELINE_LIBRARIES");
+            libraries_ = vk_.pipelineLibraries && gcn::genericTranslation() && !(e && !std::strcmp(e, "0"));
+            if (libraries_) std::fprintf(stderr, "[gpu] pipelines linked from per-shader libraries\n");
+        }
         if (const char* js = getenv("LPN_DLSS_JITTER_SIGN")) std::sscanf(js, "%f,%f", &jitterSign_[0], &jitterSign_[1]);
         VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1695,8 +1700,33 @@ private:
             spareChunks_.push_back(std::move(c));
         }
     }
-    void pushDescriptors(VkPipelineBindPoint point, VkPipelineLayout layout, std::vector<VkWriteDescriptorSet>& writes,
+    struct Layout {
+        VkDescriptorSetLayout set = VK_NULL_HANDLE;
+        VkPipelineLayout pipeline = VK_NULL_HANDLE;
+        // Pipeline libraries (libraries_, graphics only): `set` holds the vertex shader's bindings
+        // (pushed) and psSet the pixel shader's (a set per draw); the layouts are independent-set
+        // ones, pre and frag for the stages' libraries, with their keys.
+        VkDescriptorSetLayout psSet = VK_NULL_HANDLE;
+        VkPipelineLayout pre = VK_NULL_HANDLE, frag = VK_NULL_HANDLE;
+        std::string preKey, fragKey;
+    };
+
+    void pushDescriptors(VkPipelineBindPoint point, const Layout& lay, std::vector<VkWriteDescriptorSet>& writes,
                          std::vector<VkDescriptorBufferInfo>& bufs, std::vector<VkDescriptorImageInfo>& imgs) {
+        const VkPipelineLayout layout = lay.pipeline;
+        if (lay.psSet) { // pipeline libraries: the pixel shader's part goes in a set of its own
+            thread_local std::vector<VkWriteDescriptorSet> vw;
+            thread_local std::vector<VkDescriptorBufferInfo> vb;
+            thread_local std::vector<VkDescriptorImageInfo> vi;
+            pixelDescriptors(point, lay, writes, bufs, imgs, vw, vb, vi);
+            if (vw.empty()) return;
+            pushVertex(point, layout, vw, vb, vi);
+            return;
+        }
+        pushVertex(point, layout, writes, bufs, imgs);
+    }
+    void pushVertex(VkPipelineBindPoint point, VkPipelineLayout layout, std::vector<VkWriteDescriptorSet>& writes,
+                    std::vector<VkDescriptorBufferInfo>& bufs, std::vector<VkDescriptorImageInfo>& imgs) {
         if (syncRecord_ || R().immediate_) {
             linkWrites(writes, bufs, imgs);
             vk_.cmdPushDescriptorSet(R().cmd_, point, layout, 0, uint32_t(writes.size()), writes.data());
@@ -1712,6 +1742,108 @@ private:
         }
         const uint32_t n = uint32_t(writes.size());
         rec([this, c = R().cmd_, point, layout, n, w] { vk_.cmdPushDescriptorSet(c, point, layout, 0, n, w); });
+    }
+
+    // Pipeline libraries: the pixel shader's writes go into what is bound (Bound::ps*), the rest
+    // to vw/vb/vi (to be pushed); then all of the pixel shader's are written into a new set, bound
+    // as set 1. Push descriptors update incrementally (a fast draw pushes only what changed), a set
+    // does not.
+    void pixelDescriptors(VkPipelineBindPoint point, const Layout& lay, const std::vector<VkWriteDescriptorSet>& writes,
+                          const std::vector<VkDescriptorBufferInfo>& bufs, const std::vector<VkDescriptorImageInfo>& imgs,
+                          std::vector<VkWriteDescriptorSet>& vw, std::vector<VkDescriptorBufferInfo>& vb,
+                          std::vector<VkDescriptorImageInfo>& vi) {
+        Bound& bd = R().bound_;
+        if (bd.psLayout != &lay) bd.psLayout = &lay, bd.psHas = 0;
+        bool any = false;
+        size_t nb = 0, ni = 0;
+        vw.clear(), vb.clear(), vi.clear();
+        for (size_t k = 0; k < writes.size(); ++k) {
+            const VkWriteDescriptorSet& w = writes[k];
+            const bool buf = w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            const size_t at = buf ? nb++ : ni++;
+            if (w.dstBinding >= kPsBindingBase && w.dstBinding < kPsBindingBase + 64) {
+                const uint32_t i = w.dstBinding - kPsBindingBase;
+                bd.psHas |= 1ull << i;
+                bd.psType[i] = w.descriptorType;
+                if (buf) bd.psBuf[i] = bufs[at];
+                else bd.psImg[i] = imgs[at];
+                any = true;
+                continue;
+            }
+            vw.push_back(w); // the vertex shader's, pushed as before
+            if (buf) vb.push_back(bufs[at]);
+            else vi.push_back(imgs[at]);
+        }
+        linkWrites(vw, vb, vi);
+        if (!any || !bd.psHas) return;
+        const VkDescriptorSet set = allocPixelSet(lay.psSet);
+        if (!set) return;
+        thread_local std::vector<VkWriteDescriptorSet> sw;
+        sw.clear();
+        for (uint64_t m = bd.psHas; m; m &= m - 1) {
+            const uint32_t i = uint32_t(std::countr_zero(m));
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = set;
+            w.dstBinding = kPsBindingBase + i;
+            w.descriptorCount = 1;
+            w.descriptorType = bd.psType[i];
+            if (w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) w.pBufferInfo = &bd.psBuf[i];
+            else w.pImageInfo = &bd.psImg[i];
+            sw.push_back(w);
+        }
+        vkUpdateDescriptorSets(vk_.device, uint32_t(sw.size()), sw.data(), 0, nullptr);
+        if (syncRecord_ || R().immediate_) {
+            vkCmdBindDescriptorSets(R().cmd_, point, lay.pipeline, 1, 1, &set, 0, nullptr);
+            return;
+        }
+        rec([c = R().cmd_, point, layout = lay.pipeline, set] { vkCmdBindDescriptorSets(c, point, layout, 1, 1, &set, 0, nullptr); });
+    }
+    // Pixel shader sets come from pools used in turn: a full pool is retired, and reset for reuse
+    // once every batch that could hold its sets has finished (more pools are made meanwhile).
+    VkDescriptorSet allocPixelSet(VkDescriptorSetLayout l) {
+        std::lock_guard lock(setPoolMutex_);
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (setPool_) {
+                VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+                ai.descriptorPool = setPool_;
+                ai.descriptorSetCount = 1;
+                ai.pSetLayouts = &l;
+                VkDescriptorSet set = VK_NULL_HANDLE;
+                if (vkAllocateDescriptorSets(vk_.device, &ai, &set) == VK_SUCCESS) return set;
+                uint64_t mark;
+                {
+                    std::lock_guard dl(doneMutex_);
+                    mark = submitted_ + kBatches + 1; // any batch recording now is submitted by then
+                }
+                retiredPools_.push_back({mark, setPool_});
+                setPool_ = VK_NULL_HANDLE;
+            }
+            uint64_t completed;
+            {
+                std::lock_guard dl(doneMutex_);
+                completed = completed_;
+            }
+            if (!retiredPools_.empty() && retiredPools_.front().first <= completed) {
+                setPool_ = retiredPools_.front().second;
+                retiredPools_.pop_front();
+                vkResetDescriptorPool(vk_.device, setPool_, 0);
+                continue;
+            }
+            constexpr uint32_t kSets = 2048;
+            const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kSets * 8},
+                                                  {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kSets * 8},
+                                                  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kSets}};
+            VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            pci.maxSets = kSets;
+            pci.poolSizeCount = uint32_t(std::size(sizes));
+            pci.pPoolSizes = sizes;
+            if (vkCreateDescriptorPool(vk_.device, &pci, nullptr, &setPool_) != VK_SUCCESS) {
+                setPool_ = VK_NULL_HANDLE;
+                std::fprintf(stderr, "[gpu] descriptor pool not created\n");
+                return VK_NULL_HANDLE;
+            }
+        }
+        return VK_NULL_HANDLE;
     }
 
     void useBatch(uint32_t i) {
@@ -2302,13 +2434,17 @@ private:
 
     // ---- shaders and pipelines -----------------------------------------------------------------
 
+    // Pixel shaders' resources are descriptor set 1 when pipelines are linked from libraries: each
+    // stage's library has only its own set, and only one set can be pushed.
+    uint32_t descriptorSet(const gcn::Program& p) const { return libraries_ && p.launch.stage == gcn::Stage::Pixel ? 1 : 0; }
+
     ShaderModule* shader(const gcn::Program& p, uint32_t bindingBase) {
         std::string key = p.key();
         key.append(reinterpret_cast<const char*>(&bindingBase), 4);
         auto it = shaders_.find(key);
         if (it != shaders_.end()) return it->second.get();
         auto m = std::make_unique<ShaderModule>();
-        m->translation = gcn::translate(p, bindingBase);
+        m->translation = gcn::translate(p, bindingBase, descriptorSet(p));
         for (const auto& w : p.warnings) warnOnce("shader 0x" + hex(p.launch.entry) + ": " + w);
         for (const auto& w : m->translation.warnings) warnOnce("shader 0x" + hex(p.launch.entry) + ": " + w);
         const gcn::GlslStage stage = p.launch.stage == gcn::Stage::Pixel     ? gcn::GlslStage::Fragment
@@ -2575,7 +2711,7 @@ private:
         uint32_t bindingBase;
         if (bytes.size() < 4 || !gcn::deserialize(bytes.substr(4), p)) return out;
         std::memcpy(&bindingBase, bytes.data(), 4);
-        const gcn::Translation t = gcn::translate(p, bindingBase);
+        const gcn::Translation t = gcn::translate(p, bindingBase, descriptorSet(p));
         const gcn::GlslStage stage = p.launch.stage == gcn::Stage::Pixel     ? gcn::GlslStage::Fragment
                                      : p.launch.stage == gcn::Stage::Compute ? gcn::GlslStage::Compute
                                                                              : gcn::GlslStage::Vertex;
@@ -2648,10 +2784,6 @@ private:
         return m;
     }
 
-    struct Layout {
-        VkDescriptorSetLayout set = VK_NULL_HANDLE;
-        VkPipelineLayout pipeline = VK_NULL_HANDLE;
-    };
 
     void addBindings(std::vector<VkDescriptorSetLayoutBinding>& b, const gcn::Program& p, uint32_t base,
                      VkShaderStageFlags stage) {
@@ -2674,6 +2806,40 @@ private:
         auto it = layouts_.find(key);
         if (it != layouts_.end()) return it->second;
         Layout l;
+        bool graphics = false;
+        for (const auto& b : bindings) graphics |= (b.stageFlags & VK_SHADER_STAGE_VERTEX_BIT) != 0;
+        if (libraries_ && graphics) {
+            thread_local std::vector<VkDescriptorSetLayoutBinding> vsb, psb;
+            vsb.clear(), psb.clear();
+            for (const auto& b : bindings) {
+                (b.binding < kPsBindingBase ? vsb : psb).push_back(b);
+                const uint32_t k[] = {b.binding, uint32_t(b.descriptorType), b.stageFlags};
+                (b.binding < kPsBindingBase ? l.preKey : l.fragKey).append(reinterpret_cast<const char*>(k), sizeof(k));
+            }
+            VkDescriptorSetLayoutCreateInfo dci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            dci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+            dci.bindingCount = uint32_t(vsb.size());
+            dci.pBindings = vsb.data();
+            VK_CHECK(vkCreateDescriptorSetLayout(vk_.device, &dci, nullptr, &l.set));
+            dci.flags = 0;
+            dci.bindingCount = uint32_t(psb.size());
+            dci.pBindings = psb.data();
+            VK_CHECK(vkCreateDescriptorSetLayout(vk_.device, &dci, nullptr, &l.psSet));
+            auto make = [&](VkDescriptorSetLayout a, VkDescriptorSetLayout b, uint32_t n) {
+                const VkDescriptorSetLayout sets[2] = {a, b};
+                VkPipelineLayoutCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+                pci.flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT;
+                pci.setLayoutCount = n;
+                pci.pSetLayouts = sets;
+                VkPipelineLayout pl;
+                VK_CHECK(vkCreatePipelineLayout(vk_.device, &pci, nullptr, &pl));
+                return pl;
+            };
+            l.pipeline = make(l.set, l.psSet, 2);
+            l.pre = make(l.set, VK_NULL_HANDLE, 1);
+            l.frag = make(VK_NULL_HANDLE, l.psSet, 2);
+            return layouts_[key] = l;
+        }
         VkDescriptorSetLayoutCreateInfo dci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         dci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
         dci.bindingCount = uint32_t(bindings.size());
@@ -2703,6 +2869,10 @@ private:
     struct DynamicState {
         uint32_t stencilMasks = 0, stencilMasksBf = 0; // DB_STENCILREFMASK(_BF)
         uint32_t polyOffset[3] = {}; // clamp, scale, offset (float bits) while polygon offset is on
+        // Pipeline libraries: the rasteriser and depth/stencil state the pipeline has dynamic (see
+        // libraryState): cull mode, front face, depth bias enable, depth test, write, compare,
+        // stencil test, then each face's fail, pass, depth fail ops and compare op.
+        uint32_t lib[15] = {};
     };
 
     static VkBlendFactor blendFactor(uint32_t f) {
@@ -2775,6 +2945,8 @@ private:
         std::string record; // appended to pipelines.list once built, unless it came from there
         bool prebuild = false; // from pipelines.list: vs and ps are shared, held by keep
         std::shared_ptr<void> keep; // a startup build's shader modules, destroyed with the last job using them
+        const Layout* lay = nullptr; // for libraries: its stages' layouts
+        std::string vsName, psName;  // for libraries: what they are kept by
     };
     static constexpr uint32_t kRecordVersion = 1;
 
@@ -2825,8 +2997,9 @@ private:
         return VK_NULL_HANDLE;
     }
 
-    VkPipeline graphicsPipeline(const GraphicsState& s, ShaderModule* vs, ShaderModule* ps, VkPipelineLayout layout,
+    VkPipeline graphicsPipeline(const GraphicsState& s, ShaderModule* vs, ShaderModule* ps, const Layout& lay,
                                 const std::vector<VkDescriptorSetLayoutBinding>& bindings) {
+        const VkPipelineLayout layout = lay.pipeline;
         thread_local std::string key; // per draw: built in a reused buffer
         key.assign(reinterpret_cast<const char*>(&s), sizeof(s));
         auto it = pipelines_.find(key);
@@ -2848,6 +3021,9 @@ private:
             ++R().prof_.pipelinesMade;
             notePipeline(c, vs->name, ps ? ps->name : std::string(), R().prof_.on);
             PipelineJob j{c, vs->module, ps ? ps->module : VK_NULL_HANDLE, geometryFor(s), layout, b, std::move(record), false};
+            j.lay = &lay;
+            j.vsName = vs->name;
+            j.psName = ps ? ps->name : std::string();
             if (syncPipelines_) runJob(j);
             else {
                 queueJob(std::move(j), true);
@@ -3003,7 +3179,7 @@ private:
     }
 
     void runJob(PipelineJob& j) {
-        j.out->pipeline = buildGraphics(j.state, j.vs, j.ps, j.geom, j.layout);
+        j.out->pipeline = libraries_ && j.lay && j.lay->pre ? linkGraphics(j) : buildGraphics(j.state, j.vs, j.ps, j.geom, j.layout);
         j.out->started = true;
         j.out->ready.store(true, std::memory_order_release);
         j.out->ready.notify_all();
@@ -3194,7 +3370,10 @@ private:
             j.vs = vs.get();
             j.ps = ps.get();
             j.keep = std::make_shared<std::pair<decltype(vs), decltype(ps)>>(std::move(vs), std::move(ps));
-            j.layout = layout(bindings).pipeline;
+            j.lay = &layout(bindings);
+            j.layout = j.lay->pipeline;
+            j.vsName = vsName;
+            j.psName = psName;
             j.geom = geometryFor(s);
             {
                 std::lock_guard lock(buildMutex_);
@@ -3275,62 +3454,15 @@ private:
         vp.viewportCount = 1;
         vp.scissorCount = 1;
         VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-        rs.polygonMode = VK_POLYGON_MODE_FILL;
-        const bool rect = s.topology == 17 || s.topology == 19;
-        rs.cullMode = VK_CULL_MODE_NONE;
-        if (!rect && (s.modeCntl & 1)) rs.cullMode |= VK_CULL_MODE_FRONT_BIT;
-        if (!rect && (s.modeCntl & 2)) rs.cullMode |= VK_CULL_MODE_BACK_BIT;
-        rs.frontFace = (s.modeCntl & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth = 1.0f;
-        if (s.modeCntl & (3u << 11)) { // POLY_OFFSET_FRONT/BACK_ENABLE
-            // Scale is in 1/16ths of the slope; the offset is in the depth format's units, as Vulkan's.
-            rs.depthBiasEnable = VK_TRUE; // the factors are dynamic (setDynamicState)
-        }
+        rasterState(s, rs);
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-        if (s.depthFormat) {
-            ds.depthTestEnable = (s.depthControl >> 1) & 1;
-            ds.depthWriteEnable = ((s.depthControl >> 2) & 1) && !s.depthWriteOff;
-            ds.depthCompareOp = VkCompareOp((s.depthControl >> 4) & 7);
-            if (s.stencil) {
-                ds.stencilTestEnable = s.depthControl & 1;
-                auto face = [&](uint32_t func, uint32_t ops) { // masks and reference are dynamic
-                    VkStencilOpState f{};
-                    f.compareOp = VkCompareOp(func);
-                    f.failOp = stencilOp(ops & 0xF);
-                    f.passOp = stencilOp((ops >> 4) & 0xF);
-                    f.depthFailOp = stencilOp((ops >> 8) & 0xF);
-                    return f;
-                };
-                ds.front = face((s.depthControl >> 8) & 7, s.stencilControl);
-                ds.back = (s.depthControl >> 7) & 1 ? face((s.depthControl >> 20) & 7, s.stencilControl >> 12) : ds.front;
-            }
-        }
+        depthState(s, ds);
         VkPipelineColorBlendAttachmentState att[8]{};
         uint32_t colorCount = 0;
         VkFormat formats[8]{};
-        for (uint32_t i = 0; i < 8; ++i) {
-            formats[i] = VkFormat(s.colorFormats[i]);
-            if (formats[i]) colorCount = i + 1;
-            const uint32_t b = s.blend[i];
-            att[i].colorWriteMask = (s.writeMasks >> (i * 4)) & 0xF;
-            att[i].blendEnable = (b >> 30) & 1;
-            att[i].srcColorBlendFactor = blendFactor(b & 0x1F);
-            att[i].colorBlendOp = blendOp((b >> 5) & 7);
-            att[i].dstColorBlendFactor = blendFactor((b >> 8) & 0x1F);
-            if ((b >> 29) & 1) {
-                att[i].srcAlphaBlendFactor = blendFactor((b >> 16) & 0x1F);
-                att[i].alphaBlendOp = blendOp((b >> 21) & 7);
-                att[i].dstAlphaBlendFactor = blendFactor((b >> 24) & 0x1F);
-            } else {
-                att[i].srcAlphaBlendFactor = att[i].srcColorBlendFactor;
-                att[i].alphaBlendOp = att[i].colorBlendOp;
-                att[i].dstAlphaBlendFactor = att[i].dstColorBlendFactor;
-            }
-            // Integer targets cannot blend.
-            if (formats[i] && isIntegerFormat(formats[i])) att[i].blendEnable = VK_FALSE;
-        }
+        blendState(s, att, formats, colorCount);
         VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         cb.attachmentCount = colorCount;
         cb.pAttachments = att;
@@ -3366,7 +3498,257 @@ private:
         return p;
     }
 
+    // The rasteriser, depth/stencil and blend state of `s`: baked into pipelines (buildGraphics),
+    // or with pipeline libraries the first two set per draw (libraryState) and the last baked
+    // into the fragment output library.
+    static void rasterState(const GraphicsState& s, VkPipelineRasterizationStateCreateInfo& rs) {
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        const bool rect = s.topology == 17 || s.topology == 19;
+        rs.cullMode = VK_CULL_MODE_NONE;
+        if (!rect && (s.modeCntl & 1)) rs.cullMode |= VK_CULL_MODE_FRONT_BIT;
+        if (!rect && (s.modeCntl & 2)) rs.cullMode |= VK_CULL_MODE_BACK_BIT;
+        rs.frontFace = (s.modeCntl & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rs.lineWidth = 1.0f;
+        if (s.modeCntl & (3u << 11)) { // POLY_OFFSET_FRONT/BACK_ENABLE
+            // Scale is in 1/16ths of the slope; the offset is in the depth format's units, as Vulkan's.
+            rs.depthBiasEnable = VK_TRUE; // the factors are dynamic (setDynamicState)
+        }
+    }
+    static void depthState(const GraphicsState& s, VkPipelineDepthStencilStateCreateInfo& ds) {
+        if (s.depthFormat) {
+            ds.depthTestEnable = (s.depthControl >> 1) & 1;
+            ds.depthWriteEnable = ((s.depthControl >> 2) & 1) && !s.depthWriteOff;
+            ds.depthCompareOp = VkCompareOp((s.depthControl >> 4) & 7);
+            if (s.stencil) {
+                ds.stencilTestEnable = s.depthControl & 1;
+                auto face = [&](uint32_t func, uint32_t ops) { // masks and reference are dynamic
+                    VkStencilOpState f{};
+                    f.compareOp = VkCompareOp(func);
+                    f.failOp = stencilOp(ops & 0xF);
+                    f.passOp = stencilOp((ops >> 4) & 0xF);
+                    f.depthFailOp = stencilOp((ops >> 8) & 0xF);
+                    return f;
+                };
+                ds.front = face((s.depthControl >> 8) & 7, s.stencilControl);
+                ds.back = (s.depthControl >> 7) & 1 ? face((s.depthControl >> 20) & 7, s.stencilControl >> 12) : ds.front;
+            }
+        }
+    }
+    static void blendState(const GraphicsState& s, VkPipelineColorBlendAttachmentState* att, VkFormat* formats, uint32_t& colorCount) {
+        for (uint32_t i = 0; i < 8; ++i) {
+            formats[i] = VkFormat(s.colorFormats[i]);
+            if (formats[i]) colorCount = i + 1;
+            const uint32_t b = s.blend[i];
+            att[i].colorWriteMask = (s.writeMasks >> (i * 4)) & 0xF;
+            att[i].blendEnable = (b >> 30) & 1;
+            att[i].srcColorBlendFactor = blendFactor(b & 0x1F);
+            att[i].colorBlendOp = blendOp((b >> 5) & 7);
+            att[i].dstColorBlendFactor = blendFactor((b >> 8) & 0x1F);
+            if ((b >> 29) & 1) {
+                att[i].srcAlphaBlendFactor = blendFactor((b >> 16) & 0x1F);
+                att[i].alphaBlendOp = blendOp((b >> 21) & 7);
+                att[i].dstAlphaBlendFactor = blendFactor((b >> 24) & 0x1F);
+            } else {
+                att[i].srcAlphaBlendFactor = att[i].srcColorBlendFactor;
+                att[i].alphaBlendOp = att[i].colorBlendOp;
+                att[i].dstAlphaBlendFactor = att[i].dstColorBlendFactor;
+            }
+            // Integer targets cannot blend.
+            if (formats[i] && isIntegerFormat(formats[i])) att[i].blendEnable = VK_FALSE;
+        }
+    }
+
+    // Pipeline libraries: the state libraryState sets per draw, as the pipeline would have it.
+    static void libraryState(const GraphicsState& s, DynamicState& d) {
+        VkPipelineRasterizationStateCreateInfo rs{};
+        rasterState(s, rs);
+        VkPipelineDepthStencilStateCreateInfo ds{};
+        depthState(s, ds);
+        const uint32_t v[15] = {rs.cullMode, uint32_t(rs.frontFace), rs.depthBiasEnable, ds.depthTestEnable, ds.depthWriteEnable,
+                                uint32_t(ds.depthCompareOp), ds.stencilTestEnable,
+                                uint32_t(ds.front.failOp), uint32_t(ds.front.passOp), uint32_t(ds.front.depthFailOp), uint32_t(ds.front.compareOp),
+                                uint32_t(ds.back.failOp), uint32_t(ds.back.passOp), uint32_t(ds.back.depthFailOp), uint32_t(ds.back.compareOp)};
+        std::memcpy(d.lib, v, sizeof v);
+    }
+
+    // ---- pipeline libraries (docs/shader-precompile.md stage 3) ----
+    // With fast-linked graphics pipeline libraries (LPN_GENERIC_SHADERS=1; LPN_PIPELINE_LIBRARIES=0
+    // turns them off) a pipeline is linked from four parts: vertex input (per topology),
+    // pre-rasterisation (per vertex shader, with the rect-list geometry shader), fragment shader
+    // (per pixel shader) and fragment output (per targets' formats and blend). The shader parts are
+    // compiled once per shader, whatever state it is drawn with; cull mode, depth and stencil state
+    // are dynamic, set per draw from DynamicState; and a link without link-time optimisation takes
+    // a fraction of a millisecond, so new state no longer compiles anything.
+    struct LibSlot {
+        std::once_flag once;
+        VkPipeline p = VK_NULL_HANDLE;
+    };
+    std::mutex libMutex_;
+    std::unordered_map<std::string, std::unique_ptr<LibSlot>> libs_; // by kind and what it is made of
+    template <class F> VkPipeline library(const std::string& key, F&& make) {
+        LibSlot* slot;
+        {
+            std::lock_guard lock(libMutex_);
+            auto& u = libs_[key];
+            if (!u) u = std::make_unique<LibSlot>();
+            slot = u.get();
+        }
+        std::call_once(slot->once, [&] { slot->p = make(); }); // others wanting it wait for this build
+        return slot->p;
+    }
+    VkPipeline makeLibrary(VkGraphicsPipelineCreateInfo& gci, VkGraphicsPipelineLibraryFlagsEXT flags, const char* what) {
+        VkGraphicsPipelineLibraryCreateInfoEXT li{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT};
+        li.flags = flags;
+        li.pNext = gci.pNext;
+        gci.pNext = &li;
+        gci.flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+        VkPipeline p = VK_NULL_HANDLE;
+        const VkResult r = vkCreateGraphicsPipelines(vk_.device, pipelineCache_, 1, &gci, nullptr, &p);
+        if (r != VK_SUCCESS) std::fprintf(stderr, "[gpu] %s pipeline library not created: %s\n", what, vkResultName(r));
+        return r == VK_SUCCESS ? p : VK_NULL_HANDLE;
+    }
+
+    VkPipeline linkGraphics(const PipelineJob& j) {
+        const GraphicsState& s = j.state;
+        const Layout& lay = *j.lay;
+        VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        switch (s.topology) {
+        case 1: topo = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
+        case 2: topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+        case 3: topo = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
+        case 5: topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
+        case 6: topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
+        case 19: topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY; break;
+        default: break;
+        }
+        VkPipelineRenderingCreateInfo none{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO}; // view mask 0
+
+        const VkPipeline input = library("vi" + std::to_string(topo), [&] {
+            VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+            VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+            ia.topology = topo;
+            VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+            gci.pVertexInputState = &vi;
+            gci.pInputAssemblyState = &ia;
+            return makeLibrary(gci, VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, "vertex input");
+        });
+        const bool rect = s.topology == 17 || s.topology == 19;
+        const std::string preKey = "pre" + j.vsName + (rect ? "/" + std::to_string(s.topology) + "/" + std::to_string(s.vsOutputs) : "") +
+                                   "/" + lay.preKey;
+        const VkPipeline pre = library(preKey, [&] {
+            VkPipelineShaderStageCreateInfo st[2]{};
+            for (auto& i : st) i.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, i.pName = "main";
+            st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+            st[0].module = j.vs;
+            st[1].stage = VK_SHADER_STAGE_GEOMETRY_BIT;
+            st[1].module = j.geom;
+            VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+            vp.viewportCount = 1;
+            vp.scissorCount = 1;
+            VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+            rs.polygonMode = VK_POLYGON_MODE_FILL;
+            rs.lineWidth = 1.0f;
+            const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT,  VK_DYNAMIC_STATE_SCISSOR,    VK_DYNAMIC_STATE_DEPTH_BIAS,
+                                          VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE};
+            VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+            dy.dynamicStateCount = uint32_t(std::size(dyn));
+            dy.pDynamicStates = dyn;
+            VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+            gci.pNext = &none;
+            gci.stageCount = j.geom ? 2 : 1;
+            gci.pStages = st;
+            gci.pViewportState = &vp;
+            gci.pRasterizationState = &rs;
+            gci.pDynamicState = &dy;
+            gci.layout = lay.pre;
+            return makeLibrary(gci, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, "vertex shader");
+        });
+        const VkPipeline frag = library("frag" + j.psName + "/" + lay.fragKey, [&] {
+            VkPipelineShaderStageCreateInfo st{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            st.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            st.module = j.ps;
+            st.pName = "main";
+            VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+            const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,       VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+                                          VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,        VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE,
+                                          VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,     VK_DYNAMIC_STATE_STENCIL_OP,
+                                          VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,    VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                                          VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+            VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+            dy.dynamicStateCount = uint32_t(std::size(dyn));
+            dy.pDynamicStates = dyn;
+            VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+            gci.pNext = &none;
+            gci.stageCount = j.ps ? 1 : 0;
+            gci.pStages = &st;
+            gci.pMultisampleState = &ms;
+            gci.pDepthStencilState = &ds;
+            gci.pDynamicState = &dy;
+            gci.layout = lay.frag;
+            return makeLibrary(gci, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, "pixel shader");
+        });
+        std::string outKey = "out";
+        outKey.append(reinterpret_cast<const char*>(s.colorFormats), sizeof s.colorFormats);
+        outKey.append(reinterpret_cast<const char*>(s.blend), sizeof s.blend);
+        for (uint32_t v : {s.writeMasks, s.depthFormat, s.stencil}) outKey.append(reinterpret_cast<const char*>(&v), 4);
+        const VkPipeline output = library(outKey, [&] {
+            VkPipelineColorBlendAttachmentState att[8]{};
+            uint32_t colorCount = 0;
+            VkFormat formats[8]{};
+            blendState(s, att, formats, colorCount);
+            VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+            cb.attachmentCount = colorCount;
+            cb.pAttachments = att;
+            VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+            VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+            dy.dynamicStateCount = 1;
+            dy.pDynamicStates = dyn;
+            VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+            ri.colorAttachmentCount = colorCount;
+            ri.pColorAttachmentFormats = formats;
+            ri.depthAttachmentFormat = VkFormat(s.depthFormat);
+            if (s.stencil) ri.stencilAttachmentFormat = VkFormat(s.depthFormat);
+            VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+            gci.pNext = &ri;
+            gci.pColorBlendState = &cb;
+            gci.pMultisampleState = &ms;
+            gci.pDynamicState = &dy;
+            return makeLibrary(gci, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT, "output");
+        });
+        if (!input || !pre || !frag || !output) return VK_NULL_HANDLE;
+        const VkPipeline parts[] = {input, pre, frag, output};
+        VkPipelineLibraryCreateInfoKHR li{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
+        li.libraryCount = uint32_t(std::size(parts));
+        li.pLibraries = parts;
+        VkGraphicsPipelineCreateInfo gci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        gci.pNext = &li;
+        gci.layout = lay.pipeline;
+        VkPipeline p = VK_NULL_HANDLE;
+        const VkResult r = vkCreateGraphicsPipelines(vk_.device, VK_NULL_HANDLE, 1, &gci, nullptr, &p);
+        if (r != VK_SUCCESS) std::fprintf(stderr, "[gpu] pipeline link failed: %s\n", vkResultName(r));
+        return r == VK_SUCCESS ? p : VK_NULL_HANDLE;
+    }
+
     void setDynamicState(const DynamicState& d, uint32_t depthControl) {
+        if (libraries_ && (!R().bound_.state || std::memcmp(R().bound_.lib, d.lib, sizeof d.lib) != 0)) {
+            std::memcpy(R().bound_.lib, d.lib, sizeof d.lib);
+            rec([c = R().cmd_, v = std::to_array(d.lib)] {
+                vkCmdSetCullMode(c, v[0]);
+                vkCmdSetFrontFace(c, VkFrontFace(v[1]));
+                vkCmdSetDepthBiasEnable(c, v[2]);
+                vkCmdSetDepthTestEnable(c, v[3]);
+                vkCmdSetDepthWriteEnable(c, v[4]);
+                vkCmdSetDepthCompareOp(c, VkCompareOp(v[5]));
+                vkCmdSetDepthBoundsTestEnable(c, VK_FALSE);
+                vkCmdSetStencilTestEnable(c, v[6]);
+                vkCmdSetStencilOp(c, VK_STENCIL_FACE_FRONT_BIT, VkStencilOp(v[7]), VkStencilOp(v[8]), VkStencilOp(v[9]), VkCompareOp(v[10]));
+                vkCmdSetStencilOp(c, VK_STENCIL_FACE_BACK_BIT, VkStencilOp(v[11]), VkStencilOp(v[12]), VkStencilOp(v[13]), VkCompareOp(v[14]));
+            });
+        }
         // Scale is in 1/16ths of the slope; the offset is in the depth format's units, as Vulkan's.
         if (!R().bound_.state || std::memcmp(R().bound_.polyOffset, d.polyOffset, sizeof d.polyOffset) != 0) {
             std::memcpy(R().bound_.polyOffset, d.polyOffset, sizeof d.polyOffset);
@@ -3389,7 +3771,14 @@ private:
     struct Bound {
         VkPipeline pipeline = VK_NULL_HANDLE;
         bool state = false; // the dynamic state below has been set
-        uint32_t blend[4] = {}, polyOffset[3] = {}, stencil[2] = {};
+        uint32_t blend[4] = {}, polyOffset[3] = {}, stencil[2] = {}, lib[15] = {};
+        // Pipeline libraries: the pixel shader's descriptors in the set bound last (pushDescriptors),
+        // by binding from kPsBindingBase, for the layout `psLayout`.
+        const void* psLayout = nullptr;
+        uint64_t psHas = 0;
+        VkDescriptorType psType[64] = {};
+        VkDescriptorBufferInfo psBuf[64] = {};
+        VkDescriptorImageInfo psImg[64] = {};
         VkViewport viewport{};
         VkRect2D scissor{};
         VkBuffer index = VK_NULL_HANDLE;
@@ -5335,9 +5724,13 @@ void main() {
         }
         ++c.prof.pipelinesMade;
         notePipeline(gs, a.vsm->name, a.psm ? a.psm->name : std::string(), c.prof.on, "ahead");
-        queueJob(PipelineJob{gs, a.vsm->module, a.psm ? a.psm->module : VK_NULL_HANDLE, geometryFor(gs), layout(lb).pipeline,
-                             std::move(b), std::move(record), false},
-                 true);
+        const Layout& lay = layout(lb);
+        PipelineJob job{gs, a.vsm->module, a.psm ? a.psm->module : VK_NULL_HANDLE, geometryFor(gs), lay.pipeline,
+                        std::move(b), std::move(record), false};
+        job.lay = &lay;
+        job.vsName = a.vsm->name;
+        job.psName = a.psm ? a.psm->name : std::string();
+        queueJob(std::move(job), true);
     }
 
     static void psTargetLaunch(gcn::LaunchState& l, uint32_t i, uint32_t fmt, uint32_t num, uint32_t info) {
@@ -5370,7 +5763,7 @@ void main() {
         linkWrites(writes, bufs, imgs);
         fullBarrier();
         rec([c = R().cmd_, pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pipe); });
-        pushDescriptors(VK_PIPELINE_BIND_POINT_COMPUTE, lay.pipeline, writes, bufs, imgs);
+        pushDescriptors(VK_PIPELINE_BIND_POINT_COMPUTE, lay, writes, bufs, imgs);
         if (trace_) captureProgram(cs, m, "cs");
         if (trace_)
             for (const auto& b : cs.buffers) {
@@ -5757,7 +6150,8 @@ void main() {
         {
             ProfScope pp(R().prof_, kProfPipeline);
             layp = &layout(lb);
-            pipe = graphicsPipeline(gs, vsm, psm, layp->pipeline, lb);
+            if (libraries_) libraryState(gs, dyn);
+            pipe = graphicsPipeline(gs, vsm, psm, *layp, lb);
         }
         if (!pipe) {
             if (again()) goto retry;
@@ -5880,7 +6274,7 @@ void main() {
             rec([c = R().cmd_, pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); });
             R().bound_.pipeline = pipe;
         }
-        pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, lay.pipeline, writes, bufs, imgs);
+        pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, lay, writes, bufs, imgs);
         setViewportScissor(r, width, height, jitter, hud);
         if (!R().bound_.state || std::memcmp(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
             std::memcpy(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
@@ -5948,7 +6342,7 @@ void main() {
             f.prim = prim;
             f.ctxHash = a.ctxHash;
             if (R().prof_.on) f.ctx.assign(r.ctx, r.ctx + ::gpu::kContextRegs);
-            f.layout = lay.pipeline;
+            f.layout = &lay;
             f.vsm = vsm;
             f.psm = psm;
             f.pipe = pipe;
@@ -5982,7 +6376,7 @@ void main() {
         uint32_t indexType = 0, numInstances = 0, prim = 0;
         uint64_t ctxHash = 0;      // DrawAnalysis::ctxHash
         std::vector<uint32_t> ctx; // the registers themselves, with LPN_PROFILE (which ones differ)
-        VkPipelineLayout layout = VK_NULL_HANDLE;
+        const Layout* layout = nullptr;
         ShaderModule *vsm = nullptr, *psm = nullptr;
         // What switchDraw sets again: the pipeline, dynamic state and every descriptor as the
         // full draw bound them, in pass `pass` with memory as of `epoch`.
@@ -6126,7 +6520,7 @@ void main() {
             rec([c = R().cmd_, pipe = f.pipe] { vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); });
             R().bound_.pipeline = f.pipe;
         }
-        pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, f.layout, f.writes, f.bufs, f.imgs);
+        pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, *f.layout, f.writes, f.bufs, f.imgs);
         setViewportScissor(r, f.width, f.height, f.jitter, f.hud);
         if (!R().bound_.state || std::memcmp(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16) != 0) {
             std::memcpy(R().bound_.blend, &r.ctx[reg::kCbBlendRed], 16);
@@ -6288,7 +6682,7 @@ void main() {
         };
         data(a.vs, R().prevDraw_->vs, 0, vsAlike, vsMoved || vsImages);
         if (a.psm) data(a.ps, R().prevDraw_->ps, kPsBindingBase, psAlike, psMoved || psImages);
-        if (!writes.empty()) pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, f.layout, writes, bufs, imgs);
+        if (!writes.empty()) pushDescriptors(VK_PIPELINE_BIND_POINT_GRAPHICS, *f.layout, writes, bufs, imgs);
         bool sameIndex = true;
         if (d.kind == DrawCall::kIndexed) {
             const VkIndexType it = r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
@@ -6840,6 +7234,10 @@ private:
     std::string pipelineCachePath_;
     std::atomic<uint32_t> newPipelines_{0};
     bool syncPipelines_ = false;
+    bool libraries_ = false; // pipelines linked from libraries (see library())
+    std::mutex setPoolMutex_; // setPool_, retiredPools_
+    VkDescriptorPool setPool_ = VK_NULL_HANDLE;
+    std::deque<std::pair<uint64_t, VkDescriptorPool>> retiredPools_; // reusable once completed_ reaches the first
     std::mutex buildMutex_, listMutex_; // built_ and jobs_; pipelines.list
     std::condition_variable buildCv_;
     std::unordered_map<std::string, std::shared_ptr<BuiltPipeline>> built_; // by pipelineRecord
