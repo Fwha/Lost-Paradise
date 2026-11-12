@@ -307,6 +307,22 @@ int fetchSurvey(const char* dir) {
 
 // Stage 4 check: how many of the cache's saved generic programs a translation made without their
 // draw (analyzeUnbound, as the boot compile will) reproduces exactly, and what differs in the rest.
+// A program saved before the generic draw data gained its linkage words (data::smrd() was 20):
+// its scalar load and resource words moved up to where they are now.
+void upgradeDataLayout(gcn::Program& p) {
+    const uint32_t at = gcn::data::smrd(), was = 20;
+    bool old = p.data.size() < at;
+    for (const auto& [pc, o] : p.smrd) old |= o < at;
+    for (const auto& b : p.buffers) old |= b.data < at;
+    for (const auto& im : p.images) old |= im.data < at;
+    if (!old || at == was) return;
+    const uint32_t by = at - was;
+    for (auto& [pc, o] : p.smrd) o += by;
+    for (auto& b : p.buffers) b.data += by;
+    for (auto& im : p.images) im.data += by;
+    p.data.insert(p.data.begin() + was, by, 0);
+}
+
 int bootSurvey(const char* dir) {
     std::map<std::string, size_t> total, same, why;
     std::map<std::string, std::string> example;
@@ -317,6 +333,7 @@ int bootSurvey(const char* dir) {
         const std::string bytes((std::istreambuf_iterator<char>(f)), {});
         gcn::Program p;
         if (bytes.size() < 4 || !gcn::deserialize(bytes.substr(4), p)) continue;
+        upgradeDataLayout(p);
         uint32_t base;
         std::memcpy(&base, bytes.data(), 4);
         const char* stage = p.launch.stage == gcn::Stage::Pixel ? "ps" : p.launch.stage == gcn::Stage::Compute ? "cs" : "vs";
@@ -331,7 +348,8 @@ int bootSurvey(const char* dir) {
             if (fmt == 7) l.colorUint |= 1u << m;
             if (fmt == 8) l.colorSint |= 1u << m;
         }
-        for (uint32_t i = 0; i < 32; ++i) l.psInputCntl[i] = i;
+        std::memset(l.psInputCntl, 0, sizeof l.psInputCntl); // generic: the draw's linkage is draw data
+        l.glClipZ = false;
         auto read = [&](uint64_t addr, void* dst, size_t n) {
             auto it = p.code.find(addr);
             if (it == p.code.end() || n > it->second.size) return false;
@@ -347,10 +365,12 @@ int bootSurvey(const char* dir) {
         }
         std::vector<std::string> reasons;
         if (p.launch.stage == gcn::Stage::Pixel) {
-            bool identity = true;
-            for (uint32_t i = 0; i < 32; ++i)
-                if (p.launch.psInputCntl[i] && p.launch.psInputCntl[i] != i) identity = false;
-            if (!identity) reasons.push_back("PS input mapping");
+            // FLAT_SHADE on an input the code interpolates: the generic translation interpolates it.
+            for (const auto& [pc, in] : p.code)
+                if (in.format == gcn::Format::VINTRP && in.op != 2 && (p.launch.psInputCntl[(in.words[0] >> 10) & 0x3F] >> 10 & 1)) {
+                    reasons.push_back("flat shade");
+                    break;
+                }
             if (p.launch.colorUint != l.colorUint || p.launch.colorSint != l.colorSint) reasons.push_back("int MRT guess");
         }
         if (p.fetchSlots != b.fetchSlots)
@@ -370,7 +390,6 @@ int bootSurvey(const char* dir) {
                 }
             }
         if (p.smrd.size() != b.smrd.size()) reasons.push_back("scalar loads");
-        if (p.launch.glClipZ) reasons.push_back("clip z");
         std::string r = stage;
         for (const auto& x : reasons) r += ", " + x;
         {

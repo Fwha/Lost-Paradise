@@ -59,7 +59,7 @@ public:
     }
 
     Program run() {
-        p_.data.assign(data::kSmrd, 0);
+        p_.data.assign(data::smrd(), 0);
         p_.labels.insert(p_.launch.entry);
         unsigned steps = 0;
         {
@@ -126,8 +126,8 @@ public:
     // launch's walk met them, so the translation does not depend on which way it went.
     void canonicalize() {
         std::map<uint32_t, uint32_t> slotMap; // old data offset -> new
-        std::vector<uint32_t> data(p_.data.begin(), p_.data.begin() + std::min<size_t>(p_.data.size(), data::kSmrd));
-        data.resize(data::kSmrd, 0);
+        std::vector<uint32_t> data(p_.data.begin(), p_.data.begin() + std::min<size_t>(p_.data.size(), data::smrd()));
+        data.resize(data::smrd(), 0);
         auto move = [&](uint32_t from, unsigned n) {
             const uint32_t to = uint32_t(data.size());
             for (unsigned i = 0; i < n; ++i) data.push_back(from + i < p_.data.size() ? p_.data[from + i] : 0);
@@ -257,6 +257,7 @@ private:
                 p_.data[data::kColorSwizzle + m / 4] |=
                     (std::min<uint32_t>(p_.launch.colorComps[m], 4) * 4 + (p_.launch.colorSwap[m] & 3)) << ((m % 4) * 8);
         }
+        if (genericTranslation()) linkageData(p_.launch, p_.data.data());
         State st;
         const uint32_t user = unbound_ ? 0 : p_.launch.userSgprs();
         for (uint32_t i = 0; i < user && i < 16; ++i) {
@@ -1246,6 +1247,32 @@ bool genericTranslation() {
     return on;
 }
 
+// Generic translation: the draw data words that carry what the translation would otherwise take
+// from the launch (data::kClipZ, kPsInputMap, kPsDefaults).
+void linkageData(const LaunchState& l, uint32_t* d) {
+    if (l.stage == Stage::Vertex) {
+        d[data::kClipZ] = l.glClipZ;
+        for (uint32_t j = 0; j < 32; ++j) {
+            const uint32_t cntl = l.psInputCntl[j];
+            const uint32_t from = j >= l.numInterp || (cntl & 0x20) ? 0xFF : cntl & 0x1F;
+            d[data::kPsInputMap + j / 4] = (d[data::kPsInputMap + j / 4] & ~(0xFFu << (j % 4 * 8))) | from << (j % 4 * 8);
+        }
+    } else if (l.stage == Stage::Pixel) {
+        d[data::kPsDefaults] = d[data::kPsDefaults + 1] = d[data::kPsDefaults + 2] = 0;
+        for (uint32_t j = 0; j < 32; ++j) {
+            const uint32_t cntl = l.psInputCntl[j];
+            if (!(cntl & 0x20)) continue;
+            d[data::kPsDefaults] |= 1u << j;
+            d[data::kPsDefaults + 1 + j / 16] |= ((cntl >> 8) & 3) << (j % 16 * 2);
+        }
+    }
+}
+
+uint32_t data::smrd() {
+    static const uint32_t at = genericTranslation() ? 32 : 20;
+    return at;
+}
+
 Program analyze(const LaunchState& launch, const ReadMemory& readCode, const ReadMemory& readData) {
     return Analyzer(launch, readCode, readData).run();
 }
@@ -1349,10 +1376,11 @@ std::string Program::key() const {
     put(&l.entry, 8);
     put(&l.rsrc1, 4);
     put(&l.rsrc2, 4);
-    put(&l.glClipZ, 1);
+    // Generic: clip z and the inputs' mapping come with the draw (linkageData).
+    if (!genericTranslation()) put(&l.glClipZ, 1);
     if (l.stage == Stage::Pixel) {
         put(&l.psInputEna, 4);
-        put(l.psInputCntl, sizeof(l.psInputCntl));
+        if (!genericTranslation()) put(l.psInputCntl, sizeof(l.psInputCntl));
         put(&l.colorFormat, 4);
         put(&l.colorUint, 4);
         put(&l.colorSint, 4);

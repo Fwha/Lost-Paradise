@@ -2132,12 +2132,12 @@ private:
             return f[i] > 0 && f[i + 1] > 0 && f[i + 2] == -1.0f && f[i + 3] == 0.0f &&
                    std::fabs(f[i] / f[i + 1] - 16.0f / 9) < 1e-3f;
         };
-        for (size_t i = gcn::data::kSmrd; i + 4 <= n; ++i) {
+        for (size_t i = gcn::data::smrd(); i + 4 <= n; ++i) {
             if (!pixel(i)) continue;
             const float aspect = -f[i + 1] / f[i]; // (s/h) / (s/w)
             if (std::fabs(aspect - 16.0f / 9) < 0.02f || aspect < 1.0f || aspect > 4.0f) continue;
             if (i + 8 <= n && tan(i + 4)) out[i + 4] = f[i + 5] * aspect;
-            if (i >= gcn::data::kSmrd + 4 && tan(i - 4)) out[i - 4] = f[i - 3] * aspect;
+            if (i >= gcn::data::smrd() + 4 && tan(i - 4)) out[i - 4] = f[i - 3] * aspect;
         }
     }
 
@@ -2551,7 +2551,7 @@ private:
         // Generic translations (gcn::genericTranslation) name other SPIR-V than specialised ones
         // and record other pipelines: each kind keeps its own cache, so switching back and forth
         // (LPN_GENERIC_SHADERS) never builds the other kind's pipelines at startup.
-        if (spirvDir_ != "-" && gcn::genericTranslation()) spirvDir_ += "/generic2"; // generic/ held stage 1 programs, whose draw data lacks V# words
+        if (spirvDir_ != "-" && gcn::genericTranslation()) spirvDir_ += "/generic3"; // generic/ held stage 1 programs, whose draw data lacks V# words; generic2/ ones lack linkage words
         if (spirvDir_ != "-") {
             std::error_code ec;
             std::filesystem::create_directories(spirvDir_, ec);
@@ -5273,6 +5273,10 @@ void main() {
             l.rsrc1 = r.sh[reg::kRsrc1Vs];
             l.rsrc2 = r.sh[reg::kRsrc2Vs];
             l.glClipZ = !((r.ctx[reg::kPaClClipCntl] >> 19) & 1);
+            if (gcn::genericTranslation()) { // the pixel shader's inputs, which it exports to (gcn::linkageData)
+                std::memcpy(l.psInputCntl, &r.ctx[reg::kSpiPsInputCntl], sizeof(l.psInputCntl));
+                l.numInterp = r.ctx[reg::kSpiPsInControl] & 0x3F;
+            }
             break;
         case gcn::Stage::Pixel:
             l.entry = shaderAddress(r, reg::kPgmLoPs);
@@ -6175,9 +6179,9 @@ void main() {
                     for (uint32_t i = 0; i < prog->launch.userSgprs() && i < 16; ++i) std::fprintf(traceOut_, " %x", prog->launch.userData[i]);
                     std::fprintf(traceOut_, "\n");
                 }
-                if (prog->data.size() <= gcn::data::kSmrd) continue;
+                if (prog->data.size() <= gcn::data::smrd()) continue;
                 std::fprintf(traceOut_, "[trace]   %s smrd:", prog == &vs ? "vs" : "ps");
-                for (size_t i = gcn::data::kSmrd; i < prog->data.size() && i < gcn::data::kSmrd + 24; ++i) {
+                for (size_t i = gcn::data::smrd(); i < prog->data.size() && i < gcn::data::smrd() + 24; ++i) {
                     float f;
                     std::memcpy(&f, &prog->data[i], 4);
                     std::fprintf(traceOut_, " %g", f);
@@ -6756,7 +6760,7 @@ void main() {
         moved = 0;
         if (images) *images = 0;
         if (cur.data.size() != prev.data.size() || cur.buffers.size() != prev.buffers.size() ||
-            cur.images.size() != prev.images.size() || cur.data.size() < gcn::data::kSmrd || cur.buffers.size() > 32)
+            cur.images.size() != prev.images.size() || cur.data.size() < gcn::data::smrd() || cur.buffers.size() > 32)
             return 0;
         for (size_t i = 0; i < cur.buffers.size(); ++i) {
             const gcn::BufferResource &x = cur.buffers[i], &y = prev.buffers[i];
@@ -6783,7 +6787,7 @@ void main() {
     // worker: comparing on the recorder was ~6% of it, the data written on another core.
     static bool dataAlike(const gcn::Program& cur, const gcn::Program& prev) {
         const size_t n = cur.data.size();
-        if (n != prev.data.size() || n < gcn::data::kSmrd) return false;
+        if (n != prev.data.size() || n < gcn::data::smrd()) return false;
         thread_local std::vector<uint8_t> skip;
         skip.assign(n, 0);
         // A pixel shader's words there are its colour swaps (generic translation), compared.
@@ -6957,7 +6961,7 @@ void main() {
             return v;
         };
         float layoutW = 0, layoutH = 0;
-        for (size_t i = gcn::data::kSmrd; i + 4 <= vs.data.size(); ++i)
+        for (size_t i = gcn::data::smrd(); i + 4 <= vs.data.size(); ++i)
             if (at(i) > 0 && at(i + 1) < 0 && at(i + 2) == -1.0f && at(i + 3) == 1.0f) {
                 layoutW = 2 / at(i), layoutH = -2 / at(i + 1);
                 break;
