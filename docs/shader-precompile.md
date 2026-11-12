@@ -78,7 +78,7 @@ shader whose translation still differs from the boot one is logged once
 (`boot compile missed ...`).
 
 Without a T#, an image's dimension comes from its instruction: a cube when it declares an array
-(DA) or its third address derives from a v_cubeid face, else 2D. Counting the address registers written before the sample took 154 of the play
+(DA) or its addresses derive from v_cubesc/v_cubetc coordinates and a v_cubeid face, else 2D. Counting the address registers written before the sample took 154 of the play
 cache's 2D images for 3D, and no 3D image was ever bound.
 
 ### The shader tables (measured on the user's PC, 2026-11-12)

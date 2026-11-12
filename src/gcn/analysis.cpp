@@ -1190,20 +1190,27 @@ uint32_t imageDimension(const Program& p, const ImageResource& im) {
     }
     auto from = it;
     for (int n = 0; n < 64 && from != p.code.begin(); ++n) --from;
-    std::bitset<256> face; // VGPRs holding a value derived from a cube face
+    // VGPRs holding a value derived from a cube face (v_cubeid_f32), and from a face coordinate
+    // (v_cubesc_f32, v_cubetc_f32): a cube's s and t are face coordinates too, which tells it
+    // from a 2D sample whose next register happens to hold another sample's face.
+    std::bitset<256> face, coord;
     for (auto at = from; at != it; ++at) {
         const Instruction& x = at->second;
         const auto [first, count] = vgprWrites(x);
         if (!count) continue;
-        bool derived = x.format == Format::VOP3 && x.op == 324; // v_cubeid_f32
-        if (!derived && (x.format == Format::VOP1 || x.format == Format::VOP2 || x.format == Format::VOP3))
-            vgprReads(x, [&](uint32_t v) { derived |= v < 256 && face[v]; });
-        for (uint32_t i = 0; i < count && first + i < 256; ++i) face[first + i] = derived;
+        const bool vop3 = x.format == Format::VOP3;
+        bool f = vop3 && x.op == 324, c = vop3 && (x.op == 325 || x.op == 326);
+        if (!f && !c && (x.format == Format::VOP1 || x.format == Format::VOP2 || vop3))
+            vgprReads(x, [&](uint32_t v) {
+                if (v < 256) f |= face[v], c |= coord[v];
+            });
+        for (uint32_t i = 0; i < count && first + i < 256; ++i) face[first + i] = f, coord[first + i] = c;
     }
     const uint32_t third = vaddr + prefix + 2;
+    if (third < 256 && face[third] && coord[vaddr + prefix]) return 11;
     // 3D images were never seen bound (lpn-gcn --boot on a play cache: counting address
     // registers written took 154 2D images for 3D), so the rest are 2D.
-    return third < 256 && face[third] ? 11 : 9;
+    return 9;
 }
 
 uint32_t bufferWords(const Program& p, const BufferResource& b) {
