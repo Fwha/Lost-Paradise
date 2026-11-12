@@ -178,8 +178,10 @@ inline Program analyze(const LaunchState& launch, const ReadMemory& read) { retu
 
 // Generic translation without a draw (docs/shader-precompile.md stage 4): the program as any
 // launch of it translates, with no user data and nothing read but code; a vertex shader's call
-// to its fetch shader takes `fetchSlots` slots (one per four input VGPRs from v4).
-Program analyzeUnbound(const LaunchState& launch, const ReadMemory& readCode, uint32_t fetchSlots);
+// to its fetch shader takes `fetchSlots` slots (one per four input VGPRs from v4; ~0u: as many as
+// its code reads, see fetchSlotsFromCode).
+Program analyzeUnbound(const LaunchState& launch, const ReadMemory& readCode, uint32_t fetchSlots = ~0u);
+uint32_t fetchSlotsFromCode(const Program& program, uint64_t site);
 
 // Re-evaluates `program` (analysed from the same code and launch registers) for a launch with
 // other user data or memory by replaying its trace. False when a branch would go another way;

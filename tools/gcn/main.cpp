@@ -338,7 +338,7 @@ int bootSurvey(const char* dir) {
             std::memcpy(dst, it->second.words, n);
             return true;
         };
-        const gcn::Program b = gcn::analyzeUnbound(l, read, p.fetchSlots);
+        const gcn::Program b = gcn::analyzeUnbound(l, read); // fetch slots from its code
         const std::string want = gcn::translate(p, base, set).glsl, got = gcn::translate(b, base, set).glsl;
         ++total[stage];
         if (want == got) {
@@ -353,6 +353,8 @@ int bootSurvey(const char* dir) {
             if (!identity) reasons.push_back("PS input mapping");
             if (p.launch.colorUint != l.colorUint || p.launch.colorSint != l.colorSint) reasons.push_back("int MRT guess");
         }
+        if (p.fetchSlots != b.fetchSlots)
+            reasons.push_back("fetch slots " + std::to_string(p.fetchSlots) + " vs " + std::to_string(b.fetchSlots) + " from code");
         if (p.code.size() != b.code.size()) reasons.push_back("code walked");
         if (p.buffers.size() != b.buffers.size()) reasons.push_back("buffer count");
         if (p.images.size() != b.images.size()) reasons.push_back("image count");
@@ -360,17 +362,22 @@ int bootSurvey(const char* dir) {
             for (size_t i = 0; i < p.images.size(); ++i) {
                 const uint32_t nf = p.images[i].numFormat();
                 if (nf == 4 || nf == 5) { reasons.push_back("int image"); break; }
-                if (gcn::imageDimension(p, p.images[i]) != gcn::imageDimension(b, b.images[i])) { reasons.push_back("image dimension"); break; }
+                auto cls = [](uint32_t t) { return t == 8 || t == 10 || t == 11 || t == 12 || t == 13 ? t : 9u; };
+                const uint32_t dp = cls(gcn::imageDimension(p, p.images[i])), db = cls(gcn::imageDimension(b, b.images[i]));
+                if (dp != db) {
+                    reasons.push_back("image dimension " + std::to_string(dp) + " vs " + std::to_string(db) + " from code");
+                    break;
+                }
             }
         if (p.smrd.size() != b.smrd.size()) reasons.push_back("scalar loads");
         if (p.launch.glClipZ) reasons.push_back("clip z");
         std::string r = stage;
         for (const auto& x : reasons) r += ", " + x;
-        if (reasons.empty()) {
+        {
             size_t i = 0;
             while (i < want.size() && i < got.size() && want[i] == got[i]) ++i;
             const size_t ls = want.rfind('\n', i) + 1, le = want.find('\n', i), gs = got.rfind('\n', i) + 1, ge = got.find('\n', i);
-            r += ", other";
+            if (reasons.empty()) r += ", other";
             if (!example.count(r)) example[r] = "draw: " + want.substr(ls, le - ls) + "\n      boot: " + got.substr(gs, ge - gs);
         }
         ++why[r];

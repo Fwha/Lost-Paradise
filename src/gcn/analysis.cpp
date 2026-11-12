@@ -481,7 +481,7 @@ private:
             label(next);
             if (k && generic() && p_.launch.stage == Stage::Vertex && fetch(pc, a64 & 0xFFFFFFFFFFFFull, st))
                 return true; // pulled in the vertex shader itself; the walk goes on after the call
-            if (!k && unbound_ && p_.launch.stage == Stage::Vertex && !speculative_ && !p_.fetchSlots) {
+            if (!k && unbound_ && p_.launch.stage == Stage::Vertex && !speculative_ && !p_.fetchSite) {
                 unboundFetch(pc); // its slots as a draw's fetch shader will fill them
                 return true;
             }
@@ -1121,7 +1121,60 @@ bool readsVgpr(const Instruction& in, uint32_t v) {
     default: return false;
     }
 }
+// Every VGPR an instruction reads (a superset: loads' and samples' address ranges at their largest).
+template <class F> void vgprReads(const Instruction& in, F&& f) {
+    const uint32_t w = in.words[0], w1 = in.size > 4 ? in.words[1] : 0;
+    auto src = [&](uint32_t code) {
+        if (code >= 256 && code < 512) f(code - 256);
+    };
+    switch (in.format) {
+    case Format::VOP1: src(w & 0x1FF); break;
+    case Format::VOP2:
+        src(w & 0x1FF), f((w >> 9) & 0xFF);
+        if (in.op == 31 || in.op == 32 || in.op == 33) f((w >> 17) & 0xFF); // v_mac/madmk/madak read vdst
+        break;
+    case Format::VOPC: src(w & 0x1FF), f((w >> 9) & 0xFF); break;
+    case Format::VOP3: src(w1 & 0x1FF), src((w1 >> 9) & 0x1FF), src((w1 >> 18) & 0x1FF); break;
+    case Format::VINTRP: f(w & 0xFF); break;
+    case Format::EXP:
+        for (uint32_t i = 0; i < 4; ++i)
+            if ((w >> i) & 1) f((w1 >> (i * 8)) & 0xFF);
+        break;
+    case Format::MUBUF:
+    case Format::MTBUF: {
+        const bool offen = (w >> 12) & 1, idxen = (w >> 13) & 1;
+        if (offen || idxen) f(w1 & 0xFF);
+        if (offen && idxen) f((w1 & 0xFF) + 1);
+        const bool store = in.format == Format::MTBUF ? in.op >= 4 : (in.op >= 4 && in.op <= 7) || (in.op >= 24 && in.op <= 31);
+        if (store)
+            for (uint32_t i = 0; i < 4; ++i) f(((w1 >> 8) & 0xFF) + i);
+        break;
+    }
+    case Format::MIMG:
+        for (uint32_t i = 0; i < 4; ++i) f((w1 & 0xFF) + i);
+        break;
+    case Format::DS: f(w1 & 0xFF), f((w1 >> 8) & 0xFF), f((w1 >> 16) & 0xFF); break;
+    default: break;
+    }
+}
 } // namespace
+
+// The fetch slots a vertex shader's inputs take, from its code: the VGPRs from v4 it reads after
+// the call to its fetch shader before writing them, in slots of four.
+uint32_t fetchSlotsFromCode(const Program& p, uint64_t site) {
+    std::set<uint32_t> written;
+    uint32_t last = 0; // highest input VGPR + 1
+    for (auto it = p.code.upper_bound(site); it != p.code.end(); ++it) {
+        const Instruction& in = it->second;
+        vgprReads(in, [&](uint32_t v) {
+            if (v >= 4 && v < 256 && !written.count(v)) last = std::max(last, v + 1);
+        });
+        const auto [first, count] = vgprWrites(in);
+        if (in.format == Format::VOP3 && in.op < 256) continue; // VOPC in VOP3 form writes SGPRs
+        for (uint32_t i = 0; i < count; ++i) written.insert(first + i);
+    }
+    return last > 4 ? (last - 4 + 3) / 4 : 0;
+}
 
 // The image's dimension as the translation declares it (a T# type: 9 2D, 10 3D, 11 cube, 13 2D
 // array, 8/12 1D). From the T# when the analysis resolved one; for an image it could not (code a
@@ -1176,7 +1229,7 @@ uint32_t bufferWords(const Program& p, const BufferResource& b) {
 }
 
 bool formatInData(const Instruction& in) {
-    return genericTranslation() && in.format == Format::MUBUF && in.op <= 3; // buffer_load_format_*
+    return genericTranslation() && in.format == Format::MUBUF && in.op <= 7; // buffer_load/store_format_*
 }
 
 bool formatInData(const Program& p, const BufferResource& b) {
@@ -1199,10 +1252,15 @@ Program analyze(const LaunchState& launch, const ReadMemory& readCode, const Rea
 
 Program analyzeUnbound(const LaunchState& launch, const ReadMemory& readCode, uint32_t fetchSlots) {
     static const ReadMemory none = [](uint64_t, void*, size_t) { return false; };
-    Analyzer a(launch, readCode, none);
-    a.unbound_ = true;
-    a.unboundSlots_ = fetchSlots;
-    Program p = a.run();
+    auto run = [&](uint32_t slots) {
+        Analyzer a(launch, readCode, none);
+        a.unbound_ = true;
+        a.unboundSlots_ = slots;
+        return a.run();
+    };
+    Program p = run(fetchSlots == ~0u ? 0 : fetchSlots);
+    if (fetchSlots == ~0u && p.fetchSite) // the slots from its code, then walked again with them
+        if (const uint32_t slots = fetchSlotsFromCode(p, p.fetchSite)) p = run(slots);
     p.trace.clear(); // nothing to replay: every launch is analysed against its own data
     return p;
 }

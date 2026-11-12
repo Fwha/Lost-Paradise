@@ -1127,7 +1127,8 @@ vec3 cubeDir(vec3 c) {
                 out(fmt("atomicAnd(%s.m[a_ >> 2], ~(%s << (%s)));\n", bn.c_str(), mask, shift));
                 out(fmt("atomicOr(%s.m[a_ >> 2], (%s & %s) << (%s));\n", bn.c_str(), vreg(vdata).c_str(), mask, shift));
             } else {
-                storeFormat(r, bn, vdata, count);
+                if (formatInData(in)) storeFormatDynamic(o, bn, vdata, count);
+                else storeFormat(r, bn, vdata, count);
             }
             out("}\n}\n");
             return;
@@ -1237,6 +1238,18 @@ vec3 cubeDir(vec3 c) {
         out(fmt("uint w2_ = nd_ > 2u ? %s.m[i_ + 2u] : 0u, w3_ = nd_ > 3u ? %s.m[i_ + 3u] : 0u;\n", bn.c_str(), bn.c_str()));
         out("uvec4 v_ = decodeFormat(w0_, w1_, w2_, w3_, (a_ & 3u) * 8u, f_);\n");
         out("r_[0] = v_.x; r_[1] = v_.y; r_[2] = v_.z; r_[3] = v_.w;\n");
+    }
+
+    // Generic translation: the stored element's format from V# word 3 in the draw data (the formats
+    // storeFormat handles: 32-bit components, and unorm 8_8_8_8).
+    void storeFormatDynamic(uint32_t o, const std::string& bn, uint32_t vdata, unsigned count) {
+        out(fmt("uint f_ = D[%u], df_ = (f_ >> 15) & 15u, nf_ = (f_ >> 12) & 7u;\n", o + 4));
+        out("uint nc_ = df_ == 4u ? 1u : df_ == 11u ? 2u : df_ == 13u ? 3u : df_ == 14u ? 4u : 0u;\n");
+        for (unsigned i = 0; i < count; ++i)
+            out(fmt("if (nc_ > %uu) %s.m[(a_ >> 2) + %uu] = %s;\n", i, bn.c_str(), i, vreg(vdata + i).c_str()));
+        std::string v = "vec4(";
+        for (unsigned i = 0; i < 4; ++i) v += (i ? ", " : "") + (i < count ? "F(" + vreg(vdata + i) + ")" : std::string("0.0"));
+        out(fmt("if (df_ == 10u && nf_ == 0u) %s.m[a_ >> 2] = packUnorm4x8(%s));\n", bn.c_str(), v.c_str()));
     }
 
     void storeFormat(const BufferResource& r, const std::string& bn, uint32_t vdata, unsigned count) {
