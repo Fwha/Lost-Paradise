@@ -71,7 +71,7 @@ then per entry builds a launch from the Gnmx registers, analyses it without a dr
 (`gcn::analyzeUnbound`; a vertex shader's fetch slots from its input semantics), translates and
 compiles it, saves its .gcn, and builds its pre-rasterisation or fragment library. Before that
 (after the startup compile) it builds the libraries of every .gcn an earlier run saved, so in play
-a draw only links. It runs on a quarter of the cores at low priority and waits while a draw waits
+a draw only links. It runs on half the cores at low priority and waits while a draw waits
 for a pipeline: built behind the progress screen, 551 libraries held the game 92 s (0.17 s each
 without the driver's cache), and run beside play at full width they tripled the first hitches. A drawn
 shader whose translation still differs from the boot one is logged once

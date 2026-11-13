@@ -3339,7 +3339,9 @@ private:
         profile::nameThread("lpn-boot-compile");
         profile::lowerThreadPriority();
         while (warmupAll_.load() && !warmupDone_.load()) std::this_thread::sleep_for(std::chrono::milliseconds(100)); // the startup compile's CPU
-        const unsigned n = std::max(1u, std::thread::hardware_concurrency() / 4);
+        // Half the cores: it waits whenever a draw waits for a pipeline (yieldToDraws), so draws keep
+        // theirs, and on Windows (antivirus scanning each new file) a quarter left 3,600 files to minutes.
+        const unsigned n = std::max(1u, std::thread::hardware_concurrency() / 2);
         // First the libraries of every shader an earlier run saved (most of them registered ones),
         // in the background rather than behind the progress screen (0.17 s each, uncached).
         {
