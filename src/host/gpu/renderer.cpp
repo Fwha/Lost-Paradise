@@ -3253,7 +3253,15 @@ private:
     // Background compiles wait while a draw waits for a pipeline: the CPU is the draw's
     // (with them competing, the new game's first pipelines took 7.4 s instead of 3.1).
     void yieldToDraws() {
-        while (drawBuilds_.load() > 0) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        const auto since = std::chrono::steady_clock::now();
+        bool told = false;
+        while (drawBuilds_.load() > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            if (!told && std::chrono::steady_clock::now() - since > std::chrono::seconds(10)) {
+                told = true;
+                std::fprintf(stderr, "[gpu] boot compile waiting 10 s for %d draw pipelines\n", drawBuilds_.load());
+            }
+        }
     }
 
     // The boot compile: once the title menu has registered the game's shaders in the engine's
@@ -3357,14 +3365,16 @@ private:
         }
         // The tables fill while the title menu loads: wait for them to stop growing.
         std::vector<TableShader> shaders;
-        for (size_t last = 0, steady = 0; steady < 6;) {
+        for (size_t last = 0, steady = 0, polls = 0; steady < 6; ++polls) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             shaders = readShaderTables();
             steady = shaders.size() && shaders.size() == last ? steady + 1 : 0;
             last = shaders.size();
+            if (polls == 240) std::fprintf(stderr, "[gpu] boot compile: the shader tables hold %zu entries after 2 minutes\n", last);
         }
+        std::fprintf(stderr, "[gpu] boot compile started: %zu registered shaders on %u threads\n", shaders.size(), n);
         const auto start = std::chrono::steady_clock::now();
-        std::atomic<size_t> next{0}, compiled{0}, failed{0};
+        std::atomic<size_t> next{0}, compiled{0}, failed{0}, done{0};
         const size_t before = librariesBuilt_.load();
         std::vector<std::thread> pool;
         for (unsigned i = 0; i < n; ++i)
@@ -3405,6 +3415,9 @@ private:
                         bootNames_.insert(name);
                         bootEntries_.insert(l.entry);
                     }
+                    if (const size_t d = ++done; d % 500 == 0)
+                        std::fprintf(stderr, "[gpu] boot compile: %zu of %zu after %.1f s\n", d, shaders.size(),
+                                     std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
                 }
             });
         for (auto& t : pool) t.join();
