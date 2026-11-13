@@ -2237,17 +2237,15 @@ private:
     // is imported on a thread of its own instead, in kAheadChunk pieces as it is mapped, and the
     // renderer adopts what is ready; a draw only imports what that thread has not reached.
     // On by default on Windows; LPN_IMPORT_AHEAD=1/0 sets it.
-    static constexpr uint64_t kAheadChunk = 16ull << 20, kAheadSeam = 4ull << 20;
+    static constexpr uint64_t kAheadChunk = 16ull << 20, kAheadOverlap = 6ull << 20;
     std::mutex aheadMutex_;
     std::condition_variable aheadCv_;
     std::deque<std::pair<uint64_t, uint64_t>> aheadQueue_; // mapped ranges still to import
-    // Ranges whose pieces are imported and whose seams are not: a buffer lying across two pieces
-    // (or two mappings) is in neither, so a draw imported it. A second import of kAheadSeam
-    // centred on each seam takes every such buffer up to half that size (a quarter more memory
-    // imported in all: the driver counts imports against a budget).
-    std::deque<std::pair<uint64_t, uint64_t>> aheadSeams_;
-    // The mappings noted so far, adjacent ones merged (start -> end). A seam is only imported
-    // inside one: past a mapping's end lies memory that is not the game's (the driver's own
+    // A buffer lying across two pieces is in neither, so a draw imported it (up to 4 MB ones, in
+    // play): each piece runs kAheadOverlap into the next, and one more import spans a mapping's
+    // start, which takes every buffer up to that size.
+    // The mappings noted so far, adjacent ones merged (start -> end). Nothing is imported
+    // outside them: past a mapping's end lies memory that is not the game's (the driver's own
     // mappings among it), and importing that made a later allocation fail.
     std::map<uint64_t, uint64_t> aheadMapped_;
     bool aheadMappedHas(uint64_t a, uint64_t e) { // aheadMutex_ held
@@ -2283,7 +2281,7 @@ public:
                 if (it->first <= e && it->second >= a) a = std::min(a, it->first), e = std::max(e, it->second), it = aheadMapped_.erase(it);
                 else ++it;
             aheadMapped_[a] = e;
-            aheadPending_ += 2 * len; // its pieces, then its seams (counted as a pass each)
+            aheadPending_ += len;
             if (!aheadStarted_) {
                 aheadStarted_ = true;
                 std::thread([this] { importAheadThread(); }).detach();
@@ -2315,38 +2313,31 @@ private:
         };
         for (;;) {
             std::pair<uint64_t, uint64_t> range;
-            bool seams;
             {
                 std::unique_lock lock(aheadMutex_);
-                aheadCv_.wait(lock, [&] { return !aheadQueue_.empty() || !aheadSeams_.empty(); });
-                seams = aheadQueue_.empty(); // every mapping's pieces first
-                auto& q = seams ? aheadSeams_ : aheadQueue_;
-                range = q.front();
-                q.pop_front();
+                aheadCv_.wait(lock, [&] { return !aheadQueue_.empty(); });
+                range = aheadQueue_.front();
+                aheadQueue_.pop_front();
             }
             const uint64_t start = (range.first + align - 1) & ~(align - 1), end = range.second & ~(align - 1);
-            if (seams) {
-                // Its own ends too, where another mapping adjoins it.
-                const uint64_t half = kAheadSeam / 2;
-                auto seam = [&](uint64_t b) {
-                    {
-                        std::lock_guard lock(aheadMutex_);
-                        if (!aheadMappedHas(b - half, b + half)) return;
-                    }
-                    import(b - half, b + half);
-                };
-                seam(start);
-                for (uint64_t b = (start + kAheadChunk) & ~(kAheadChunk - 1); b < end; b += kAheadChunk) seam(b);
-                seam(end);
-            } else {
-                for (uint64_t a = start; a < end;) {
-                    const uint64_t e = std::min(end, (a + kAheadChunk) & ~(kAheadChunk - 1));
-                    import(a, e);
-                    a = e;
-                }
+            // How far past `e` an import may run: to the end of the game's mapped memory there.
+            auto mappedTo = [&](uint64_t a, uint64_t e) {
                 std::lock_guard lock(aheadMutex_);
-                aheadSeams_.push_back(range);
+                auto it = aheadMapped_.upper_bound(a);
+                if (it == aheadMapped_.begin()) return e;
+                return std::max(e, std::min(e + kAheadOverlap, std::prev(it)->second & ~(align - 1)));
+            };
+            for (uint64_t a = start; a < end;) {
+                const uint64_t e = std::min(end, (a + kAheadChunk) & ~(kAheadChunk - 1));
+                import(a, mappedTo(a, e));
+                a = e;
             }
+            bool before;
+            {
+                std::lock_guard lock(aheadMutex_);
+                before = start > kAheadOverlap && aheadMappedHas(start - kAheadOverlap, start + kAheadOverlap);
+            }
+            if (before && end - start >= kAheadOverlap) import(start - kAheadOverlap, start + kAheadOverlap);
             aheadPending_ -= range.second - range.first;
         }
     }
