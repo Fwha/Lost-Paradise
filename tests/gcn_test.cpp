@@ -329,7 +329,7 @@ int main() {
     // format and components read from the draw data, so meshes with other vertex layouts (here
     // float4 and float3 positions, loaded as xyzw and xyz) share one translation.
     if (gcn::genericTranslation()) {
-        const std::vector<uint32_t> vsCode = {
+        std::vector<uint32_t> vsCode = {
             0xbe802100,             // s_swappc_b64 s[0:1], s[0:1]
             0xf80008cf, 0x07060504, // exp pos0 v4 v5 v6 v7 done
             0xbf810000,             // s_endpgm
@@ -372,6 +372,18 @@ int main() {
             std::fprintf(stderr, "vertex fetch: %u slots, %zu calls, %zu buffers, keys %s, ctl %x, refresh %d\n%s\n%s\n",
                          four.fetchSlots, four.calls.size(), four.buffers.size(), four.key() == three.key() ? "equal" : "differ",
                          ctl(three), refreshed, error.c_str(), glsl.c_str());
+            ++failures;
+        }
+        // A vertex shader reading more inputs than this mesh's fetch shader loads (v8, slot 2)
+        // takes the slots its code reads, as the boot compile does without a draw.
+        vsCode[2] = 0x08060504; // exp pos0 v4 v5 v6 v8 done
+        gcn::Program wide = gcn::analyze(vl, readFetch);
+        const gcn::Program boot = gcn::analyzeUnbound(vl, readFetch);
+        const bool rewide = gcn::refresh(wide, vl, readFetch);
+        if (wide.fetchSlots != 2 || wide.buffers.size() != 2 || boot.fetchSlots != 2 || !rewide ||
+            gcn::translate(wide, 0).glsl != gcn::translate(boot, 0).glsl) {
+            std::fprintf(stderr, "vertex fetch from code: %u slots drawn, %u at boot, refresh %d\n", wide.fetchSlots,
+                         boot.fetchSlots, rewide);
             ++failures;
         }
     }
@@ -428,6 +440,9 @@ int main() {
             0xd28c0006, 0x040a0300, // v_cubetc_f32 v6, v0, v1, v2
             0xd2880007, 0x040a0300, // v_cubeid_f32 v7, v0, v1, v2
             0xf0800f00, 0x00400005, // image_sample v[0:3], v5, s[0:7], s[8:11] (v7 a cube face)
+            0x06100f05,             // v_add_f32 v8, v5, v7: an atlas of faces, 2D
+            0x06120f06,             // v_add_f32 v9, v6, v7
+            0x7e140307,             // v_mov_b32 v10, v7 (a face third, as a cube's)
             0xf0800f00, 0x00400008, // image_sample v[0:3], v8, s[0:7], s[8:11]
             0xbf810000,             // s_endpgm
         };
