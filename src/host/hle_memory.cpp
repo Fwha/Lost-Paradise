@@ -2,6 +2,7 @@
 //
 // Direct memory is backed by one sparse memfd the size of the PS4's, so mapping the same
 // physical range twice aliases it exactly like on the console.
+#include "host/gpu/renderer.h"
 #include "host/hle.h"
 #include "host/kernel.h"
 #include "host/memory.h"
@@ -109,6 +110,7 @@ int32_t sceKernelMapDirectMemory(void** addr, uint64_t len, int32_t prot, int32_
     void* r = mapAligned(*addr, len, align, hostProt(prot), hflags, directFd(), uint64_t(directStart));
     if (r == MAP_FAILED) return sceErrorFromHost(errno);
     *addr = r;
+    render::noteDirectMapping(uint64_t(r), len);
     return 0;
 }
 

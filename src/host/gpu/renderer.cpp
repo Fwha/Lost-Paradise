@@ -1257,6 +1257,7 @@ public:
                 std::fprintf(stderr, "[capture] saved %s\n", traceDir_.c_str());
             }
         }
+        adoptImports();
         if (R().prof_.on) reportSlowFrame();
         savePipelineCache();
         dlssFrameEnd();
@@ -1288,9 +1289,11 @@ public:
         if (ms > 50 && frame_ > 0) {
             std::fprintf(stderr, "[prof] slow frame %" PRIu64 ": %.1f ms;", frame_, ms);
             for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.1f", kProfNames[i], (R().prof_.ns[i] - frameNs_[i]) / 1e6);
-            std::fprintf(stderr, "; %" PRIu64 " analyses, %" PRIu64 " pipelines made\n", R().prof_.analyses - frameAnalyses_,
-                         R().prof_.pipelinesMade - framePipelines_);
+            std::fprintf(stderr, "; %" PRIu64 " analyses, %" PRIu64 " pipelines made, %" PRIu64 " memory imports (%.1f ms)\n",
+                         R().prof_.analyses - frameAnalyses_, R().prof_.pipelinesMade - framePipelines_,
+                         syncImports_.load() - frameSyncImports_, (syncImportNs_.load() - frameSyncImportNs_) / 1e6);
         }
+        frameSyncImports_ = syncImports_, frameSyncImportNs_ = syncImportNs_;
         lastFrameEnd_ = now;
         std::copy(std::begin(R().prof_.ns), std::end(R().prof_.ns), frameNs_);
         frameAnalyses_ = R().prof_.analyses;
@@ -1444,6 +1447,14 @@ public:
         std::fprintf(stderr, "[prof] t=%.1f VRAM copies %zu: %.1f allocations, %.2f evictions (%.1f freed, %.2f found none) per frame\n",
                      profile::seconds(), vram_.size(), R().prof_.vramAllocs / n, R().prof_.vramEvicts / n, R().prof_.vramFreed / n,
                      R().prof_.vramEvictsEmpty / n);
+        {
+            const uint64_t si = syncImports_ - windowSyncImports_, sn = syncImportNs_ - windowSyncImportNs_;
+            const uint64_t ai = aheadImports_ - windowAheadImports_, an = aheadImportNs_ - windowAheadImportNs_;
+            windowSyncImports_ += si, windowSyncImportNs_ += sn, windowAheadImports_ += ai, windowAheadImportNs_ += an;
+            std::fprintf(stderr, "[prof] t=%.1f memory imports %zu: %" PRIu64 " by draws (%.1f ms), %" PRIu64 " ahead (%.1f ms; %" PRIu64 " MB so far, %" PRIu64 " MB waiting)\n",
+                         profile::seconds(), imports_.size(), si, sn / 1e6, ai, an / 1e6, aheadImportBytes_.load() >> 20,
+                         aheadPending_.load() >> 20);
+        }
         if (const gcn::ReplayStats rs = gcn::takeReplayStats(); rs.planned)
             std::fprintf(stderr, "[prof] t=%.1f fast replays %.0f per frame, %.0f%% of their trace steps run directly (%.0f of %.0f); %" PRIu64 " differed from a full replay, %" PRIu64 " changed memory\n",
                          profile::seconds(), rs.planned / n, 100.0 * rs.kept / std::max<uint64_t>(rs.steps, 1), rs.kept / n,
@@ -2221,6 +2232,108 @@ private:
         return true;
     }
 
+    // Importing guest memory is slow on some drivers (tens of ms a call on NVIDIA's Windows one: a
+    // hitch whenever a draw first read from a new 2 MB of memory). The direct memory the game maps
+    // is imported on a thread of its own instead, in kAheadChunk pieces as it is mapped, and the
+    // renderer adopts what is ready; a draw only imports what that thread has not reached.
+    // On by default on Windows; LPN_IMPORT_AHEAD=1/0 sets it.
+    static constexpr uint64_t kAheadChunk = 16ull << 20;
+    std::mutex aheadMutex_;
+    std::condition_variable aheadCv_;
+    std::deque<std::pair<uint64_t, uint64_t>> aheadQueue_; // mapped ranges still to import
+    std::vector<Import> aheadReady_;
+    std::atomic<bool> aheadHasReady_{false};
+    bool aheadStarted_ = false;
+    std::atomic<uint64_t> syncImports_{0}, syncImportNs_{0}; // imports made by a draw
+    std::atomic<uint64_t> aheadImports_{0}, aheadImportNs_{0}, aheadImportBytes_{0}, aheadPending_{0};
+    uint64_t frameSyncImports_ = 0, frameSyncImportNs_ = 0;
+    static bool importAheadOn() {
+        static const bool on = [] {
+            if (const char* e = getenv("LPN_IMPORT_AHEAD"); e && *e) return *e != '0';
+#ifdef _WIN32
+            return true;
+#else
+            return false;
+#endif
+        }();
+        return on;
+    }
+public:
+    // The game mapped [addr, addr + len) of direct memory (any thread).
+    void noteMapping(uint64_t addr, uint64_t len) {
+        if (!importAheadOn() || !vk_.getMemoryHostPointerProperties || !addr || addr + len > (1ull << 40)) return;
+        {
+            std::lock_guard lock(aheadMutex_);
+            aheadQueue_.emplace_back(addr, addr + len);
+            aheadPending_ += len;
+            if (!aheadStarted_) {
+                aheadStarted_ = true;
+                std::thread([this] { importAheadThread(); }).detach();
+            }
+        }
+        aheadCv_.notify_one();
+    }
+
+private:
+    void importAheadThread() {
+        profile::nameThread("lpn-import");
+        const uint64_t align = std::max<uint64_t>(vk_.hostPointerAlignment, 4096);
+        for (;;) {
+            std::pair<uint64_t, uint64_t> range;
+            {
+                std::unique_lock lock(aheadMutex_);
+                aheadCv_.wait(lock, [&] { return !aheadQueue_.empty(); });
+                range = aheadQueue_.front();
+                aheadQueue_.pop_front();
+            }
+            const uint64_t start = (range.first + align - 1) & ~(align - 1), end = range.second & ~(align - 1);
+            for (uint64_t a = start; a < end;) {
+                const uint64_t e = std::min(end, (a + kAheadChunk) & ~(kAheadChunk - 1));
+                bool have;
+                {
+                    std::shared_lock lock(cacheMutex_);
+                    VkBuffer b;
+                    VkDeviceSize o;
+                    have = importFor(a, e - a, b, o);
+                }
+                Import im;
+                const auto t0 = std::chrono::steady_clock::now();
+                if (!have && importRange(a, e, im)) {
+                    aheadImportNs_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+                    ++aheadImports_;
+                    aheadImportBytes_ += e - a;
+                    std::lock_guard lock(aheadMutex_);
+                    aheadReady_.push_back(im);
+                    aheadHasReady_.store(true, std::memory_order_release);
+                }
+                a = e;
+            }
+            aheadPending_ -= range.second - range.first;
+        }
+    }
+    // Takes over what the import thread has ready (m_ held exclusively). Whether there was any.
+    bool adoptImports() {
+        if (!aheadHasReady_.load(std::memory_order_acquire)) return false;
+        std::vector<Import> ready;
+        {
+            std::lock_guard lock(aheadMutex_);
+            ready.swap(aheadReady_);
+            aheadHasReady_.store(false, std::memory_order_release);
+        }
+        std::unique_lock lock(cacheMutex_);
+        for (const Import& im : ready) {
+            auto [it, fresh] = imports_.try_emplace(im.start, im);
+            if (fresh) continue;
+            if (it->second.end >= im.end) { // a draw imported as much there meanwhile: this one was never used
+                vkDestroyBuffer(vk_.device, im.buffer, nullptr);
+                vkFreeMemory(vk_.device, im.memory, nullptr);
+            } else {
+                it->second = im; // the smaller one stays alive: recorded commands may name its buffer
+            }
+        }
+        return !ready.empty();
+    }
+
     // A Vulkan buffer over guest memory [addr, addr + size).
     bool guestBuffer(uint64_t addr, uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) {
         if (!addr || addr >= (1ull << 40) || !size) return false;
@@ -2247,20 +2360,25 @@ private:
         for (const auto& [start, im] : imports_) {
             if (start > addr) break;
             if (im.end >= end) {
+                hit = &im;
                 buffer = im.buffer;
                 offset = addr - start;
                 return true;
             }
         }
         if (sharedMiss()) return false; // a recorder thread's draw: recorded again with m_ held
+        if (adoptImports()) return guestBuffer(addr, size, buffer, offset); // the import thread may have it by now
         const uint64_t align = std::max<uint64_t>(vk_.hostPointerAlignment, 4096);
         Import im;
+        const auto t0 = std::chrono::steady_clock::now();
         const uint64_t gs = addr & ~(kImportGranule - 1), ge = (end + kImportGranule - 1) & ~(kImportGranule - 1);
         const uint64_t ps = addr & ~(align - 1), pe = (end + align - 1) & ~(align - 1);
         if (!importRange(gs, ge, im) && !importRange(ps, pe, im)) {
             warnOnce("cannot import guest memory at 0x" + std::to_string(addr));
             return false;
         }
+        ++syncImports_;
+        syncImportNs_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
         {
             std::unique_lock lock(cacheMutex_);
             imports_[im.start] = im;
@@ -5659,13 +5777,18 @@ void main() {
     // guestBuffer's lookup of an existing import, without making one (cacheMutex_ held shared).
     bool importFor(uint64_t addr, uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) const {
         if (!addr || addr >= (1ull << 40) || !size) return false;
-        auto it = imports_.upper_bound(addr);
-        if (it == imports_.begin()) return false;
-        --it;
-        if (it->second.end < addr + size) return false;
-        buffer = it->second.buffer;
-        offset = addr - it->first;
-        return true;
+        // The closest import below usually covers it; a larger one (the import thread's) may start
+        // further down, behind small ones a draw made first.
+        for (auto it = imports_.upper_bound(addr); it != imports_.begin();) {
+            --it;
+            if (it->second.end >= addr + size) {
+                buffer = it->second.buffer;
+                offset = addr - it->first;
+                return true;
+            }
+            if (addr - it->first > kAheadChunk) break;
+        }
+        return false;
     }
     // A worker's resolution of `p`'s buffers, if still good (see resolveAhead).
     const std::vector<BufRes>* aheadFor(const DrawAnalysis& a, const gcn::Program& p) const {
@@ -7385,6 +7508,7 @@ void main() {
     uint64_t windowFrames_ = 0, slowFrames_ = 0; // LPN_PROFILE: frames in the report window, and those over 17 ms
     double worstFrameMs_ = 0;
     uint64_t frameNs_[kProfCount] = {}, frameAnalyses_ = 0, framePipelines_ = 0;
+    uint64_t windowSyncImports_ = 0, windowSyncImportNs_ = 0, windowAheadImports_ = 0, windowAheadImportNs_ = 0;
 
     std::map<uint64_t, Import> imports_; // never erased while rendering: importHits_ points into it
     static constexpr size_t kImportHits = 64;
@@ -8092,6 +8216,10 @@ void fetchDisplayCopy(const DisplayCopy& c, uint32_t width, uint32_t height, std
 
 void captureNextFrame(const std::string& dir) {
     if (gRenderer) gRenderer->captureNextFrame(dir);
+}
+
+void noteDirectMapping(uint64_t address, uint64_t size) {
+    if (gRenderer) gRenderer->noteMapping(address, size);
 }
 
 void saveCaches() {

@@ -49,6 +49,10 @@ bool warmupProgress(WarmupProgress& p);
 // Starts the game now; what is left builds in the background as when the setting is off.
 void skipWarmup();
 
+// The game mapped direct memory at [address, address + size): the renderer imports it into
+// Vulkan ahead of the draws that read it, where a draw doing so would hitch (any thread).
+void noteDirectMapping(uint64_t address, uint64_t size);
+
 // Before exiting: writes the driver's pipeline cache, so pipelines made since the last periodic
 // save are not compiled again next run.
 void saveCaches();
