@@ -3856,6 +3856,7 @@ private:
         VkPipeline p = VK_NULL_HANDLE;
         const VkResult r = vkCreateGraphicsPipelines(vk_.device, pipelineCache_, 1, &gci, nullptr, &p);
         if (r != VK_SUCCESS) std::fprintf(stderr, "[gpu] %s pipeline library not created: %s\n", what, vkResultName(r));
+        else ++newPipelines_; // pipelines.bin is written again with it (savePipelineCache)
         return r == VK_SUCCESS ? p : VK_NULL_HANDLE;
     }
 
