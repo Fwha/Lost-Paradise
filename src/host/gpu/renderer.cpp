@@ -3393,7 +3393,15 @@ private:
     // Background compiles wait while a draw waits for a pipeline: the CPU is the draw's
     // (with them competing, the new game's first pipelines took 7.4 s instead of 3.1).
     void yieldToDraws() {
-        while (drawBuilds_.load() > 0) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        const auto since = std::chrono::steady_clock::now();
+        bool told = false;
+        while (drawBuilds_.load() > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            if (!told && std::chrono::steady_clock::now() - since > std::chrono::seconds(10)) {
+                told = true;
+                std::fprintf(stderr, "[gpu] boot compile waiting 10 s for %d draw pipelines\n", drawBuilds_.load());
+            }
+        }
     }
 
     // The boot compile: once the title menu has registered the game's shaders in the engine's
@@ -3471,7 +3479,9 @@ private:
         profile::nameThread("lpn-boot-compile");
         profile::lowerThreadPriority();
         while (warmupAll_.load() && !warmupDone_.load()) std::this_thread::sleep_for(std::chrono::milliseconds(100)); // the startup compile's CPU
-        const unsigned n = std::max(1u, std::thread::hardware_concurrency() / 4);
+        // Half the cores: it waits whenever a draw waits for a pipeline (yieldToDraws), so draws keep
+        // theirs, and on Windows (antivirus scanning each new file) a quarter left 3,600 files to minutes.
+        const unsigned n = std::max(1u, std::thread::hardware_concurrency() / 2);
         // First the libraries of every shader an earlier run saved (most of them registered ones),
         // in the background rather than behind the progress screen (0.17 s each, uncached).
         {
@@ -3497,14 +3507,20 @@ private:
         }
         // The tables fill while the title menu loads: wait for them to stop growing.
         std::vector<TableShader> shaders;
-        for (size_t last = 0, steady = 0; steady < 6;) {
+        for (size_t last = 0, steady = 0, polls = 0; steady < 6; ++polls) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             shaders = readShaderTables();
             steady = shaders.size() && shaders.size() == last ? steady + 1 : 0;
             last = shaders.size();
+            if (polls == 240) std::fprintf(stderr, "[gpu] boot compile: the shader tables hold %zu entries after 2 minutes\n", last);
         }
+        std::fprintf(stderr, "[gpu] boot compile started: %zu registered shaders on %u threads\n", shaders.size(), n);
         const auto start = std::chrono::steady_clock::now();
+        bootStart_ = start;
+        bootTotal_ = shaders.size();
+        bootRunning_ = true;
         std::atomic<size_t> next{0}, compiled{0}, failed{0};
+        std::atomic<size_t>& done = bootCount_;
         const size_t before = librariesBuilt_.load();
         std::vector<std::thread> pool;
         for (unsigned i = 0; i < n; ++i)
@@ -3518,50 +3534,109 @@ private:
                         ++failed;
                         continue;
                     }
-                    const gcn::Program p = gcn::analyzeUnbound(l, readGuest, slots);
-                    if (p.code.empty()) {
-                        ++failed;
-                        continue;
+                    // A vertex shader takes the fetch slots its code reads, as a draw does (at
+                    // least: gcn::analyze); its input semantics may declare more, which a mesh's
+                    // fetch shader then loads, so that count is translated too.
+                    std::vector<gcn::Program> programs{gcn::analyzeUnbound(l, readGuest)};
+                    if (l.stage == gcn::Stage::Vertex && slots != ~0u && !programs[0].code.empty() &&
+                        programs[0].fetchSite && slots > programs[0].fetchSlots)
+                        programs.push_back(gcn::analyzeUnbound(l, readGuest, slots));
+                    // An image its code takes for a cube may still be bound 2D (a face's coordinates
+                    // sampled another way): that translation is made too, the T# its draw gives.
+                    for (size_t n = programs.size(), i = 0; i < n; ++i) {
+                        gcn::Program flat = programs[i];
+                        bool cube = false;
+                        for (gcn::ImageResource& im : flat.images)
+                            if (!im.t[0] && !im.t[1] && !im.t[3] && gcn::imageDimension(flat, im) == 11) {
+                                im.t[3] = 9u << 28;
+                                cube = true;
+                            }
+                        if (cube) programs.push_back(std::move(flat));
                     }
-                    const uint32_t base = l.stage == gcn::Stage::Pixel ? kPsBindingBase : 0;
-                    const gcn::Translation t = gcn::translate(p, base, descriptorSet(p));
-                    const gcn::GlslStage stage = l.stage == gcn::Stage::Pixel ? gcn::GlslStage::Fragment : gcn::GlslStage::Vertex;
-                    const std::string name = spirvName(t.glsl, stage), path = spirvCachePath(t.glsl, stage);
-                    if (path.empty()) continue;
-                    if (access(path.c_str(), F_OK) != 0) {
-                        std::string error;
-                        const std::vector<uint32_t> spirv = gcn::compileGlsl(t.glsl, stage, &error);
-                        if (spirv.empty()) {
+                    for (const gcn::Program& p : programs) {
+                        if (p.code.empty()) {
                             ++failed;
-                            continue;
+                            break;
                         }
-                        saveSpirv(path, spirv);
-                        ++compiled;
-                    }
-                    saveSource(name, p, base); // the startup compile builds its library in later runs
-                    buildLibraries(p, name);
-                    {
+                        const uint32_t base = l.stage == gcn::Stage::Pixel ? kPsBindingBase : 0;
+                        const gcn::Translation t = gcn::translate(p, base, descriptorSet(p));
+                        const gcn::GlslStage stage = l.stage == gcn::Stage::Pixel ? gcn::GlslStage::Fragment : gcn::GlslStage::Vertex;
+                        const std::string name = spirvName(t.glsl, stage), path = spirvCachePath(t.glsl, stage);
+                        if (path.empty()) continue;
+                        if (access(path.c_str(), F_OK) != 0) {
+                            std::string error;
+                            const std::vector<uint32_t> spirv = gcn::compileGlsl(t.glsl, stage, &error);
+                            if (spirv.empty()) {
+                                ++failed;
+                                continue;
+                            }
+                            saveSpirv(path, spirv);
+                            ++compiled;
+                        }
+                        saveSource(name, p, base); // the startup compile builds its library in later runs
+                        buildLibraries(p, name);
                         std::lock_guard lock(bootMutex_);
                         bootNames_.insert(name);
                         bootEntries_.insert(l.entry);
+                        bootPrograms_.emplace(l.entry, p);
                     }
+                    if (const size_t d = ++done; d % 500 == 0)
+                        std::fprintf(stderr, "[gpu] boot compile: %zu of %zu after %.1f s\n", d, shaders.size(),
+                                     std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
                 }
             });
         for (auto& t : pool) t.join();
         std::fprintf(stderr, "[gpu] boot compile: %zu registered shaders in %.1f s (%zu SPIR-V compiled, %zu libraries built, %zu failed)\n",
                      shaders.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), compiled.load(),
                      librariesBuilt_.load() - before, failed.load());
+        bootRunning_ = false;
         bootDone_ = true;
     }
+  public:
+    // The boot compile's progress, for the corner of the window: shown once it has run a second
+    // (a run with everything cached takes a fraction of one).
+    bool bootProgress(size_t& done, size_t& total) {
+        if (!bootRunning_.load() || std::chrono::steady_clock::now() - bootStart_.load() < std::chrono::seconds(1)) return false;
+        done = bootCount_.load(), total = bootTotal_.load();
+        return true;
+    }
+  private:
+    std::atomic<size_t> bootCount_{0}, bootTotal_{0};
+    std::atomic<bool> bootRunning_{false};
+    std::atomic<std::chrono::steady_clock::time_point> bootStart_{};
     // A drawn shader the boot compile also translated, but otherwise (its translation depends on
     // the draw after all): logged once per shader, the boot compile's misses to look into.
     void checkBootTranslation(const gcn::Program& p, const std::string& name) {
         if (!bootDone_.load() || p.launch.stage == gcn::Stage::Compute) return;
         std::lock_guard lock(bootMutex_);
         if (bootNames_.count(name) || !bootEntries_.count(p.launch.entry) || !bootMissed_.insert(p.launch.entry).second) return;
-        std::fprintf(stderr, "[gpu] boot compile missed %s 0x%" PRIx64 ": its draw translates it otherwise\n",
-                     p.launch.stage == gcn::Stage::Pixel ? "ps" : "vs", p.launch.entry);
+        std::string why;
+        auto add = [&](const std::string& w) { why += (why.empty() ? "" : ", ") + w; };
+        auto it = bootPrograms_.find(p.launch.entry);
+        if (it != bootPrograms_.end()) { // what differs, as lpn-gcn --boot reports it
+            const gcn::Program& b = it->second;
+            if (p.fetchSlots != b.fetchSlots)
+                add("fetch slots " + std::to_string(p.fetchSlots) + " drawn, " + std::to_string(b.fetchSlots) + " at boot");
+            if (p.code.size() != b.code.size()) add("code walked " + std::to_string(p.code.size()) + " vs " + std::to_string(b.code.size()));
+            if (p.buffers.size() != b.buffers.size()) add("buffers " + std::to_string(p.buffers.size()) + " vs " + std::to_string(b.buffers.size()));
+            if (p.images.size() != b.images.size()) add("images " + std::to_string(p.images.size()) + " vs " + std::to_string(b.images.size()));
+            else
+                for (size_t i = 0; i < p.images.size(); ++i) {
+                    const uint32_t dp = gcn::imageDimension(p, p.images[i]), db = gcn::imageDimension(b, b.images[i]);
+                    if (dp != db) add("image " + std::to_string(i) + " dimension " + std::to_string(dp) + " drawn, " + std::to_string(db) + " at boot");
+                    if (p.images[i].numFormat() == 4 || p.images[i].numFormat() == 5) add("image " + std::to_string(i) + " integer");
+                }
+            if (p.smrd.size() != b.smrd.size()) add("scalar loads " + std::to_string(p.smrd.size()) + " vs " + std::to_string(b.smrd.size()));
+            if (p.launch.stage == gcn::Stage::Pixel) {
+                if (p.launch.colorUint != b.launch.colorUint || p.launch.colorSint != b.launch.colorSint) add("integer targets");
+                if (p.launch.colorFormat != b.launch.colorFormat) add("export formats");
+            }
+            if (why.empty()) add("other");
+        }
+        std::fprintf(stderr, "[gpu] boot compile missed %s 0x%" PRIx64 ": its draw translates it otherwise (%s)\n",
+                     p.launch.stage == gcn::Stage::Pixel ? "ps" : "vs", p.launch.entry, why.c_str());
     }
+    std::unordered_map<uint64_t, gcn::Program> bootPrograms_; // what the boot compile translated, for the reasons above
     std::mutex bootMutex_;
     std::unordered_set<std::string> bootNames_;
     std::unordered_set<uint64_t> bootEntries_, bootMissed_;
@@ -3964,6 +4039,7 @@ private:
         VkPipeline p = VK_NULL_HANDLE;
         const VkResult r = vkCreateGraphicsPipelines(vk_.device, pipelineCache_, 1, &gci, nullptr, &p);
         if (r != VK_SUCCESS) std::fprintf(stderr, "[gpu] %s pipeline library not created: %s\n", what, vkResultName(r));
+        else ++newPipelines_; // pipelines.bin is written again with it (savePipelineCache)
         return r == VK_SUCCESS ? p : VK_NULL_HANDLE;
     }
 
@@ -8219,6 +8295,8 @@ bool startRenderer(bool computeOnly) {
 }
 
 bool warmupProgress(WarmupProgress& p) { return gRenderer && gRenderer->warmupProgress(p); }
+
+bool bootCompileProgress(size_t& done, size_t& total) { return gRenderer && gRenderer->bootProgress(done, total); }
 
 void skipWarmup() {
     if (gRenderer) gRenderer->skipWarmup();

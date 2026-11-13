@@ -826,14 +826,18 @@ private:
             if (prior_) diverged_ = true; // this launch's fetch shader is another kind: analyse it anew
             return prior_ != nullptr;
         }
-        uint32_t slots = 0;
+        // At least the slots its code reads (minSlots_, see analyze), so a vertex shader drawn with
+        // meshes that fetch fewer inputs takes one translation, the one the boot compile makes.
+        uint32_t slots = minSlots_;
         for (const auto& l : loads) slots = std::max(slots, l.slot + 1);
         std::vector<uint32_t> index; // buffers of the slots, in slot order
         if (prior_) {
-            if (prior_->fetchSite != site || prior_->fetchSlots != slots) {
+            // A fetch shader loading fewer slots than the program has leaves the rest unknown (0).
+            if (prior_->fetchSite != site || prior_->fetchSlots < slots) {
                 diverged_ = true;
                 return true;
             }
+            slots = prior_->fetchSlots;
             for (uint32_t i = 0; i < p_.buffers.size(); ++i)
                 if (p_.buffers[i].pc == site) index.push_back(i);
             if (index.size() != slots) {
@@ -879,6 +883,7 @@ private:
 public:
     bool unbound_ = false;      // analyzeUnbound: no user data
     uint32_t unboundSlots_ = 0; // its fetch slots
+    uint32_t minSlots_ = 0;     // a draw's fetch slots at least (fetchSlotsFromCode)
 private:
     const ReadMemory& readCode_;
     const ReadMemory& readData_;
@@ -1168,7 +1173,7 @@ uint32_t fetchSlotsFromCode(const Program& p, uint64_t site) {
 // The image's dimension as the translation declares it (a T# type: 9 2D, 10 3D, 11 cube, 13 2D
 // array, 8/12 1D). From the T# when the analysis resolved one; for an image it could not (code a
 // launch skips, or a shader compiled before any draw) from the code: a cube if the instruction
-// declares an array (DA) or its third coordinate comes from a v_cubeid face, else 2D.
+// declares an array (DA) or it takes a v_cubeid face third and face coordinates first, else 2D.
 uint32_t imageDimension(const Program& p, const ImageResource& im) {
     if (im.t[0] || im.t[1] || im.t[3]) return im.type();
     auto it = p.code.find(im.pc);
@@ -1190,24 +1195,28 @@ uint32_t imageDimension(const Program& p, const ImageResource& im) {
     }
     auto from = it;
     for (int n = 0; n < 64 && from != p.code.begin(); ++n) --from;
-    // VGPRs holding a value derived from a cube face (v_cubeid_f32), and from a face coordinate
-    // (v_cubesc_f32, v_cubetc_f32): a cube's s and t are face coordinates too, which tells it
-    // from a 2D sample whose next register happens to hold another sample's face.
-    std::bitset<256> face, coord;
+    // VGPRs holding a cube face as v_cubeid_f32 gives it (moved at most), a value derived from
+    // one, and one derived from a face coordinate (v_cubesc_f32, v_cubetc_f32). A cube sample
+    // takes the face itself third and face coordinates (scaled, not offset by the face) as s and
+    // t; a 2D sample of an atlas of faces computes its s and t from the face too.
+    std::bitset<256> faceId, face, coord;
     for (auto at = from; at != it; ++at) {
         const Instruction& x = at->second;
         const auto [first, count] = vgprWrites(x);
         if (!count) continue;
         const bool vop3 = x.format == Format::VOP3;
-        bool f = vop3 && x.op == 324, c = vop3 && (x.op == 325 || x.op == 326);
+        const bool id = vop3 && x.op == 324;
+        bool f = id, c = vop3 && (x.op == 325 || x.op == 326), moved = false;
         if (!f && !c && (x.format == Format::VOP1 || x.format == Format::VOP2 || vop3))
             vgprReads(x, [&](uint32_t v) {
-                if (v < 256) f |= face[v], c |= coord[v];
+                if (v < 256) f |= face[v], c |= coord[v], moved |= faceId[v];
             });
-        for (uint32_t i = 0; i < count && first + i < 256; ++i) face[first + i] = f, coord[first + i] = c;
+        const bool isId = id || (moved && x.format == Format::VOP1 && x.op == 1); // v_mov_b32
+        for (uint32_t i = 0; i < count && first + i < 256; ++i)
+            faceId[first + i] = isId, face[first + i] = f, coord[first + i] = c;
     }
-    const uint32_t third = vaddr + prefix + 2;
-    if (third < 256 && face[third] && coord[vaddr + prefix]) return 11;
+    const uint32_t s = vaddr + prefix, t = s + 1, third = s + 2;
+    if (third < 256 && faceId[third] && coord[s] && coord[t] && !face[s] && !face[t]) return 11;
     // 3D images were never seen bound (lpn-gcn --boot on a play cache: counting address
     // registers written took 154 2D images for 3D), so the rest are 2D.
     return 9;
@@ -1263,7 +1272,16 @@ uint32_t data::smrd() {
 }
 
 Program analyze(const LaunchState& launch, const ReadMemory& readCode, const ReadMemory& readData) {
-    return Analyzer(launch, readCode, readData).run();
+    Program p = Analyzer(launch, readCode, readData).run();
+    // Generic: the fetch slots its code reads too, as the boot compile takes them, whichever
+    // mesh this draw's fetch shader loads (it may skip inputs the shader still reads).
+    if (genericTranslation() && p.fetchSlots)
+        if (const uint32_t code = fetchSlotsFromCode(p, p.fetchSite); code > p.fetchSlots) {
+            Analyzer a(launch, readCode, readData);
+            a.minSlots_ = code;
+            p = a.run();
+        }
+    return p;
 }
 
 Program analyzeUnbound(const LaunchState& launch, const ReadMemory& readCode, uint32_t fetchSlots) {

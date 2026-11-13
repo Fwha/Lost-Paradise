@@ -36,7 +36,9 @@ is part of the shader binary's own registers and so known without a draw.
 2. **Vertex pulling.** Translate the fetch shader's typed loads as a generic formatted load whose
    format comes from the draw data, so one VS translation serves every mesh layout. Done (see
    gpu.md, generic translation): the translation depends only on how many slots of four VGPRs the
-   fetch fills, which the VS's own input semantics fix, so stage 4 can lay out a VS without a mesh.
+   fetch fills. A mesh's fetch shader may load fewer inputs than the VS reads, so a draw takes at
+   least the slots the VS's code reads (`gcn::fetchSlotsFromCode`), and stage 4 lays out a VS
+   without a mesh the same way.
 3. **No per-state pipelines.** VK_EXT_shader_object (or graphics pipeline libraries) with
    blend, depth/stencil, topology and colour write state dynamic, so a shader pair needs no
    pipeline build per state. Done with fast-linked pipeline libraries (gpu.md): shader objects
@@ -68,17 +70,20 @@ Scalar load results start after these words (`data::smrd()`, 32 in the generic t
 With pipeline libraries on, a background thread (`bootCompile`, `LPN_BOOT_COMPILE=0` turns it
 off) waits for the vertex and pixel shader tables to stop growing (the title menu fills them),
 then per entry builds a launch from the Gnmx registers, analyses it without a draw
-(`gcn::analyzeUnbound`; a vertex shader's fetch slots from its input semantics), translates and
+(`gcn::analyzeUnbound`; a vertex shader's fetch slots from its code, and again from its input
+semantics when they declare more), translates and
 compiles it, saves its .gcn, and builds its pre-rasterisation or fragment library. Before that
 (after the startup compile) it builds the libraries of every .gcn an earlier run saved, so in play
-a draw only links. It runs on a quarter of the cores at low priority and waits while a draw waits
+a draw only links. It runs on half the cores at low priority and waits while a draw waits
 for a pipeline: built behind the progress screen, 551 libraries held the game 92 s (0.17 s each
 without the driver's cache), and run beside play at full width they tripled the first hitches. A drawn
 shader whose translation still differs from the boot one is logged once
 (`boot compile missed ...`).
 
 Without a T#, an image's dimension comes from its instruction: a cube when it declares an array
-(DA) or its addresses derive from v_cubesc/v_cubetc coordinates and a v_cubeid face, else 2D. Counting the address registers written before the sample took 154 of the play
+(DA) or it takes a v_cubeid face third and s, t derived from v_cubesc/v_cubetc but not from the
+face (a 2D atlas of faces adds the face to its coordinates), else 2D. A shader with an image taken for a cube is
+also translated with it 2D, as one in play was bound. Counting the address registers written before the sample took 154 of the play
 cache's 2D images for 3D, and no 3D image was ever bound.
 
 ### The shader tables (measured on the user's PC, 2026-11-12)
