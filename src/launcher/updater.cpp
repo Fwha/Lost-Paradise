@@ -390,8 +390,11 @@ void start(void (*fn)(), UpdateState state, const char* message) {
     }).detach();
 }
 
+// The numbers of a release tag (v1.2.3). Anything else (a CI build of a branch or pull request,
+// e.g. "main" or "75-merge") has none, so it is never taken for a release and always offered one.
 std::vector<long> numbers(std::string v) {
-    if (!v.empty() && (v[0] == 'v' || v[0] == 'V')) v.erase(0, 1);
+    if (v.size() < 2 || (v[0] != 'v' && v[0] != 'V') || !std::isdigit(static_cast<unsigned char>(v[1]))) return {};
+    v.erase(0, 1);
     std::vector<long> out;
     size_t i = 0;
     while (i < v.size() && std::isdigit(static_cast<unsigned char>(v[i]))) {
