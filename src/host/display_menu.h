@@ -39,6 +39,8 @@ void applyDisplayOptions(SDL_Window* win);
 // Compile Shaders at Startup: the progress screen while the game waits for the startup compile
 // (gpu/renderer.h warmupProgress). False when there is none.
 bool drawShaderWarmup(SDL_Renderer* ren);
+// The boot compile's progress in the bottom left corner while it runs.
+void drawBootCompile(SDL_Renderer* ren);
 // The frames shown a second, in the top right corner, when the menu's FPS counter is on.
 void drawFpsCounter(SDL_Renderer* ren);
 #endif

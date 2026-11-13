@@ -216,6 +216,7 @@ void presenterThread() {
         }
         drawSaveMenu(ren);
         drawFpsCounter(ren);
+        drawBootCompile(ren);
         drawDisplayMenu(ren);
         SDL_RenderPresent(ren);
     }

@@ -385,6 +385,30 @@ void drawFpsCounter(SDL_Renderer* ren) {
     SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
 }
 
+void drawBootCompile(SDL_Renderer* ren) {
+    size_t done = 0, total = 0;
+    if (!render::bootCompileProgress(done, total) || !total) return;
+    int w = 0, h = 0;
+    SDL_GetRendererOutputSize(ren, &w, &h);
+    const float u = std::max(0.5f, h / 720.0f);
+    auto U = [u](float v) { return std::max(1, int(std::lround(v * u))); };
+    const std::string label = "Compiling shaders", count = std::to_string(done) + " / " + std::to_string(total);
+    const int ts = U(14), pad = U(10);
+    const int pw = std::max(U(220), textW(label, ts, true) + textW(count, ts) + U(16) + 2 * pad), ph = U(46);
+    const int px = U(8), py = h - ph - U(8);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    fillR(ren, px, py, pw, ph, U(6), 0, 0, 0, 170);
+    color(ren, 245, 240, 228);
+    text(ren, px + pad, py + U(7), ts, label, true);
+    color(ren, 200, 192, 176);
+    text(ren, px + pw - pad - textW(count, ts), py + U(7), ts, count);
+    const int bx = px + pad, by = py + U(30), bw = pw - 2 * pad, bh = U(6);
+    fillR(ren, bx, by, bw, bh, bh / 2, 40, 40, 48);
+    const int fw = int(double(bw) * std::min(done, total) / total);
+    if (fw > 0) fillR(ren, bx, by, std::max(fw, bh), bh, bh / 2, ui::kAccent.fill);
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+}
+
 bool drawShaderWarmup(SDL_Renderer* ren) {
     render::WarmupProgress p;
     if (!render::warmupProgress(p)) return false;

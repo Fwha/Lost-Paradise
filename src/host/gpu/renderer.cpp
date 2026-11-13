@@ -3376,7 +3376,11 @@ private:
         }
         std::fprintf(stderr, "[gpu] boot compile started: %zu registered shaders on %u threads\n", shaders.size(), n);
         const auto start = std::chrono::steady_clock::now();
-        std::atomic<size_t> next{0}, compiled{0}, failed{0}, done{0};
+        bootStart_ = start;
+        bootTotal_ = shaders.size();
+        bootRunning_ = true;
+        std::atomic<size_t> next{0}, compiled{0}, failed{0};
+        std::atomic<size_t>& done = bootCount_;
         const size_t before = librariesBuilt_.load();
         std::vector<std::thread> pool;
         for (unsigned i = 0; i < n; ++i)
@@ -3426,8 +3430,21 @@ private:
         std::fprintf(stderr, "[gpu] boot compile: %zu registered shaders in %.1f s (%zu SPIR-V compiled, %zu libraries built, %zu failed)\n",
                      shaders.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), compiled.load(),
                      librariesBuilt_.load() - before, failed.load());
+        bootRunning_ = false;
         bootDone_ = true;
     }
+  public:
+    // The boot compile's progress, for the corner of the window: shown once it has run a second
+    // (a run with everything cached takes a fraction of one).
+    bool bootProgress(size_t& done, size_t& total) {
+        if (!bootRunning_.load() || std::chrono::steady_clock::now() - bootStart_.load() < std::chrono::seconds(1)) return false;
+        done = bootCount_.load(), total = bootTotal_.load();
+        return true;
+    }
+  private:
+    std::atomic<size_t> bootCount_{0}, bootTotal_{0};
+    std::atomic<bool> bootRunning_{false};
+    std::atomic<std::chrono::steady_clock::time_point> bootStart_{};
     // A drawn shader the boot compile also translated, but otherwise (its translation depends on
     // the draw after all): logged once per shader, the boot compile's misses to look into.
     void checkBootTranslation(const gcn::Program& p, const std::string& name) {
@@ -8088,6 +8105,8 @@ bool startRenderer(bool computeOnly) {
 }
 
 bool warmupProgress(WarmupProgress& p) { return gRenderer && gRenderer->warmupProgress(p); }
+
+bool bootCompileProgress(size_t& done, size_t& total) { return gRenderer && gRenderer->bootProgress(done, total); }
 
 void skipWarmup() {
     if (gRenderer) gRenderer->skipWarmup();

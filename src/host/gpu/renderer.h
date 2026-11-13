@@ -46,6 +46,9 @@ struct WarmupProgress {
     double seconds = 0;
 };
 bool warmupProgress(WarmupProgress& p);
+// The boot compile (docs/shader-precompile.md stage 4): every shader the game registers, compiled
+// in the background from the title menu on. False when it is not running.
+bool bootCompileProgress(size_t& done, size_t& total);
 // Starts the game now; what is left builds in the background as when the setting is off.
 void skipWarmup();
 
