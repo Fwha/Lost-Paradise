@@ -133,7 +133,9 @@ void presenterThread() {
     const int winW = int(720 * aspectValue(displaySettings().aspect) + 0.5);
     SDL_Window* win = SDL_CreateWindow("Fist of the North Star: Lost Paradise", SDL_WINDOWPOS_CENTERED,
                                        SDL_WINDOWPOS_CENTERED, winW, 720, SDL_WINDOW_RESIZABLE);
-    SDL_Renderer* ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC) : nullptr;
+    bool vsync = displaySettings().vsync; // VSync: as the renderer was made or last set
+    SDL_Renderer* ren =
+        win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | (vsync ? SDL_RENDERER_PRESENTVSYNC : 0)) : nullptr;
     if (!ren) {
         std::fprintf(stderr, "[window] cannot create window: %s\n", SDL_GetError());
         gEnabled = false;
@@ -176,6 +178,14 @@ void presenterThread() {
         }
         pollPad(gc);
         applyDisplayOptions(win);
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+        if (displaySettings().vsync != vsync) { // changed in the PC Settings screen
+            vsync = displaySettings().vsync;
+            if (SDL_RenderSetVSync(ren, vsync ? 1 : 0) != 0)
+                std::fprintf(stderr, "[window] cannot turn vsync %s: %s\n", vsync ? "on" : "off", SDL_GetError());
+            else std::fprintf(stderr, "[window] vsync %s\n", vsync ? "on" : "off");
+        }
+#endif
 
         std::unique_lock lock(gMutex);
         gCv.wait_for(lock, std::chrono::milliseconds(16), [] { return gNewFrame; });

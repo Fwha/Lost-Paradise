@@ -25,6 +25,11 @@ enum class AspectRatio { Wide16x9, Wide16x10, Ultrawide21x9 };
 constexpr int kAspectChoices = 3;
 constexpr const char* kAspectNames[kAspectChoices] = {"16:9", "16:10", "21:9"};
 double aspectValue(AspectRatio a); // 16/9, 16/10, 64/27 (2560x1080)
+// Anisotropic filtering forced on the game's filtered textures (gpu/renderer.cpp), at most what
+// the GPU supports. Off leaves each texture as the game sets it (a few ask for some themselves).
+constexpr int kAnisoChoices[] = {0, 2, 4, 8, 16};
+constexpr int kAnisoCount = int(sizeof kAnisoChoices / sizeof kAnisoChoices[0]);
+constexpr const char* kAnisoNames[kAnisoCount] = {"Off", "2x", "4x", "8x", "16x"};
 
 struct DisplaySettings {
     WindowMode window = WindowMode::Windowed;
@@ -37,6 +42,10 @@ struct DisplaySettings {
     bool skipIntro = false; // fast-forward the boot logos to the title screen
     ButtonIcons buttonIcons = ButtonIcons::PlayStation; // as the game draws its own
     AspectRatio aspect = AspectRatio::Wide16x9;
+    int anisotropy = 0; // one of kAnisoChoices
+    // Present each frame at the monitor's refresh (no tearing). Off shows it as soon as it is
+    // ready; the frame rate cap still paces the game.
+    bool vsync = true;
     // Build every shader and pipeline the cache knows before the game starts, behind a progress
     // screen, instead of in the background while it plays (gpu/renderer.cpp).
     bool precompileShaders = true;
