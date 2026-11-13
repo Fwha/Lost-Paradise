@@ -2,6 +2,12 @@
 //
 // Direct memory is backed by one sparse memfd the size of the PS4's, so mapping the same
 // physical range twice aliases it exactly like on the console.
+//
+// Some GPU drivers cannot import memfd (file-backed) pages: amdgpu's userptr, which RADV
+// uses for VK_EXT_external_memory_host, takes anonymous memory only. When the renderer finds
+// that (useAnonymousDirectMemory), direct memory is mapped as anonymous private memory
+// instead. Each mapping then has its own pages: mapping a physical range that is already
+// mapped elsewhere no longer aliases it, which is logged.
 #include "host/gpu/renderer.h"
 #include "host/hle.h"
 #include "host/kernel.h"
@@ -9,6 +15,7 @@
 
 #include "host/mman.h"
 
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <map>
@@ -33,6 +40,39 @@ enum : int32_t { kMapFixed = 0x10, kMapNoOverwrite = 0x80 };
 std::mutex gMutex;
 int gDirectFd = -1;
 std::map<uint64_t, uint64_t> gAllocated; // start -> length, physical offsets
+
+// Anonymous direct memory (see the top of the file): the mappings made, to tell when the game
+// maps a physical range twice.
+bool gAnonymous = false;
+bool gMappedAny = false; // whether any direct memory was mapped yet: the backing is fixed then
+struct DirectView {
+    uint64_t end, phys; // virtual end, physical offset of the start
+};
+std::map<uint64_t, DirectView> gViews; // virtual start -> view
+std::atomic<uint32_t> gAliasWarnings{0};
+
+// Forgets the views in the virtual range [a, e) (gMutex held), keeping the parts outside it.
+void dropViews(uint64_t a, uint64_t e) {
+    auto it = gViews.upper_bound(a);
+    if (it != gViews.begin()) --it;
+    while (it != gViews.end() && it->first < e) {
+        const uint64_t s = it->first;
+        const DirectView v = it->second;
+        if (v.end <= a) {
+            ++it;
+            continue;
+        }
+        it = gViews.erase(it);
+        if (s < a) gViews[s] = {a, v.phys};
+        if (v.end > e) gViews[e] = {v.end, v.phys + (e - s)};
+    }
+}
+
+// Something else was mapped, or nothing is, at [addr, addr + len).
+void forgetViews(void* addr, uint64_t len) {
+    std::lock_guard lock(gMutex);
+    if (gAnonymous) dropViews(uint64_t(addr), uint64_t(addr) + len);
+}
 
 uint64_t alignUp(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
 
@@ -98,18 +138,41 @@ int32_t sceKernelReleaseDirectMemory(int64_t start, uint64_t len) {
     if (it == gAllocated.end()) return sceError(ps4errno::kENOENT);
     if (it->second != len) std::fprintf(stderr, "[memory] partial direct memory release not supported\n");
     gAllocated.erase(it);
-    releaseSharedMemory(directFd(), uint64_t(start), len);
+    if (!gAnonymous) releaseSharedMemory(directFd(), uint64_t(start), len);
     return 0;
 }
 
 int32_t sceKernelMapDirectMemory(void** addr, uint64_t len, int32_t prot, int32_t flags, int64_t directStart,
                                  uint64_t align) {
     if (!addr || len == 0) return sceError(ps4errno::kEINVAL);
-    int hflags = MAP_SHARED;
+    std::unique_lock lock(gMutex);
+    gMappedAny = true;
+    const bool anonymous = gAnonymous;
+    if (!anonymous) lock.unlock();
+    int hflags = anonymous ? MAP_PRIVATE | MAP_ANONYMOUS : MAP_SHARED;
     if (flags & kMapFixed) hflags |= (flags & kMapNoOverwrite) ? MAP_FIXED_NOREPLACE : MAP_FIXED;
-    void* r = mapAligned(*addr, len, align, hostProt(prot), hflags, directFd(), uint64_t(directStart));
+    void* r = mapAligned(*addr, len, align, hostProt(prot), hflags, anonymous ? -1 : directFd(),
+                         anonymous ? 0 : uint64_t(directStart));
     if (r == MAP_FAILED) return sceErrorFromHost(errno);
     *addr = r;
+    if (anonymous) {
+        const uint64_t va = uint64_t(r), phys = uint64_t(directStart);
+        dropViews(va, va + len); // a fixed mapping replaced what was there
+        for (const auto& [s, v] : gViews) {
+            const uint64_t vlen = v.end - s;
+            if (v.phys < phys + len && phys < v.phys + vlen) {
+                if (gAliasWarnings.fetch_add(1) < 8)
+                    std::fprintf(stderr,
+                                 "[memory] direct memory 0x%llx+0x%llx mapped twice (at 0x%llx and 0x%llx): "
+                                 "anonymous direct memory does not alias it\n",
+                                 (unsigned long long)phys, (unsigned long long)len, (unsigned long long)s,
+                                 (unsigned long long)va);
+                break;
+            }
+        }
+        gViews[va] = {va + len, phys};
+        lock.unlock();
+    }
     render::noteDirectMapping(uint64_t(r), len);
     return 0;
 }
@@ -121,6 +184,7 @@ int32_t sceKernelMapNamedFlexibleMemory(void** addr, uint64_t len, int32_t prot,
     void* r = mapAligned(*addr, len, kPage, hostProt(prot), hflags, -1, 0);
     if (r == MAP_FAILED) return sceErrorFromHost(errno);
     *addr = r;
+    if (hflags & MAP_FIXED) forgetViews(r, len);
     render::noteDirectMapping(uint64_t(r), len); // the game hands the GPU flexible memory too
     return 0;
 }
@@ -129,7 +193,9 @@ int32_t sceKernelMapFlexibleMemory(void** addr, uint64_t len, int32_t prot, int3
 }
 
 int32_t sceKernelMunmap(void* addr, uint64_t len) {
-    return munmap(addr, len) == 0 ? 0 : sceErrorFromHost(errno);
+    if (munmap(addr, len) != 0) return sceErrorFromHost(errno);
+    forgetViews(addr, len);
+    return 0;
 }
 
 int32_t sceKernelMprotect(void* addr, uint64_t len, int32_t prot) {
@@ -148,11 +214,13 @@ void* mmap_(void* addr, uint64_t len, int32_t prot, int32_t flags, int32_t fd, i
     }
     void* r = guestMap(addr, len, kPage, prot & 7, hflags, fd, off);
     if (r == MAP_FAILED) *guestErrno() = toPs4Errno(errno);
+    else if (hflags & MAP_FIXED) forgetViews(r, len);
     return r;
 }
 int32_t munmap_(void* addr, uint64_t len) {
     const int r = munmap(addr, len);
     if (r) *guestErrno() = toPs4Errno(errno);
+    else forgetViews(addr, len);
     return r;
 }
 int32_t msync_(void* addr, uint64_t len, int32_t flags) { return msync(addr, len, flags ? MS_SYNC : MS_ASYNC); }
@@ -170,6 +238,7 @@ int32_t sceKernelMemoryPoolReserve(void* addrIn, uint64_t len, uint64_t align, i
     if (flags & kMapFixed) hflags |= MAP_FIXED;
     void* r = mapAligned(addrIn, len, align ? align : 0x200000, PROT_NONE, hflags, -1, 0);
     if (r == MAP_FAILED) return sceErrorFromHost(errno);
+    if (hflags & MAP_FIXED) forgetViews(r, len);
     *addrOut = r;
     return 0;
 }
@@ -210,6 +279,13 @@ int32_t sceKernelMemoryPoolBatch(const PoolBatchEntry* entries, int32_t n, int32
 }
 
 } // namespace
+
+bool useAnonymousDirectMemory() {
+    std::lock_guard lock(gMutex);
+    if (gMappedAny) return false;
+    gAnonymous = true;
+    return true;
+}
 
 void registerMemoryHle() {
     HLE("libkernel", sceKernelMemoryPoolExpand);

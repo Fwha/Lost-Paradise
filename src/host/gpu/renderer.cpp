@@ -18,6 +18,7 @@
 #include "host/crash.h"
 #include "host/display_settings.h"
 #include "host/kernel.h"
+#include "host/memory.h"
 #include "host/module.h"
 #include "host/videoout.h"
 #include "host/pm4.h"
@@ -727,6 +728,9 @@ public:
             std::fprintf(stderr, "[gpu] no renderer: VK_EXT_external_memory_host is required\n");
             return false;
         }
+#ifndef _WIN32
+        chooseDirectMemoryBacking();
+#endif
         dlss::init(vk_);
         { // pipeline libraries: with generic translations (docs/shader-precompile.md stage 3)
             const char* e = getenv("LPN_PIPELINE_LIBRARIES");
@@ -2197,6 +2201,54 @@ private:
         return b;
     }
 
+#ifndef _WIN32
+    // Whether the driver imports a page mapped like direct memory (MAP_SHARED from a memfd), or
+    // like anonymous memory (fd -1: MAP_PRIVATE | MAP_ANONYMOUS).
+    bool importsMapping(int fd) {
+        const uint64_t align = std::max<uint64_t>(vk_.hostPointerAlignment, 4096), size = std::max<uint64_t>(align, 0x10000);
+        void* reserve = mmap(nullptr, size + align, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (reserve == MAP_FAILED) return false;
+        void* at = reinterpret_cast<void*>((uint64_t(reserve) + align - 1) & ~(align - 1));
+        const int flags = MAP_FIXED | (fd >= 0 ? MAP_SHARED : MAP_PRIVATE | MAP_ANONYMOUS);
+        bool ok = false;
+        if (mmap(at, size, PROT_READ | PROT_WRITE, flags, fd, 0) != MAP_FAILED) {
+            std::memset(at, 0, size); // resident, for importRange's mincore check
+            Import im;
+            if ((ok = importRange(uint64_t(at), uint64_t(at) + size, im))) {
+                vkDestroyBuffer(vk_.device, im.buffer, nullptr);
+                vkFreeMemory(vk_.device, im.memory, nullptr);
+            }
+        }
+        munmap(reserve, size + align);
+        return ok;
+    }
+
+    // Direct memory is a shared memfd so that two mappings of one physical range alias, but
+    // amdgpu (RADV) imports anonymous memory only: every draw from direct memory there failed
+    // to import and read nothing. Then direct memory is anonymous instead.
+    // LPN_DIRECT_MEMORY=shared/anonymous sets it.
+    void chooseDirectMemoryBacking() {
+        const char* e = getenv("LPN_DIRECT_MEMORY");
+        if (e && !std::strcmp(e, "shared")) return;
+        const char* why = "LPN_DIRECT_MEMORY=anonymous";
+        if (!(e && !std::strcmp(e, "anonymous"))) {
+            const int fd = createSharedMemory("lpn-import-probe", 0x10000 + vk_.hostPointerAlignment);
+            const bool shared = fd >= 0 && importsMapping(fd);
+            if (fd >= 0) close(fd);
+            if (shared) return;
+            if (!importsMapping(-1)) {
+                std::fprintf(stderr, "[gpu] the driver imports neither shared nor anonymous memory: direct memory stays shared\n");
+                return;
+            }
+            why = "the driver cannot import shared memory";
+        }
+        if (useAnonymousDirectMemory())
+            std::fprintf(stderr, "[gpu] direct memory is anonymous (%s): a physical range mapped twice does not alias\n", why);
+        else
+            std::fprintf(stderr, "[gpu] direct memory already mapped: it stays shared\n");
+    }
+#endif
+
     bool importRange(uint64_t start, uint64_t end, Import& out) {
         // Some drivers (lavapipe) accept any pointer, so make sure every page is mapped.
         std::vector<unsigned char> residency((end - start + 4095) / 4096);
@@ -2406,7 +2458,11 @@ private:
         const uint64_t gs = addr & ~(kImportGranule - 1), ge = (end + kImportGranule - 1) & ~(kImportGranule - 1);
         const uint64_t ps = addr & ~(align - 1), pe = (end + align - 1) & ~(align - 1);
         if (!importRange(gs, ge, im) && !importRange(ps, pe, im)) {
-            warnOnce("cannot import guest memory at 0x" + std::to_string(addr));
+            {
+                char msg[64];
+                std::snprintf(msg, sizeof msg, "cannot import guest memory at 0x%" PRIx64, addr);
+                warnOnce(msg);
+            }
             return false;
         }
         ++syncImports_;
