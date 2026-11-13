@@ -121,6 +121,7 @@ int32_t sceKernelMapNamedFlexibleMemory(void** addr, uint64_t len, int32_t prot,
     void* r = mapAligned(*addr, len, kPage, hostProt(prot), hflags, -1, 0);
     if (r == MAP_FAILED) return sceErrorFromHost(errno);
     *addr = r;
+    render::noteDirectMapping(uint64_t(r), len); // the game hands the GPU flexible memory too
     return 0;
 }
 int32_t sceKernelMapFlexibleMemory(void** addr, uint64_t len, int32_t prot, int32_t flags) {
