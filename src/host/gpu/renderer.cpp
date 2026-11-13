@@ -3401,6 +3401,18 @@ private:
                     if (l.stage == gcn::Stage::Vertex && slots != ~0u && !programs[0].code.empty() &&
                         programs[0].fetchSite && slots > programs[0].fetchSlots)
                         programs.push_back(gcn::analyzeUnbound(l, readGuest, slots));
+                    // An image its code takes for a cube may still be bound 2D (a face's coordinates
+                    // sampled another way): that translation is made too, the T# its draw gives.
+                    for (size_t n = programs.size(), i = 0; i < n; ++i) {
+                        gcn::Program flat = programs[i];
+                        bool cube = false;
+                        for (gcn::ImageResource& im : flat.images)
+                            if (!im.t[0] && !im.t[1] && !im.t[3] && gcn::imageDimension(flat, im) == 11) {
+                                im.t[3] = 9u << 28;
+                                cube = true;
+                            }
+                        if (cube) programs.push_back(std::move(flat));
+                    }
                     for (const gcn::Program& p : programs) {
                         if (p.code.empty()) {
                             ++failed;

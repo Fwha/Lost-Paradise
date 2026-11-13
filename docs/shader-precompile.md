@@ -82,7 +82,8 @@ shader whose translation still differs from the boot one is logged once
 
 Without a T#, an image's dimension comes from its instruction: a cube when it declares an array
 (DA) or it takes a v_cubeid face third and s, t derived from v_cubesc/v_cubetc but not from the
-face (a 2D atlas of faces adds the face to its coordinates), else 2D. Counting the address registers written before the sample took 154 of the play
+face (a 2D atlas of faces adds the face to its coordinates), else 2D. A shader with an image taken for a cube is
+also translated with it 2D, as one in play was bound. Counting the address registers written before the sample took 154 of the play
 cache's 2D images for 3D, and no 3D image was ever bound.
 
 ### The shader tables (measured on the user's PC, 2026-11-12)
