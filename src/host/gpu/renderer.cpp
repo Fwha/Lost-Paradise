@@ -2241,6 +2241,10 @@ private:
     std::mutex aheadMutex_;
     std::condition_variable aheadCv_;
     std::deque<std::pair<uint64_t, uint64_t>> aheadQueue_; // mapped ranges still to import
+    // Ranges whose pieces are imported and whose seams are not: a buffer lying across two pieces
+    // (or two mappings) is in neither, so a draw imported it. A second import of kAheadChunk
+    // centred on each seam takes every such buffer up to half that size.
+    std::deque<std::pair<uint64_t, uint64_t>> aheadSeams_;
     std::vector<Import> aheadReady_;
     std::atomic<bool> aheadHasReady_{false};
     bool aheadStarted_ = false;
@@ -2265,7 +2269,7 @@ public:
         {
             std::lock_guard lock(aheadMutex_);
             aheadQueue_.emplace_back(addr, addr + len);
-            aheadPending_ += len;
+            aheadPending_ += 2 * len; // its pieces, then its seams
             if (!aheadStarted_) {
                 aheadStarted_ = true;
                 std::thread([this] { importAheadThread(); }).detach();
@@ -2278,35 +2282,50 @@ private:
     void importAheadThread() {
         profile::nameThread("lpn-import");
         const uint64_t align = std::max<uint64_t>(vk_.hostPointerAlignment, 4096);
+        auto import = [&](uint64_t a, uint64_t e) {
+            {
+                std::shared_lock lock(cacheMutex_);
+                VkBuffer b;
+                VkDeviceSize o;
+                if (importFor(a, e - a, b, o)) return;
+            }
+            Import im;
+            const auto t0 = std::chrono::steady_clock::now();
+            if (!importRange(a, e, im)) return;
+            aheadImportNs_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+            ++aheadImports_;
+            aheadImportBytes_ += e - a;
+            std::lock_guard lock(aheadMutex_);
+            aheadReady_.push_back(im);
+            aheadHasReady_.store(true, std::memory_order_release);
+        };
         for (;;) {
             std::pair<uint64_t, uint64_t> range;
+            bool seams;
             {
                 std::unique_lock lock(aheadMutex_);
-                aheadCv_.wait(lock, [&] { return !aheadQueue_.empty(); });
-                range = aheadQueue_.front();
-                aheadQueue_.pop_front();
+                aheadCv_.wait(lock, [&] { return !aheadQueue_.empty() || !aheadSeams_.empty(); });
+                seams = aheadQueue_.empty(); // every mapping's pieces first
+                auto& q = seams ? aheadSeams_ : aheadQueue_;
+                range = q.front();
+                q.pop_front();
             }
             const uint64_t start = (range.first + align - 1) & ~(align - 1), end = range.second & ~(align - 1);
-            for (uint64_t a = start; a < end;) {
-                const uint64_t e = std::min(end, (a + kAheadChunk) & ~(kAheadChunk - 1));
-                bool have;
-                {
-                    std::shared_lock lock(cacheMutex_);
-                    VkBuffer b;
-                    VkDeviceSize o;
-                    have = importFor(a, e - a, b, o);
+            if (seams) {
+                // The mapping's own ends too: the memory beyond may be another mapping (the import
+                // fails if it is not mapped).
+                const uint64_t half = kAheadChunk / 2;
+                import(start - half, start + half);
+                for (uint64_t b = (start + kAheadChunk) & ~(kAheadChunk - 1); b < end; b += kAheadChunk) import(b - half, b + half);
+                import(end - half, end + half);
+            } else {
+                for (uint64_t a = start; a < end;) {
+                    const uint64_t e = std::min(end, (a + kAheadChunk) & ~(kAheadChunk - 1));
+                    import(a, e);
+                    a = e;
                 }
-                Import im;
-                const auto t0 = std::chrono::steady_clock::now();
-                if (!have && importRange(a, e, im)) {
-                    aheadImportNs_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
-                    ++aheadImports_;
-                    aheadImportBytes_ += e - a;
-                    std::lock_guard lock(aheadMutex_);
-                    aheadReady_.push_back(im);
-                    aheadHasReady_.store(true, std::memory_order_release);
-                }
-                a = e;
+                std::lock_guard lock(aheadMutex_);
+                aheadSeams_.push_back(range);
             }
             aheadPending_ -= range.second - range.first;
         }
@@ -2378,6 +2397,9 @@ private:
             return false;
         }
         ++syncImports_;
+        if (R().prof_.on && importAheadOn())
+            std::fprintf(stderr, "[prof] memory import by a draw: 0x%" PRIx64 " +0x%" PRIx64 " (imported 0x%" PRIx64 "-0x%" PRIx64 ")\n", addr,
+                         size, im.start, im.end);
         syncImportNs_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
         {
             std::unique_lock lock(cacheMutex_);
