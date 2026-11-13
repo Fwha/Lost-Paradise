@@ -19,11 +19,20 @@ void saveDisplaySettings();
 // The game picks its render size in one place at boot: rewrite the sizes it stores there.
 // Changing the resolution therefore takes a restart. Returns false when the eboot does not
 // hold the expected instructions (another game version).
-bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height);
+// width x height is the picture (0x0: the game's own). With an upscale ratio above 1 (an
+// upscaler below Native, common/settings_file.h) the game draws its scene that much smaller and
+// still outputs the picture's size (1920x1080 for the game's own): the renderer's upscaler then
+// turns the small scene into the output size (gpu/upscale.h).
+bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height, double upscale = 1.0);
 // With a picture that is not 16:9 (renderSize with an Aspect Ratio), it also outputs at that size
 // and builds its 3D projections for that shape instead of 16:9.
 // The resolution the running game was started with (0x0: the game's own).
 void activeRenderResolution(uint32_t* width, uint32_t* height);
+// The running game's upscale ratio (1: the scene is drawn at the resolution as set).
+double activeUpscaleRatio();
+// When the running game draws its scene smaller than its output (an upscale ratio above 1): the
+// scene's size and the output's (true).
+bool upscaleSizes(uint32_t* sceneW, uint32_t* sceneH, uint32_t* outW, uint32_t* outH);
 // When the running game's picture is not 16:9: its output size (true). The renderer then draws
 // the HUD (what goes into the display buffers but the full-screen scene) in the largest 16:9
 // rectangle in the middle of it. LPN_HUD_STRETCH=1 leaves it stretched to the whole picture.

@@ -9,10 +9,21 @@
 namespace host {
 
 enum class WindowMode { Windowed, Borderless, Fullscreen };
-// NVIDIA DLSS (gpu/dlss.h): anti-aliasing at the render size (DLAA) or upscaling to it.
-enum class DlssMode { Off, Dlaa, Quality, Balanced, Performance };
-constexpr int kDlssModes = 5;
-const char* dlssModeName(DlssMode m); // "Off", "DLAA", "Quality", ...
+// The temporal upscaler that replaces the game's SMAA (gpu/upscale.h): NVIDIA DLSS (an RTX card
+// with NVIDIA's driver) or AMD FSR 3.1 (any GPU). Off keeps the game's own anti-aliasing.
+enum class Upscaler { Off, Dlss, Fsr };
+constexpr int kUpscalerChoices = 3;
+constexpr const char* kUpscalerNames[kUpscalerChoices] = {"Off", "DLSS", "FSR 3.1"};
+// How small the upscaler's scene is drawn. Native anti-aliases at the resolution as set (DLAA,
+// or FSR's native AA); the others draw the scene smaller (each side divided by
+// kUpscaleRatios) and upscale it to the output size. Changing between Native and the others
+// takes a restart (the game picks its render size at boot).
+enum class UpscaleQuality { Native, Quality, Balanced, Performance };
+constexpr int kUpscaleQualities = 4;
+constexpr const char* kUpscaleQualityNames[kUpscaleQualities] = {"Native", "Quality", "Balanced", "Performance"};
+constexpr double kUpscaleRatios[kUpscaleQualities] = {1.0, 1.5, 1.7, 2.0};
+// "Off", "DLAA", "DLSS Quality", "FSR Native AA", "FSR Performance", ...
+std::string upscaleLabel(Upscaler u, UpscaleQuality q);
 // Which controller's buttons the menus' control hints show (host/pad_glyphs.h). Auto follows the
 // controller plugged in.
 enum class ButtonIcons { PlayStation, Xbox, Switch, Auto };
@@ -38,7 +49,8 @@ struct DisplaySettings {
     // Frames a second shown at most (see setFpsCap); 0 leaves the rate to the game.
     int fps = 30;
     bool fpsCounter = false; // frames shown a second, in the top right corner
-    DlssMode dlss = DlssMode::Off;
+    Upscaler upscaler = Upscaler::Off;
+    UpscaleQuality upscaleQuality = UpscaleQuality::Quality;
     bool skipIntro = false; // fast-forward the boot logos to the title screen
     ButtonIcons buttonIcons = ButtonIcons::PlayStation; // as the game draws its own
     AspectRatio aspect = AspectRatio::Wide16x9;
@@ -61,6 +73,10 @@ bool writeSettings(const std::string& path, const DisplaySettings& s);
 // own); otherwise the resolution's height (896 for the game's own) and as wide as the aspect ratio
 // makes it, to 32 pixels: 1080p at 21:9 is 2560x1080, at 16:10 1728x1080.
 void renderSize(const DisplaySettings& s, uint32_t* width, uint32_t* height);
+// How much smaller than the output the scene is drawn: 1 without an upscaler or at Native.
+double upscaleRatio(const DisplaySettings& s);
+// The scene's size for an output of outW x outH at a ratio: each side divided by it, to 8 pixels.
+void upscaledSceneSize(uint32_t outW, uint32_t outH, double ratio, uint32_t* w, uint32_t* h);
 
 // The choices the menus offer.
 constexpr const char* kWindowModeNames[] = {"Windowed", "Borderless Fullscreen", "Fullscreen"};

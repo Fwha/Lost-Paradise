@@ -24,7 +24,9 @@ and known issues.
   sides and 16:10 a little less), and the HUD stays 16:9 in the middle. Not stretched.
 - **Frame rate:** cap at 30, 60 or 90 fps, or uncapped, with the game still running at normal
   speed. The title screen, menus and real-time cutscenes go uncapped too. Optional FPS counter.
-- **DLAA:** NVIDIA DLSS anti-aliasing in place of the game's SMAA (RTX cards, see Build).
+- **Upscaling:** NVIDIA DLSS (RTX cards) or AMD FSR 3.1 (any GPU) in place of the game's SMAA,
+  either as anti-aliasing at full resolution (Native, DLAA) or rendering the 3D scene smaller
+  and upscaling it (Quality, Balanced, Performance). See Build.
 - **PC Settings:** these options from the F11 menu, from a PC SETTINGS entry in the title
   and pause menus, or from the launcher.
 - **Launcher:** an AppImage with Play, Settings, Skip intro logos and a .pkg unpacker.
@@ -47,7 +49,8 @@ ninja -C build
 scripts/fetch-nids.sh aerolib.csv     # import names, needed to run
 ```
 
-Optional, for NVIDIA DLSS: run `scripts/fetch-dlss.sh`, then the two build commands again.
+Optional, for the upscalers: `scripts/fetch-fsr.sh` (AMD FSR 3.1) and `scripts/fetch-dlss.sh`
+(NVIDIA DLSS), then the two build commands again.
 
 ### Windows (experimental)
 
@@ -55,7 +58,8 @@ Each push builds a Windows zip: open the commit's **Windows** workflow run on Gi
 `Lost_Paradise-windows` under Artifacts. Unzip it, put the dump in the `game` folder next to
 `Lost Paradise.exe` (the launcher makes the folder on its first start) and press Play; the
 game's log goes to `play.log` in that folder. Releases carry the same zip. Needs Windows 10 1803
-or later and a Vulkan driver. DLSS is Linux only for now.
+or later and a Vulkan driver. FSR works there too (`scripts/fetch-fsr.sh` before building); DLSS is
+Linux only for now (the DLSS SDK's Windows libraries are built for MSVC).
 
 To build it yourself, in an [MSYS2](https://www.msys2.org) UCRT64 shell:
 
@@ -217,9 +221,12 @@ Third-party code and art keep their own licenses:
 - `external/nanosvg`: zlib (notice at the top of each header).
 - `external/controllerimage`: button art is public domain, see its `DATA-LICENSE.txt` and
   `credits.txt`.
+- FSR-Vulkan (optional, fetched by `scripts/fetch-fsr.sh`, not in this repository):
+  [FireBurn/FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan), MIT, with AMD's FidelityFX SDK
+  1.1.4 (MIT). Only its FSR 3.1 upscaler is built.
 - NVIDIA DLSS SDK (optional, fetched by `scripts/fetch-dlss.sh`, not in this repository):
   NVIDIA RTX SDKs license. Release builds that bundle the DLSS runtime are subject to it.
 - `aerolib.csv` (fetched by `scripts/fetch-nids.sh`, not in this repository): from
   [zecoxao/sce_symbols](https://github.com/zecoxao/sce_symbols).
 
-This project is not affiliated with or endorsed by Sega, Sony or NVIDIA.
+This project is not affiliated with or endorsed by Sega, Sony, NVIDIA or AMD.

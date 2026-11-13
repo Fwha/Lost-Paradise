@@ -181,6 +181,15 @@ bool Vk::init(std::string* error) {
     want13.dynamicRendering = VK_TRUE;
     want13.synchronization2 = have13.synchronization2;
     want13.maintenance4 = have13.maintenance4;
+    // FSR's 16-bit shader variants and its subgroup sizes (gpu/fsr.cpp), when the GPU has them.
+    want12.shaderFloat16 = have12.shaderFloat16;
+    want13.subgroupSizeControl = have13.subgroupSizeControl;
+    want13.computeFullSubgroups = have13.computeFullSubgroups;
+    storageWriteWithoutFormat = h.shaderStorageImageWriteWithoutFormat;
+    shaderFloat16 = have12.shaderFloat16;
+    subgroupSizeControl = have13.subgroupSizeControl;
+    computeFullSubgroups = have13.computeFullSubgroups;
+    synchronization2 = have13.synchronization2;
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};

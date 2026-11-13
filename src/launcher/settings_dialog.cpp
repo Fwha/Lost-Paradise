@@ -72,10 +72,20 @@ const std::vector<Tab> kTabs = {
      }},
     {"Graphics",
      {
-         {"DLSS", "NVIDIA DLAA: DLSS anti-aliasing in place of the game's. Needs an RTX card; Off on other GPUs.", true,
-          [](const DisplaySettings&) { return std::vector<std::string>{"Off", "DLAA"}; },
-          [](const DisplaySettings& s) { return int(s.dlss != host::DlssMode::Off); },
-          [](DisplaySettings& s, int i) { s.dlss = i ? host::DlssMode::Dlaa : host::DlssMode::Off; }},
+         {"Upscaler",
+          "Replace the game's anti-aliasing with NVIDIA DLSS (RTX cards with NVIDIA's driver) or AMD FSR 3.1 (any GPU). "
+          "Off on a GPU that cannot run the one chosen.",
+          true, [](const DisplaySettings&) { return names(host::kUpscalerNames, host::kUpscalerChoices); },
+          [](const DisplaySettings& s) { return int(s.upscaler); },
+          [](DisplaySettings& s, int i) { s.upscaler = host::Upscaler(std::clamp(i, 0, host::kUpscalerChoices - 1)); }},
+         {"Upscale Quality",
+          "Native anti-aliases at the resolution as set (DLAA). Quality, Balanced and Performance render the 3D scene "
+          "smaller (1.5x, 1.7x, 2x) and upscale it, for more speed.",
+          true, [](const DisplaySettings&) { return names(host::kUpscaleQualityNames, host::kUpscaleQualities); },
+          [](const DisplaySettings& s) { return int(s.upscaleQuality); },
+          [](DisplaySettings& s, int i) {
+              s.upscaleQuality = host::UpscaleQuality(std::clamp(i, 0, host::kUpscaleQualities - 1));
+          }},
          {"Anisotropic Filtering", "Keep textures sharp at a glancing angle, such as the ground ahead. Up to what your GPU supports.",
           false, [](const DisplaySettings&) { return names(host::kAnisoNames, host::kAnisoCount); }, anisoIndex,
           [](DisplaySettings& s, int i) { s.anisotropy = host::kAnisoChoices[std::clamp(i, 0, host::kAnisoCount - 1)]; }},

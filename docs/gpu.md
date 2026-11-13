@@ -139,21 +139,40 @@ is not emulated, and `ds_swizzle_b32` only in its quad mode.
 
 2D-tiled detiling, a swapchain, and batching draws per render pass.
 
-## DLSS (DLAA)
+## Upscaling (DLSS, FSR)
 
-`scripts/fetch-dlss.sh` puts NVIDIA's DLSS SDK in `third_party/dlss`; cmake then links NGX and
-copies the DLSS runtime beside `lpn-host`. PC Settings > DLSS (Off/DLAA, `dlss` in
-lpn-display.ini) replaces the game's SMAA (three full-screen draws, found by a hash of their
-pixel shaders' code) with DLAA (`gpu/dlss.cpp`, `dlssSmaa` in the renderer):
+PC Settings > Upscaler (Off/DLSS/FSR 3.1) and Upscale Quality (Native/Quality/Balanced/
+Performance; `upscaler` and `upscale_quality` in lpn-display.ini, an older `dlss = ...` is read
+as DLSS) replace the game's SMAA (three full-screen draws, found by a hash of their pixel
+shaders' code) with a temporal upscaler (`gpu/upscale.h`; `upscaleSmaa` in the renderer):
 
-- Depth: the depth buffer bound to the SMAA blend (the scene's).
+- DLSS: `scripts/fetch-dlss.sh` puts NVIDIA's DLSS SDK in `third_party/dlss`; cmake then links
+  NGX and copies the DLSS runtime beside `lpn-host` (`gpu/dlss.cpp`; Linux only).
+- FSR 3.1: `scripts/fetch-fsr.sh` puts FSR-Vulkan (MIT; AMD's FidelityFX SDK 1.1.4 upscaler, its
+  Vulkan backend and compiled shaders behind a C API) in `third_party/fsr-vulkan`; cmake builds
+  its upscaler into `lpn-host` (`gpu/fsr.cpp`). Any GPU with storage writes without a format.
+- Native: the upscaler anti-aliases the scene where the SMAA blend would (DLAA, FSR native AA).
+- Quality/Balanced/Performance: at boot the game is told to draw its scene 1.5x/1.7x/2x smaller
+  (each side, to 8 pixels) while its output keeps the resolution (1080p at least, as the game's
+  own). The game already draws its scene smaller than its output on a base PS4 (1600x896 into
+  1920x1080) and scales it up in a later full-screen pass. The SMAA blend is skipped and the
+  scene left as it is until a draw first samples it (the game may still draw into it: Ken's aura).
+  That draw runs the upscaler into an image at the output size, and it and later draws of the
+  frame sample that image wherever they sample the scene (`resolveImageUncached`, with the UV
+  scale mapping the scene's part of the texture onto it). A draw that then renders or stores
+  into the scene ends that for the frame (logged once). `[upscale] ... first read by` says which
+  pass that was. Mipmapped textures get a mip bias of log2(scene / output).
+- Depth: the depth buffer bound to the SMAA blend (the scene's). FSR gets an R32F copy the motion
+  pass writes. The camera's projection gives FSR the depth range (inverted or not) and the field
+  of view.
 - Motion vectors: a compute pass reprojects that depth with this and last frame's camera. The
   scene vertex shaders read it from the constant buffer whose V# s[12:13] points at: projection
   rows at 0x0, view rotation rows at 0x40/0x50/0x60, camera position at 0x220 (positions are
-  camera-relative). Only camera motion: moving characters rely on DLSS.
+  camera-relative). Only camera motion: moving characters rely on the upscaler.
 - Jitter: every draw with the scene depth bound before SMAA (full-screen lighting passes too, or
-  shadows flicker) gets a Halton sub-pixel viewport offset, passed to DLSS as is. So do 3D draws
-  after SMAA that depth-test against it (Ken's aura redraws his body additively; unjittered it
-  passed or failed its depth test by frame and flickered).
-- `[dlss] last 300 frames` lines count history resets; `LPN_DLSS_NO_JITTER=1`,
-  `LPN_DLSS_JITTER_SIGN=x,y` for debugging. Upscaling (render the scene smaller) is not done.
+  shadows flicker) gets a Halton sub-pixel viewport offset (8 phases, 8 x ratio^2 when
+  upscaling), passed to the upscaler as is. So do 3D draws after SMAA that depth-test against it
+  (Ken's aura redraws his body additively; unjittered it passed or failed its depth test by frame
+  and flickered).
+- `[upscale] last 300 frames` lines count history resets; `LPN_UPSCALE_NO_JITTER=1` (or
+  `LPN_DLSS_NO_JITTER=1`), `LPN_DLSS_JITTER_SIGN=x,y` for debugging.
