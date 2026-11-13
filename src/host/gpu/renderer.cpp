@@ -3420,6 +3420,7 @@ private:
                         std::lock_guard lock(bootMutex_);
                         bootNames_.insert(name);
                         bootEntries_.insert(l.entry);
+                        bootPrograms_.emplace(l.entry, p);
                     }
                     if (const size_t d = ++done; d % 500 == 0)
                         std::fprintf(stderr, "[gpu] boot compile: %zu of %zu after %.1f s\n", d, shaders.size(),
@@ -3451,9 +3452,33 @@ private:
         if (!bootDone_.load() || p.launch.stage == gcn::Stage::Compute) return;
         std::lock_guard lock(bootMutex_);
         if (bootNames_.count(name) || !bootEntries_.count(p.launch.entry) || !bootMissed_.insert(p.launch.entry).second) return;
-        std::fprintf(stderr, "[gpu] boot compile missed %s 0x%" PRIx64 ": its draw translates it otherwise\n",
-                     p.launch.stage == gcn::Stage::Pixel ? "ps" : "vs", p.launch.entry);
+        std::string why;
+        auto add = [&](const std::string& w) { why += (why.empty() ? "" : ", ") + w; };
+        auto it = bootPrograms_.find(p.launch.entry);
+        if (it != bootPrograms_.end()) { // what differs, as lpn-gcn --boot reports it
+            const gcn::Program& b = it->second;
+            if (p.fetchSlots != b.fetchSlots)
+                add("fetch slots " + std::to_string(p.fetchSlots) + " drawn, " + std::to_string(b.fetchSlots) + " at boot");
+            if (p.code.size() != b.code.size()) add("code walked " + std::to_string(p.code.size()) + " vs " + std::to_string(b.code.size()));
+            if (p.buffers.size() != b.buffers.size()) add("buffers " + std::to_string(p.buffers.size()) + " vs " + std::to_string(b.buffers.size()));
+            if (p.images.size() != b.images.size()) add("images " + std::to_string(p.images.size()) + " vs " + std::to_string(b.images.size()));
+            else
+                for (size_t i = 0; i < p.images.size(); ++i) {
+                    const uint32_t dp = gcn::imageDimension(p, p.images[i]), db = gcn::imageDimension(b, b.images[i]);
+                    if (dp != db) add("image " + std::to_string(i) + " dimension " + std::to_string(dp) + " drawn, " + std::to_string(db) + " at boot");
+                    if (p.images[i].numFormat() == 4 || p.images[i].numFormat() == 5) add("image " + std::to_string(i) + " integer");
+                }
+            if (p.smrd.size() != b.smrd.size()) add("scalar loads " + std::to_string(p.smrd.size()) + " vs " + std::to_string(b.smrd.size()));
+            if (p.launch.stage == gcn::Stage::Pixel) {
+                if (p.launch.colorUint != b.launch.colorUint || p.launch.colorSint != b.launch.colorSint) add("integer targets");
+                if (p.launch.colorFormat != b.launch.colorFormat) add("export formats");
+            }
+            if (why.empty()) add("other");
+        }
+        std::fprintf(stderr, "[gpu] boot compile missed %s 0x%" PRIx64 ": its draw translates it otherwise (%s)\n",
+                     p.launch.stage == gcn::Stage::Pixel ? "ps" : "vs", p.launch.entry, why.c_str());
     }
+    std::unordered_map<uint64_t, gcn::Program> bootPrograms_; // what the boot compile translated, for the reasons above
     std::mutex bootMutex_;
     std::unordered_set<std::string> bootNames_;
     std::unordered_set<uint64_t> bootEntries_, bootMissed_;
