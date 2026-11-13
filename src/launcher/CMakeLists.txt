@@ -6,6 +6,7 @@ if(NOT SDL2_FOUND)
 endif()
 add_executable(lpn-launcher
     main.cpp
+    settings_dialog.cpp
     updater.cpp
     ../host/menu_font.cpp
     ../host/pad_glyphs.cpp
@@ -18,7 +19,12 @@ if(WIN32)
     target_sources(lpn-launcher PRIVATE "${PROJECT_SOURCE_DIR}/packaging/windows/launcher.rc")
     set_target_properties(lpn-launcher PROPERTIES WIN32_EXECUTABLE ON OUTPUT_NAME "Lost Paradise")
     target_compile_definitions(lpn-launcher PRIVATE SDL_MAIN_HANDLED)
-    target_link_libraries(lpn-launcher PRIVATE comdlg32 shell32 ole32)
+    target_sources(lpn-launcher PRIVATE settings_dialog_win32.cpp)
+    target_link_libraries(lpn-launcher PRIVATE comdlg32 shell32 ole32 comctl32)
+else()
+    # GTK 3 is opened at run time (settings_dialog_gtk.cpp): nothing to build or link against.
+    target_sources(lpn-launcher PRIVATE settings_dialog_gtk.cpp)
+    target_link_libraries(lpn-launcher PRIVATE ${CMAKE_DL_LIBS})
 endif()
 target_include_directories(lpn-launcher SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/external/stb"
                            "${PROJECT_SOURCE_DIR}/external/nanosvg")
