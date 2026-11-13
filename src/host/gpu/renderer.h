@@ -51,6 +51,8 @@ bool warmupProgress(WarmupProgress& p);
 bool bootCompileProgress(size_t& done, size_t& total);
 // Starts the game now; what is left builds in the background as when the setting is off.
 void skipWarmup();
+// The most anisotropic filtering the GPU does (1: none; 16 before the renderer starts).
+int maxAnisotropy();
 
 // The game mapped direct or flexible memory at [address, address + size): the renderer imports it into
 // Vulkan ahead of the draws that read it, where a draw doing so would hitch (any thread).

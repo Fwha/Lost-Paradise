@@ -3,6 +3,9 @@
 #include "host/display_menu.h"
 #include "host/display_settings.h"
 #include "host/gpu/dlss.h"
+#include "host/gpu/renderer.h"
+
+#include <algorithm>
 
 namespace host {
 
@@ -42,7 +45,31 @@ void aspectChoose(int i) {
     saveDisplaySettings();
 }
 
+// The levels the GPU does (render::maxAnisotropy): Off and up to its most.
+std::vector<std::string> anisoChoices() {
+    std::vector<std::string> out;
+    for (int i = 0; i < kAnisoCount; ++i)
+        if (i == 0 || kAnisoChoices[i] <= render::maxAnisotropy()) out.push_back(kAnisoNames[i]);
+    return out;
+}
+int anisoValue() {
+    int v = 0;
+    for (int i = 0; i < kAnisoCount; ++i)
+        if (kAnisoChoices[i] == displaySettings().anisotropy) v = i;
+    return std::min(v, int(anisoChoices().size()) - 1);
+}
+void anisoChoose(int i) {
+    if (i < 0 || i >= int(anisoChoices().size())) return;
+    displaySettings().anisotropy = kAnisoChoices[i];
+    saveDisplaySettings();
+}
+
 std::vector<std::string> onOff() { return {"Off", "On"}; }
+int vsyncValue() { return displaySettings().vsync ? 1 : 0; }
+void vsyncChoose(int i) {
+    displaySettings().vsync = i != 0; // the window thread applies it (window.cpp)
+    saveDisplaySettings();
+}
 int skipIntroValue() { return displaySettings().skipIntro ? 1 : 0; }
 void skipIntroChoose(int i) {
     displaySettings().skipIntro = i != 0;
@@ -69,10 +96,14 @@ const std::vector<PcSetting>& pcSettings() {
          &aspectChoices, &aspectSetting, &aspectChoose},
         display<2>("Frame Rate Cap",
                    "Set the most frames shown per second. Uncapped follows the monitor's refresh rate."),
+        {"VSync", "Show each frame at the monitor's refresh, without tearing. Off can lower input lag.", &onOff,
+         &vsyncValue, &vsyncChoose},
         display<3>("FPS Counter", "Show the frame rate in the top right corner of the screen."),
         {"DLSS",
          "NVIDIA DLAA: DLSS anti-aliasing in place of the game's. Needs an RTX card; Off on other GPUs.",
          &dlssChoices, &dlssValue, &dlssChoose},
+        {"Anisotropic Filtering", "Keep textures sharp at a glancing angle, such as the ground ahead. Off: as the game sets them.",
+         &anisoChoices, &anisoValue, &anisoChoose},
         {"Skip Intro Logos", "Go straight to the title screen when the game starts. Takes effect at the next start.",
          &onOff, &skipIntroValue, &skipIntroChoose},
         {"Button Icons",

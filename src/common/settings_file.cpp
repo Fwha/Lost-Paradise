@@ -69,6 +69,12 @@ void readSettings(const std::string& path, DisplaySettings& s) {
                 if (!std::strcmp(value, kButtonIconKeys[i])) s.buttonIcons = ButtonIcons(i);
         } else if (!std::strcmp(key, "precompile_shaders")) {
             s.precompileShaders = !std::strcmp(value, "on");
+        } else if (!std::strcmp(key, "anisotropy")) {
+            s.anisotropy = 0;
+            for (int i = 1; i < kAnisoCount; ++i)
+                if (std::atoi(value) == kAnisoChoices[i]) s.anisotropy = kAnisoChoices[i];
+        } else if (!std::strcmp(key, "vsync")) {
+            s.vsync = std::strcmp(value, "off") != 0;
         } else if (!std::strcmp(key, "aspect")) {
             for (int i = 0; i < kAspectChoices; ++i)
                 if (!std::strcmp(value, kAspectKeys[i])) s.aspect = AspectRatio(i);
@@ -90,6 +96,9 @@ bool writeSettings(const std::string& path, const DisplaySettings& s) {
     std::fprintf(f, "skip_intro = %s\n", s.skipIntro ? "on" : "off");
     std::fprintf(f, "button_icons = %s\n", kButtonIconKeys[int(s.buttonIcons)]);
     std::fprintf(f, "aspect = %s\n", kAspectKeys[int(s.aspect)]);
+    if (s.anisotropy) std::fprintf(f, "anisotropy = %dx\n", s.anisotropy);
+    else std::fprintf(f, "anisotropy = off\n");
+    std::fprintf(f, "vsync = %s\n", s.vsync ? "on" : "off");
     std::fprintf(f, "precompile_shaders = %s\n", s.precompileShaders ? "on" : "off");
     return std::fclose(f) == 0;
 }

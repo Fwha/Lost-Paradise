@@ -1263,6 +1263,8 @@ public:
         dlssFrameEnd();
         sweepVram();
         trace_ = false; // recorder threads read it (a traced frame is recorded here, in order)
+        // Anisotropic Filtering changed: remembered bindings hold the old samplers.
+        if (const int a = displaySettings().anisotropy; a != anisoSeen_) anisoSeen_ = a, ++imageGen_;
         ++frame_;
         frameNow_.store(frame_, std::memory_order_relaxed);
         if (!pendingCapture_.empty()) { // F12: trace this frame into the capture folder
@@ -3677,6 +3679,12 @@ private:
     }
 
   public:
+    int maxAnisotropy() {
+        VkPhysicalDeviceFeatures f{};
+        vkGetPhysicalDeviceFeatures(vk_.phys, &f);
+        return f.samplerAnisotropy ? int(vk_.props.limits.maxSamplerAnisotropy) : 1;
+    }
+
     bool warmupProgress(WarmupProgress& p) {
         if (!warmupAll_.load() || warmupDone_.load()) return false;
         p.phase = warmupPhase_.load();
@@ -4273,7 +4281,9 @@ private:
     // ---- resources -----------------------------------------------------------------------------
 
     VkSampler sampler(const uint32_t* s, bool compare) {
-        std::array<uint32_t, 5> key{s[0], s[1], s[2], s[3], compare};
+        // The Anisotropic Filtering setting is part of the key: a change makes new samplers.
+        const uint32_t userAniso = uint32_t(std::max(displaySettings().anisotropy, 0));
+        std::array<uint32_t, 6> key{s[0], s[1], s[2], s[3], compare, userAniso};
         auto it = samplers_.find(key);
         if (it != samplers_.end()) return it->second;
         auto wrap = [](uint32_t m) {
@@ -4302,11 +4312,15 @@ private:
         const int32_t bias = int32_t(s[2] << 18) >> 18;
         ci.mipLodBias = std::clamp(float(bias) / 256.0f, -vk_.props.limits.maxSamplerLodBias,
                                    vk_.props.limits.maxSamplerLodBias);
-        // MAX_ANISO_RATIO 0-4: 1x to 16x, used when a filter is anisotropic. LPN_ANISO=N forces Nx
-        // on every filtered sampler (1 turns it off).
+        // MAX_ANISO_RATIO 0-4: 1x to 16x, used when a filter is anisotropic. The Anisotropic
+        // Filtering setting raises every filtered (non-depth-compare) sampler to at least its Nx.
+        // LPN_ANISO=N forces Nx on them instead (1 turns it off).
         static const int forced = getenv("LPN_ANISO") ? std::atoi(getenv("LPN_ANISO")) : 0;
         float aniso = (mag >= 2 || min >= 2) ? float(1u << std::min((s[0] >> 9) & 7, 4u)) : 1.0f;
-        if (forced > 0 && (min & 1) && !compare) aniso = float(forced);
+        if ((min & 1) && !compare) {
+            if (forced > 0) aniso = float(forced);
+            else if (userAniso > 1) aniso = std::max(aniso, float(userAniso));
+        }
         static const bool canAniso = [this] { // the device enables it whenever it has it (vk.cpp)
             VkPhysicalDeviceFeatures f{};
             vkGetPhysicalDeviceFeatures(vk_.phys, &f);
@@ -7626,7 +7640,7 @@ void main() {
     std::unordered_map<std::array<uint32_t, 6>, GuestTexture, WordsHash> textures_;
     static constexpr uint32_t kMaxMips = 15;
     const bool noMips_ = getenv("LPN_NO_MIPS") != nullptr;
-    std::map<std::array<uint32_t, 5>, VkSampler> samplers_;
+    std::map<std::array<uint32_t, 6>, VkSampler> samplers_;
     std::unordered_map<std::string, std::unique_ptr<ShaderModule>> shaders_;
     std::unordered_map<uint64_t, VkShaderModule> expanders_;
     std::unordered_map<std::string, Layout> layouts_;
@@ -7694,6 +7708,7 @@ private:
     };
     std::array<ImageMemo, kImageMemos> imageMemos_{};
     uint64_t imageGen_ = 1;
+    int anisoSeen_ = 0; // the Anisotropic Filtering setting the bindings were made with
     std::string spirvDir_; // "-": no SPIR-V cache
     VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
     std::string pipelineCachePath_;
@@ -8308,6 +8323,8 @@ bool startRenderer(bool computeOnly) {
 bool warmupProgress(WarmupProgress& p) { return gRenderer && gRenderer->warmupProgress(p); }
 
 bool bootCompileProgress(size_t& done, size_t& total) { return gRenderer && gRenderer->bootProgress(done, total); }
+
+int maxAnisotropy() { return gRenderer ? gRenderer->maxAnisotropy() : 16; }
 
 void skipWarmup() {
     if (gRenderer) gRenderer->skipWarmup();

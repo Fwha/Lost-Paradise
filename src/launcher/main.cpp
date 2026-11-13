@@ -128,8 +128,10 @@ const Row kRows[] = {
     {"Resolution", "Set the 3D rendering resolution."},
     {"Aspect Ratio", "Match your monitor's shape: the 3D view widens to fit, the HUD stays 16:9 in the middle."},
     {"Frame Rate Cap", "Set the most frames shown per second. Uncapped follows the monitor's refresh rate."},
+    {"VSync", "Show each frame at the monitor's refresh, without tearing. Off can lower input lag."},
     {"FPS Counter", "Show the frame rate in the top right corner of the screen."},
     {"DLSS", "NVIDIA DLAA: DLSS anti-aliasing in place of the game's. Needs an RTX card; Off on other GPUs."},
+    {"Anisotropic Filtering", "Keep textures sharp at a glancing angle, such as the ground ahead. Up to what your GPU supports."},
     {"Skip Intro Logos", "Go straight to the title screen when the game starts."},
     {"Button Icons", "Which controller's buttons to show. Auto matches your controller. Takes effect at the next start."},
     {"Compile Shaders", "Build every shader seen in earlier runs before the game starts, so they don't stutter in play. In Background: they build while you play."},
@@ -147,6 +149,12 @@ int fpsIndex() {
     return -1;
 }
 
+int anisoIndex() {
+    for (int i = 0; i < host::kAnisoCount; ++i)
+        if (host::kAnisoChoices[i] == gS.anisotropy) return i;
+    return 0;
+}
+
 std::string valueName(int row) {
     switch (row) {
     case 0: return host::kWindowModeNames[int(gS.window)];
@@ -160,10 +168,12 @@ std::string valueName(int row) {
         return name;
     }
     case 3: return gS.fps ? std::to_string(gS.fps) : "Uncapped";
-    case 4: return gS.fpsCounter ? "On" : "Off";
-    case 5: return gS.dlss != host::DlssMode::Off ? "DLAA" : "Off";
-    case 6: return gS.skipIntro ? "On" : "Off";
-    case 7: return host::kButtonIconNames[int(gS.buttonIcons)];
+    case 4: return gS.vsync ? "On" : "Off";
+    case 5: return gS.fpsCounter ? "On" : "Off";
+    case 6: return gS.dlss != host::DlssMode::Off ? "DLAA" : "Off";
+    case 7: return host::kAnisoNames[anisoIndex()];
+    case 8: return gS.skipIntro ? "On" : "Off";
+    case 9: return host::kButtonIconNames[int(gS.buttonIcons)];
     default: return gS.precompileShaders ? "At Startup" : "In Background";
     }
 }
@@ -186,10 +196,12 @@ void stepValue(int row, int d) {
         gS.fps = host::kFpsChoices[wrap(i < 0 ? (d > 0 ? 0 : -1) : i + d, host::kFpsCount)];
         break;
     }
-    case 4: gS.fpsCounter = !gS.fpsCounter; break;
-    case 5: gS.dlss = gS.dlss == host::DlssMode::Off ? host::DlssMode::Dlaa : host::DlssMode::Off; break;
-    case 6: gS.skipIntro = !gS.skipIntro; break;
-    case 8: gS.precompileShaders = !gS.precompileShaders; break;
+    case 4: gS.vsync = !gS.vsync; break;
+    case 5: gS.fpsCounter = !gS.fpsCounter; break;
+    case 6: gS.dlss = gS.dlss == host::DlssMode::Off ? host::DlssMode::Dlaa : host::DlssMode::Off; break;
+    case 7: gS.anisotropy = host::kAnisoChoices[wrap(anisoIndex() + d, host::kAnisoCount)]; break;
+    case 8: gS.skipIntro = !gS.skipIntro; break;
+    case 10: gS.precompileShaders = !gS.precompileShaders; break;
     default: gS.buttonIcons = host::ButtonIcons(wrap(int(gS.buttonIcons) + d, host::kButtonIconChoices)); break;
     }
     save();
@@ -279,8 +291,8 @@ const Box kSkip{40, kH - 64, 300, 32};
 const Box kUpdate{kW - 260, 24, 236, 40};
 const Box kGear{kW - 84, kH - 56, 44, 44};
 // Settings screen
-const Box kPanel{176, 64, kW - 352, 470};
-constexpr int kRowY0 = 134, kRowH = 37;
+const Box kPanel{176, 40, kW - 352, 512};
+constexpr int kRowY0 = 110, kRowH = 34;
 Box rowBox(int r) { return {kPanel.x + 24, kRowY0 + r * kRowH, kPanel.w - 48, kRowH - 6}; }
 Box arrowBox(int r, bool right) {
     const Box b = rowBox(r);
@@ -790,7 +802,7 @@ void drawSettings(int focus) {
     if (focus < kRowCount) {
         color(200, 192, 176);
         std::string d = kRows[focus].description;
-        if (focus == 1 || focus == 2 || focus == 5) d += " Takes effect at the next start.";
+        if (focus == 1 || focus == 2 || focus == 6) d += " Takes effect at the next start.";
         // Up to two lines, broken between words.
         const int maxW = kPanel.w - 56;
         std::string first = d, rest;

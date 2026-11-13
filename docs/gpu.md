@@ -95,7 +95,8 @@ screen loop). Addresses are guest addresses and change between runs.
   memory with their whole mip chain (levels 0 to the T#'s LAST_LEVEL, laid out as GCN does for
   linear-aligned and 1D-thin modes), detiled if needed, and re-uploaded when their bytes change.
   Samplers take the S#'s LOD bias and anisotropy. `LPN_NO_MIPS=1` uploads level 0 only;
-  `LPN_ANISO=N` forces Nx anisotropic filtering on filtered samplers. Each texture is hashed
+  the Anisotropic Filtering setting (`anisotropy` in lpn-display.ini) raises filtered samplers to
+  at least Nx, clamped to the device's limit; `LPN_ANISO=N` forces Nx on them instead. Each texture is hashed
   once per frame, in 128 KiB chunks on worker threads (~90 MB per gameplay frame).
 - **Draws.** RECTLIST and QUADLIST go through a generated geometry shader; GNM's
   decompress/eliminate passes are skipped; screen-space draws (viewport transform off) are
