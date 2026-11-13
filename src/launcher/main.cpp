@@ -4,6 +4,8 @@
 // the working directory (on Windows: $LPN_HOME, else the folder of the .exe). That folder holds game/CUSA12776 (common/game_dir.h), lpn-data,
 // lpn-display.ini and play.log, as for launch.sh. The settings are the in-game PC Settings: both
 // read and write lpn-display.ini (common/settings_file.h), so a change in either shows in the other.
+// Settings opens them in a window of the desktop's own controls (settings_dialog.h); from a
+// controller, or where that window cannot open (Linux without GTK 3), in the launcher's own screen.
 // Play replaces the launcher with lpn-host, its log going to play.log. Check for updates: updater.h.
 // The gear at the bottom right opens Tools: unpacking a PS4 .pkg into the game folder (pkg/pkg.h),
 // picked with the desktop's file chooser (zenity or kdialog) or dropped on the window.
@@ -14,11 +16,13 @@
 #include "host/menu_font.h"
 #include "host/pad_glyphs.h"
 #include "host/rounded.h"
+#include "launcher/settings_dialog.h"
 #include "launcher/updater.h"
 #include "pkg/install.h"
 #include "pkg/pkg.h"
 
 #include <SDL.h>
+#include <SDL_syswm.h>
 #include <nanosvg.h>
 #include <nanosvgrast.h>
 #include <stb_image.h>
@@ -211,6 +215,7 @@ void stepValue(int row, int d) {
 SDL_Renderer* gRen = nullptr;
 SDL_Texture* gArt = nullptr; // the game's own key art (sce_sys/pic1.png), when there is a game
 int gArtW = 0, gArtH = 0;
+launcher::settings::Image gArtImage; // the same, for the Settings window's banner
 
 void color(Uint8 r, Uint8 g, Uint8 b, Uint8 a = 255) { SDL_SetRenderDrawColor(gRen, r, g, b, a); }
 void color(ui::Rgb c, Uint8 a = 255) { color(c.r, c.g, c.b, a); }
@@ -249,6 +254,10 @@ void loadArt(SDL_Window* win) {
     if (SDL_Surface* s = loadPng(fs::path(gGameDir) / "sce_sys/pic1.png")) {
         gArt = SDL_CreateTextureFromSurface(gRen, s);
         gArtW = s->w, gArtH = s->h;
+        gArtImage.w = s->w, gArtImage.h = s->h;
+        gArtImage.rgba.resize(size_t(s->w) * s->h * 4);
+        for (int y = 0; y < s->h; ++y)
+            std::memcpy(gArtImage.rgba.data() + size_t(y) * s->w * 4, static_cast<uint8_t*>(s->pixels) + y * s->pitch, size_t(s->w) * 4);
         SDL_FreeSurface(s);
     }
     if (SDL_Surface* s = loadPng(fs::path(gGameDir) / "sce_sys/icon0.png")) {
@@ -821,6 +830,37 @@ void drawSettings(int focus) {
     padHints(40, kBack.y + (kBack.h - 40) / 2, "Back");
 }
 
+// Settings from the mouse or keyboard: the Settings window, with the launcher's main screen kept
+// drawn behind it. False when it cannot open, for the launcher's own Settings screen instead.
+bool settingsWindow(SDL_Window* win) {
+    void* parent = nullptr;
+#ifdef _WIN32
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (SDL_GetWindowWMInfo(win, &info) && info.subsystem == SDL_SYSWM_WINDOWS) parent = info.info.win.window;
+#else
+    (void)win;
+#endif
+    // The game may have changed them since the launcher last looked.
+    DisplaySettings s{};
+    host::readSettings(host::kSettingsFile, s);
+    const auto idle = [] {
+        // The launcher's window takes no input meanwhile (on Windows it is disabled, as a dialog's
+        // owner is).
+        SDL_PumpEvents();
+        SDL_FlushEvents(SDL_FIRSTEVENT, SDL_LASTEVENT);
+        drawMain(1);
+        SDL_RenderPresent(gRen);
+        SDL_Delay(5);
+    };
+    switch (launcher::settings::show(s, parent, gArtImage, idle)) {
+    case launcher::settings::Result::Unavailable: return false;
+    case launcher::settings::Result::Ok: gS = s, save(); break;
+    case launcher::settings::Result::Cancel: gS = DisplaySettings{}, host::readSettings(host::kSettingsFile, gS); break;
+    }
+    return true;
+}
+
 // Play: hand over to lpn-host in the install folder, the log to play.log, as launch.sh does.
 void play(SDL_Window* win, int argc, char** argv) {
     std::vector<std::string> args = {gHost, gGameDir, "--nids", gNids, "--data", "lpn-data"};
@@ -942,10 +982,17 @@ int main(int argc, char** argv) {
         gGameDir = gVersions[size_t(i)].dir;
         return true;
     };
+    bool fromPad = false; // the input being handled is a controller's
+    // Settings: the Settings window, or from a controller (which it cannot be used with) or where
+    // it cannot open, the launcher's own screen.
+    auto openSettings = [&] {
+        if (fromPad || !settingsWindow(win)) screen = Settings, focus = 0;
+        else focus = 1;
+    };
     auto confirm = [&]() -> bool {
         if (screen == Main) {
             if (focus == 0 && canPlay()) return play_();
-            if (focus == 1) screen = Settings, focus = 0;
+            if (focus == 1) return openSettings(), false;
             if (focus == 2) gS.skipIntro = !gS.skipIntro, save();
             if (focus == 3) updateButton();
             if (focus == 4) screen = Tools, focus = 0;
@@ -1029,7 +1076,7 @@ int main(int argc, char** argv) {
                 const int x = e.button.x, y = e.button.y;
                 if (screen == Main) {
                     if (kPlay.in(x, y) && canPlay()) start = play_();
-                    else if (kSettings.in(x, y)) screen = Settings, focus = 0;
+                    else if (kSettings.in(x, y)) fromPad = false, openSettings();
                     else if (kSkip.in(x, y)) gS.skipIntro = !gS.skipIntro, save();
                     else if (kUpdate.in(x, y)) updateButton();
                     else if (kGear.in(x, y)) screen = Tools, focus = 0;
@@ -1051,6 +1098,7 @@ int main(int argc, char** argv) {
                 back();
             } else if (e.type == SDL_KEYDOWN || e.type == SDL_CONTROLLERBUTTONDOWN) {
                 int key = 0; // 1 up, 2 down, 3 left, 4 right, 5 confirm, 6 back
+                fromPad = e.type == SDL_CONTROLLERBUTTONDOWN;
                 if (e.type == SDL_KEYDOWN) {
                     switch (e.key.keysym.sym) {
                     case SDLK_UP: key = 1; break;

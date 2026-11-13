@@ -130,6 +130,11 @@ The launcher has **Play**, **Settings** (the in-game PC Settings: the same `lpn-
 change in one shows in the other) and a **Skip intro logos** box, which runs the boot as fast as
 it draws until the title screen.
 
+Settings opens a separate window of the desktop's own controls, in tabs (Display, Graphics,
+Controller, Extras), with **Set To Default**, **Ok** and **Cancel**: Win32 controls on Windows, GTK 3
+on Linux (opened at run time, so neither the build nor the AppImage needs it). From a controller, or
+on Linux without GTK 3, Settings shows the launcher's own screen instead.
+
 **Check for updates** (top right) asks GitHub for the latest release. From the AppImage, a newer
 one is downloaded over it and started; a build from source is told to pull and rebuild. 
 
