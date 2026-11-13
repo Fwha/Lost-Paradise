@@ -3394,29 +3394,35 @@ private:
                         ++failed;
                         continue;
                     }
-                    const gcn::Program p = gcn::analyzeUnbound(l, readGuest, slots);
-                    if (p.code.empty()) {
-                        ++failed;
-                        continue;
-                    }
-                    const uint32_t base = l.stage == gcn::Stage::Pixel ? kPsBindingBase : 0;
-                    const gcn::Translation t = gcn::translate(p, base, descriptorSet(p));
-                    const gcn::GlslStage stage = l.stage == gcn::Stage::Pixel ? gcn::GlslStage::Fragment : gcn::GlslStage::Vertex;
-                    const std::string name = spirvName(t.glsl, stage), path = spirvCachePath(t.glsl, stage);
-                    if (path.empty()) continue;
-                    if (access(path.c_str(), F_OK) != 0) {
-                        std::string error;
-                        const std::vector<uint32_t> spirv = gcn::compileGlsl(t.glsl, stage, &error);
-                        if (spirv.empty()) {
+                    // A vertex shader takes the fetch slots its code reads, as a draw does (at
+                    // least: gcn::analyze); its input semantics may declare more, which a mesh's
+                    // fetch shader then loads, so that count is translated too.
+                    std::vector<gcn::Program> programs{gcn::analyzeUnbound(l, readGuest)};
+                    if (l.stage == gcn::Stage::Vertex && slots != ~0u && !programs[0].code.empty() &&
+                        programs[0].fetchSite && slots > programs[0].fetchSlots)
+                        programs.push_back(gcn::analyzeUnbound(l, readGuest, slots));
+                    for (const gcn::Program& p : programs) {
+                        if (p.code.empty()) {
                             ++failed;
-                            continue;
+                            break;
                         }
-                        saveSpirv(path, spirv);
-                        ++compiled;
-                    }
-                    saveSource(name, p, base); // the startup compile builds its library in later runs
-                    buildLibraries(p, name);
-                    {
+                        const uint32_t base = l.stage == gcn::Stage::Pixel ? kPsBindingBase : 0;
+                        const gcn::Translation t = gcn::translate(p, base, descriptorSet(p));
+                        const gcn::GlslStage stage = l.stage == gcn::Stage::Pixel ? gcn::GlslStage::Fragment : gcn::GlslStage::Vertex;
+                        const std::string name = spirvName(t.glsl, stage), path = spirvCachePath(t.glsl, stage);
+                        if (path.empty()) continue;
+                        if (access(path.c_str(), F_OK) != 0) {
+                            std::string error;
+                            const std::vector<uint32_t> spirv = gcn::compileGlsl(t.glsl, stage, &error);
+                            if (spirv.empty()) {
+                                ++failed;
+                                continue;
+                            }
+                            saveSpirv(path, spirv);
+                            ++compiled;
+                        }
+                        saveSource(name, p, base); // the startup compile builds its library in later runs
+                        buildLibraries(p, name);
                         std::lock_guard lock(bootMutex_);
                         bootNames_.insert(name);
                         bootEntries_.insert(l.entry);
