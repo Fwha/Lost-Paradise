@@ -8596,6 +8596,15 @@ private:
         begin();
         endPass(); // secondaries run outside a render pass
         rec([this, c = R().cmd_, batch = R().cur_, g] { executeSegment(c, batch, *g); });
+        // What the secondary bound (its pipelines, descriptors, viewport) is left in the primary,
+        // which Vulkan calls undefined: what this thread remembers binding no longer holds. A draw
+        // recorded here next (one touching the scene the upscaler waits on, say) sets it all again:
+        // a copy into the game's screen grab skipped its viewport and drew with the segment's.
+        R().bound_ = Bound{};
+        ++R().passSerial_;
+        R().fast_.valid = false;
+        for (FastSlot& f : R().fastSlots_) f.f.valid = false;
+        R().lastMergeable_ = false;
         R().afterFlush_.push_back([this, sl = g->slot] {
             {
                 std::lock_guard lock(segMutex_);
