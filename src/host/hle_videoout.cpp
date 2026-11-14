@@ -244,8 +244,8 @@ void vblankThread() {
             const double cap = gFpsCap;
             // Skip intro logos runs the boot the same way, up to the title (skippingIntro).
             loading = (fastLoading && gDisplay.flipRate == 2) || skippingIntro();
-            // Uncapped, the title screen's 30 fps (flip rate 1) runs at the monitor's rate;
-            // cutscenes keep it (uncap30FpsScenes).
+            // Above a 30 cap, the title screen's 30 fps (flip rate 1) runs at the cap or the
+            // monitor's rate; cutscenes keep it (uncap30FpsScenes).
             const int32_t rate = gDisplay.flipRate == 1 && uncap30FpsScenes() ? 0 : gDisplay.flipRate;
             const double interval = loading ? 0.0
                                             : std::max(rate > 0 ? (rate + 1) / kPs4Hz : 0.0,
