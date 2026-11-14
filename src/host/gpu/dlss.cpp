@@ -1,3 +1,5 @@
+// DLSS through NGX (Linux), and the stubs for a build without DLSS. Windows' Streamline backend
+// is gpu/dlss_streamline.cpp.
 #include "host/gpu/dlss.h"
 
 #include "host/gpu/vk.h"
@@ -18,7 +20,11 @@
 
 namespace host::render::dlss {
 
-#ifdef LPN_HAVE_DLSS
+#if defined(LPN_HAVE_DLSS)
+
+void deviceFeatures(const VkPhysicalDeviceVulkan12Features&, const VkPhysicalDeviceVulkan13Features&,
+                    VkPhysicalDeviceVulkan12Features*, VkPhysicalDeviceVulkan13Features*) {}
+uint32_t extraQueues() { return 0; }
 
 namespace {
 
@@ -207,14 +213,23 @@ bool evaluate(VkCommandBuffer cmd, VkDevice device, const upscale::Frame& f) {
     return true;
 }
 
-#else
+#elif !defined(LPN_HAVE_STREAMLINE)
 
 bool evaluate(VkCommandBuffer, VkDevice, const upscale::Frame&) { return false; }
+void deviceFeatures(const VkPhysicalDeviceVulkan12Features&, const VkPhysicalDeviceVulkan13Features&,
+                    VkPhysicalDeviceVulkan12Features*, VkPhysicalDeviceVulkan13Features*) {}
+uint32_t extraQueues() { return 0; }
 bool builtIn() { return false; }
 
 std::vector<std::string> instanceExtensions() { return {}; }
 std::vector<std::string> deviceExtensions(VkInstance, VkPhysicalDevice) { return {}; }
-void init(const Vk&) { std::fprintf(stderr, "[dlss] not built in (scripts/fetch-dlss.sh, then re-run cmake)\n"); }
+void init(const Vk&) {
+#ifdef _WIN32
+    std::fprintf(stderr, "[dlss] not built in (scripts/fetch-streamline.sh, then re-run cmake)\n");
+#else
+    std::fprintf(stderr, "[dlss] not built in (scripts/fetch-dlss.sh, then re-run cmake)\n");
+#endif
+}
 bool available() { return false; }
 bool usable() { return false; }
 void shutdown() {}

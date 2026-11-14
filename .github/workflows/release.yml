@@ -21,6 +21,7 @@ jobs:
           scripts/fetch-nids.sh aerolib.csv
           scripts/fetch-dlss.sh
           scripts/fetch-fsr.sh
+          scripts/fetch-streamline.sh
       - name: Build
         run: |
           cmake -S . -B build -G Ninja -DLPN_VERSION="${GITHUB_REF_NAME}"
@@ -64,6 +65,7 @@ jobs:
         run: |
           scripts/fetch-nids.sh aerolib.csv
           scripts/fetch-fsr.sh
+          scripts/fetch-streamline.sh
           cmake -S . -B build -G Ninja -DLPN_VERSION="${GITHUB_REF_NAME}"
           ninja -C build
           ctest --test-dir build --output-on-failure

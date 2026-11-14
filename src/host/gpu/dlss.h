@@ -1,6 +1,8 @@
-// NVIDIA DLSS through the DLSS SDK's NGX library, on the renderer's Vulkan device. Built in when
-// the SDK is in third_party/dlss (scripts/fetch-dlss.sh, LPN_HAVE_DLSS); used when the driver
-// offers it (an RTX card with NVIDIA's driver). Otherwise every call here is a no-op.
+// NVIDIA DLSS on the renderer's Vulkan device. On Linux through the DLSS SDK's NGX library, built
+// in when the SDK is in third_party/dlss (scripts/fetch-dlss.sh, LPN_HAVE_DLSS; gpu/dlss.cpp). On
+// Windows through NVIDIA Streamline, built in when its SDK is in third_party/streamline
+// (scripts/fetch-streamline.sh, LPN_HAVE_STREAMLINE; gpu/dlss_streamline.cpp). Used when the
+// driver offers it (an RTX card with NVIDIA's driver). Otherwise every call here is a no-op.
 #pragma once
 
 #include "host/gpu/upscale.h"
@@ -21,6 +23,11 @@ namespace dlss {
 // enables those the driver has).
 std::vector<std::string> instanceExtensions();
 std::vector<std::string> deviceExtensions(VkInstance instance, VkPhysicalDevice phys);
+// The Vulkan 1.2 and 1.3 features DLSS needs: set in want where the GPU has them.
+void deviceFeatures(const VkPhysicalDeviceVulkan12Features& have12, const VkPhysicalDeviceVulkan13Features& have13,
+                    VkPhysicalDeviceVulkan12Features* want12, VkPhysicalDeviceVulkan13Features* want13);
+// Queues DLSS wants beside the renderer's, in the renderer's family (they follow its queue 0).
+uint32_t extraQueues();
 
 // After the device is made: starts NGX and asks the driver whether DLSS can run. Logs why not.
 void init(const Vk& vk);
@@ -29,7 +36,7 @@ bool available();
 bool usable();
 void shutdown();
 
-// Whether the build has the DLSS SDK (LPN_HAVE_DLSS).
+// Whether the build has DLSS (LPN_HAVE_DLSS or LPN_HAVE_STREAMLINE).
 bool builtIn();
 
 // Records DLSS into cmd, which runs on the GPU queue the renderer uses; the images are in the

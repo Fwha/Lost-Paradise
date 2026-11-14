@@ -1,6 +1,7 @@
 #!/bin/sh
 # Packs the Windows build into build/Lost_Paradise-windows.zip: one "Lost Paradise" folder with
-# Lost Paradise.exe (the launcher), lpn-host.exe, the MSYS2 DLLs they use and aerolib.csv.
+# Lost Paradise.exe (the launcher), lpn-host.exe, the MSYS2 DLLs they use, aerolib.csv and, when
+# fetched, NVIDIA Streamline's DLLs for DLSS.
 # Run in an MSYS2 UCRT64 shell after building (README), from the repo:
 #   scripts/make-windows-zip.sh
 # The folder is the install folder: game\CUSA12776, lpn-data, lpn-display.ini and play.log go
@@ -17,6 +18,12 @@ rm -rf "$BUILD/zip"
 mkdir -p "$DIR"
 cp "$BUILD/src/launcher/Lost Paradise.exe" "$BUILD/src/host/lpn-host.exe" aerolib.csv "$DIR/"
 cp packaging/windows/README.txt "$DIR/"
+# DLSS (NVIDIA Streamline, scripts/fetch-streamline.sh): its DLLs go beside lpn-host.exe, with
+# their licenses.
+if [ -f third_party/streamline/bin/sl.interposer.dll ]; then
+    cp third_party/streamline/bin/* "$DIR/"
+    cp third_party/streamline/license.txt "$DIR/streamline.license.txt"
+fi
 # The DLLs from the MSYS2 environment (not Windows' own, nor vulkan-1.dll, which comes with the
 # graphics driver).
 for exe in "$DIR/Lost Paradise.exe" "$DIR/lpn-host.exe"; do

@@ -58,8 +58,9 @@ Each push builds a Windows zip: open the commit's **Windows** workflow run on Gi
 `Lost_Paradise-windows` under Artifacts. Unzip it, put the dump in the `game` folder next to
 `Lost Paradise.exe` (the launcher makes the folder on its first start) and press Play; the
 game's log goes to `play.log` in that folder. Releases carry the same zip. Needs Windows 10 1803
-or later and a Vulkan driver. FSR works there too (`scripts/fetch-fsr.sh` before building); DLSS is
-Linux only for now (the DLSS SDK's Windows libraries are built for MSVC).
+or later and a Vulkan driver. FSR and DLSS work there too: the zip carries both (to build them
+yourself, run `scripts/fetch-fsr.sh` and `scripts/fetch-streamline.sh` first). On Windows, DLSS
+goes through NVIDIA Streamline, whose DLLs sit beside `lpn-host.exe`.
 
 To build it yourself, in an [MSYS2](https://www.msys2.org) UCRT64 shell:
 
@@ -226,6 +227,10 @@ Third-party code and art keep their own licenses:
   1.1.4 (MIT). Only its FSR 3.1 upscaler is built.
 - NVIDIA DLSS SDK (optional, fetched by `scripts/fetch-dlss.sh`, not in this repository):
   NVIDIA RTX SDKs license. Release builds that bundle the DLSS runtime are subject to it.
+- NVIDIA Streamline (optional, Windows DLSS, fetched by `scripts/fetch-streamline.sh`, not in this
+  repository): [NVIDIA-RTX/Streamline](https://github.com/NVIDIA-RTX/Streamline), its headers
+  MIT; its signed DLLs and the DLSS runtime under NVIDIA's licenses (`streamline.license.txt` and
+  `nvngx_dlss.license.txt` in the Windows zip).
 - `aerolib.csv` (fetched by `scripts/fetch-nids.sh`, not in this repository): from
   [zecoxao/sce_symbols](https://github.com/zecoxao/sce_symbols).
 

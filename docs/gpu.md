@@ -147,7 +147,14 @@ as DLSS) replace the game's SMAA (three full-screen draws, found by a hash of th
 shaders' code) with a temporal upscaler (`gpu/upscale.h`; `upscaleSmaa` in the renderer):
 
 - DLSS: `scripts/fetch-dlss.sh` puts NVIDIA's DLSS SDK in `third_party/dlss`; cmake then links
-  NGX and copies the DLSS runtime beside `lpn-host` (`gpu/dlss.cpp`; Linux only).
+  NGX and copies the DLSS runtime beside `lpn-host` (`gpu/dlss.cpp`; Linux). On Windows the SDK's
+  libraries are MSVC-only, so `scripts/fetch-streamline.sh` puts NVIDIA Streamline 2.9 in
+  `third_party/streamline` instead: lpn-host builds against its headers and loads
+  `sl.interposer.dll` from its own directory at run time (`gpu/dlss_streamline.cpp`). Streamline
+  runs in manual hooking mode: `slInit` before the Vulkan instance, its extensions, features and
+  queues added to the device (`vk.cpp`), `slSetVulkanInfo` after, then per frame a token, the
+  options, the constants, the four tags and `slEvaluateFeature` on the renderer's command
+  buffer. No over-the-air updates. `LPN_NO_DLSS=1` skips it, `LPN_DLSS_LOG=1` logs Streamline.
 - FSR 3.1: `scripts/fetch-fsr.sh` puts FSR-Vulkan (MIT; AMD's FidelityFX SDK 1.1.4 upscaler, its
   Vulkan backend and compiled shaders behind a C API) in `third_party/fsr-vulkan`; cmake builds
   its upscaler into `lpn-host` (`gpu/fsr.cpp`). Any GPU with storage writes without a format.

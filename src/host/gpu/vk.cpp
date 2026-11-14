@@ -185,17 +185,20 @@ bool Vk::init(std::string* error) {
     want12.shaderFloat16 = have12.shaderFloat16;
     want13.subgroupSizeControl = have13.subgroupSizeControl;
     want13.computeFullSubgroups = have13.computeFullSubgroups;
+    dlss::deviceFeatures(have12, have13, &want12, &want13);
     storageWriteWithoutFormat = h.shaderStorageImageWriteWithoutFormat;
     shaderFloat16 = have12.shaderFloat16;
     subgroupSizeControl = have13.subgroupSizeControl;
     computeFullSubgroups = have13.computeFullSubgroups;
     synchronization2 = have13.synchronization2;
 
-    const float priority = 1.0f;
+    // Queue 0 is the renderer's; DLSS (Streamline) may want more in the same family after it.
+    const uint32_t queues = std::min(1 + dlss::extraQueues(), families[family].queueCount);
+    const std::vector<float> priorities(queues, 1.0f);
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = family;
-    qci.queueCount = 1;
-    qci.pQueuePriorities = &priority;
+    qci.queueCount = queues;
+    qci.pQueuePriorities = priorities.data();
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &want;
     dci.queueCreateInfoCount = 1;
