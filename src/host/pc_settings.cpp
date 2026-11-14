@@ -105,13 +105,13 @@ void buttonIconsChoose(int i) {
 
 } // namespace
 
+// Descriptions stay on one line under the menu (about 90 characters): the game does not wrap them.
 const std::vector<PcSetting>& pcSettings() {
     static const std::vector<PcSetting> settings = {
         display<0>("Window Mode", "Play in a window, a borderless window or fullscreen."),
         display<1>("Resolution", "Set the 3D rendering resolution. Takes effect after restarting the game."),
         {"Aspect Ratio",
-         "Match your monitor's shape: the 3D view widens to fit, the HUD stays 16:9 in the middle. Takes effect "
-         "after restarting the game.",
+         "Match your monitor's shape; the HUD stays 16:9. Takes effect after restarting the game.",
          &aspectChoices, &aspectSetting, &aspectChoose},
         display<2>("Frame Rate Cap",
                    "Set the most frames shown per second. Uncapped follows the monitor's refresh rate."),
@@ -119,19 +119,17 @@ const std::vector<PcSetting>& pcSettings() {
          &vsyncValue, &vsyncChoose},
         display<3>("FPS Counter", "Show the frame rate in the top right corner of the screen."),
         {"Upscaler",
-         "Replace the game's anti-aliasing with NVIDIA DLSS (RTX cards) or AMD FSR 3.1 (any GPU), which can also "
-         "render the 3D scene smaller and upscale it for more speed.",
+         "Swap the game's anti-aliasing for NVIDIA DLSS (RTX cards) or AMD FSR 3.1 (any GPU).",
          &upscalerChoices, &upscalerValue, &upscalerChoose},
         {"Upscale Quality",
-         "Native anti-aliases at full resolution. Quality, Balanced and Performance render smaller for more speed. "
-         "Switching to or from Native takes effect after restarting the game.",
+         "Native: anti-aliasing only. Others render smaller, faster. Changing Native needs a restart.",
          &qualityChoices, &qualityValue, &qualityChoose},
-        {"Anisotropic Filtering", "Keep textures sharp at a glancing angle, such as the ground ahead. Off: as the game sets them.",
+        {"Anisotropic Filtering", "Keep textures sharp at glancing angles, like the ground ahead. Off: as the game sets them.",
          &anisoChoices, &anisoValue, &anisoChoose},
         {"Skip Intro Logos", "Go straight to the title screen when the game starts. Takes effect at the next start.",
          &onOff, &skipIntroValue, &skipIntroChoose},
         {"Button Icons",
-         "Which controller's buttons to show. Auto matches your controller. Takes effect at the next start.",
+         "Controller buttons to show. Auto matches your controller. Takes effect at the next start.",
          &buttonIconChoices, &buttonIconsValue, &buttonIconsChoose},
         display<4>("Exit Game", "Close the game. Progress since your last save is lost."),
     };

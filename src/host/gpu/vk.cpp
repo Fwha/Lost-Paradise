@@ -118,7 +118,9 @@ bool Vk::create(std::string* error, bool withDlss) {
     const std::vector<std::string> dlssDevice =
         withDlss ? dlss::deviceExtensions(instance, phys) : std::vector<std::string>{};
     for (const std::string& e : dlssDevice)
-        if (has(e.c_str()) && std::find_if(enable.begin(), enable.end(), [&](const char* x) { return e == x; }) ==
+        // VK_EXT_buffer_device_address must not be enabled with the KHR one (core in 1.2), which
+        // Streamline asks for too: the driver refuses the device with both.
+        if (e != VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME && has(e.c_str()) && std::find_if(enable.begin(), enable.end(), [&](const char* x) { return e == x; }) ==
                                   enable.end())
             enable.push_back(e.c_str());
 
