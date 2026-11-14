@@ -1,7 +1,9 @@
 #include "host/cpu_compat.h"
 
 #include "common/x86_emu.h"
+#include "common/compat.h"
 #include "host/linker.h"
+#include "host/mman.h"
 #include "host/module.h"
 #include "ps4elf/ehframe.h"
 
@@ -14,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -23,7 +27,6 @@
 #else
 #include <signal.h>
 #include <ucontext.h>
-#include <unistd.h>
 #endif
 
 namespace host {
@@ -185,8 +188,12 @@ size_t patchMissingInstructions(Module& m) {
     }
     std::sort(sites.begin(), sites.end());
     sites.erase(std::unique(sites.begin(), sites.end()), sites.end());
+    const uintptr_t page = uintptr_t(sysconf(_SC_PAGESIZE));
     for (const uint64_t off : sites) {
         uint8_t* p = m.base() + off;
+        // Other patches (display settings) may already have set this page back to read+exec;
+        // Module::protect sets the final protection afterwards.
+        mprotect(reinterpret_cast<void*>(uintptr_t(p) & ~(page - 1)), page, PROT_READ | PROT_WRITE | PROT_EXEC);
         x86::Insn in;
         x86::decode(p, 15, &in);
         ++counts[size_t(x86::classify(in))];
