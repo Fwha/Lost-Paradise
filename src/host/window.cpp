@@ -154,6 +154,25 @@ void stickMotion(PadState& p, float dt) {
     lastPitch = pitch, lastRoll = roll;
 }
 
+// The mouse shakes the pad, on top of the sensors or the stick: moving it is moving the pad
+// (sideways along x, up and down along y), so waggling it reads as shaking, with a matching
+// turn on the gyro. Only while the cursor is over the window.
+float gMouseDx = 0, gMouseDy = 0; // pixels moved since the last poll
+void mouseShake(PadState& p, float dt) {
+    static float vel[2] = {}, lastVel[2] = {};
+    constexpr float kMetresPerPixel = 0.0004f, kRadPerPixel = 0.003f;
+    const float moved[2] = {gMouseDx, -gMouseDy}; // screen y runs down, pad y up
+    gMouseDx = gMouseDy = 0;
+    if (dt <= 0) return;
+    for (int i = 0; i < 2; ++i) {
+        vel[i] = 0.5f * vel[i] + 0.5f * moved[i] * kMetresPerPixel / dt; // smoothed, m/s
+        p.acceleration[i] = std::clamp(p.acceleration[i] + (vel[i] - lastVel[i]) / dt / 9.80665f, -4.0f, 4.0f);
+        lastVel[i] = vel[i];
+    }
+    p.angularVelocity[2] -= moved[0] * kRadPerPixel / dt; // sideways: roll
+    p.angularVelocity[0] += moved[1] * kRadPerPixel / dt; // up and down: pitch
+}
+
 // Keyboard: arrows = d-pad, WASD = left stick, IJKL = right stick, Enter = Cross,
 // Backspace = Circle, Z = Square, X = Triangle, Q/E = L1/R1, 1/3 = L2/R2, Esc = Options.
 void pollPad(SDL_GameController* gc) {
@@ -215,6 +234,7 @@ void pollPad(SDL_GameController* gc) {
     const float dt = std::min(float(double(tick - lastTick) / double(SDL_GetPerformanceFrequency())), 0.1f);
     lastTick = tick;
     if (!readSensors(gc, p, dt)) stickMotion(p, dt);
+    mouseShake(p, dt);
     // The game sees nothing while one of our menus is open, nor the keys still held as it closes.
     static bool suppress = false;
     if (saveMenuOpen() || displayMenuOpen()) suppress = true;
@@ -272,6 +292,7 @@ void presenterThread() {
             if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F10 && !e.key.repeat) profile::mark();
             if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F9 && !e.key.repeat) coverage::onKey();
             if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F8 && !e.key.repeat) combo_trace::onKey();
+            if (e.type == SDL_MOUSEMOTION) gMouseDx += float(e.motion.xrel), gMouseDy += float(e.motion.yrel);
             if (e.type == SDL_CONTROLLERDEVICEADDED && !gc) {
                 gc = SDL_GameControllerOpen(e.cdevice.which);
                 enableSensors(gc);
