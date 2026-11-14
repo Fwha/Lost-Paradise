@@ -171,6 +171,7 @@ int main(int argc, char** argv) {
     if (!modsDir.empty()) host::loadMods(fs::absolute(modsDir).lexically_normal().string());
     host::prepareSaveFolder();
     if (!host::checkCpu()) return 1;
+    for (auto* m : modules) host::scanMissingInstructions(*m); // before the code patches below
     host::installCrashHandler();
     host::registerBuiltinHle();
     host::layoutStaticTls(modules);

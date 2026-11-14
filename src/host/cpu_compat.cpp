@@ -47,6 +47,21 @@ struct Patch {
 };
 std::vector<Patch> gPatches;
 
+// Instructions found by scanMissingInstructions, on the code as loaded.
+struct Site {
+    uint8_t* at;
+    uint8_t len;
+    x86::Op op;
+    uint8_t bytes[15];
+};
+struct Scan {
+    const Module* module;
+    std::vector<Site> sites;
+    size_t skipped, functions;
+};
+std::vector<Scan> gScans;
+uint32_t gOnly = 0; // LPN_CPU_EMULATE=<names>: only these (bit per x86::Op); 0 for all
+
 std::atomic<uint64_t> gCount[size_t(x86::Op::Count)];
 std::atomic<bool> gSeen[size_t(x86::Op::Count)];
 
@@ -71,7 +86,8 @@ Features readFeatures() {
 }
 
 bool wanted(x86::Op op) {
-    if (gForce) return op != x86::Op::None;
+    if (op == x86::Op::None) return false;
+    if (gForce) return !gOnly || (gOnly >> unsigned(op) & 1);
     // Only the ones that would not trap by themselves: older CPUs read F3 0F BD as bsr and
     // F3 0F BC as bsf. The others raise #UD on their own.
     if (op == x86::Op::Lzcnt) return !gCpu.lzcnt;
@@ -135,6 +151,12 @@ bool checkCpu() {
     gCpu = readFeatures();
     const char* env = std::getenv("LPN_CPU_EMULATE");
     gForce = env && *env && std::strcmp(env, "0") != 0;
+    // A list of names (lzcnt,movbe,...) narrows it, to find which one misbehaves.
+    if (gForce && std::strcmp(env, "1") != 0) {
+        const std::string list = std::string(",") + env + ",";
+        for (unsigned i = 1; i < unsigned(x86::Op::Count); ++i)
+            if (list.find(std::string(",") + x86::opName(x86::Op(i)) + ",") != std::string::npos) gOnly |= 1u << i;
+    }
     if (!gCpu.avx) {
         std::fprintf(stderr, "error: this CPU (or OS) has no AVX, which the game's code needs. "
                              "AVX CPUs start with Intel Sandy Bridge (2011) and AMD Bulldozer.\n");
@@ -147,29 +169,28 @@ bool checkCpu() {
     if (!gCpu.f16c) missing += " F16C";
     if (!missing.empty())
         std::fprintf(stderr, "[cpu] missing%s: the game's uses of them run in software\n", missing.c_str());
-    if (gForce) std::fprintf(stderr, "[cpu] LPN_CPU_EMULATE: emulating all of BMI1, LZCNT, MOVBE and F16C\n");
+    if (gForce)
+        std::fprintf(stderr, "[cpu] LPN_CPU_EMULATE: emulating %s\n", gOnly ? env : "all of BMI1, LZCNT, MOVBE and F16C");
     return true;
 }
 
-size_t patchMissingInstructions(Module& m) {
-    bool any = gForce || !gCpu.lzcnt || !gCpu.bmi1;
-    if (!any) return 0;
+void scanMissingInstructions(Module& m) {
+    if (!gForce && gCpu.lzcnt && gCpu.bmi1) return;
     std::string error;
     const auto functions = ps4elf::functionsFromEhFrame(m.elf(), &error);
     if (functions.empty()) {
         std::fprintf(stderr, "[cpu] %s: no function list (%s), nothing patched\n", m.name().c_str(), error.c_str());
-        return 0;
+        return;
     }
     // Decode each function from its start, so only real instruction boundaries are touched. A
     // function that does not decode to its exact end is left alone.
-    size_t counts[size_t(x86::Op::Count)] = {};
     size_t skipped = 0;
-    std::vector<uint64_t> sites;
+    std::vector<Site> sites;
     for (const auto& f : functions) {
         uint8_t* const start = m.base() + f.start;
         if (f.start + f.size > m.size()) continue;
         size_t at = 0;
-        std::vector<uint64_t> here;
+        std::vector<Site> here;
         bool ok = true;
         while (at < f.size) {
             x86::Insn in;
@@ -177,7 +198,11 @@ size_t patchMissingInstructions(Module& m) {
                 ok = false;
                 break;
             }
-            if (wanted(x86::classify(in))) here.push_back(f.start + at);
+            if (wanted(x86::classify(in))) {
+                Site site{start + at, in.len, x86::classify(in), {}};
+                std::memcpy(site.bytes, start + at, in.len);
+                here.push_back(site);
+            }
             at += in.len;
         }
         if (!ok || at != f.size) {
@@ -186,28 +211,46 @@ size_t patchMissingInstructions(Module& m) {
         }
         sites.insert(sites.end(), here.begin(), here.end());
     }
-    std::sort(sites.begin(), sites.end());
-    sites.erase(std::unique(sites.begin(), sites.end()), sites.end());
+    std::sort(sites.begin(), sites.end(), [](const Site& a, const Site& b) { return a.at < b.at; });
+    sites.erase(std::unique(sites.begin(), sites.end(), [](const Site& a, const Site& b) { return a.at == b.at; }),
+                sites.end());
+    gScans.push_back({&m, std::move(sites), skipped, functions.size()});
+}
+
+size_t patchMissingInstructions(Module& m) {
+    const Scan* scan = nullptr;
+    for (const Scan& sc : gScans)
+        if (sc.module == &m) scan = &sc;
+    if (!scan) return 0;
+    size_t counts[size_t(x86::Op::Count)] = {};
+    size_t patched = 0, changed = 0;
     const uintptr_t page = uintptr_t(sysconf(_SC_PAGESIZE));
-    for (const uint64_t off : sites) {
-        uint8_t* p = m.base() + off;
+    for (const Site& site : scan->sites) {
+        uint8_t* p = site.at;
+        // Another patch (title menu, draw sites...) rewrote this code since the scan: leave it.
+        if (std::memcmp(p, site.bytes, site.len) != 0) {
+            ++changed;
+            continue;
+        }
         // Other patches (display settings) may already have set this page back to read+exec;
         // Module::protect sets the final protection afterwards.
         mprotect(reinterpret_cast<void*>(uintptr_t(p) & ~(page - 1)), page, PROT_READ | PROT_WRITE | PROT_EXEC);
-        x86::Insn in;
-        x86::decode(p, 15, &in);
-        ++counts[size_t(x86::classify(in))];
+        ++counts[size_t(site.op)];
         gPatches.push_back({uint64_t(p), *p});
         *p = 0x06;
+        ++patched;
     }
     std::sort(gPatches.begin(), gPatches.end(), [](const Patch& a, const Patch& b) { return a.at < b.at; });
 
     std::string list;
     for (size_t i = 1; i < size_t(x86::Op::Count); ++i)
         if (counts[i]) list += " " + std::to_string(counts[i]) + " " + x86::opName(x86::Op(i));
-    std::fprintf(stderr, "[cpu] %s: %zu instructions set to trap for emulation%s%s (%zu of %zu functions not decoded)\n",
-                 m.name().c_str(), sites.size(), list.empty() ? "" : ":", list.c_str(), skipped, functions.size());
-    return sites.size();
+    std::fprintf(stderr,
+                 "[cpu] %s: %zu instructions set to trap for emulation%s%s (%zu left as other patches changed them, "
+                 "%zu of %zu functions not decoded)\n",
+                 m.name().c_str(), patched, list.empty() ? "" : ":", list.c_str(), changed, scan->skipped,
+                 scan->functions);
+    return patched;
 }
 
 #ifdef _WIN32
