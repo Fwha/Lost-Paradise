@@ -5293,12 +5293,15 @@ void main() {
         // field) read it as it is, and what the game draws back into the scene after them (its
         // aura, the bloom's blend) is then in the upscaled picture too.
         const uint32_t targetW = ((r.ctx[reg::kCbColorBase + ::gpu::ctx::kCbColorPitch] & 0x7FF) + 1) * 8;
-        // A dispatch: when an image it stores to is wider than the scene.
-        bool toOutput = d.kind != DrawCall::kDispatch && targetW > upIn_.w + 8;
+        // A dispatch: when an image it stores to is output-sized.
+        // (The scene's own targets are padded: 1704 wide at a 1792 pitch, so the test is the
+        // output's width.)
+        const uint32_t outW = upOutW_ > 16 ? upOutW_ - 16 : upOutW_;
+        bool toOutput = d.kind != DrawCall::kDispatch && targetW >= outW;
         if (d.kind == DrawCall::kDispatch)
             for (const gcn::Program* p : {&a.vs, &a.ps})
                 for (const auto& t : p->images)
-                    if (t.storage && t.base() != scene && t.width() > upIn_.w + 8) toOutput = true;
+                    if (t.storage && t.base() != scene && t.width() >= outW) toOutput = true;
         if (upIn_.on && samples && toOutput) {
             const UpscaleInputs in = upIn_;
             upIn_.on = false;
