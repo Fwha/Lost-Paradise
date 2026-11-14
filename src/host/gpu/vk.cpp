@@ -56,6 +56,22 @@ bool Vk::init(std::string* error) {
         return true;
     }
     destroy();
+    // Keeping all of DLSS's additions, without one of the renderer's own optional features.
+    struct Own {
+        bool DlssAdditions::*flag;
+        const char* name;
+    };
+    for (const Own& o : {Own{&DlssAdditions::noRobustAccess, "robust buffer access"},
+                         Own{&DlssAdditions::noPipelineLibraries, "pipeline libraries"},
+                         Own{&DlssAdditions::noHostImport, "host memory import"}}) {
+        a = {};
+        a.*o.flag = true;
+        if (create(error, a)) {
+            std::fprintf(stderr, "[gpu] the device works with DLSS's additions without %s\n", o.name);
+            return true;
+        }
+        destroy();
+    }
     for (const std::string& e : exts) {
         a = {};
         a.dropExt = e;
@@ -137,7 +153,7 @@ bool Vk::create(std::string* error, const DlssAdditions& add) {
         return false;
     }
     enable.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
-    hostImport = has(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    hostImport = !add.noHostImport && has(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (hostImport) enable.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     // Pipeline libraries (docs/shader-precompile.md stage 3): checked for the feature below.
     const bool gplExt = has(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) && has(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
@@ -180,7 +196,8 @@ bool Vk::create(std::string* error, const DlssAdditions& add) {
     have12.pNext = &have13;
     if (gplExt) have13.pNext = &haveGpl;
     vkGetPhysicalDeviceFeatures2(phys, &have);
-    if (gplExt && haveGpl.graphicsPipelineLibrary) {
+    pipelineLibraries = false;
+    if (gplExt && haveGpl.graphicsPipelineLibrary && !add.noPipelineLibraries) {
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -212,7 +229,7 @@ bool Vk::create(std::string* error, const DlssAdditions& add) {
     const auto& h = have.features;
     f.geometryShader = VK_TRUE;
     // Out-of-range buffer accesses read zero instead of faulting, as on the PS4.
-    f.robustBufferAccess = h.robustBufferAccess;
+    f.robustBufferAccess = add.noRobustAccess ? VK_FALSE : h.robustBufferAccess;
     f.independentBlend = h.independentBlend;
     f.dualSrcBlend = h.dualSrcBlend;
     f.samplerAnisotropy = h.samplerAnisotropy;

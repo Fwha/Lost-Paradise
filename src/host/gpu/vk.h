@@ -36,6 +36,9 @@ private:
     // What of DLSS's Vulkan additions create() makes the instance and device with.
     struct DlssAdditions {
         bool on = true, features = true;
+        // The renderer's own optional features, left out to find one the driver will not combine
+        // with DLSS's.
+        bool noRobustAccess = false, noPipelineLibraries = false, noHostImport = false;
         std::string dropExt; // a device extension left out
     };
     bool create(std::string* error, const DlssAdditions& add);
