@@ -69,12 +69,8 @@ struct Site {
 // red zone that System V code (the game's) keeps locals in without moving rsp. So there each
 // instruction jumps to a stub that moves rsp past the red zone before it traps:
 //   lea rsp, [rsp-128]; 06 (traps); lea rsp, [rsp+128]; [moved instruction]; jmp back
-// Linux leaves the red zone alone when it delivers a signal, so it traps in place.
-#ifdef _WIN32
-bool gStubs = true;
-#else
-bool gStubs = false; // LPN_CPU_STUBS=1 to try the Windows way
-#endif
+// Linux leaves the red zone alone when it delivers a signal, but stubs are faster there too.
+bool gStubs = true; // LPN_CPU_STUBS=0: trap in place (fine on Linux, slow)
 struct Stub {
     uint64_t trap; // address of the 06 in the stub
     uint64_t orig; // where the instruction was
@@ -86,6 +82,8 @@ std::unique_ptr<std::atomic<uint64_t>[]> gStubHits; // per gStubTable entry, for
 uint8_t* gStubNext = nullptr;
 uint8_t* gStubEnd = nullptr;
 constexpr int kRedZone = 128;
+bool gFastStubs = true; // LPN_CPU_FAST=0: every stub traps
+size_t gFastCount = 0;
 struct Scan {
     const Module* module;
     std::vector<Site> sites;
@@ -315,10 +313,263 @@ bool stubSpace(const Module& m, size_t need) {
 
 bool fitsRel32(int64_t d) { return d >= INT32_MIN && d <= INT32_MAX; }
 
+// ---- Stubs that run the instruction without a trap ----
+//
+// For the busy ones (bextr, andn, tzcnt, lzcnt, movbe) the stub does the same work with older
+// instructions, between the same two leas, so the red zone is safe and pushes land below it.
+// Results and the flags the instruction defines match; the flags it leaves undefined may differ.
+
+struct Emitter {
+    uint8_t* p;
+    void b(uint8_t v) { *p++ = v; }
+    void d32(int32_t v) {
+        std::memcpy(p, &v, 4);
+        p += 4;
+    }
+    void rex(bool w, int reg, int index, int base) {
+        const uint8_t r = uint8_t(0x40 | (w ? 8 : 0) | ((reg >> 3) & 1) << 2 | ((index >> 3) & 1) << 1 | ((base >> 3) & 1));
+        if (r != 0x40) b(r);
+    }
+    // op reg, rm (both registers)
+    void rr(int size, std::initializer_list<uint8_t> op, int reg, int rm) {
+        if (size == 16) b(0x66);
+        rex(size == 64, reg, 0, rm);
+        for (uint8_t o : op) b(o);
+        b(uint8_t(0xC0 | (reg & 7) << 3 | (rm & 7)));
+    }
+    // op reg, [the memory operand of m], with rsp-based addresses moved by adjust. origNext is
+    // where the original instruction ended (for rip-relative ones). Returns false if it cannot.
+    void mem(int size, std::initializer_list<uint8_t> op, int reg, const x86::Insn& m, int64_t adjust, uint64_t origNext,
+             int immBytes = 0) {
+        if (size == 16) b(0x66);
+        if (m.addr32) b(0x67);
+        if (m.ripRelative) {
+            rex(size == 64, reg, 0, 0);
+            for (uint8_t o : op) b(o);
+            b(uint8_t((reg & 7) << 3 | 5));
+            const uint64_t target = origNext + uint64_t(int64_t(m.disp));
+            const int64_t disp = int64_t(target) - int64_t(uint64_t(p) + 4 + immBytes);
+            d32(int32_t(disp));
+            return;
+        }
+        const int base = m.hasSib ? (m.noBase ? -1 : m.base) : m.rm;
+        const int index = m.hasSib ? m.index : 4;
+        const int64_t disp = int64_t(m.disp) + ((base & 15) == 4 && base >= 0 ? adjust : 0);
+        rex(size == 64, reg, index == 4 ? 0 : index, base < 0 ? 0 : base);
+        for (uint8_t o : op) b(o);
+        const uint8_t sibIndex = uint8_t((index == 4 ? 4 : index & 7) << 3 | m.scale << 6);
+        if (base < 0) {
+            b(uint8_t((reg & 7) << 3 | 4));
+            b(uint8_t(sibIndex | 5));
+        } else if (m.hasSib || (base & 7) == 4) {
+            b(uint8_t(0x80 | (reg & 7) << 3 | 4));
+            b(uint8_t(sibIndex | (base & 7)));
+        } else
+            b(uint8_t(0x80 | (reg & 7) << 3 | (base & 7)));
+        d32(int32_t(disp));
+    }
+    void push(int r) {
+        if (r >= 8) b(0x41);
+        b(uint8_t(0x50 | (r & 7)));
+    }
+    void pop(int r) {
+        if (r >= 8) b(0x41);
+        b(uint8_t(0x58 | (r & 7)));
+    }
+    void movImm32(int r, uint32_t v) { // mov r32, imm32
+        if (r >= 8) b(0x41);
+        b(uint8_t(0xB8 | (r & 7)));
+        d32(int32_t(v));
+    }
+    uint8_t* jcc8(uint8_t op) { // returns where to patch the rel8
+        b(op);
+        b(0);
+        return p - 1;
+    }
+    void land(uint8_t* at) { *at = uint8_t(p - (at + 1)); }
+};
+
+bool fitsDisp(int64_t d) { return d >= INT32_MIN && d <= INT32_MAX; }
+
+// Registers an instruction reads or writes, so scratch registers avoid them.
+uint32_t regsOf(const x86::Insn& in) {
+    uint32_t r = 1u << 4; // rsp
+    if (in.hasModrm) {
+        r |= 1u << in.reg;
+        if (in.mod == 3) r |= 1u << in.rm;
+        else if (!in.ripRelative) {
+            if (in.hasSib) {
+                if (!in.noBase) r |= 1u << in.base;
+                if (in.index != 4) r |= 1u << in.index;
+            } else
+                r |= 1u << in.rm;
+        }
+    }
+    if (in.vex) r |= 1u << in.vexV;
+    return r;
+}
+
+int scratch(uint32_t& used) {
+    static const int order[] = {11, 10, 9, 8, 3, 6, 7, 2, 0, 5, 12, 13, 14, 15, 1};
+    for (int r : order)
+        if (!(used >> r & 1)) {
+            used |= 1u << r;
+            return r;
+        }
+    return -1;
+}
+
+// Loads the r/m operand of in (register or memory) into register t, size bits wide (16 zero-
+// extends to 32). depth: bytes pushed since the stub's first lea.
+void loadRm(Emitter& e, const x86::Insn& in, int size, int t, int depth, uint64_t origNext) {
+    if (size == 16) {
+        if (in.mod == 3) e.rr(32, {0x0F, 0xB7}, t, in.rm);
+        else e.mem(32, {0x0F, 0xB7}, t, in, kRedZone + depth, origNext);
+    } else if (in.mod == 3)
+        e.rr(size, {0x8B}, t, in.rm);
+    else
+        e.mem(size, {0x8B}, t, in, kRedZone + depth, origNext);
+}
+
+// Writes the body for site at e (after the first lea, before the second). Returns false when this
+// instruction has no fast form here (it then traps in its stub).
+bool emitFast(Emitter& e, const Site& site) {
+    x86::Insn in;
+    if (!x86::decode(site.bytes, site.len, &in) || in.segment || in.lock) return false;
+    if (in.memoryOperand() && !in.ripRelative && !fitsDisp(int64_t(in.disp) + kRedZone + 64)) return false;
+    const uint64_t origNext = uint64_t(site.at) + site.len;
+    uint32_t used = regsOf(in);
+    switch (site.op) {
+    case x86::Op::Andn: { // t = ~v & src; flags from the and (SF ZF; CF OF clear) as andn
+        const int size = in.vexW ? 64 : 32, t = scratch(used);
+        if (t < 0) return false;
+        e.push(t);
+        e.rr(64, {0x8B}, t, in.vexV);    // mov t, v
+        e.rr(size, {0xF7}, 2, t);         // not t
+        if (in.mod == 3) e.rr(size, {0x23}, t, in.rm);
+        else e.mem(size, {0x23}, t, in, kRedZone + 8, origNext); // and t, src
+        e.rr(size, {0x89}, t, in.reg);    // mov dest, t
+        e.pop(t);
+        return true;
+    }
+    case x86::Op::Bextr: { // dest = (src >> start) & ((1 << len) - 1); ZF from it, CF OF clear
+        const int size = in.vexW ? 64 : 32;
+        used |= 1u << 1; // rcx is the shift count
+        const int t1 = scratch(used), t2 = scratch(used);
+        if (t1 < 0 || t2 < 0) return false;
+        e.push(1);
+        e.push(t1);
+        e.push(t2);
+        loadRm(e, in, size, t1, 24, origNext);  // t1 = src
+        e.rr(64, {0x8B}, t2, in.vexV);           // t2 = control
+        e.rr(32, {0x8B}, 1, t2);                 // ecx = control
+        e.rr(32, {0x81}, 4, 1);                  // and ecx, 0xff
+        e.d32(0xFF);
+        e.rr(32, {0x83}, 7, 1);                  // cmp ecx, size
+        e.b(uint8_t(size));
+        uint8_t* const zero = e.jcc8(0x73);      // jae: start past the operand
+        e.rr(size, {0xD3}, 5, t1);               // shr t1, cl
+        e.rr(32, {0x8B}, 1, t2);                 // ecx = control >> 8 & 0xff
+        e.rr(32, {0xC1}, 5, 1);
+        e.b(8);
+        e.rr(32, {0x81}, 4, 1);
+        e.d32(0xFF);
+        e.rr(32, {0x83}, 7, 1);                  // cmp ecx, size
+        e.b(uint8_t(size));
+        uint8_t* const whole = e.jcc8(0x73);     // jae: no mask
+        e.movImm32(t2, 1);                       // t2 = (1 << len) - 1
+        e.rr(64, {0xD3}, 4, t2);
+        e.rr(64, {0xFF}, 1, t2);
+        e.rr(size, {0x23}, t1, t2);              // and t1, t2
+        uint8_t* const done = e.jcc8(0xEB);
+        e.land(zero);
+        e.rr(32, {0x31}, t1, t1);                // xor t1, t1
+        e.land(whole);
+        e.land(done);
+        e.rr(size, {0x85}, t1, t1);              // test t1, t1: ZF, CF = OF = 0
+        if (in.reg == 1) { // the result goes where rcx is restored from
+            e.rex(true, t1, 0, 4);
+            e.b(0x89);
+            e.b(uint8_t(0x40 | (t1 & 7) << 3 | 4));
+            e.b(0x24);
+            e.b(16); // mov [rsp+16], t1
+        } else
+            e.rr(size, {0x89}, t1, in.reg);
+        e.pop(t2);
+        e.pop(t1);
+        e.pop(1);
+        return true;
+    }
+    case x86::Op::Tzcnt: case x86::Op::Lzcnt: {
+        // t = bsf/bsr src; zero: t = size with CF=1 ZF=0; else tzcnt: t, lzcnt: t ^ (size-1),
+        // with ZF from it and CF=0.
+        const int size = in.w ? 64 : in.opsize ? 16 : 32, t = scratch(used);
+        if (t < 0) return false;
+        const int work = size == 16 ? 32 : size;
+        e.push(t);
+        loadRm(e, in, size, t, 8, origNext);
+        e.rr(work, {0x0F, uint8_t(site.op == x86::Op::Tzcnt ? 0xBC : 0xBD)}, t, t);
+        uint8_t* const zero = e.jcc8(0x74);
+        if (site.op == x86::Op::Tzcnt) e.rr(work, {0x85}, t, t); // test t, t
+        else {
+            e.rr(work, {0x83}, 6, t); // xor t, size-1
+            e.b(uint8_t(size - 1));
+        }
+        uint8_t* const done = e.jcc8(0xEB);
+        e.land(zero);
+        e.movImm32(t, uint32_t(size));
+        e.rr(32, {0x83}, 7, t); // cmp t, size+1: CF=1, ZF=0
+        e.b(uint8_t(size + 1));
+        e.land(done);
+        e.rr(size, {0x89}, t, in.reg);
+        e.pop(t);
+        return true;
+    }
+    case x86::Op::Movbe: {
+        const int size = in.w ? 64 : in.opsize ? 16 : 32;
+        if (in.opcode == 0xF0) { // load: mov dest, [m]; swap
+            e.mem(size, {0x8B}, in.reg, in, kRedZone, origNext);
+            if (size == 16) {
+                e.b(0x9C);                     // pushfq; rol dest16, 8; popfq
+                e.rr(16, {0xC1}, 0, in.reg);
+                e.b(8);
+                e.b(0x9D);
+            } else {
+                e.rex(size == 64, 0, 0, in.reg);
+                e.b(0x0F);
+                e.b(uint8_t(0xC8 | (in.reg & 7)));
+            }
+            return true;
+        }
+        // store: t = src; swap; mov [m], t
+        const int t = scratch(used);
+        if (t < 0) return false;
+        e.push(t);
+        e.rr(64, {0x8B}, t, in.reg);
+        if (size == 16) {
+            e.b(0x9C);
+            e.rr(16, {0xC1}, 0, t);
+            e.b(8);
+            e.b(0x9D);
+        } else {
+            e.rex(size == 64, 0, 0, t);
+            e.b(0x0F);
+            e.b(uint8_t(0xC8 | (t & 7)));
+        }
+        e.mem(size, {0x89}, t, in, kRedZone + 8, origNext);
+        e.pop(t);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+
 // Sends the instruction at site through a new stub. Returns false (nothing changed) when there is
 // no room within reach.
 bool writeStub(const Module& m, const Site& site) {
-    constexpr size_t kMax = 5 + 1 + 8 + 15 + 5;
+    constexpr size_t kMax = 5 + 160 + 8 + 15 + 5;
     if (!stubSpace(m, kMax)) return false;
     uint8_t* const stub = gStubNext;
     const uint64_t back = uint64_t(site.at) + site.len + site.movedLen;
@@ -329,7 +580,13 @@ bool writeStub(const Module& m, const Site& site) {
     std::memcpy(p, kDown, sizeof kDown);
     p += sizeof kDown;
     const uint64_t trap = uint64_t(p);
-    *p++ = 0x06;
+    bool fast = false;
+    if (gFastStubs) {
+        Emitter e{p};
+        fast = emitFast(e, site);
+        if (fast) p = e.p;
+    }
+    if (!fast) *p++ = 0x06;
     std::memcpy(p, kUp, sizeof kUp);
     p += sizeof kUp;
     if (site.movedLen) {
@@ -353,9 +610,12 @@ bool writeStub(const Module& m, const Site& site) {
     p += 4;
     gStubNext = p;
 
-    Stub entry{trap, uint64_t(site.at), site.len, {}};
-    std::memcpy(entry.bytes, site.bytes, site.len);
-    gStubTable.push_back(entry);
+    if (fast) ++gFastCount;
+    else {
+        Stub entry{trap, uint64_t(site.at), site.len, {}};
+        std::memcpy(entry.bytes, site.bytes, site.len);
+        gStubTable.push_back(entry);
+    }
 
     // The instruction (and the one taken along) becomes a jump to the stub, then int3 padding.
     const int32_t to = int32_t(int64_t(uint64_t(stub)) - int64_t(uint64_t(site.at) + 5));
@@ -378,6 +638,7 @@ bool checkCpu() {
             if (list.find(std::string(",") + x86::opName(x86::Op(i)) + ",") != std::string::npos) gOnly |= 1u << i;
     }
     if (const char* stubs = std::getenv("LPN_CPU_STUBS")) gStubs = std::strcmp(stubs, "0") != 0;
+    if (const char* fast = std::getenv("LPN_CPU_FAST")) gFastStubs = std::strcmp(fast, "0") != 0;
     if (!gCpu.avx) {
         std::fprintf(stderr, "error: this CPU (or OS) has no AVX, which the game's code needs. "
                              "AVX CPUs start with Intel Sandy Bridge (2011) and AMD Bulldozer.\n");
@@ -450,6 +711,7 @@ size_t patchMissingInstructions(Module& m) {
     std::sort(gPatches.begin(), gPatches.end(), [](const Patch& a, const Patch& b) { return a.at < b.at; });
     std::sort(gStubTable.begin(), gStubTable.end(), [](const Stub& a, const Stub& b) { return a.trap < b.trap; });
     gStubHits.reset(new std::atomic<uint64_t>[gStubTable.size()]());
+    if (gFastCount) std::fprintf(stderr, "[cpu] %zu stubs so far run without a trap\n", gFastCount);
     // A trap in place on Windows can overwrite the game's red zone: count them.
     if (inPlace)
         std::fprintf(stderr, "[cpu] %s: %zu of them trap in place (no stub possible), which may misbehave on Windows\n",

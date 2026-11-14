@@ -175,6 +175,7 @@ Defaults suit most machines. These environment variables override them:
 | `LPN_PROFILE=1` | off | Prints per-frame timings. |
 | `LPN_HUD_STRETCH=1` | off | With a 16:10 or 21:9 aspect ratio, stretch the HUD over the whole picture instead of keeping it 16:9. |
 | `LPN_CPU_EMULATE=1` | off | Runs the game's BMI1, LZCNT, MOVBE and F16C instructions in software even on a CPU that has them (see CPU below), to try that path and count how often it is hit (`[cpu] emulated:` at exit). |
+| `LPN_CPU_FAST=0` | on | Turns off the stubs that run andn, bextr, tzcnt, lzcnt and movbe directly; every emulated instruction then traps (slower, but counted per instruction in the `[cpu]` summary). |
 | `LPN_HUD_LOG=1` | off | Logs which draws are treated as HUD (`[hud]` lines), for reporting HUD problems. |
 
 Example: `LPN_RECORD_THREADS=0 ./launch.sh`
