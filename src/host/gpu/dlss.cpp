@@ -214,6 +214,8 @@ bool evaluate(VkCommandBuffer cmd, VkDevice device, const upscale::Frame& f) {
     e.Feature.pInOutput = &output;
     e.pInDepth = &depth;
     e.pInMotionVectors = &motion;
+    NVSDK_NGX_Resource_VK moved = resource(f.moved, false);
+    if (f.moved.image) e.pInBiasCurrentColorMask = &moved;
     e.InJitterOffsetX = f.jitterX;
     e.InJitterOffsetY = f.jitterY;
     e.InRenderSubrectDimensions = {f.renderW, f.renderH};

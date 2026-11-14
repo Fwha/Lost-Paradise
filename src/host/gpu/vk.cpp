@@ -3,8 +3,10 @@
 #include "host/gpu/dlss.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace host::render {
@@ -48,6 +50,16 @@ bool Vk::init(std::string* error) {
     std::fprintf(stderr, "[gpu] %s with DLSS's Vulkan additions: looking for the one the driver refuses\n",
                  error->c_str());
     destroy();
+    // The refusal comes and goes on the same driver (VK_NVX_binary_import dropped some runs and
+    // not others, DLSS then missing): the same device again first, after a moment.
+    for (int i = 0; i < 3; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        if (create(error, {})) {
+            std::fprintf(stderr, "[gpu] the device works with DLSS's additions on try %d\n", i + 2);
+            return true;
+        }
+        destroy();
+    }
     const std::vector<std::string> exts = dlssDeviceExts_;
     DlssAdditions a;
     a.features = false;

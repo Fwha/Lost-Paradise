@@ -1408,11 +1408,18 @@ vec3 cubeDir(vec3 c) {
         }
         if (in.op == 14) { // image_get_resinfo
             std::string size = "textureSize(" + tn + ", " + iv(vaddr) + ")";
+            // The T#'s size, not the image's: a render target is padded (1704 wide at a 1792
+            // pitch), and the draw data's scale (T# over image) maps one to the other as it does
+            // coordinates. Shaders that size their screen from it read the scene shrunk otherwise.
+            const std::string sx = fmt("F(D[%u])", im.data), sy = fmt("F(D[%u])", im.data + 1);
+            const std::string w = "uint(round(float(" + size + ".x) * " + sx + "))";
+            const std::string h = "uint(round(float(" + size + ".y) * " + sy + "))";
+            const std::string levels = "uint(textureQueryLevels(" + tn + "))";
             std::string v;
-            if (oneD && array) v = "uvec4(uint(" + size + ".x), uint(" + size + ".z), 1u, uint(textureQueryLevels(" + tn + ")))";
-            else if (oneD) v = "uvec4(uint(" + size + ".x), 1u, 1u, uint(textureQueryLevels(" + tn + ")))";
-            else if (coords == 2) v = "uvec4(uvec2(" + size + "), 1u, uint(textureQueryLevels(" + tn + ")))";
-            else v = "uvec4(uvec3(" + size + "), uint(textureQueryLevels(" + tn + ")))";
+            if (oneD && array) v = "uvec4(" + w + ", uint(" + size + ".z), 1u, " + levels + ")";
+            else if (oneD) v = "uvec4(" + w + ", 1u, 1u, " + levels + ")";
+            else if (coords == 2) v = "uvec4(" + w + ", " + h + ", 1u, " + levels + ")";
+            else v = "uvec4(" + w + ", " + h + ", uint(" + size + ".z), " + levels + ")";
             out("{ uvec4 t_ = " + v + ";\n");
             uint32_t r = vdata;
             for (int c = 0; c < 4; ++c)

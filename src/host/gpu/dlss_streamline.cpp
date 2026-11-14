@@ -284,7 +284,9 @@ void shutdown() {
 }
 
 namespace {
-// Logs a Streamline call that took long on the CPU, to find stalls (at most 20 lines a run).
+// Logs a Streamline call that took long on the CPU, to find stalls (at most 20 lines a run), and
+// the time the calls took over the first 300 frames.
+double gSlMs = 0;
 struct SlowCall {
     const char* what;
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
@@ -292,6 +294,7 @@ struct SlowCall {
     ~SlowCall() {
         static int logged = 0;
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        gSlMs += ms;
         if (ms >= 20.0 && logged < 20) {
             ++logged;
             std::fprintf(stderr, "[dlss] %s took %.0f ms (frame %u)\n", what, ms, gFrame);
@@ -318,6 +321,7 @@ bool evaluate(VkCommandBuffer cmd, VkDevice, const upscale::Frame& f) {
     const sl::ViewportHandle viewport(0u);
     sl::FrameToken* token = nullptr;
     const uint32_t index = gFrame++;
+    if (gFrame == 301) std::fprintf(stderr, "[dlss] Streamline calls took %.0f ms over the first 300 frames\n", gSlMs);
     sl::Result r = gSl.getNewFrameToken(token, &index);
     if (r != sl::Result::eOk || !token) return fail("getting a frame token", r);
 
@@ -369,18 +373,21 @@ bool evaluate(VkCommandBuffer cmd, VkDevice, const upscale::Frame& f) {
     if (r != sl::Result::eOk) return fail("setting the constants", r);
 
     sl::Resource color = resource(f.color), depth = resource(f.depth), motion = resource(f.motion),
-                 output = resource(f.output);
+                 output = resource(f.output), moved = resource(f.moved);
     const sl::Extent inExtent{0, 0, f.renderW, f.renderH}, outExtent{0, 0, f.outW, f.outH};
+    // Valid until the evaluation, which follows in the same command buffer: with eOnlyValidNow
+    // Streamline copied every image first, and the first frames' setTagForFrame took 0.4 s each.
     const sl::ResourceTag tags[] = {
-        sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &inExtent),
-        sl::ResourceTag(&output, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &outExtent),
-        sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &inExtent),
-        sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &inExtent),
+        sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &inExtent),
+        sl::ResourceTag(&output, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &outExtent),
+        sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &inExtent),
+        sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &inExtent),
+        sl::ResourceTag(&moved, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eValidUntilEvaluate, &inExtent),
     };
     auto* slCmd = reinterpret_cast<sl::CommandBuffer*>(cmd);
     {
         SlowCall t("slSetTagForFrame");
-        r = gSl.setTagForFrame(*token, viewport, tags, 4, slCmd);
+        r = gSl.setTagForFrame(*token, viewport, tags, f.moved.image ? 5 : 4, slCmd);
     }
     if (r != sl::Result::eOk) return fail("tagging the images", r);
 

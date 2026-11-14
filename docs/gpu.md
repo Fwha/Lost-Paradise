@@ -162,11 +162,16 @@ shaders' code) with a temporal upscaler (`gpu/upscale.h`; `upscaleSmaa` in the r
 - Quality/Balanced/Performance: at boot the game is told to draw its scene 1.5x/1.7x/2x smaller
   (each side, to 8 pixels) while its output keeps the resolution (1080p at least, as the game's
   own). The game already draws its scene smaller than its output on a base PS4 (1600x896 into
-  1920x1080) and scales it up in a later full-screen pass. The SMAA blend is skipped and the
-  scene left as it is until a draw first samples it (the game may still draw into it: Ken's aura).
-  That draw runs the upscaler into an image at the output size, and it and later draws of the
-  frame sample that image wherever they sample the scene (`resolveImageUncached`, with the UV
-  scale mapping the scene's part of the texture onto it). A draw that then renders or stores
+  1920x1080) and scales it up in a later full-screen pass. The SMAA blend is skipped (when it
+  reads the colour from another target than it writes, as this game's does, that colour is
+  copied into its target instead) and the scene left as it is until a draw first samples it into an output-sized target (the game may
+  still draw into it: Ken's aura). A draw that copies it into another target of its size (the
+  bloom's blend) moves it there (`[upscale] the scene is composited into a copy`); one that moves
+  it back into a target it was in this frame is the game blending in earlier frames (its
+  afterimage effect), and such frames run the upscaler without its history, which would pile up
+  the ghosts. The output-sized draw runs the upscaler into an image at the output size, and it
+  and later draws of the frame sample that image wherever they sample the scene
+  (`resolveImageUncached`, with the UV scale mapping the scene's part of the texture onto it). A draw that then renders or stores
   into the scene ends that for the frame (logged once). `[upscale] ... first read by` says which
   pass that was. Mipmapped textures get a mip bias of log2(scene / output).
 - Depth: the depth buffer bound to the SMAA blend (the scene's). FSR gets an R32F copy the motion
@@ -175,7 +180,12 @@ shaders' code) with a temporal upscaler (`gpu/upscale.h`; `upscaleSmaa` in the r
 - Motion vectors: a compute pass reprojects that depth with this and last frame's camera. The
   scene vertex shaders read it from the constant buffer whose V# s[12:13] points at: projection
   rows at 0x0, view rotation rows at 0x40/0x50/0x60, camera position at 0x220 (positions are
-  camera-relative). Only camera motion: moving characters rely on the upscaler.
+  camera-relative). Only camera motion: for what moves by itself (characters), the motion pass
+  compares each pixel's view distance with last frame's around where the camera puts it, and
+  marks it where none is within 3%: DLSS gets that as its bias-current-colour mask, FSR as its
+  reactive mask, so they do not smear characters' history (`LPN_UPSCALE_NO_MASK=1` leaves it
+  out). FSR's at 0.4 (`LPN_FSR_REACTIVE`, 0 to 1): at 1 the fighters' outlines had no history and
+  shook with the jitter.
 - Jitter: every draw with the scene depth bound before SMAA (full-screen lighting passes too, or
   shadows flicker) gets a Halton sub-pixel viewport offset (8 phases, 8 x ratio^2 when
   upscaling), passed to the upscaler as is. So do 3D draws after SMAA that depth-test against it

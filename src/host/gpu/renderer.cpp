@@ -1071,7 +1071,10 @@ public:
         // Analyses move by pointer: moved by value (two Programs each), handing them along was
         // ~10% of the recorder at 8,000 draws a frame.
         std::unique_ptr<DrawAnalysis>& held = taken_[takenNext_++];
-        if (upDiag_ == 1 && smaaSeen_) upscaleDiag(d, r, *held);
+        if ((upDiag_ == 1 || upTrace_) && smaaSeen_) upscaleDiag(d, r, *held);
+        if (upOn_ && upScaled_) upscaleWritten(d, r, *held);
+        if (upPrevScene_ && !smaaSeen_) upscalePrevWritten(d, r, *held);
+        if (upIn_.on && smaaSeen_ && !upEffect_ && upLastScene_) upscaleEffect(d, r, *held);
         if (recordThreads_) {
             if (segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
                 addToSegment(d, r, held);
@@ -5063,12 +5066,21 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D depthTex;
 layout(set = 0, binding = 1, rg16f) uniform writeonly image2D motion;
 layout(set = 0, binding = 2, r32f) uniform writeonly image2D depthCopy; // FSR's depth, as a colour image
+layout(set = 0, binding = 3, r32f) uniform readonly image2D lastDistance; // the last frame's view distances
+layout(set = 0, binding = 4, r32f) uniform writeonly image2D distance;    // this frame's
+layout(set = 0, binding = 5, rgba8) uniform writeonly image2D moved;        // 1: favour this frame's colour
 layout(push_constant) uniform P {
     mat4 reproject; // current NDC (x, y, depth, 1) to the previous clip position
     vec4 vp;        // viewport offset x, y and scale x, y: pixel = ndc * scale + offset
     vec4 z;         // depth offset, scale; this frame's viewport jitter x, y (pixels)
-    ivec4 size;
+    ivec4 size;     // z: the mask's value where something moved, in thousandths
+    vec4 proj;      // this projection's A, B, s (view z from NDC depth); w: 1 when lastDistance is usable
 } p;
+// The view distance at NDC depth n: (z * A + B) / (z * s) = n.
+float viewDistance(float n) {
+    float d = p.proj.z * n - p.proj.x;
+    return abs(d) < 1e-12 ? 1e30 : abs(p.proj.y / d);
+}
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     if (c.x >= p.size.x || c.y >= p.size.y) return;
@@ -5078,14 +5090,31 @@ void main() {
     vec2 was = prev.xy / prev.w * p.vp.zw + p.vp.xy;
     imageStore(motion, c, vec4(prev.w > 0.0 ? was - pix : vec2(0.0), 0.0, 0.0));
     imageStore(depthCopy, c, vec4(d));
+    imageStore(distance, c, vec4(viewDistance((d - p.z.x) / p.z.y)));
+    // Something moved here (a character: the motion vectors are the camera's only) when no surface
+    // near where this one was last frame was at the distance it would have been: its history is
+    // another surface's, which DLSS would otherwise smear along.
+    float m = 0.0;
+    if (p.proj.w > 0.0 && prev.w > 0.0) {
+        ivec2 q = ivec2(floor(was));
+        float expect = abs(prev.w), best = 1e30;
+        if (all(greaterThanEqual(q, ivec2(1))) && all(lessThan(q, p.size.xy - 1))) {
+            for (int y = -1; y <= 1; ++y)
+                for (int x = -1; x <= 1; ++x) best = min(best, abs(imageLoad(lastDistance, q + ivec2(x, y)).r - expect));
+            m = best > 0.03 * expect ? 1.0 : 0.0;
+        }
+    }
+    imageStore(moved, c, vec4(m * float(p.size.z) / 1000.0));
 }
 )";
     struct MotionPush {
         float m[16];
         float vp[4], z[4];
         int32_t size[4];
+        float proj[4];
     };
 
+    static constexpr uint32_t kMotionBindings = 6;
     bool motionPipeline() {
         if (mvPipe_) return true;
         const VkShaderModule sm = module(kMotionGlsl, gcn::GlslStage::Compute);
@@ -5094,13 +5123,12 @@ void main() {
         sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
         sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         VK_CHECK(vkCreateSampler(vk_.device, &sci, nullptr, &mvSampler_));
-        VkDescriptorSetLayoutBinding b[3]{};
+        VkDescriptorSetLayoutBinding b[kMotionBindings]{};
         b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        b[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        for (uint32_t i = 1; i < kMotionBindings; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-        dl.bindingCount = 3;
+        dl.bindingCount = kMotionBindings;
         dl.pBindings = b;
         VK_CHECK(vkCreateDescriptorSetLayout(vk_.device, &dl, nullptr, &mvSetLayout_));
         const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MotionPush)};
@@ -5139,11 +5167,12 @@ void main() {
 
     // A draw of one of the SMAA shaders with an upscaler on: true when it was handled (skipped,
     // or the blend replaced by the upscaler).
-    bool upscaleSmaa(const DrawRegs& r, uint8_t role) {
+    bool upscaleSmaa(const DrawRegs& r, uint8_t role, const DrawAnalysis& a) {
         if (upKind_ == Upscaler::Off || !upscale::usable(upKind_)) return false;
         smaaSeen_ = true; // later draws are post-processing: not jittered
-        if (role != 3) return true; // edges and weights: the upscaler needs neither
         const uint32_t* cb = &r.ctx[reg::kCbColorBase];
+        if (role == 2) smaaWeights_ = uint64_t(cb[0]) << 8;
+        if (role != 3) return true; // edges and weights: the upscaler needs neither
         const uint32_t info = cb[::gpu::ctx::kCbColorInfo];
         const uint32_t fmt = (info >> 2) & 0x1F, num = (info >> 8) & 7;
         const VkFormat vf = colorFormat(fmt, num);
@@ -5170,10 +5199,45 @@ void main() {
         in.w = std::min(uint32_t(std::lround(std::fabs(v[0]) * 2)), std::min(out->img.width, depth->img.width));
         in.h = std::min(uint32_t(std::lround(std::fabs(v[2]) * 2)), std::min(out->img.height, depth->img.height));
         if (!in.w || !in.h) return false;
+        // The blend reads the scene's colour from another target than it writes (this game: by
+        // turns into two): skipped, its target would keep a frame from before, which the game's
+        // later passes and the upscaler would read. That colour is copied over in its place.
+        uint64_t colour = 0;
+        for (const auto& t : a.ps.images)
+            if (!t.storage && t.base() != smaaWeights_ && t.base() != in.colorAddr && t.width() >= in.w && t.height() >= in.h)
+                colour = t.base();
+        if (colour) {
+            auto it = colors_.find(colour);
+            Surface* src = it != colors_.end() ? &it->second : nullptr;
+            if (!src || src->img.width < in.w || src->img.height < in.h || src->img.format != out->img.format) {
+                warnOnce("[upscale] the SMAA blend's colour is not a render target of the scene's size and format");
+                return false; // the blend runs as the game has it
+            }
+            if (!smaaCopyLogged_) {
+                smaaCopyLogged_ = true;
+                std::fprintf(stderr, "[upscale] the SMAA blend reads the scene from 0x%" PRIx64 " into 0x%" PRIx64 ": copied in its place\n",
+                             colour, in.colorAddr);
+            }
+            if (!ringFits(1 << 12)) flush();
+            begin();
+            fullBarrier();
+            const VkImageCopy copy{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                                   {in.w, in.h, 1}};
+            rec([c = R().cmd_, from = src->img.image, to = out->img.image, copy] {
+                vkCmdCopyImage(c, from, VK_IMAGE_LAYOUT_GENERAL, to, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+            });
+            barrier();
+            gpuWrote(*out);
+        }
         if (!upScaled_) return runUpscaler(in, true); // Native: anti-aliased in place, as the blend would
         // Upscaling: the scene stays as it is (the game may still draw into it, Ken's aura) until a
         // draw first reads it (upscaleTouch), which then reads the upscaled picture instead.
         upIn_ = in;
+        upFollowed_.assign(1, in.colorAddr);
+        // The last frame's scene when it was another target: a game that renders into one every
+        // frame has none (an address kept from frames before was the bloom's copy, read each frame).
+        upThisScene_ = in.colorAddr;
+        upLastScene_ = upPrevScene_ != in.colorAddr ? upPrevScene_ : 0;
         return true;
     }
 
@@ -5197,6 +5261,8 @@ void main() {
         begin();
         if (!upscaleImage(upColor_, vf, out->img.width, out->img.height) ||
             !upscaleImage(upMotion_, VK_FORMAT_R16G16_SFLOAT, w, h) || !upscaleImage(upDepth_, VK_FORMAT_R32_SFLOAT, w, h) ||
+            !upscaleImage(upDistance_[0], VK_FORMAT_R32_SFLOAT, w, h) || !upscaleImage(upDistance_[1], VK_FORMAT_R32_SFLOAT, w, h) ||
+            !upscaleImage(upMoved_, VK_FORMAT_R8G8B8A8_UNORM, w, h) ||
             !motionPipeline() ||
             (!inPlace && !upscaleImage(upOut_, vf, ow, oh)))
             return false;
@@ -5223,15 +5289,34 @@ void main() {
         mp.z[0] = k.valid ? k.zo : 0, mp.z[1] = k.valid ? k.zs : 1;
         mp.z[2] = jitterOn_ ? jitterX_ : 0, mp.z[3] = jitterOn_ ? jitterY_ : 0;
         mp.size[0] = int32_t(w), mp.size[1] = int32_t(h);
+        // FSR takes the mask as its reactive mask: at full strength it leaves the silhouettes of
+        // whatever moved (the fighters) without history, the jitter shaking their outlines.
+        mp.size[2] = int32_t(std::lround((upKind_ == Upscaler::Fsr ? fsrReactive_ : 1.0f) * 1000.0f));
+        // This frame's view distances go to one image, the last frame's are in the other: usable
+        // when the camera carried over (moved) and the last run wrote them at this size.
+        const double pA = k.valid ? k.proj[10] : 0, pB = k.valid ? k.proj[11] : 1, pS = k.valid ? k.proj[14] : 1;
+        mp.proj[0] = float(pA), mp.proj[1] = float(pB), mp.proj[2] = float(pS);
+        const bool sameSize = upDistanceW_ == w && upDistanceH_ == h;
+        mp.proj[3] = moved && sameSize && upMask_ ? 1.0f : 0.0f;
+        upDistanceW_ = w, upDistanceH_ = h;
+        upDistanceNext_ ^= 1;
+        Image& lastDist = upDistance_[upDistanceNext_ ^ 1];
+        Image& curDist = upDistance_[upDistanceNext_];
         const VkImageView depthView = view(depth->img, df, VK_IMAGE_VIEW_TYPE_2D, kIdentity, VK_IMAGE_ASPECT_DEPTH_BIT);
         const VkImageView mvView = view(upMotion_, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
         const VkImageView depthCopyView = view(upDepth_, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
-        rec([this, c = R().cmd_, mp, depthView, mvView, depthCopyView] {
-            const VkDescriptorImageInfo di[3] = {{mvSampler_, depthView, VK_IMAGE_LAYOUT_GENERAL},
-                                                 {VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL},
-                                                 {VK_NULL_HANDLE, depthCopyView, VK_IMAGE_LAYOUT_GENERAL}};
-            VkWriteDescriptorSet wr[3]{};
-            for (uint32_t i = 0; i < 3; ++i) {
+        const VkImageView lastDistView = view(lastDist, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
+        const VkImageView distView = view(curDist, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
+        const VkImageView movedView = view(upMoved_, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
+        rec([this, c = R().cmd_, mp, depthView, mvView, depthCopyView, lastDistView, distView, movedView] {
+            const VkDescriptorImageInfo di[kMotionBindings] = {{mvSampler_, depthView, VK_IMAGE_LAYOUT_GENERAL},
+                                                               {VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL},
+                                                               {VK_NULL_HANDLE, depthCopyView, VK_IMAGE_LAYOUT_GENERAL},
+                                                               {VK_NULL_HANDLE, lastDistView, VK_IMAGE_LAYOUT_GENERAL},
+                                                               {VK_NULL_HANDLE, distView, VK_IMAGE_LAYOUT_GENERAL},
+                                                               {VK_NULL_HANDLE, movedView, VK_IMAGE_LAYOUT_GENERAL}};
+            VkWriteDescriptorSet wr[kMotionBindings]{};
+            for (uint32_t i = 0; i < kMotionBindings; ++i) {
                 wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 wr[i].dstBinding = i;
                 wr[i].descriptorCount = 1;
@@ -5239,7 +5324,7 @@ void main() {
                 wr[i].pImageInfo = &di[i];
             }
             vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, mvPipe_);
-            vk_.cmdPushDescriptorSet(c, VK_PIPELINE_BIND_POINT_COMPUTE, mvLayout_, 0, 3, wr);
+            vk_.cmdPushDescriptorSet(c, VK_PIPELINE_BIND_POINT_COMPUTE, mvLayout_, 0, kMotionBindings, wr);
             vkCmdPushConstants(c, mvLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof mp, &mp);
             vkCmdDispatch(c, (uint32_t(mp.size[0]) + 7) / 8, (uint32_t(mp.size[1]) + 7) / 8, 1);
         });
@@ -5258,6 +5343,7 @@ void main() {
         else
             f.depth = {upDepth_.image, depthCopyView, VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, w, h, kUpscaleUsage};
         f.motion = {upMotion_.image, mvView, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, w, h, kUpscaleUsage};
+        if (upMask_) f.moved = {upMoved_.image, movedView, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, w, h, kUpscaleUsage};
         if (inPlace)
             f.output = {out->img.image, view(out->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), vf, VK_IMAGE_ASPECT_COLOR_BIT, w, h,
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | kUpscaleUsage};
@@ -5267,7 +5353,7 @@ void main() {
         f.outW = ow, f.outH = oh;
         f.jitterX = jitterOn_ ? jitterX_ * jitterSign_[0] : 0;
         f.jitterY = jitterOn_ ? jitterY_ * jitterSign_[1] : 0;
-        f.reset = !moved;
+        f.reset = !moved || upEffect_ || upNoHistory_;
         f.quality = inPlace ? UpscaleQuality::Native : displaySettings().upscaleQuality;
         if (f.quality == UpscaleQuality::Native && !inPlace) f.quality = UpscaleQuality::Quality;
         // The last camera's range, kept across frames without one (FSR remakes its context when
@@ -5279,10 +5365,10 @@ void main() {
             f.frameMs = std::clamp(std::chrono::duration<float, std::milli>(now - upLastRun_).count(), 1.0f, 200.0f);
         upLastRun_ = now;
         // Every 300 frames: how often the history was dropped, to tell a camera problem.
-        ++upStats_[0], upStats_[1] += f.reset, upStats_[2] += cam_.valid, upStats_[3] += jitterOn_;
+        ++upStats_[0], upStats_[1] += f.reset, upStats_[2] += cam_.valid, upStats_[3] += jitterOn_, upStats_[4] += upEffect_;
         if (upStats_[0] == 300) {
-            std::fprintf(stderr, "[upscale] last 300 frames: history reset %u, camera read %u, jittered %u\n", upStats_[1],
-                         upStats_[2], upStats_[3]);
+            std::fprintf(stderr, "[upscale] last 300 frames: history reset %u (afterimage %u), camera read %u, jittered %u\n",
+                         upStats_[1], upStats_[4], upStats_[2], upStats_[3]);
             std::memset(upStats_, 0, sizeof upStats_);
         }
         if (upKind_ == Upscaler::Dlss)
@@ -5371,6 +5457,22 @@ void main() {
             const VkFormat vf = colorFormat(fmt, num);
             if (addr != scene && targetW == upIn_.pitch && vf == upIn_.format &&
                 uint32_t(std::lround(std::fabs(v[0]) * 2)) == upIn_.w && uint32_t(std::lround(std::fabs(v[2]) * 2)) == upIn_.h) {
+                // Back into a target the scene was in before this frame: the game blends copies of
+                // the scene with earlier frames' (its afterimage effect). The upscaler's history
+                // would pile up those ghosts: it starts over for such frames.
+                // Only with an earlier frame's picture in it: a target of the scene's size this frame
+                // has not written (the depth buffer aside). A copy blended straight back (the game's
+                // glow, every frame, depth tested) is not.
+                bool earlier = false;
+                for (const gcn::Program* p : {&a.vs, &a.ps})
+                    for (const auto& t : p->images)
+                        if (!t.storage && t.width() == upIn_.w && t.height() == upIn_.h && !depths_.count(t.base()) &&
+                            std::find(upWritten_.begin(), upWritten_.end(), t.base()) == upWritten_.end())
+                            earlier = true;
+                if (std::find(upFollowed_.begin(), upFollowed_.end(), addr) != upFollowed_.end()) {
+                    if (earlier) afterimage("the scene went back into a target it was in, with an earlier frame's");
+                } else
+                    upFollowed_.push_back(addr);
                 upIn_.colorAddr = addr;
                 upIn_.rows = ((cb[::gpu::ctx::kCbColorSlice] & 0x3FFFFF) + 1) * 64 / upIn_.pitch;
                 if (!upFollowLogged_) {
@@ -5404,12 +5506,13 @@ void main() {
         }
     }
 
-    // One frame's draws after the SMAA blend, when none read the scene into an output-sized
-    // target: their targets and images, to see how the game takes the scene to the output.
+    // The draws after the SMAA blend, logged at frame end (upscaleDiagEnd): one frame's when none
+    // read the scene into an output-sized target; with LPN_UPSCALE_TRACE=1, a frame's whenever
+    // their targets and image sizes differ from every frame logged before (a pass the game adds
+    // in motion, say). To see how the game takes the scene to the output.
     void upscaleDiag(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
-        if (upDiagLines_ >= 80) return;
-        ++upDiagLines_;
-        const uint64_t scene = upIn_.colorAddr;
+        if (upDiagFrame_.size() >= 80) return;
+        const uint64_t scene = upRedirect_ ? upSceneAddr_ : upIn_.colorAddr;
         const uint32_t* cb = &r.ctx[reg::kCbColorBase];
         std::string line;
         char buf[160];
@@ -5420,24 +5523,102 @@ void main() {
                           (uint64_t(cb[0]) << 8) == scene ? " (scene)" : "", ((cb[::gpu::ctx::kCbColorPitch] & 0x7FF) + 1) * 8,
                           (cb[::gpu::ctx::kCbColorInfo] >> 2) & 0x1F);
             line = buf;
+            upDiagShape_ += "d" + std::to_string(((cb[::gpu::ctx::kCbColorPitch] & 0x7FF) + 1) * 8);
         }
+        if (upRedirect_) line += " [after upscaling]";
         for (const gcn::Program* p : {&a.vs, &a.ps})
             for (const auto& t : p->images) {
                 std::snprintf(buf, sizeof buf, "; %s 0x%" PRIx64 "%s %ux%u", t.storage ? "stores" : "reads", t.base(),
                               t.base() == scene ? " (scene)" : "", t.width(), t.height());
                 line += buf;
+                // The shape: images at the scene's size only (textures vary from frame to frame).
+                if (t.width() == upIn_.w || t.storage) upDiagShape_ += t.storage ? "s" : "r";
             }
-        std::fprintf(stderr, "[upscale] after SMAA: %s\n", line.c_str());
+        upDiagShape_ += d.kind == DrawCall::kDispatch ? "D;" : ";";
+        upDiagFrame_.push_back(std::move(line));
+    }
+    void upscaleDiagEnd() {
+        // (Once upscaling runs: menus before it have many shapes of their own.)
+        const bool newShape = upTrace_ && upRanLast_ && !upDiagFrame_.empty() && upDiagShapes_.size() < 32 &&
+                              upDiagShapes_.insert(upDiagShape_).second;
+        if ((upDiag_ == 1 || newShape) && !upDiagFrame_.empty()) {
+            std::fprintf(stderr, "[upscale] frame %" PRIu64 ": %zu draws after SMAA\n", frame_, upDiagFrame_.size());
+            for (const std::string& l : upDiagFrame_) std::fprintf(stderr, "[upscale] after SMAA: %s\n", l.c_str());
+        }
+        upDiagFrame_.clear();
+        upDiagShape_.clear();
+    }
+
+    // A frame of the game's afterimage effect: it blends earlier frames into the scene, which the
+    // upscaler's history would pile up into long trails. Such frames run without the history.
+    void afterimage(const char* why) {
+        if (!upEffect_ && upEffectLogged_ < 2) {
+            ++upEffectLogged_;
+            std::fprintf(stderr, "[upscale] the game blends earlier frames into the scene (an afterimage: %s): no upscaler history in such frames\n", why);
+        }
+        upEffect_ = true;
+    }
+    // A draw after SMAA that reads the last frame's scene (the game renders into two by turns).
+    // A draw that renders into that target first makes it this frame's picture.
+    static bool writes(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a, uint64_t addr) {
+        if (rendersInto(d, r, addr)) return true;
+        for (const gcn::Program* p : {&a.vs, &a.ps})
+            for (const auto& t : p->images)
+                if (t.storage && t.base() == addr) return true;
+        return false;
+    }
+    // The scene-sized targets the frame has written so far (rendered into or stored to).
+    void upscaleWritten(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
+        auto add = [&](uint64_t addr) {
+            if (std::find(upWritten_.begin(), upWritten_.end(), addr) == upWritten_.end()) upWritten_.push_back(addr);
+        };
+        if (d.kind != DrawCall::kDispatch)
+            for (uint32_t i = 0; i < 8; ++i) {
+                const uint32_t* cb = &r.ctx[reg::kCbColorBase + i * reg::kCbColorStride];
+                const uint32_t pitch = ((cb[::gpu::ctx::kCbColorPitch] & 0x7FF) + 1) * 8;
+                if (((cb[::gpu::ctx::kCbColorInfo] >> 2) & 0x1F) && pitch >= upSceneW_) add(uint64_t(cb[0]) << 8);
+            }
+        for (const gcn::Program* p : {&a.vs, &a.ps})
+            for (const auto& t : p->images)
+                if (t.storage && t.width() >= upSceneW_) add(t.base());
+    }
+    // Before SMAA: a draw that writes last frame's scene target makes it this frame's picture.
+    void upscalePrevWritten(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
+        if (writes(d, r, a, upPrevScene_)) upPrevScene_ = 0;
+    }
+    void upscaleEffect(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
+        if (writes(d, r, a, upLastScene_)) {
+            upLastScene_ = 0;
+            return;
+        }
+        for (const gcn::Program* p : {&a.vs, &a.ps})
+            for (const auto& t : p->images)
+                if (!t.storage && t.base() == upLastScene_) {
+                    // Which pass reads it, once each: to tell the game's afterimage from a pass it
+                    // runs every frame.
+                    const uint64_t ps = shaderAddress(r, d.kind == DrawCall::kDispatch ? reg::kPgmLoCs : reg::kPgmLoPs);
+                    if (upEffectPs_.size() < 8 && std::find(upEffectPs_.begin(), upEffectPs_.end(), ps) == upEffectPs_.end()) {
+                        upEffectPs_.push_back(ps);
+                        std::fprintf(stderr, "[upscale] %s 0x%" PRIx64 " reads last frame's scene 0x%" PRIx64 " (this frame's 0x%" PRIx64 ")\n",
+                                     d.kind == DrawCall::kDispatch ? "cs" : "ps", ps, upLastScene_, upThisScene_);
+                    }
+                    return afterimage("the last frame's scene was read");
+                }
     }
 
     // Each frame: which upscaler runs, the cameras and the next jitter.
     void upscaleFrameEnd() {
         prevCam_ = cam_;
         cam_.valid = false;
+        upPrevScene_ = smaaSeen_ ? upThisScene_ : 0;
+        upWritten_.clear();
+        upThisScene_ = upLastScene_ = 0;
         smaaSeen_ = false;
         camTries_ = 0;
         upRanLast_ = upRan_;
         upRan_ = false;
+        upscaleDiagEnd();
+        upEffect_ = false;
         if (upDiag_ == 1) upDiag_ = 2; // one frame logged
         if (upIn_.on && ++upUnread_ == 120) { // waiting since the SMAA blend: nothing read the scene
             std::fprintf(stderr, "[upscale] the scene was not read by a draw after SMAA: left at its size\n");
@@ -5470,15 +5651,40 @@ void main() {
     float upLodBias_ = 0, upDepth0_ = 0.1f, upDepth1_ = 1000.0f, upFovY_ = 1.0f;
     std::chrono::steady_clock::time_point upLastRun_{};
     uint64_t sceneDepth_ = 0, jitterIndex_ = 0;
-    uint32_t camTries_ = 0, upStats_[4] = {}, upUnread_ = 0;
+    uint32_t camTries_ = 0, upStats_[5] = {}, upUnread_ = 0;
     int upDiag_ = 0; // 1: this frame's draws after SMAA are logged (upscaleDiag); 2: done
-    uint32_t upDiagLines_ = 0;
+    bool upTrace_ = getenv("LPN_UPSCALE_TRACE") != nullptr;
+    std::vector<std::string> upDiagFrame_;
+    std::string upDiagShape_;
+    std::set<std::string> upDiagShapes_;
     bool upFollowLogged_ = false;
+    uint64_t smaaWeights_ = 0; // the SMAA blend weights' target (upscaleSmaa)
+    bool smaaCopyLogged_ = false;
+    std::vector<uint64_t> upFollowed_; // where the scene was this frame (upscaleTouch)
+    bool upEffect_ = false;
+    int upEffectLogged_ = 0;
+    uint64_t upThisScene_ = 0, upLastScene_ = 0; // the SMAA blend's target this frame and last frame's, if another
+    uint64_t upPrevScene_ = 0;                    // the SMAA blend's target last frame, until written
+    std::vector<uint64_t> upEffectPs_;            // shaders logged reading it
+    std::vector<uint64_t> upWritten_;             // scene-sized targets written this frame (upscaleWritten)
     float jitterX_ = 0, jitterY_ = 0;
     // LPN_DLSS_JITTER_SIGN=<x>,<y> (each 1 or -1): flips the jitter the upscaler is told (debugging).
     float jitterSign_[2] = {1, 1};
     Camera cam_, prevCam_;
     Image upColor_, upMotion_, upDepth_, upOut_;
+    // The motion pass's view distances (this frame's and the last, by turns) and its mask of what
+    // moved by itself (upscale::Frame::moved); LPN_UPSCALE_NO_MASK=1 leaves the mask out.
+    Image upDistance_[2], upMoved_;
+    uint32_t upDistanceNext_ = 0, upDistanceW_ = 0, upDistanceH_ = 0;
+    bool upMask_ = !getenv("LPN_UPSCALE_NO_MASK");
+    // FSR's reactive mask where something moved (LPN_FSR_REACTIVE, 0 to 1): 1 took the fighters'
+    // outlines out of its history.
+    float fsrReactive_ = [] {
+        const char* v = getenv("LPN_FSR_REACTIVE");
+        return v ? std::clamp(float(std::atof(v)), 0.0f, 1.0f) : 0.4f;
+    }();
+    // Every frame without the upscaler's history: to tell its ghosts from the game's.
+    bool upNoHistory_ = getenv("LPN_UPSCALE_NO_HISTORY") != nullptr;
     VkPipeline mvPipe_ = VK_NULL_HANDLE;
     VkPipelineLayout mvLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout mvSetLayout_ = VK_NULL_HANDLE;
@@ -6397,6 +6603,21 @@ void main() {
         if (cbMode > 1 || (dbRender & 0x1C)) return;
         const uint32_t prim = r.uconfig[reg::kPrimitiveType];
         if (prim == 0 || prim == 8 || prim == 13) return;
+        // Debugging: draws with these pixel shaders (LPN_SKIP_PS=0x...,0x...) are left out, to
+        // tell which pass draws something.
+        static const std::vector<uint64_t> skipPs = [] {
+            std::vector<uint64_t> v;
+            if (const char* e = getenv("LPN_SKIP_PS"))
+                for (const char* c = e; *c;) {
+                    char* end;
+                    const uint64_t a = std::strtoull(c, &end, 16);
+                    if (end == c) break;
+                    if (a) v.push_back(a);
+                    c = *end ? end + 1 : end;
+                }
+            return v;
+        }();
+        if (!skipPs.empty() && std::find(skipPs.begin(), skipPs.end(), shaderAddress(r, reg::kPgmLoPs)) != skipPs.end()) return;
         j.vs = launch(r, gcn::Stage::Vertex);
         j.kind = DrawJob::kDraw;
         j.hasPs = shaderAddress(r, reg::kPgmLoPs) != 0;
@@ -6772,7 +6993,7 @@ void main() {
         }
 
         if (!a.ok) return;
-        if (upOn_ && a.psm && a.psm->smaa && upscaleSmaa(r, a.psm->smaa)) return;
+        if (upOn_ && a.psm && a.psm->smaa && upscaleSmaa(r, a.psm->smaa, a)) return;
         const bool wasMergeable = R().lastMergeable_;
         R().lastMergeable_ = false;
         if (fastDraw(d, r, a, wasMergeable) || switchDraw(d, r, a)) return;
@@ -8377,6 +8598,15 @@ private:
         begin();
         endPass(); // secondaries run outside a render pass
         rec([this, c = R().cmd_, batch = R().cur_, g] { executeSegment(c, batch, *g); });
+        // What the secondary bound (its pipelines, descriptors, viewport) is left in the primary,
+        // which Vulkan calls undefined: what this thread remembers binding no longer holds. A draw
+        // recorded here next (one touching the scene the upscaler waits on, say) sets it all again:
+        // a copy into the game's screen grab skipped its viewport and drew with the segment's.
+        R().bound_ = Bound{};
+        ++R().passSerial_;
+        R().fast_.valid = false;
+        for (FastSlot& f : R().fastSlots_) f.f.valid = false;
+        R().lastMergeable_ = false;
         R().afterFlush_.push_back([this, sl = g->slot] {
             {
                 std::lock_guard lock(segMutex_);
