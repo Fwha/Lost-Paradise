@@ -175,7 +175,10 @@ shaders' code) with a temporal upscaler (`gpu/upscale.h`; `upscaleSmaa` in the r
 - Motion vectors: a compute pass reprojects that depth with this and last frame's camera. The
   scene vertex shaders read it from the constant buffer whose V# s[12:13] points at: projection
   rows at 0x0, view rotation rows at 0x40/0x50/0x60, camera position at 0x220 (positions are
-  camera-relative). Only camera motion: moving characters rely on the upscaler.
+  camera-relative). Only camera motion: for what moves by itself (characters), the motion pass
+  compares each pixel's view distance with last frame's around where the camera puts it, and
+  marks it where none is within 3%: DLSS gets that as its bias-current-colour mask, so it does
+  not smear characters' history (`LPN_UPSCALE_NO_MASK=1` leaves it out; FSR does not use it).
 - Jitter: every draw with the scene depth bound before SMAA (full-screen lighting passes too, or
   shadows flicker) gets a Halton sub-pixel viewport offset (8 phases, 8 x ratio^2 when
   upscaling), passed to the upscaler as is. So do 3D draws after SMAA that depth-test against it

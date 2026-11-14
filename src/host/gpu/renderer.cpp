@@ -5063,12 +5063,21 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D depthTex;
 layout(set = 0, binding = 1, rg16f) uniform writeonly image2D motion;
 layout(set = 0, binding = 2, r32f) uniform writeonly image2D depthCopy; // FSR's depth, as a colour image
+layout(set = 0, binding = 3, r32f) uniform readonly image2D lastDistance; // the last frame's view distances
+layout(set = 0, binding = 4, r32f) uniform writeonly image2D distance;    // this frame's
+layout(set = 0, binding = 5, r8) uniform writeonly image2D moved;         // 1: favour this frame's colour
 layout(push_constant) uniform P {
     mat4 reproject; // current NDC (x, y, depth, 1) to the previous clip position
     vec4 vp;        // viewport offset x, y and scale x, y: pixel = ndc * scale + offset
     vec4 z;         // depth offset, scale; this frame's viewport jitter x, y (pixels)
     ivec4 size;
+    vec4 proj;      // this projection's A, B, s (view z from NDC depth); w: 1 when lastDistance is usable
 } p;
+// The view distance at NDC depth n: (z * A + B) / (z * s) = n.
+float viewDistance(float n) {
+    float d = p.proj.z * n - p.proj.x;
+    return abs(d) < 1e-12 ? 1e30 : abs(p.proj.y / d);
+}
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     if (c.x >= p.size.x || c.y >= p.size.y) return;
@@ -5078,14 +5087,31 @@ void main() {
     vec2 was = prev.xy / prev.w * p.vp.zw + p.vp.xy;
     imageStore(motion, c, vec4(prev.w > 0.0 ? was - pix : vec2(0.0), 0.0, 0.0));
     imageStore(depthCopy, c, vec4(d));
+    imageStore(distance, c, vec4(viewDistance((d - p.z.x) / p.z.y)));
+    // Something moved here (a character: the motion vectors are the camera's only) when no surface
+    // near where this one was last frame was at the distance it would have been: its history is
+    // another surface's, which DLSS would otherwise smear along.
+    float m = 0.0;
+    if (p.proj.w > 0.0 && prev.w > 0.0) {
+        ivec2 q = ivec2(floor(was));
+        float expect = abs(prev.w), best = 1e30;
+        if (all(greaterThanEqual(q, ivec2(1))) && all(lessThan(q, p.size.xy - 1))) {
+            for (int y = -1; y <= 1; ++y)
+                for (int x = -1; x <= 1; ++x) best = min(best, abs(imageLoad(lastDistance, q + ivec2(x, y)).r - expect));
+            m = best > 0.03 * expect ? 1.0 : 0.0;
+        }
+    }
+    imageStore(moved, c, vec4(m));
 }
 )";
     struct MotionPush {
         float m[16];
         float vp[4], z[4];
         int32_t size[4];
+        float proj[4];
     };
 
+    static constexpr uint32_t kMotionBindings = 6;
     bool motionPipeline() {
         if (mvPipe_) return true;
         const VkShaderModule sm = module(kMotionGlsl, gcn::GlslStage::Compute);
@@ -5094,13 +5120,12 @@ void main() {
         sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
         sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         VK_CHECK(vkCreateSampler(vk_.device, &sci, nullptr, &mvSampler_));
-        VkDescriptorSetLayoutBinding b[3]{};
+        VkDescriptorSetLayoutBinding b[kMotionBindings]{};
         b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        b[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        for (uint32_t i = 1; i < kMotionBindings; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-        dl.bindingCount = 3;
+        dl.bindingCount = kMotionBindings;
         dl.pBindings = b;
         VK_CHECK(vkCreateDescriptorSetLayout(vk_.device, &dl, nullptr, &mvSetLayout_));
         const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MotionPush)};
@@ -5197,6 +5222,8 @@ void main() {
         begin();
         if (!upscaleImage(upColor_, vf, out->img.width, out->img.height) ||
             !upscaleImage(upMotion_, VK_FORMAT_R16G16_SFLOAT, w, h) || !upscaleImage(upDepth_, VK_FORMAT_R32_SFLOAT, w, h) ||
+            !upscaleImage(upDistance_[0], VK_FORMAT_R32_SFLOAT, w, h) || !upscaleImage(upDistance_[1], VK_FORMAT_R32_SFLOAT, w, h) ||
+            !upscaleImage(upMoved_, VK_FORMAT_R8_UNORM, w, h) ||
             !motionPipeline() ||
             (!inPlace && !upscaleImage(upOut_, vf, ow, oh)))
             return false;
@@ -5223,15 +5250,31 @@ void main() {
         mp.z[0] = k.valid ? k.zo : 0, mp.z[1] = k.valid ? k.zs : 1;
         mp.z[2] = jitterOn_ ? jitterX_ : 0, mp.z[3] = jitterOn_ ? jitterY_ : 0;
         mp.size[0] = int32_t(w), mp.size[1] = int32_t(h);
+        // This frame's view distances go to one image, the last frame's are in the other: usable
+        // when the camera carried over (moved) and the last run wrote them at this size.
+        const double pA = k.valid ? k.proj[10] : 0, pB = k.valid ? k.proj[11] : 1, pS = k.valid ? k.proj[14] : 1;
+        mp.proj[0] = float(pA), mp.proj[1] = float(pB), mp.proj[2] = float(pS);
+        const bool sameSize = upDistanceW_ == w && upDistanceH_ == h;
+        mp.proj[3] = moved && sameSize && upMask_ ? 1.0f : 0.0f;
+        upDistanceW_ = w, upDistanceH_ = h;
+        upDistanceNext_ ^= 1;
+        Image& lastDist = upDistance_[upDistanceNext_ ^ 1];
+        Image& curDist = upDistance_[upDistanceNext_];
         const VkImageView depthView = view(depth->img, df, VK_IMAGE_VIEW_TYPE_2D, kIdentity, VK_IMAGE_ASPECT_DEPTH_BIT);
         const VkImageView mvView = view(upMotion_, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
         const VkImageView depthCopyView = view(upDepth_, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
-        rec([this, c = R().cmd_, mp, depthView, mvView, depthCopyView] {
-            const VkDescriptorImageInfo di[3] = {{mvSampler_, depthView, VK_IMAGE_LAYOUT_GENERAL},
-                                                 {VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL},
-                                                 {VK_NULL_HANDLE, depthCopyView, VK_IMAGE_LAYOUT_GENERAL}};
-            VkWriteDescriptorSet wr[3]{};
-            for (uint32_t i = 0; i < 3; ++i) {
+        const VkImageView lastDistView = view(lastDist, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
+        const VkImageView distView = view(curDist, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
+        const VkImageView movedView = view(upMoved_, VK_FORMAT_R8_UNORM, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
+        rec([this, c = R().cmd_, mp, depthView, mvView, depthCopyView, lastDistView, distView, movedView] {
+            const VkDescriptorImageInfo di[kMotionBindings] = {{mvSampler_, depthView, VK_IMAGE_LAYOUT_GENERAL},
+                                                               {VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL},
+                                                               {VK_NULL_HANDLE, depthCopyView, VK_IMAGE_LAYOUT_GENERAL},
+                                                               {VK_NULL_HANDLE, lastDistView, VK_IMAGE_LAYOUT_GENERAL},
+                                                               {VK_NULL_HANDLE, distView, VK_IMAGE_LAYOUT_GENERAL},
+                                                               {VK_NULL_HANDLE, movedView, VK_IMAGE_LAYOUT_GENERAL}};
+            VkWriteDescriptorSet wr[kMotionBindings]{};
+            for (uint32_t i = 0; i < kMotionBindings; ++i) {
                 wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 wr[i].dstBinding = i;
                 wr[i].descriptorCount = 1;
@@ -5239,7 +5282,7 @@ void main() {
                 wr[i].pImageInfo = &di[i];
             }
             vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, mvPipe_);
-            vk_.cmdPushDescriptorSet(c, VK_PIPELINE_BIND_POINT_COMPUTE, mvLayout_, 0, 3, wr);
+            vk_.cmdPushDescriptorSet(c, VK_PIPELINE_BIND_POINT_COMPUTE, mvLayout_, 0, kMotionBindings, wr);
             vkCmdPushConstants(c, mvLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof mp, &mp);
             vkCmdDispatch(c, (uint32_t(mp.size[0]) + 7) / 8, (uint32_t(mp.size[1]) + 7) / 8, 1);
         });
@@ -5258,6 +5301,7 @@ void main() {
         else
             f.depth = {upDepth_.image, depthCopyView, VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, w, h, kUpscaleUsage};
         f.motion = {upMotion_.image, mvView, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, w, h, kUpscaleUsage};
+        if (upMask_) f.moved = {upMoved_.image, movedView, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, w, h, kUpscaleUsage};
         if (inPlace)
             f.output = {out->img.image, view(out->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), vf, VK_IMAGE_ASPECT_COLOR_BIT, w, h,
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | kUpscaleUsage};
@@ -5479,6 +5523,11 @@ void main() {
     float jitterSign_[2] = {1, 1};
     Camera cam_, prevCam_;
     Image upColor_, upMotion_, upDepth_, upOut_;
+    // The motion pass's view distances (this frame's and the last, by turns) and its mask of what
+    // moved by itself (upscale::Frame::moved); LPN_UPSCALE_NO_MASK=1 leaves the mask out.
+    Image upDistance_[2], upMoved_;
+    uint32_t upDistanceNext_ = 0, upDistanceW_ = 0, upDistanceH_ = 0;
+    bool upMask_ = !getenv("LPN_UPSCALE_NO_MASK");
     VkPipeline mvPipe_ = VK_NULL_HANDLE;
     VkPipelineLayout mvLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout mvSetLayout_ = VK_NULL_HANDLE;

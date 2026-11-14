@@ -369,18 +369,19 @@ bool evaluate(VkCommandBuffer cmd, VkDevice, const upscale::Frame& f) {
     if (r != sl::Result::eOk) return fail("setting the constants", r);
 
     sl::Resource color = resource(f.color), depth = resource(f.depth), motion = resource(f.motion),
-                 output = resource(f.output);
+                 output = resource(f.output), moved = resource(f.moved);
     const sl::Extent inExtent{0, 0, f.renderW, f.renderH}, outExtent{0, 0, f.outW, f.outH};
     const sl::ResourceTag tags[] = {
         sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &inExtent),
         sl::ResourceTag(&output, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &outExtent),
         sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &inExtent),
         sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &inExtent),
+        sl::ResourceTag(&moved, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eOnlyValidNow, &inExtent),
     };
     auto* slCmd = reinterpret_cast<sl::CommandBuffer*>(cmd);
     {
         SlowCall t("slSetTagForFrame");
-        r = gSl.setTagForFrame(*token, viewport, tags, 4, slCmd);
+        r = gSl.setTagForFrame(*token, viewport, tags, f.moved.image ? 5 : 4, slCmd);
     }
     if (r != sl::Result::eOk) return fail("tagging the images", r);
 

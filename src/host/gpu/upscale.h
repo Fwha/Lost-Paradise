@@ -30,6 +30,9 @@ struct Image {
 
 struct Frame {
     Image color, depth, motion, output; // motion: RG16F, pixels to the previous frame (render size)
+    // R8: 1 where something moved by itself (no image when off). The motion vectors are the
+    // camera's only, so there the history is another surface's: DLSS favours this frame's colour.
+    Image moved;
     uint32_t renderW = 0, renderH = 0, outW = 0, outH = 0;
     float jitterX = 0, jitterY = 0; // the sample's offset from the pixel centre, in render pixels (y down)
     bool reset = false;             // no usable history (first frame, camera cut)
