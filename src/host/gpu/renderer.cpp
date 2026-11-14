@@ -1072,6 +1072,7 @@ public:
         // ~10% of the recorder at 8,000 draws a frame.
         std::unique_ptr<DrawAnalysis>& held = taken_[takenNext_++];
         if ((upDiag_ == 1 || upTrace_) && smaaSeen_) upscaleDiag(d, r, *held);
+        if (upPrevScene_ && !smaaSeen_) upscalePrevWritten(d, r, *held);
         if (upIn_.on && smaaSeen_ && !upEffect_ && upLastScene_) upscaleEffect(d, r, *held);
         if (recordThreads_) {
             if (segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
@@ -5546,14 +5547,35 @@ void main() {
     }
     // A draw after SMAA that reads the last frame's scene (the game renders into two by turns).
     // A draw that renders into that target first makes it this frame's picture.
+    static bool writes(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a, uint64_t addr) {
+        if (rendersInto(d, r, addr)) return true;
+        for (const gcn::Program* p : {&a.vs, &a.ps})
+            for (const auto& t : p->images)
+                if (t.storage && t.base() == addr) return true;
+        return false;
+    }
+    // Before SMAA: a draw that writes last frame's scene target makes it this frame's picture.
+    void upscalePrevWritten(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
+        if (writes(d, r, a, upPrevScene_)) upPrevScene_ = 0;
+    }
     void upscaleEffect(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
-        if (rendersInto(d, r, upLastScene_)) {
+        if (writes(d, r, a, upLastScene_)) {
             upLastScene_ = 0;
             return;
         }
         for (const gcn::Program* p : {&a.vs, &a.ps})
             for (const auto& t : p->images)
-                if (!t.storage && t.base() == upLastScene_) return afterimage("the last frame's scene was read");
+                if (!t.storage && t.base() == upLastScene_) {
+                    // Which pass reads it, once each: to tell the game's afterimage from a pass it
+                    // runs every frame.
+                    const uint64_t ps = shaderAddress(r, d.kind == DrawCall::kDispatch ? reg::kPgmLoCs : reg::kPgmLoPs);
+                    if (upEffectPs_.size() < 8 && std::find(upEffectPs_.begin(), upEffectPs_.end(), ps) == upEffectPs_.end()) {
+                        upEffectPs_.push_back(ps);
+                        std::fprintf(stderr, "[upscale] %s 0x%" PRIx64 " reads last frame's scene 0x%" PRIx64 " (this frame's 0x%" PRIx64 ")\n",
+                                     d.kind == DrawCall::kDispatch ? "cs" : "ps", ps, upLastScene_, upThisScene_);
+                    }
+                    return afterimage("the last frame's scene was read");
+                }
     }
 
     // Each frame: which upscaler runs, the cameras and the next jitter.
@@ -5613,7 +5635,8 @@ void main() {
     bool upEffect_ = false;
     int upEffectLogged_ = 0;
     uint64_t upThisScene_ = 0, upLastScene_ = 0; // the SMAA blend's target this frame and last frame's, if another
-    uint64_t upPrevScene_ = 0;                    // the SMAA blend's target last frame
+    uint64_t upPrevScene_ = 0;                    // the SMAA blend's target last frame, until written
+    std::vector<uint64_t> upEffectPs_;            // shaders logged reading it
     float jitterX_ = 0, jitterY_ = 0;
     // LPN_DLSS_JITTER_SIGN=<x>,<y> (each 1 or -1): flips the jitter the upscaler is told (debugging).
     float jitterSign_[2] = {1, 1};
