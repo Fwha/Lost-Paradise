@@ -141,8 +141,12 @@ int main(int argc, char** argv) {
     // DLSS's Vulkan extension sets up CUDA, which needs address space the guest's reservation (at
     // the first module load) would take: make the device first (gpu/renderer.h prepareVulkan).
     host::loadDisplaySettings();
-    if (gpu && host::displaySettings().upscaler == host::Upscaler::Dlss && host::render::upscale::builtIn(host::Upscaler::Dlss))
+    if (gpu && host::displaySettings().upscaler == host::Upscaler::Dlss && host::render::upscale::builtIn(host::Upscaler::Dlss)) {
+        // The guest's thread pointer needs one of the TEB's 64 inline TLS slots: take it before
+        // the driver's DLLs take theirs.
+        host::guestThreadPointerSlot();
         host::render::prepareVulkan();
+    }
 #endif
 
     std::string error;
