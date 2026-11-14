@@ -5073,7 +5073,7 @@ layout(push_constant) uniform P {
     mat4 reproject; // current NDC (x, y, depth, 1) to the previous clip position
     vec4 vp;        // viewport offset x, y and scale x, y: pixel = ndc * scale + offset
     vec4 z;         // depth offset, scale; this frame's viewport jitter x, y (pixels)
-    ivec4 size;
+    ivec4 size;     // z: the mask's value where something moved, in thousandths
     vec4 proj;      // this projection's A, B, s (view z from NDC depth); w: 1 when lastDistance is usable
 } p;
 // The view distance at NDC depth n: (z * A + B) / (z * s) = n.
@@ -5104,7 +5104,7 @@ void main() {
             m = best > 0.03 * expect ? 1.0 : 0.0;
         }
     }
-    imageStore(moved, c, vec4(m));
+    imageStore(moved, c, vec4(m * float(p.size.z) / 1000.0));
 }
 )";
     struct MotionPush {
@@ -5289,6 +5289,9 @@ void main() {
         mp.z[0] = k.valid ? k.zo : 0, mp.z[1] = k.valid ? k.zs : 1;
         mp.z[2] = jitterOn_ ? jitterX_ : 0, mp.z[3] = jitterOn_ ? jitterY_ : 0;
         mp.size[0] = int32_t(w), mp.size[1] = int32_t(h);
+        // FSR takes the mask as its reactive mask: at full strength it leaves the silhouettes of
+        // whatever moved (the fighters) without history, the jitter shaking their outlines.
+        mp.size[2] = int32_t(std::lround((upKind_ == Upscaler::Fsr ? fsrReactive_ : 1.0f) * 1000.0f));
         // This frame's view distances go to one image, the last frame's are in the other: usable
         // when the camera carried over (moved) and the last run wrote them at this size.
         const double pA = k.valid ? k.proj[10] : 0, pB = k.valid ? k.proj[11] : 1, pS = k.valid ? k.proj[14] : 1;
@@ -5674,6 +5677,12 @@ void main() {
     Image upDistance_[2], upMoved_;
     uint32_t upDistanceNext_ = 0, upDistanceW_ = 0, upDistanceH_ = 0;
     bool upMask_ = !getenv("LPN_UPSCALE_NO_MASK");
+    // FSR's reactive mask where something moved (LPN_FSR_REACTIVE, 0 to 1): 1 took the fighters'
+    // outlines out of its history.
+    float fsrReactive_ = [] {
+        const char* v = getenv("LPN_FSR_REACTIVE");
+        return v ? std::clamp(float(std::atof(v)), 0.0f, 1.0f) : 0.4f;
+    }();
     // Every frame without the upscaler's history: to tell its ghosts from the game's.
     bool upNoHistory_ = getenv("LPN_UPSCALE_NO_HISTORY") != nullptr;
     VkPipeline mvPipe_ = VK_NULL_HANDLE;

@@ -184,7 +184,8 @@ shaders' code) with a temporal upscaler (`gpu/upscale.h`; `upscaleSmaa` in the r
   compares each pixel's view distance with last frame's around where the camera puts it, and
   marks it where none is within 3%: DLSS gets that as its bias-current-colour mask, FSR as its
   reactive mask, so they do not smear characters' history (`LPN_UPSCALE_NO_MASK=1` leaves it
-  out).
+  out). FSR's at 0.4 (`LPN_FSR_REACTIVE`, 0 to 1): at 1 the fighters' outlines had no history and
+  shook with the jitter.
 - Jitter: every draw with the scene depth bound before SMAA (full-screen lighting passes too, or
   shadows flicker) gets a Halton sub-pixel viewport offset (8 phases, 8 x ratio^2 when
   upscaling), passed to the upscaler as is. So do 3D draws after SMAA that depth-test against it
