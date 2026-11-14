@@ -5458,11 +5458,12 @@ void main() {
                 // the scene with earlier frames' (its afterimage effect). The upscaler's history
                 // would pile up those ghosts: it starts over for such frames.
                 // Only with an earlier frame's picture in it: a target of the scene's size this frame
-                // has not written. A copy blended straight back (the game's glow, every frame) is not.
+                // has not written (the depth buffer aside). A copy blended straight back (the game's
+                // glow, every frame, depth tested) is not.
                 bool earlier = false;
                 for (const gcn::Program* p : {&a.vs, &a.ps})
                     for (const auto& t : p->images)
-                        if (!t.storage && t.width() == upIn_.w && t.height() == upIn_.h &&
+                        if (!t.storage && t.width() == upIn_.w && t.height() == upIn_.h && !depths_.count(t.base()) &&
                             std::find(upWritten_.begin(), upWritten_.end(), t.base()) == upWritten_.end())
                             earlier = true;
                 if (std::find(upFollowed_.begin(), upFollowed_.end(), addr) != upFollowed_.end()) {
