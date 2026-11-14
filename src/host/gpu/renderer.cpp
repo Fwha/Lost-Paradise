@@ -5303,6 +5303,27 @@ void main() {
             for (const gcn::Program* p : {&a.vs, &a.ps})
                 for (const auto& t : p->images)
                     if (t.storage && t.base() != scene && t.width() >= outW) toOutput = true;
+        // A draw that composites the scene into another target of its size (the bloom's blend
+        // into a copy) before the output reads that copy: the copy is the scene then, upscaled
+        // when the output reads it.
+        if (upIn_.on && samples && !toOutput && !stores && d.kind != DrawCall::kDispatch) {
+            const uint32_t* cb = &r.ctx[reg::kCbColorBase];
+            const uint32_t info = cb[::gpu::ctx::kCbColorInfo];
+            const uint32_t fmt = (info >> 2) & 0x1F, num = (info >> 8) & 7;
+            const uint64_t addr = uint64_t(cb[0]) << 8;
+            const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
+            const VkFormat vf = colorFormat(fmt, num);
+            if (addr != scene && targetW == upIn_.pitch && vf == upIn_.format &&
+                uint32_t(std::lround(std::fabs(v[0]) * 2)) == upIn_.w && uint32_t(std::lround(std::fabs(v[2]) * 2)) == upIn_.h) {
+                upIn_.colorAddr = addr;
+                upIn_.rows = ((cb[::gpu::ctx::kCbColorSlice] & 0x3FFFFF) + 1) * 64 / upIn_.pitch;
+                if (!upFollowLogged_) {
+                    upFollowLogged_ = true;
+                    std::fprintf(stderr, "[upscale] the scene is composited into a copy (0x%" PRIx64 "): upscaling that\n", addr);
+                }
+                return;
+            }
+        }
         if (upIn_.on && samples && toOutput) {
             const UpscaleInputs in = upIn_;
             upIn_.on = false;
@@ -5396,6 +5417,7 @@ void main() {
     uint32_t camTries_ = 0, upStats_[4] = {}, upUnread_ = 0;
     int upDiag_ = 0; // 1: this frame's draws after SMAA are logged (upscaleDiag); 2: done
     uint32_t upDiagLines_ = 0;
+    bool upFollowLogged_ = false;
     float jitterX_ = 0, jitterY_ = 0;
     // LPN_DLSS_JITTER_SIGN=<x>,<y> (each 1 or -1): flips the jitter the upscaler is told (debugging).
     float jitterSign_[2] = {1, 1};
