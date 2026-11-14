@@ -118,6 +118,8 @@ bool evaluate(VkCommandBuffer cmd, const upscale::Frame& f) {
     d.motionVectors = image(f.motion);
     d.output = image(f.output);
     d.exposure.structSize = d.reactiveMask.structSize = d.transparencyAndCompositionMask.structSize = sizeof(FfxVkPortableImage);
+    // What moved by itself (no motion vectors there): FSR's reactive mask, favouring this frame.
+    if (f.moved.image) d.reactiveMask = image(f.moved);
     d.jitterOffset = {f.jitterX, f.jitterY};
     d.motionVectorScale = {1.0f, 1.0f}; // already in render pixels
     d.renderSize = {f.renderW, f.renderH};
