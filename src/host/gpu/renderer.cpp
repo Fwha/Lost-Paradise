@@ -1071,7 +1071,7 @@ public:
         // Analyses move by pointer: moved by value (two Programs each), handing them along was
         // ~10% of the recorder at 8,000 draws a frame.
         std::unique_ptr<DrawAnalysis>& held = taken_[takenNext_++];
-        if (upDiag_ == 1 && smaaSeen_) upscaleDiag(d, r, *held);
+        if ((upDiag_ == 1 || upTrace_) && smaaSeen_) upscaleDiag(d, r, *held);
         if (recordThreads_) {
             if (segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
                 addToSegment(d, r, held);
@@ -5448,12 +5448,13 @@ void main() {
         }
     }
 
-    // One frame's draws after the SMAA blend, when none read the scene into an output-sized
-    // target: their targets and images, to see how the game takes the scene to the output.
+    // The draws after the SMAA blend, logged at frame end (upscaleDiagEnd): one frame's when none
+    // read the scene into an output-sized target; with LPN_UPSCALE_TRACE=1, a frame's whenever
+    // their targets and image sizes differ from every frame logged before (a pass the game adds
+    // in motion, say). To see how the game takes the scene to the output.
     void upscaleDiag(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
-        if (upDiagLines_ >= 80) return;
-        ++upDiagLines_;
-        const uint64_t scene = upIn_.colorAddr;
+        if (upDiagFrame_.size() >= 80) return;
+        const uint64_t scene = upRedirect_ ? upSceneAddr_ : upIn_.colorAddr;
         const uint32_t* cb = &r.ctx[reg::kCbColorBase];
         std::string line;
         char buf[160];
@@ -5464,14 +5465,27 @@ void main() {
                           (uint64_t(cb[0]) << 8) == scene ? " (scene)" : "", ((cb[::gpu::ctx::kCbColorPitch] & 0x7FF) + 1) * 8,
                           (cb[::gpu::ctx::kCbColorInfo] >> 2) & 0x1F);
             line = buf;
+            upDiagShape_ += "d" + std::to_string(((cb[::gpu::ctx::kCbColorPitch] & 0x7FF) + 1) * 8);
         }
+        if (upRedirect_) line += " [after upscaling]";
         for (const gcn::Program* p : {&a.vs, &a.ps})
             for (const auto& t : p->images) {
                 std::snprintf(buf, sizeof buf, "; %s 0x%" PRIx64 "%s %ux%u", t.storage ? "stores" : "reads", t.base(),
                               t.base() == scene ? " (scene)" : "", t.width(), t.height());
                 line += buf;
+                upDiagShape_ += (t.storage ? "s" : "r") + std::to_string(t.width()) + "x" + std::to_string(t.height());
             }
-        std::fprintf(stderr, "[upscale] after SMAA: %s\n", line.c_str());
+        upDiagShape_ += d.kind == DrawCall::kDispatch ? "D;" : ";";
+        upDiagFrame_.push_back(std::move(line));
+    }
+    void upscaleDiagEnd() {
+        const bool newShape = upTrace_ && !upDiagFrame_.empty() && upDiagShapes_.size() < 16 && upDiagShapes_.insert(upDiagShape_).second;
+        if ((upDiag_ == 1 || newShape) && !upDiagFrame_.empty()) {
+            std::fprintf(stderr, "[upscale] frame %" PRIu64 ": %zu draws after SMAA\n", frame_, upDiagFrame_.size());
+            for (const std::string& l : upDiagFrame_) std::fprintf(stderr, "[upscale] after SMAA: %s\n", l.c_str());
+        }
+        upDiagFrame_.clear();
+        upDiagShape_.clear();
     }
 
     // Each frame: which upscaler runs, the cameras and the next jitter.
@@ -5482,6 +5496,7 @@ void main() {
         camTries_ = 0;
         upRanLast_ = upRan_;
         upRan_ = false;
+        upscaleDiagEnd();
         if (upDiag_ == 1) upDiag_ = 2; // one frame logged
         if (upIn_.on && ++upUnread_ == 120) { // waiting since the SMAA blend: nothing read the scene
             std::fprintf(stderr, "[upscale] the scene was not read by a draw after SMAA: left at its size\n");
@@ -5516,7 +5531,10 @@ void main() {
     uint64_t sceneDepth_ = 0, jitterIndex_ = 0;
     uint32_t camTries_ = 0, upStats_[4] = {}, upUnread_ = 0;
     int upDiag_ = 0; // 1: this frame's draws after SMAA are logged (upscaleDiag); 2: done
-    uint32_t upDiagLines_ = 0;
+    bool upTrace_ = getenv("LPN_UPSCALE_TRACE") != nullptr;
+    std::vector<std::string> upDiagFrame_;
+    std::string upDiagShape_;
+    std::set<std::string> upDiagShapes_;
     bool upFollowLogged_ = false;
     float jitterX_ = 0, jitterY_ = 0;
     // LPN_DLSS_JITTER_SIGN=<x>,<y> (each 1 or -1): flips the jitter the upscaler is told (debugging).
