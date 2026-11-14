@@ -1,7 +1,8 @@
 // Smooth menu text: Arial when it is installed, else a metric-compatible sans (Liberation Sans,
-// Arimo) or whatever fontconfig picks for "Arial", rasterised with stb_truetype. LPN_MENU_FONT
-// names a .ttf to use instead. When no font file is found, available() is false and the menus
-// draw with their blocky pixel font.
+// Arimo) or whatever fontconfig picks for "Arial", else the Liberation Sans shipped beside the
+// program (external/liberation-fonts), rasterised with stb_truetype. LPN_MENU_FONT names a .ttf to
+// use instead. When no font file is found, available() is false and the menus draw with their
+// blocky pixel font.
 #pragma once
 
 #ifdef LPN_HAVE_SDL2
