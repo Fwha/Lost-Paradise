@@ -7405,7 +7405,7 @@ void main() {
     // targets have those). Draws into it, and into the display buffers, are HUD but for the ones
     // sampling a picture-shaped render target (the scene being copied in, post-processing).
     // 0: drawn as it is, 1: the HUD (into the 16:9 rectangle), 2: a HUD backdrop (hudWide:
-    // stretched across the whole picture, only its height fitted), 3: sceneCopy16x9.
+    // over the whole picture, as the layout is), 3: sceneCopy16x9.
     uint8_t hudDraw(const DrawRegs& r, bool hasDepth, const gcn::Program& vs, const gcn::Program* ps, const DrawCall& d,
                     uint32_t prim, uint32_t width, uint32_t height) {
         const Hud& h = hud();
@@ -7463,7 +7463,7 @@ void main() {
                              frame_, target, display ? " (display)" : "", layer ? " (HUD buffer)" : "",
                              hasDepth ? " with depth" : "", vsAddr, psAddr, prim, d.count, r.ctx[reg::kPaClVteCntl],
                              mode == 3   ? "scene copy laid out 16:9, height fitted"
-                             : mode == 2 ? "HUD backdrop, full width"
+                             : mode == 2 ? "HUD backdrop, whole picture"
                              : isHud     ? "HUD, 16:9 in the middle"
                                          : "full picture",
                              samples.empty() ? "" : ("; samples" + samples).c_str());
@@ -7563,9 +7563,11 @@ void main() {
         }
         return vp;
     }
-    // Aspect Ratio: a HUD draw moved into the 16:9 rectangle (hudDraw's mode 1; mode 2 only its
-    // height) by its vertex shader's position transform, the viewport left as the game set it: a
-    // smaller viewport cut off what reached past the rectangle (the minimap's ping).
+    // Aspect Ratio: a HUD draw moved into the 16:9 rectangle (hudDraw's mode 1) by its vertex
+    // shader's position transform, the viewport left as the game set it: a smaller viewport cut off
+    // what reached past the rectangle (the minimap's ping). A backdrop (mode 2) is left over the
+    // whole picture: the HUD's layout already covers it. Fitting its height squeezed it into the
+    // 16:9 rectangle's rows at 16:10 (the title's backdrop squashed, bands above and below, #102).
     static void hudTransform(gcn::Program& vs, const DrawRegs& r, uint32_t width, uint32_t height, uint8_t mode) {
         const Hud& h = hud();
         const VkViewport vp = gameViewport(r, width, height);
@@ -7579,8 +7581,8 @@ void main() {
         };
         if (mode == 3) { // sceneCopy16x9: from the top, the 16:9 layout's height to the picture's
             fit(t[1], t[3], float(h.outH / (h.outW * 9.0 / 16)), 0, vp.y, vp.height);
-        } else {
-            if (mode == 1) fit(t[0], t[2], h.sx, h.x, vp.x, vp.width);
+        } else if (mode == 1) {
+            fit(t[0], t[2], h.sx, h.x, vp.x, vp.width);
             fit(t[1], t[3], h.sy, h.y, vp.y, vp.height);
         }
         std::memcpy(&vs.data[gcn::data::kPosTransform], t, sizeof t);
@@ -7624,8 +7626,8 @@ void main() {
             const float w = h.outW * h.sx, margin = w * 0.06f;
             x0 = std::max<int32_t>(0, int32_t(std::floor(h.x - margin)));
             x1 = std::min<int32_t>(int32_t(width), int32_t(std::ceil(h.x + w + margin)));
-        } else if ((hudMode == 1 || hudMode == 2) && !whole) {
-            if (hudMode == 1) x0 = int32_t(std::floor(h.x + x0 * h.sx)), x1 = int32_t(std::ceil(h.x + x1 * h.sx));
+        } else if (hudMode == 1 && !whole) {
+            x0 = int32_t(std::floor(h.x + x0 * h.sx)), x1 = int32_t(std::ceil(h.x + x1 * h.sx));
             y0 = int32_t(std::floor(h.y + y0 * h.sy)), y1 = int32_t(std::ceil(h.y + y1 * h.sy));
             x1 = std::min<int32_t>(x1, int32_t(width)), y1 = std::min<int32_t>(y1, int32_t(height));
         }
