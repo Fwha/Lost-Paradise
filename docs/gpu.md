@@ -185,6 +185,11 @@ shaders' code) with a temporal upscaler (`gpu/upscale.h`; `upscaleSmaa` in the r
   marks it where none is within 3%: DLSS gets that as its bias-current-colour mask, FSR as its
   reactive mask, so they do not smear characters' history (`LPN_UPSCALE_NO_MASK=1` leaves it
   out).
+- Passes after SMAA: when upscaling (not Native), the upscaler runs at the output's read, so
+  what the game draws after the anti-aliasing (sparks, its hit and knockout blurs and zooms) is in
+  its input without depth or motion, and its history showed it twice. The scene is copied at the
+  SMAA blend and again before the game composites it into a copy (its bloom); where those differ
+  the same mask is set (`LPN_UPSCALE_NO_REACTIVE=1` leaves it out).
 - Jitter: every draw with the scene depth bound before SMAA (full-screen lighting passes too, or
   shadows flicker) gets a Halton sub-pixel viewport offset (8 phases, 8 x ratio^2 when
   upscaling), passed to the upscaler as is. So do 3D draws after SMAA that depth-test against it
