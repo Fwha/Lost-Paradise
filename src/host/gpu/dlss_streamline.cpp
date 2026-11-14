@@ -16,6 +16,7 @@
 #include <windows.h>
 
 #include <cstddef>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -282,8 +283,33 @@ void shutdown() {
     gInit = gAvailable = false;
 }
 
+namespace {
+// Logs a Streamline call that took long on the CPU, to find stalls (at most 20 lines a run).
+struct SlowCall {
+    const char* what;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    explicit SlowCall(const char* w) : what(w) {}
+    ~SlowCall() {
+        static int logged = 0;
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (ms >= 20.0 && logged < 20) {
+            ++logged;
+            std::fprintf(stderr, "[dlss] %s took %.0f ms (frame %u)\n", what, ms, gFrame);
+        }
+    }
+};
+uint32_t gLastRender[2] = {0, 0};
+} // namespace
+
 bool evaluate(VkCommandBuffer cmd, VkDevice, const upscale::Frame& f) {
     if (!usable()) return false;
+    if (f.renderW != gLastRender[0] || f.renderH != gLastRender[1]) {
+        static int logged = 0;
+        if (gLastRender[0] && logged++ < 10)
+            std::fprintf(stderr, "[dlss] input size changed: %ux%u to %ux%u\n", gLastRender[0], gLastRender[1], f.renderW,
+                         f.renderH);
+        gLastRender[0] = f.renderW, gLastRender[1] = f.renderH;
+    }
     auto fail = [](const char* what, sl::Result r) {
         std::fprintf(stderr, "[dlss] %s failed (%s): DLSS off for this run\n", what, resultName(r));
         gFailed = true;
@@ -302,7 +328,10 @@ bool evaluate(VkCommandBuffer cmd, VkDevice, const upscale::Frame& f) {
         o.outputWidth = f.outW;
         o.outputHeight = f.outH;
         o.colorBuffersHDR = sl::Boolean::eFalse; // the game's colour is already tone mapped (8-bit)
-        r = gSl.setOptions(viewport, o);
+        {
+            SlowCall t("slDLSSSetOptions");
+            r = gSl.setOptions(viewport, o);
+        }
         if (r != sl::Result::eOk) return fail("setting the options", r);
         gOptionsKey[0] = key[0], gOptionsKey[1] = key[1], gOptionsKey[2] = key[2];
         gOptionsSet = true;
@@ -333,7 +362,10 @@ bool evaluate(VkCommandBuffer cmd, VkDevice, const upscale::Frame& f) {
     c.cameraMotionIncluded = sl::Boolean::eTrue;
     c.motionVectors3D = sl::Boolean::eFalse;
     c.reset = f.reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-    r = gSl.setConstants(c, *token, viewport);
+    {
+        SlowCall t("slSetConstants");
+        r = gSl.setConstants(c, *token, viewport);
+    }
     if (r != sl::Result::eOk) return fail("setting the constants", r);
 
     sl::Resource color = resource(f.color), depth = resource(f.depth), motion = resource(f.motion),
@@ -346,11 +378,17 @@ bool evaluate(VkCommandBuffer cmd, VkDevice, const upscale::Frame& f) {
         sl::ResourceTag(&motion, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &inExtent),
     };
     auto* slCmd = reinterpret_cast<sl::CommandBuffer*>(cmd);
-    r = gSl.setTagForFrame(*token, viewport, tags, 4, slCmd);
+    {
+        SlowCall t("slSetTagForFrame");
+        r = gSl.setTagForFrame(*token, viewport, tags, 4, slCmd);
+    }
     if (r != sl::Result::eOk) return fail("tagging the images", r);
 
     const sl::BaseStructure* inputs[] = {&viewport};
-    r = gSl.evaluateFeature(sl::kFeatureDLSS, *token, inputs, 1, slCmd);
+    {
+        SlowCall t("slEvaluateFeature");
+        r = gSl.evaluateFeature(sl::kFeatureDLSS, *token, inputs, 1, slCmd);
+    }
     if (r != sl::Result::eOk) return fail("evaluating", r);
     return true;
 }
