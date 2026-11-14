@@ -5065,7 +5065,7 @@ layout(set = 0, binding = 1, rg16f) uniform writeonly image2D motion;
 layout(set = 0, binding = 2, r32f) uniform writeonly image2D depthCopy; // FSR's depth, as a colour image
 layout(set = 0, binding = 3, r32f) uniform readonly image2D lastDistance; // the last frame's view distances
 layout(set = 0, binding = 4, r32f) uniform writeonly image2D distance;    // this frame's
-layout(set = 0, binding = 5, r8) uniform writeonly image2D moved;         // 1: favour this frame's colour
+layout(set = 0, binding = 5, rgba8) uniform writeonly image2D moved;        // 1: favour this frame's colour
 layout(push_constant) uniform P {
     mat4 reproject; // current NDC (x, y, depth, 1) to the previous clip position
     vec4 vp;        // viewport offset x, y and scale x, y: pixel = ndc * scale + offset
@@ -5223,7 +5223,7 @@ void main() {
         if (!upscaleImage(upColor_, vf, out->img.width, out->img.height) ||
             !upscaleImage(upMotion_, VK_FORMAT_R16G16_SFLOAT, w, h) || !upscaleImage(upDepth_, VK_FORMAT_R32_SFLOAT, w, h) ||
             !upscaleImage(upDistance_[0], VK_FORMAT_R32_SFLOAT, w, h) || !upscaleImage(upDistance_[1], VK_FORMAT_R32_SFLOAT, w, h) ||
-            !upscaleImage(upMoved_, VK_FORMAT_R8_UNORM, w, h) ||
+            !upscaleImage(upMoved_, VK_FORMAT_R8G8B8A8_UNORM, w, h) ||
             !motionPipeline() ||
             (!inPlace && !upscaleImage(upOut_, vf, ow, oh)))
             return false;
@@ -5265,7 +5265,7 @@ void main() {
         const VkImageView depthCopyView = view(upDepth_, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
         const VkImageView lastDistView = view(lastDist, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
         const VkImageView distView = view(curDist, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
-        const VkImageView movedView = view(upMoved_, VK_FORMAT_R8_UNORM, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
+        const VkImageView movedView = view(upMoved_, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
         rec([this, c = R().cmd_, mp, depthView, mvView, depthCopyView, lastDistView, distView, movedView] {
             const VkDescriptorImageInfo di[kMotionBindings] = {{mvSampler_, depthView, VK_IMAGE_LAYOUT_GENERAL},
                                                                {VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL},
@@ -5301,7 +5301,7 @@ void main() {
         else
             f.depth = {upDepth_.image, depthCopyView, VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, w, h, kUpscaleUsage};
         f.motion = {upMotion_.image, mvView, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, w, h, kUpscaleUsage};
-        if (upMask_) f.moved = {upMoved_.image, movedView, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, w, h, kUpscaleUsage};
+        if (upMask_) f.moved = {upMoved_.image, movedView, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, w, h, kUpscaleUsage};
         if (inPlace)
             f.output = {out->img.image, view(out->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), vf, VK_IMAGE_ASPECT_COLOR_BIT, w, h,
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | kUpscaleUsage};
