@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <memory>
 #include <climits>
 #include <cpuid.h>
 #include <cstdio>
@@ -80,6 +82,7 @@ struct Stub {
     uint8_t bytes[15];
 };
 std::vector<Stub> gStubTable; // sorted by trap
+std::unique_ptr<std::atomic<uint64_t>[]> gStubHits; // per gStubTable entry, for the summary
 uint8_t* gStubNext = nullptr;
 uint8_t* gStubEnd = nullptr;
 constexpr int kRedZone = 128;
@@ -92,6 +95,7 @@ std::vector<Scan> gScans;
 uint32_t gOnly = 0; // LPN_CPU_EMULATE=<names>: only these (bit per x86::Op); 0 for all
 
 std::atomic<uint64_t> gCount[size_t(x86::Op::Count)];
+const std::chrono::steady_clock::time_point gStart = std::chrono::steady_clock::now();
 std::atomic<bool> gSeen[size_t(x86::Op::Count)];
 
 uint64_t xgetbv0() {
@@ -166,6 +170,7 @@ bool fetch(uint64_t rip, Fetched* f) {
         const auto it = std::lower_bound(gStubTable.begin(), gStubTable.end(), rip,
                                          [](const Stub& s, uint64_t a) { return s.trap < a; });
         if (it != gStubTable.end() && it->trap == rip) {
+            if (gStubHits) gStubHits[it - gStubTable.begin()].fetch_add(1, std::memory_order_relaxed);
             f->orig = it->orig;
             f->stub = true;
             return x86::decode(it->bytes, it->len, &f->in);
@@ -444,6 +449,7 @@ size_t patchMissingInstructions(Module& m) {
     }
     std::sort(gPatches.begin(), gPatches.end(), [](const Patch& a, const Patch& b) { return a.at < b.at; });
     std::sort(gStubTable.begin(), gStubTable.end(), [](const Stub& a, const Stub& b) { return a.trap < b.trap; });
+    gStubHits.reset(new std::atomic<uint64_t>[gStubTable.size()]());
     // A trap in place on Windows can overwrite the game's red zone: count them.
     if (inPlace)
         std::fprintf(stderr, "[cpu] %s: %zu of them trap in place (no stub possible), which may misbehave on Windows\n",
@@ -535,11 +541,30 @@ bool emulateIllegalInstruction(void* ctx) {
 #endif
 
 void printCpuCompatSummary() {
+    static const auto start = gStart;
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     std::string list;
     for (size_t i = 1; i < size_t(x86::Op::Count); ++i)
         if (const uint64_t n = gCount[i].load())
-            list += " " + std::string(x86::opName(x86::Op(i))) + " x" + std::to_string(n);
-    if (!list.empty()) std::fprintf(stderr, "[cpu] emulated:%s\n", list.c_str());
+            list += " " + std::string(x86::opName(x86::Op(i))) + " x" + std::to_string(n) + " (" +
+                    std::to_string(uint64_t(double(n) / std::max(secs, 1.0))) + "/s)";
+    if (list.empty()) return;
+    std::fprintf(stderr, "[cpu] emulated in %.0f s:%s\n", secs, list.c_str());
+    // The busiest places: where a faster path than a trap would pay off.
+    if (!gStubHits) return;
+    std::vector<std::pair<uint64_t, size_t>> hot;
+    for (size_t i = 0; i < gStubTable.size(); ++i)
+        if (const uint64_t n = gStubHits[i].load()) hot.push_back({n, i});
+    std::sort(hot.rbegin(), hot.rend());
+    for (size_t k = 0; k < hot.size() && k < 12; ++k) {
+        const Stub& st = gStubTable[hot[k].second];
+        x86::Insn in;
+        x86::decode(st.bytes, st.len, &in);
+        const Module* m = findModule(st.orig);
+        std::fprintf(stderr, "[cpu]   %10llu  %s at %s+0x%llx\n", (unsigned long long)hot[k].first,
+                     x86::opName(x86::classify(in)), m ? m->name().c_str() : "?",
+                     (unsigned long long)(m ? st.orig - uint64_t(m->base()) : st.orig));
+    }
 }
 
 } // namespace host

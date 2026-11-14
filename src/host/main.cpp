@@ -222,7 +222,6 @@ int main(int argc, char** argv) {
     host::startPresenter(headless);
     if (gpu) host::render::startRenderer(computeOnly);
     std::atexit(host::printUnimplementedSummary);
-    std::atexit(host::printCpuCompatSummary);
 
     // Start the bundled libraries the way the PS4 loader does: module_start(0, nullptr).
     for (size_t i = 1; i < modules.size(); ++i) {

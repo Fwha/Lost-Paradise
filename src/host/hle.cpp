@@ -1,4 +1,5 @@
 #include "host/hle.h"
+#include "host/cpu_compat.h"
 
 #include "host/guest_abi.h"
 #include "host/videoout.h"
@@ -54,6 +55,7 @@ void printUnimplementedSummary() {
     for (auto* i : v)
         std::fprintf(stderr, "  %8" PRIu64 "  %s::%s\n", i->calls, i->library.c_str(),
                      i->name.empty() ? i->nid.c_str() : i->name.c_str());
+    printCpuCompatSummary(); // every exit path comes through here
 }
 
 } // namespace host
