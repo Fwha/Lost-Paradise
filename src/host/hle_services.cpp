@@ -150,8 +150,9 @@ int32_t scePadReadState(int32_t, PadData* d) {
     }
     d->buttons = s.buttons;
     d->lx = s.lx, d->ly = s.ly, d->rx = s.rx, d->ry = s.ry, d->l2 = s.l2, d->r2 = s.r2;
-    d->orientation[3] = 1.0f;
-    d->acceleration[1] = 1.0f; // gravity, pad lying flat
+    std::memcpy(d->orientation, s.orientation, sizeof(d->orientation));
+    std::memcpy(d->acceleration, s.acceleration, sizeof(d->acceleration));
+    std::memcpy(d->angularVelocity, s.angularVelocity, sizeof(d->angularVelocity));
     d->connected = true;
     d->connectedCount = 1;
     d->timestamp = gameTimeScale() != 1.0 ? gameClockNs() / 1000

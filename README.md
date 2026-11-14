@@ -36,7 +36,9 @@ and known issues.
 - **Faster save loading:** loading screens run as fast as they draw.
 - **Save/load menu:** pick a slot to save, load, overwrite or delete, with icon, chapter, date,
   play time and controller button hints.
-- **Sound and controllers** through SDL.
+- **Sound and controllers** through SDL, with motion controls from a DualShock 4, DualSense or Switch
+  Pro controller's sensors. Waggling the mouse over the window shakes with any controller, for the
+  bartender minigame; without sensors the right stick (IJKL) tilts.
 
 ## Build
 
