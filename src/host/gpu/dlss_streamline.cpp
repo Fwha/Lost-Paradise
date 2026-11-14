@@ -127,7 +127,7 @@ void start() {
     p.logMessageCallback = logMessage;
     // No over-the-air updates: the DLLs shipped beside the exe are the ones that run.
     p.flags = sl::PreferenceFlags::eUseManualHooking | sl::PreferenceFlags::eDisableCLStateTracking |
-              sl::PreferenceFlags::eDisableDebugText;
+              sl::PreferenceFlags::eDisableDebugText | sl::PreferenceFlags::eUseFrameBasedResourceTagging;
     p.featuresToLoad = features;
     p.numFeaturesToLoad = 1;
     p.engine = sl::EngineType::eCustom;
