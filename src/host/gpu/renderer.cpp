@@ -7347,7 +7347,7 @@ void main() {
     // backdrop's shaders, was drawn across the whole picture now and then.
     bool sameHudMode(const FastDraw& f, const DrawCall& d, const DrawAnalysis& a) {
         if (!hud().on) return true;
-        if ((f.hud == 3) != (d.count == 3 && sceneCopy16x9(a.vs))) return false;
+        if ((f.hud == 3) != (d.count == 3 && sceneCopy16x9(a.vs) != 0)) return false;
         if (f.hud == 1 || f.hud == 2) return (hudWide(a.vs, a.psm ? &a.ps : nullptr, d) ? 2 : 1) == f.hud;
         return true;
     }
@@ -7658,7 +7658,7 @@ void main() {
     // targets have those). Draws into it, and into the display buffers, are HUD but for the ones
     // sampling a picture-shaped render target (the scene being copied in, post-processing).
     // 0: drawn as it is, 1: the HUD (into the 16:9 rectangle), 2: a HUD backdrop (hudWide:
-    // stretched across the whole picture, only its height fitted), 3: sceneCopy16x9.
+    // over the whole picture, as the layout is), 3: sceneCopy16x9.
     uint8_t hudDraw(const DrawRegs& r, bool hasDepth, const gcn::Program& vs, const gcn::Program* ps, const DrawCall& d,
                     uint32_t prim, uint32_t width, uint32_t height) {
         const Hud& h = hud();
@@ -7703,23 +7703,34 @@ void main() {
         const bool fill = prim == 17 && d.count == 3 && !textured;
         const bool isHud = !hasDepth && (display || layer) && sceneW == 0 && !fill;
         uint8_t mode = !isHud ? 0 : hudWide(vs, ps, d) ? 2 : 1;
-        if (!hasDepth && sceneW && prim == 17 && sceneCopy16x9(vs)) mode = 3;
+        if (!hasDepth && sceneW && prim == 17) {
+            const VkViewport vp = gameViewport(r, width, height);
+            if (sceneCopy16x9(vs, &vp)) mode = 3;
+        }
         if (hudLog_) {
             std::lock_guard lock(hudLogMutex_);
             const uint64_t vsAddr = vs.launch.entry, psAddr = ps ? ps->launch.entry : 0;
             if (hudLogged_.insert({target ^ vsAddr, psAddr, (hasDepth ? 4 : 0) | mode}).second &&
                 hudLogged_.size() <= 600) {
                 std::string samples;
-                for (int i = 0; i < pictures; ++i) samples += " 0x" + hex(picture[i]);
+                for (int i = 0; i < pictures; ++i) samples += (i ? " 0x" : "; samples 0x") + hex(picture[i]);
+                float b[4];
+                const VkViewport vp = gameViewport(r, width, height);
+                if (prim == 17 && rectBounds(vs, b)) { // where a rectangle lands (sceneCopy16x9)
+                    char at[160];
+                    std::snprintf(at, sizeof at, "; rect %.1f,%.1f-%.1f,%.1f viewport %.1f,%.1f %.1fx%.1f", b[0], b[2],
+                                  b[1], b[3], vp.x, vp.y, vp.width, vp.height);
+                    samples += at;
+                }
                 std::fprintf(stderr, "[hud] frame %" PRIu64 " into 0x%" PRIx64 "%s%s%s: vs 0x%" PRIx64 " ps 0x%" PRIx64
                                      " prim %u count %u vte 0x%x: %s%s\n",
                              frame_, target, display ? " (display)" : "", layer ? " (HUD buffer)" : "",
                              hasDepth ? " with depth" : "", vsAddr, psAddr, prim, d.count, r.ctx[reg::kPaClVteCntl],
                              mode == 3   ? "scene copy laid out 16:9, height fitted"
-                             : mode == 2 ? "HUD backdrop, full width"
+                             : mode == 2 ? "HUD backdrop, whole picture"
                              : isHud     ? "HUD, 16:9 in the middle"
                                          : "full picture",
-                             samples.empty() ? "" : ("; samples" + samples).c_str());
+                             samples.c_str());
             }
         }
         return mode;
@@ -7765,14 +7776,33 @@ void main() {
         if (textured && !(top < 2.5f && bottom > layoutH - 2.5f)) return false;
         return lo < 2.5f && hi > layoutW - 2.5f && hi - lo < 4 * layoutW;
     }
-    // A copy of the scene laid out as 16:9 at the picture's width, from the top: one rectangle
-    // (RECTLIST) from (0, 0) to (W, W * 9 / 16) in pixels. The pause screen's background is drawn
-    // so: at 21:9 it ran past the bottom, the scene zoomed in and cut off at the top and bottom (#69).
-    // Its height is fitted to the picture's (hudDraw's mode 3).
-    static bool sceneCopy16x9(const gcn::Program& vs) {
+    // A copy of the scene laid out as 16:9 at the picture's width: one rectangle (RECTLIST) landing
+    // on (0, top) to (W, top + W * 9 / 16) in pixels. The pause screen's background and the HUD
+    // buffer's copy to the display are drawn so. At 21:9 it starts at the top and ran past the
+    // bottom, the scene zoomed in and cut off (#69); at 16:10 it is centred, leaving bars above and
+    // below with the whole picture squashed between them (#102). Where it lands is its positions',
+    // or the viewport's when that is the band (vp, when known). Its height is fitted to the
+    // picture's (hudDraw's mode 3): 1 when its positions are the band (*top gets where it starts),
+    // 2 when the viewport is, 0 when neither.
+    static int sceneCopy16x9(const gcn::Program& vs, const VkViewport* vp = nullptr, float* top = nullptr) {
         const Hud& h = hud();
         const double layoutH = h.outW * 9.0 / 16;
-        if (std::fabs(layoutH - h.outH) < 1 || vs.buffers.empty()) return false;
+        float b[4];
+        if (std::fabs(layoutH - h.outH) < 1 || !rectBounds(vs, b)) return 0;
+        auto band = [&](float x0, float x1, float y0, float y1) {
+            const bool fromTop = std::fabs(y0) < 0.5f, centred = std::fabs(y0 - float((h.outH - layoutH) / 2)) < 1.5f;
+            if (!(std::fabs(x0) < 0.5f && std::fabs(x1 - float(h.outW)) < 1.5f && (fromTop || centred) &&
+                  std::fabs(y1 - y0 - float(layoutH)) < 1.5f))
+                return false;
+            if (top) *top = fromTop ? 0 : y0;
+            return true;
+        };
+        if (band(b[0], b[1], b[2], b[3])) return 1;
+        return vp && std::fabs(vp->y) > 0.5f && band(vp->x, vp->x + vp->width, vp->y, vp->y + vp->height) ? 2 : 0;
+    }
+    // A three-vertex RECTLIST's extent from its positions: x0, x1, y0, y1.
+    static bool rectBounds(const gcn::Program& vs, float* out) {
+        if (vs.buffers.empty()) return false;
         const auto& b = vs.buffers[0]; // the positions (x, y first)
         const uint32_t n = b.numRecords(), stride = b.stride();
         if (!b.known || stride < 8 || n != 3) return false;
@@ -7785,8 +7815,8 @@ void main() {
             if (!std::isfinite(p[0]) || !std::isfinite(p[1])) return false;
             x0 = std::min(x0, p[0]), x1 = std::max(x1, p[0]), y0 = std::min(y0, p[1]), y1 = std::max(y1, p[1]);
         }
-        return std::fabs(x0) < 0.5f && std::fabs(y0) < 0.5f && std::fabs(x1 - float(h.outW)) < 1.5f &&
-               std::fabs(y1 - float(layoutH)) < 1.5f;
+        out[0] = x0, out[1] = x1, out[2] = y0, out[3] = y1;
+        return true;
     }
     std::mutex hudMutex_;
     std::unordered_set<uint64_t> sceneTargets_, hudLayers_;
@@ -7816,9 +7846,11 @@ void main() {
         }
         return vp;
     }
-    // Aspect Ratio: a HUD draw moved into the 16:9 rectangle (hudDraw's mode 1; mode 2 only its
-    // height) by its vertex shader's position transform, the viewport left as the game set it: a
-    // smaller viewport cut off what reached past the rectangle (the minimap's ping).
+    // Aspect Ratio: a HUD draw moved into the 16:9 rectangle (hudDraw's mode 1) by its vertex
+    // shader's position transform, the viewport left as the game set it: a smaller viewport cut off
+    // what reached past the rectangle (the minimap's ping). A backdrop (mode 2) is left over the
+    // whole picture: the HUD's layout already covers it. Fitting its height squeezed it into the
+    // 16:9 rectangle's rows at 16:10 (the title's backdrop squashed, bands above and below, #102).
     static void hudTransform(gcn::Program& vs, const DrawRegs& r, uint32_t width, uint32_t height, uint8_t mode) {
         const Hud& h = hud();
         const VkViewport vp = gameViewport(r, width, height);
@@ -7830,10 +7862,15 @@ void main() {
             const float add = s - 1 + 2 * (o + (s - 1) * vx) / vw;
             scale *= s, offset = offset * s + add;
         };
-        if (mode == 3) { // sceneCopy16x9: from the top, the 16:9 layout's height to the picture's
-            fit(t[1], t[3], float(h.outH / (h.outW * 9.0 / 16)), 0, vp.y, vp.height);
-        } else {
-            if (mode == 1) fit(t[0], t[2], h.sx, h.x, vp.x, vp.width);
+        if (mode == 3) { // sceneCopy16x9: the 16:9 layout's rows, from where they start, to the picture's
+            // (When the viewport is the band, setViewportScissor gives it the picture's height instead.)
+            float top = 0;
+            if (sceneCopy16x9(vs, &vp, &top) == 1) {
+                const float s = float(h.outH / (h.outW * 9.0 / 16));
+                fit(t[1], t[3], s, -top * s, vp.y, vp.height);
+            }
+        } else if (mode == 1) {
+            fit(t[0], t[2], h.sx, h.x, vp.x, vp.width);
             fit(t[1], t[3], h.sy, h.y, vp.y, vp.height);
         }
         std::memcpy(&vs.data[gcn::data::kPosTransform], t, sizeof t);
@@ -7854,6 +7891,9 @@ void main() {
             vp.x += vp.width;
             vp.width = -vp.width;
         }
+        if (hudMode == 3 && std::fabs(vp.y - float((h.outH - h.outW * 9.0 / 16) / 2)) < 1.5f &&
+            std::fabs(vp.height - float(h.outW * 9.0 / 16)) < 1.5f)
+            vp.y = 0, vp.height = float(h.outH); // sceneCopy16x9 by its viewport: over the picture's height
         if (jitter) vp.x += jitterX_, vp.y += jitterY_;
         if (!R().bound_.state || std::memcmp(&R().bound_.viewport, &vp, sizeof vp) != 0) rec([c = R().cmd_, vp] { vkCmdSetViewport(c, 0, 1, &vp); }), R().bound_.viewport = vp;
 
@@ -7877,8 +7917,10 @@ void main() {
             const float w = h.outW * h.sx, margin = w * 0.06f;
             x0 = std::max<int32_t>(0, int32_t(std::floor(h.x - margin)));
             x1 = std::min<int32_t>(int32_t(width), int32_t(std::ceil(h.x + w + margin)));
-        } else if ((hudMode == 1 || hudMode == 2) && !whole) {
-            if (hudMode == 1) x0 = int32_t(std::floor(h.x + x0 * h.sx)), x1 = int32_t(std::ceil(h.x + x1 * h.sx));
+        } else if (hudMode == 3) { // sceneCopy16x9: the band's clipping becomes the picture's height
+            y0 = 0, y1 = int32_t(height);
+        } else if (hudMode == 1 && !whole) {
+            x0 = int32_t(std::floor(h.x + x0 * h.sx)), x1 = int32_t(std::ceil(h.x + x1 * h.sx));
             y0 = int32_t(std::floor(h.y + y0 * h.sy)), y1 = int32_t(std::ceil(h.y + y1 * h.sy));
             x1 = std::min<int32_t>(x1, int32_t(width)), y1 = std::min<int32_t>(y1, int32_t(height));
         }
