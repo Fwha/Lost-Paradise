@@ -5387,7 +5387,7 @@ void main() {
         f.outW = ow, f.outH = oh;
         f.jitterX = jitterOn_ ? jitterX_ * jitterSign_[0] : 0;
         f.jitterY = jitterOn_ ? jitterY_ * jitterSign_[1] : 0;
-        f.reset = !moved || upEffect_;
+        f.reset = !moved || upEffect_ || upNoHistory_;
         f.quality = inPlace ? UpscaleQuality::Native : displaySettings().upscaleQuality;
         if (f.quality == UpscaleQuality::Native && !inPlace) f.quality = UpscaleQuality::Quality;
         // The last camera's range, kept across frames without one (FSR remakes its context when
@@ -5665,6 +5665,8 @@ void main() {
     Image upBefore_, upAfter_;
     bool upBeforeTaken_ = false, upAfterTaken_ = false, upReactiveLogged_ = false;
     bool upReactive_ = !getenv("LPN_UPSCALE_NO_REACTIVE");
+    // Every frame without the upscaler's history: to tell its ghosts from the game's.
+    bool upNoHistory_ = getenv("LPN_UPSCALE_NO_HISTORY") != nullptr;
     VkPipeline mvPipe_ = VK_NULL_HANDLE;
     VkPipelineLayout mvLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout mvSetLayout_ = VK_NULL_HANDLE;
