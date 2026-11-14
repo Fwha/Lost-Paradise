@@ -44,6 +44,7 @@ add_executable(lpn-host
     mman_win.cpp
     $<$<BOOL:${WIN32}>:${PROJECT_SOURCE_DIR}/packaging/windows/host.rc>
     crash.cpp
+    cpu_compat.cpp
     trampoline.S
 )
 find_package(ZLIB REQUIRED)

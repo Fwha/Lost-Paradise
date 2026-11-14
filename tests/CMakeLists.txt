@@ -14,6 +14,10 @@ add_executable(mods_test mods_test.cpp)
 target_link_libraries(mods_test PRIVATE lpn-common)
 add_test(NAME mods_test COMMAND mods_test)
 
+add_executable(x86_emu_test x86_emu_test.cpp)
+target_link_libraries(x86_emu_test PRIVATE lpn-common)
+add_test(NAME x86_emu_test COMMAND x86_emu_test)
+
 add_executable(elf_test elf_test.cpp)
 target_link_libraries(elf_test PRIVATE ps4elf)
 add_test(NAME elf_test COMMAND elf_test)

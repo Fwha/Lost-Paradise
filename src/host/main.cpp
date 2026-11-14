@@ -6,6 +6,7 @@
 #include "host/guest_abi.h"
 #include "common/game_dir.h"
 #include "common/mods.h"
+#include "host/cpu_compat.h"
 #include "host/crash.h"
 #include "host/display_settings.h"
 #include "host/input_history.h"
@@ -169,6 +170,8 @@ int main(int argc, char** argv) {
     host::process().titleId = host::gameTitleId(gameDir);
     if (!modsDir.empty()) host::loadMods(fs::absolute(modsDir).lexically_normal().string());
     host::prepareSaveFolder();
+    if (!host::checkCpu()) return 1;
+    for (auto* m : modules) host::scanMissingInstructions(*m); // before the code patches below
     host::installCrashHandler();
     host::registerBuiltinHle();
     host::layoutStaticTls(modules);
@@ -208,6 +211,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    for (auto* m : modules) host::patchMissingInstructions(*m);
     for (auto* m : modules)
         if (!m->protect(&error)) {
             std::fprintf(stderr, "error: %s\n", error.c_str());
