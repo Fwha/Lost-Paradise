@@ -715,13 +715,20 @@ private:
     static inline const bool prefetchWrites_ = getenv("LPN_NO_CHUNK_PREFETCH") == nullptr;
 };
 
+// The device prepareVulkan made, which Renderer::init takes.
+Vk* gEarlyVk = nullptr;
+
 class Renderer final : public DrawListener {
     struct DrawAnalysis; // declared further down
 
 public:
     bool init() {
         std::string error;
-        if (!vk_.init(&error)) {
+        if (gEarlyVk) {
+            vk_ = *gEarlyVk;
+            delete gEarlyVk;
+            gEarlyVk = nullptr;
+        } else if (!vk_.init(&error)) {
             std::fprintf(stderr, "[gpu] no renderer: %s\n", error.c_str());
             return false;
         }
@@ -8487,6 +8494,17 @@ void dumpShaderTables(uint64_t flip) {
     std::fclose(f);
     std::fprintf(stderr, "[gpu] shader tables written to lpn-shader-tables.txt: %zu entries, %zu with code found\n", entries,
                  withCode);
+}
+
+void prepareVulkan() {
+    auto* v = new Vk;
+    std::string error;
+    if (!v->init(&error)) {
+        std::fprintf(stderr, "[gpu] early Vulkan device: %s\n", error.c_str());
+        delete v;
+        return;
+    }
+    gEarlyVk = v;
 }
 
 bool startRenderer(bool computeOnly) {

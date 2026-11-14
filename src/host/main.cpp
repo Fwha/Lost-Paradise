@@ -137,6 +137,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[host] game: %s\n", gameDir.c_str());
     }
 
+#ifdef _WIN32
+    // DLSS's Vulkan extension sets up CUDA, which needs address space the guest's reservation (at
+    // the first module load) would take: make the device first (gpu/renderer.h prepareVulkan).
+    host::loadDisplaySettings();
+    if (gpu && host::displaySettings().upscaler == host::Upscaler::Dlss && host::render::upscale::builtIn(host::Upscaler::Dlss))
+        host::render::prepareVulkan();
+#endif
+
     std::string error;
     ps4elf::NidDb nids;
     if (!nids.load(nidPath, &error)) {
