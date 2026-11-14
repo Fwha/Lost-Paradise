@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace host::render {
 
@@ -32,7 +33,14 @@ struct Vk {
     uint32_t memoryType(uint32_t bits, VkMemoryPropertyFlags flags) const;
 
 private:
-    bool create(std::string* error, bool withDlss);
+    // What of DLSS's Vulkan additions create() makes the instance and device with.
+    struct DlssAdditions {
+        bool on = true, features = true;
+        std::string dropExt; // a device extension left out
+    };
+    bool create(std::string* error, const DlssAdditions& add);
+    void destroy();
+    std::vector<std::string> dlssDeviceExts_; // DLSS's device extensions the GPU has
 };
 
 const char* vkResultName(VkResult r);

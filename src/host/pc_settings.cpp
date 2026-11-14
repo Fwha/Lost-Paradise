@@ -122,7 +122,7 @@ const std::vector<PcSetting>& pcSettings() {
          "Swap the game's anti-aliasing for NVIDIA DLSS (RTX cards) or AMD FSR 3.1 (any GPU).",
          &upscalerChoices, &upscalerValue, &upscalerChoose},
         {"Upscale Quality",
-         "Native: anti-aliasing only. Others render smaller, faster. Changing Native needs a restart.",
+         "Native: anti-aliasing only. Others render smaller, faster. Takes effect after a restart.",
          &qualityChoices, &qualityValue, &qualityChoose},
         {"Anisotropic Filtering", "Keep textures sharp at glancing angles, like the ground ahead. Off: as the game sets them.",
          &anisoChoices, &anisoValue, &anisoChoose},

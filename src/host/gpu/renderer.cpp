@@ -5269,8 +5269,9 @@ void main() {
                 if (t.base() == scene) return true;
         return upRedirect_ && rendersInto(d, r, scene);
     }
-    // Before such a draw (holding m_): the first one that samples the waiting scene runs the
-    // upscaler, and it and later draws sample the upscaled picture in its place (resolveImage).
+    // Before such a draw (holding m_): the first one that samples the waiting scene into an
+    // output-sized target runs the upscaler, and it and later draws sample the upscaled picture in
+    // its place (resolveImage).
     // A draw that then renders into the scene, or stores to it, ends that for the frame: what it
     // draws would be missing from the upscaled picture.
     void upscaleTouch(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
@@ -5280,7 +5281,13 @@ void main() {
             for (const auto& t : p->images)
                 if (t.base() == scene) (t.storage ? stores : samples) = true;
         stores = stores || rendersInto(d, r, scene);
-        if (upIn_.on && samples) {
+        // The pass that upscales is the first to read the scene into a target wider than it (the
+        // game's composite to the output): passes at the scene's size before it (bloom, depth of
+        // field) read it as it is, and what the game draws back into the scene after them (its
+        // aura, the bloom's blend) is then in the upscaled picture too.
+        const uint32_t targetW = ((r.ctx[reg::kCbColorBase + ::gpu::ctx::kCbColorPitch] & 0x7FF) + 1) * 8;
+        const bool toOutput = d.kind == DrawCall::kDispatch || targetW > upIn_.w + 8;
+        if (upIn_.on && samples && toOutput) {
             const UpscaleInputs in = upIn_;
             upIn_.on = false;
             if (runUpscaler(in, false)) {

@@ -30,24 +30,51 @@ uint32_t Vk::memoryType(uint32_t bits, VkMemoryPropertyFlags flags) const {
     return UINT32_MAX;
 }
 
-bool Vk::init(std::string* error) {
-    if (create(error, true)) return true;
-    if (!dlss::builtIn()) return false;
-    // DLSS adds instance and device extensions, features and queues; a driver that refuses them
-    // must not cost the picture, so try once more without DLSS.
-    std::fprintf(stderr, "[gpu] %s with DLSS's Vulkan additions: trying again without DLSS\n", error->c_str());
-    dlss::disable();
+void Vk::destroy() {
     if (device) vkDestroyDevice(device, nullptr);
     if (instance) vkDestroyInstance(instance, nullptr);
     device = VK_NULL_HANDLE;
     instance = VK_NULL_HANDLE;
     phys = VK_NULL_HANDLE;
     queue = VK_NULL_HANDLE;
-    error->clear();
-    return create(error, false);
 }
 
-bool Vk::create(std::string* error, bool withDlss) {
+bool Vk::init(std::string* error) {
+    if (create(error, {})) return true;
+    if (!dlss::builtIn()) return false;
+    // DLSS adds instance and device extensions, features and queues; a driver that refuses them
+    // must not cost the picture. Find the addition it refuses (play.log says which) and go on
+    // without it, or without DLSS.
+    std::fprintf(stderr, "[gpu] %s with DLSS's Vulkan additions: looking for the one the driver refuses\n",
+                 error->c_str());
+    destroy();
+    const std::vector<std::string> exts = dlssDeviceExts_;
+    DlssAdditions a;
+    a.features = false;
+    if (create(error, a)) {
+        std::fprintf(stderr, "[gpu] the device works without DLSS's Vulkan 1.2/1.3 features\n");
+        return true;
+    }
+    destroy();
+    for (const std::string& e : exts) {
+        a = {};
+        a.dropExt = e;
+        if (create(error, a)) {
+            std::fprintf(stderr, "[gpu] the device works without %s\n", e.c_str());
+            return true;
+        }
+        destroy();
+    }
+    std::fprintf(stderr, "[gpu] no single addition: trying again without DLSS\n");
+    dlss::disable();
+    a = {};
+    a.on = false;
+    error->clear();
+    return create(error, a);
+}
+
+bool Vk::create(std::string* error, const DlssAdditions& add) {
+    const bool withDlss = add.on;
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "lpn-host";
     app.apiVersion = VK_API_VERSION_1_3;
@@ -117,10 +144,15 @@ bool Vk::create(std::string* error, bool withDlss) {
     // DLSS's device extensions, those the driver has (none without an NVIDIA driver).
     const std::vector<std::string> dlssDevice =
         withDlss ? dlss::deviceExtensions(instance, phys) : std::vector<std::string>{};
+    if (withDlss && add.features && add.dropExt.empty()) {
+        dlssDeviceExts_.clear();
+        for (const std::string& e : dlssDevice)
+            if (e != VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME && has(e.c_str())) dlssDeviceExts_.push_back(e);
+    }
     for (const std::string& e : dlssDevice)
         // VK_EXT_buffer_device_address must not be enabled with the KHR one (core in 1.2), which
         // Streamline asks for too: the driver refuses the device with both.
-        if (e != VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME && has(e.c_str()) && std::find_if(enable.begin(), enable.end(), [&](const char* x) { return e == x; }) ==
+        if (e != VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME && e != add.dropExt && has(e.c_str()) && std::find_if(enable.begin(), enable.end(), [&](const char* x) { return e == x; }) ==
                                   enable.end())
             enable.push_back(e.c_str());
 
@@ -205,7 +237,7 @@ bool Vk::create(std::string* error, bool withDlss) {
     want12.shaderFloat16 = have12.shaderFloat16;
     want13.subgroupSizeControl = have13.subgroupSizeControl;
     want13.computeFullSubgroups = have13.computeFullSubgroups;
-    if (withDlss) dlss::deviceFeatures(have12, have13, &want12, &want13);
+    if (withDlss && add.features) dlss::deviceFeatures(have12, have13, &want12, &want13);
     storageWriteWithoutFormat = h.shaderStorageImageWriteWithoutFormat;
     shaderFloat16 = have12.shaderFloat16;
     subgroupSizeControl = have13.subgroupSizeControl;
