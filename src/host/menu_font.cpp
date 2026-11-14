@@ -86,6 +86,16 @@ bool loadFirst(Font& f, bool bold, const char* env) {
     };
     for (const auto& p : kFallback)
         if (load(f, p[bold ? 1 : 0])) return true;
+    // The Liberation Sans we ship (SteamOS 3 has none of the above): usr/share/lost-paradise/fonts
+    // in the AppImage, or the repo's external/liberation-fonts from a build tree.
+    std::error_code ec;
+    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec) {
+        const std::filesystem::path dir = exe.parent_path();
+        const char* name = bold ? "LiberationSans-Bold.ttf" : "LiberationSans-Regular.ttf";
+        for (const auto& d : {dir / "../share/lost-paradise/fonts", dir / "fonts", dir / "../../../external/liberation-fonts"})
+            if (std::filesystem::exists(d / name, ec) && load(f, (d / name).string())) return true;
+    }
     return false;
 }
 

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Packs lpn-launcher, lpn-host, aerolib.csv and the DLSS runtime (when built with it) into
+# Packs lpn-launcher, lpn-host, aerolib.csv, Liberation Sans and the DLSS runtime (when built with it) into
 # build/Lost_Paradise-x86_64.AppImage. Build first (README), then:
 #   scripts/make-appimage.sh [install folder to copy it to]
 # The AppImage runs in the folder it is put in: game/CUSA12776, lpn-data, lpn-display.ini and
@@ -13,13 +13,16 @@ BUILD=${BUILD:-build}
 
 APPDIR="$BUILD/AppDir"
 rm -rf "$APPDIR"
-mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/lost-paradise"
+mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/lost-paradise/fonts"
 cp "$BUILD/src/launcher/lpn-launcher" "$BUILD/src/host/lpn-host" "$APPDIR/usr/bin/"
 # NGX looks for the DLSS runtime beside lpn-host.
 for f in "$BUILD"/src/host/libnvidia-ngx-dlss.so.*; do
     if [ -e "$f" ]; then cp "$f" "$APPDIR/usr/bin/"; fi
 done
 cp aerolib.csv "$APPDIR/usr/share/lost-paradise/"
+# Liberation Sans (SIL OFL 1.1, its license beside it) for the menus, when the system has neither
+# Arial nor Liberation Sans (SteamOS 3).
+cp external/liberation-fonts/*.ttf external/liberation-fonts/LICENSE "$APPDIR/usr/share/lost-paradise/fonts/"
 cp packaging/AppRun packaging/lost-paradise.desktop packaging/lost-paradise.svg "$APPDIR/"
 ln -sf lost-paradise.svg "$APPDIR/.DirIcon"
 
