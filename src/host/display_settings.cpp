@@ -326,6 +326,8 @@ bool keep30FpsScenes() {
 uint8_t* gEbootText = nullptr; // set once the code is known to match
 std::atomic<int> gClockWanted{0};
 std::atomic<int> gClockActive{0};
+std::atomic<int> gClockFps{30};          // the cap last given to setFrameClock
+std::atomic<bool> gCapAbove30{false};    // that cap is 60, 90 or uncapped (or a scaled game clock)
 
 // The frame clock object (0x2486080), from +0x60.
 struct Clock {
@@ -373,6 +375,15 @@ bool gStepHooks = false;            // pushStep is in place, so the title can be
 // this same float.
 bool fixedStepKept(const Clock& c) { return c.fixedOn && c.fixedDt > 1.0f / 60; }
 
+// Uncap Cutscenes: a real-time cutscene's fixed 1/30 step (outside the title) takes the measured
+// time instead, and its 30 fps flip rate is shown at the cap. Pre-rendered videos (the one before
+// the Shin fight: 0x80000002 from 0x9c455b, decoded into a 1920x1080 and two 960x540 targets) ask
+// for measured steps with no fixed step, so they keep 30 fps. The 1/20 loading step stays.
+bool cutsceneFollowsCap(const Clock& c) {
+    return gSettings.uncapCutscenes && gCapAbove30.load(std::memory_order_relaxed) && c.fixedOn &&
+           c.fixedDt == 1.0f / 30 && !titleRunning();
+}
+
 constexpr uint32_t kNs60 = 16666666, kMaxFixedNs = 200000000, kMaxNs = 50000000;
 constexpr uint32_t kFloorNs = 2000000; // uncapped: 500 fps
 
@@ -388,7 +399,7 @@ extern "C" uint32_t stepNs(uint32_t measured) {
     const bool uncapped = gClockActive.load(std::memory_order_relaxed) == 2;
     if (c.overrideDt > 0) ++gSteps.override; // the clock replaces this step after the call
     if (skippingIntro()) return std::max<uint32_t>(kMaxNs, fixedStepKept(c) ? uint32_t(double(c.fixedDt) * 1e9) : 0);
-    if (fixedStepKept(c)) {
+    if (fixedStepKept(c) && !cutsceneFollowsCap(c)) {
         ++gSteps.fixed;
         const double ns = double(c.fixedDt) * 1e9;
         return ns <= kMaxFixedNs ? uint32_t(ns) : kMaxFixedNs;
@@ -515,9 +526,15 @@ bool prepareFrameClock(Module& eboot) {
 }
 
 // A scaled game clock (LPN_TIME_SCALE) needs the measured time unfloored, at any cap.
+// Uncap Cutscenes at a 60 cap needs the host's step (mode 1, floored at 1/60 as the game does).
 void setFrameClock(int fps) {
-    gClockWanted = fps <= 0 || fps > 61 || gameTimeScale() != 1.0 ? 2 : fps < 59 ? 1 : 0;
+    gClockFps = fps;
+    const bool scaled = gameTimeScale() != 1.0;
+    gCapAbove30 = fps <= 0 || fps >= 59 || scaled;
+    gClockWanted = fps <= 0 || fps > 61 || scaled ? 2 : fps < 59 || gSettings.uncapCutscenes ? 1 : 0;
 }
+
+void refreshFrameClock() { setFrameClock(gClockFps.load()); }
 
 namespace {
 
@@ -582,19 +599,21 @@ void titleStep(bool follow) {
 
 } // namespace
 
-// At a 30 fps cap (clock mode 1) the title already runs at the cap; at 60, 90 or uncapped it
-// follows the cap.
-static bool titleFollowsCap(int mode) { return mode != 1 && !keep30FpsScenes(); }
+// At a 30 fps cap the title already runs at the cap; at 60, 90 or uncapped it follows the cap.
+static bool titleFollowsCap() { return gCapAbove30.load(std::memory_order_relaxed) && !keep30FpsScenes(); }
 
 bool uncap30FpsScenes() {
-    return titleFollowsCap(gClockActive.load(std::memory_order_relaxed)) && titleRunning();
+    if (!gEbootText || keep30FpsScenes()) return false;
+    if (titleRunning()) return titleFollowsCap();
+    // Only once the host picks the clock's step, so a cutscene is never shown faster than it steps.
+    return gClockActive.load(std::memory_order_relaxed) >= 1 && cutsceneFollowsCap(clock());
 }
 
 void syncFrameClock() {
     if (gEbootText) clockStats();
     // Skipping the intro, the host picks every step (stepNs), whatever the cap.
     const int want = skippingIntro() ? std::max(1, gClockWanted.load()) : gClockWanted.load();
-    if (gEbootText) titleStep(gClockActive == want && titleFollowsCap(want));
+    if (gEbootText) titleStep(gClockActive == want && titleFollowsCap());
     if (!gEbootText || want == gClockActive) return;
     write(kMeasured[0], want >= 1);
     write(kMeasured[1], want >= 1);

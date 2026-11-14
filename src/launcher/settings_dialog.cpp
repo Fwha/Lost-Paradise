@@ -64,6 +64,10 @@ const std::vector<Tab> kTabs = {
           [](DisplaySettings& s, int i) {
               if (i >= 0 && i < host::kFpsCount) s.fps = host::kFpsChoices[i];
           }},
+         {"Uncap Cutscenes",
+          "Real-time cutscenes follow the frame rate cap instead of 30 fps. Pre-rendered videos stay at 30. Experimental.",
+          false, nullptr, [](const DisplaySettings& s) { return int(s.uncapCutscenes); },
+          [](DisplaySettings& s, int v) { s.uncapCutscenes = v; }},
          {"VSync", "Show each frame at the monitor's refresh, without tearing. Off can lower input lag.", false, nullptr,
           [](const DisplaySettings& s) { return int(s.vsync); }, [](DisplaySettings& s, int v) { s.vsync = v; }},
          {"FPS Counter", "Show the frame rate in the top right corner of the screen.", false, nullptr,

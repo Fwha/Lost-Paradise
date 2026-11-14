@@ -89,6 +89,12 @@ void vsyncChoose(int i) {
     displaySettings().vsync = i != 0; // the window thread applies it (window.cpp)
     saveDisplaySettings();
 }
+int uncapCutscenesValue() { return displaySettings().uncapCutscenes ? 1 : 0; }
+void uncapCutscenesChoose(int i) {
+    displaySettings().uncapCutscenes = i != 0;
+    refreshFrameClock(); // at a 60 cap the clock now needs the host's step
+    saveDisplaySettings();
+}
 int skipIntroValue() { return displaySettings().skipIntro ? 1 : 0; }
 void skipIntroChoose(int i) {
     displaySettings().skipIntro = i != 0;
@@ -115,6 +121,8 @@ const std::vector<PcSetting>& pcSettings() {
          &aspectChoices, &aspectSetting, &aspectChoose},
         display<2>("Frame Rate Cap",
                    "Set the most frames shown per second. Uncapped follows the monitor's refresh rate."),
+        {"Uncap Cutscenes", "Real-time cutscenes follow the cap instead of 30 fps. Videos stay at 30. Experimental.",
+         &onOff, &uncapCutscenesValue, &uncapCutscenesChoose},
         {"VSync", "Show each frame at the monitor's refresh, without tearing. Off can lower input lag.", &onOff,
          &vsyncValue, &vsyncChoose},
         display<3>("FPS Counter", "Show the frame rate in the top right corner of the screen."),

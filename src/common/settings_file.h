@@ -58,6 +58,9 @@ struct DisplaySettings {
     // Present each frame at the monitor's refresh (no tearing). Off shows it as soon as it is
     // ready; the frame rate cap still paces the game.
     bool vsync = true;
+    // Real-time cutscenes (the game's 1/30 s step) follow the frame rate cap instead of staying at
+    // 30. Pre-rendered videos stay at 30 either way (display_settings.h). Experimental.
+    bool uncapCutscenes = false;
     // Build every shader and pipeline the cache knows before the game starts, behind a progress
     // screen, instead of in the background while it plays (gpu/renderer.cpp).
     bool precompileShaders = true;
@@ -94,7 +97,8 @@ constexpr int kResCount = int(sizeof kResolutions / sizeof kResolutions[0]);
 // The game runs at 60 and drops itself to 30 in cutscenes and 20 on loading screens. Above 60
 // (90, or uncapped at the monitor's refresh rate) the frame clock is patched to keep its speed,
 // and the pad history keeps one entry per 1/60 s so mashing moves still count (input_history.h).
-// At 60, 90 or uncapped the title screen follows the cap too; cutscenes stay at 30.
+// At 60, 90 or uncapped the title screen follows the cap too; cutscenes stay at 30 unless
+// uncapCutscenes is on.
 constexpr int kFpsChoices[] = {30, 60, 90, 0};
 constexpr int kFpsCount = int(sizeof kFpsChoices / sizeof kFpsChoices[0]);
 

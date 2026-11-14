@@ -50,15 +50,17 @@ void logCameras(const std::string& path);
 bool prepareFrameClock(Module& eboot);
 // The frame rate cap the clock should suit (0: uncapped; above 60 is treated as uncapped). Takes effect at the next flip.
 void setFrameClock(int fps);
+// setFrameClock again with the last cap, after Uncap Cutscenes changes.
+void refreshFrameClock();
 // Called on the game's thread as it flips, between two runs of the clock: applies a change.
 void syncFrameClock();
 // Whether the clock now steps by the measured time with the low floor (above 60 fps).
 bool frameClockUncapped();
-// Whether the game's 30 fps flip rate is shown at the cap (or the monitor's rate, uncapped): on
-// the title at a 60 or 90 cap or uncapped (its 1/30 step is then turned off), unless
-// LPN_KEEP_30FPS_SCENES=1. Elsewhere it is kept: the
-// cutscenes ask for 30 fps with a fixed 1/30 step or, like the one before the Shin fight, with
-// measured steps, and flash when shown faster.
+// Whether the game's 30 fps flip rate is shown at the cap (or the monitor's rate, uncapped), at a
+// 60 or 90 cap or uncapped: on the title (its 1/30 step is then turned off), and with Uncap
+// Cutscenes in real-time cutscenes (a fixed 1/30 step, then stepped by the measured time). Never
+// with LPN_KEEP_30FPS_SCENES=1. Pre-rendered videos, like the one before the Shin fight, ask for
+// 30 fps with measured steps and no fixed step; they flash when shown faster, so they stay at 30.
 bool uncap30FpsScenes();
 
 // With Skip intro logos on: from boot until the title sequence starts, the game is run as fast as

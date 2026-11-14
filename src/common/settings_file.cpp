@@ -95,6 +95,8 @@ void readSettings(const std::string& path, DisplaySettings& s) {
             s.anisotropy = 0;
             for (int i = 1; i < kAnisoCount; ++i)
                 if (std::atoi(value) == kAnisoChoices[i]) s.anisotropy = kAnisoChoices[i];
+        } else if (!std::strcmp(key, "uncap_cutscenes")) {
+            s.uncapCutscenes = !std::strcmp(value, "on");
         } else if (!std::strcmp(key, "vsync")) {
             s.vsync = std::strcmp(value, "off") != 0;
         } else if (!std::strcmp(key, "aspect")) {
@@ -122,6 +124,7 @@ bool writeSettings(const std::string& path, const DisplaySettings& s) {
     if (s.anisotropy) std::fprintf(f, "anisotropy = %dx\n", s.anisotropy);
     else std::fprintf(f, "anisotropy = off\n");
     std::fprintf(f, "vsync = %s\n", s.vsync ? "on" : "off");
+    std::fprintf(f, "uncap_cutscenes = %s\n", s.uncapCutscenes ? "on" : "off");
     std::fprintf(f, "precompile_shaders = %s\n", s.precompileShaders ? "on" : "off");
     return std::fclose(f) == 0;
 }
