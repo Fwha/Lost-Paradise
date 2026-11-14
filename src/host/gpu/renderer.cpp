@@ -1067,6 +1067,7 @@ public:
         // Analyses move by pointer: moved by value (two Programs each), handing them along was
         // ~10% of the recorder at 8,000 draws a frame.
         std::unique_ptr<DrawAnalysis>& held = taken_[takenNext_++];
+        if (upDiag_ == 1 && smaaSeen_) upscaleDiag(d, r, *held);
         if (recordThreads_) {
             if (segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
                 addToSegment(d, r, held);
@@ -5326,6 +5327,32 @@ void main() {
         }
     }
 
+    // One frame's draws after the SMAA blend, when none read the scene into an output-sized
+    // target: their targets and images, to see how the game takes the scene to the output.
+    void upscaleDiag(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
+        if (upDiagLines_ >= 80) return;
+        ++upDiagLines_;
+        const uint64_t scene = upIn_.colorAddr;
+        const uint32_t* cb = &r.ctx[reg::kCbColorBase];
+        std::string line;
+        char buf[160];
+        if (d.kind == DrawCall::kDispatch)
+            line = "dispatch";
+        else {
+            std::snprintf(buf, sizeof buf, "draw into 0x%" PRIx64 "%s pitch %u fmt %u", uint64_t(cb[0]) << 8,
+                          (uint64_t(cb[0]) << 8) == scene ? " (scene)" : "", ((cb[::gpu::ctx::kCbColorPitch] & 0x7FF) + 1) * 8,
+                          (cb[::gpu::ctx::kCbColorInfo] >> 2) & 0x1F);
+            line = buf;
+        }
+        for (const gcn::Program* p : {&a.vs, &a.ps})
+            for (const auto& t : p->images) {
+                std::snprintf(buf, sizeof buf, "; %s 0x%" PRIx64 "%s %ux%u", t.storage ? "stores" : "reads", t.base(),
+                              t.base() == scene ? " (scene)" : "", t.width(), t.height());
+                line += buf;
+            }
+        std::fprintf(stderr, "[upscale] after SMAA: %s\n", line.c_str());
+    }
+
     // Each frame: which upscaler runs, the cameras and the next jitter.
     void upscaleFrameEnd() {
         prevCam_ = cam_;
@@ -5334,8 +5361,11 @@ void main() {
         camTries_ = 0;
         upRanLast_ = upRan_;
         upRan_ = false;
-        if (upIn_.on && ++upUnread_ == 120) // waiting since the SMAA blend: nothing read the scene
+        if (upDiag_ == 1) upDiag_ = 2; // one frame logged
+        if (upIn_.on && ++upUnread_ == 120) { // waiting since the SMAA blend: nothing read the scene
             std::fprintf(stderr, "[upscale] the scene was not read by a draw after SMAA: left at its size\n");
+            if (!upDiag_) upDiag_ = 1; // the next frame's draws after SMAA say why
+        }
         upIn_.on = false;
         if (upRedirect_) upRedirect_ = false, ++imageGen_;
         const DisplaySettings& s = displaySettings();
@@ -5364,6 +5394,8 @@ void main() {
     std::chrono::steady_clock::time_point upLastRun_{};
     uint64_t sceneDepth_ = 0, jitterIndex_ = 0;
     uint32_t camTries_ = 0, upStats_[4] = {}, upUnread_ = 0;
+    int upDiag_ = 0; // 1: this frame's draws after SMAA are logged (upscaleDiag); 2: done
+    uint32_t upDiagLines_ = 0;
     float jitterX_ = 0, jitterY_ = 0;
     // LPN_DLSS_JITTER_SIGN=<x>,<y> (each 1 or -1): flips the jitter the upscaler is told (debugging).
     float jitterSign_[2] = {1, 1};
