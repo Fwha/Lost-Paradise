@@ -163,10 +163,14 @@ shaders' code) with a temporal upscaler (`gpu/upscale.h`; `upscaleSmaa` in the r
   (each side, to 8 pixels) while its output keeps the resolution (1080p at least, as the game's
   own). The game already draws its scene smaller than its output on a base PS4 (1600x896 into
   1920x1080) and scales it up in a later full-screen pass. The SMAA blend is skipped and the
-  scene left as it is until a draw first samples it (the game may still draw into it: Ken's aura).
-  That draw runs the upscaler into an image at the output size, and it and later draws of the
-  frame sample that image wherever they sample the scene (`resolveImageUncached`, with the UV
-  scale mapping the scene's part of the texture onto it). A draw that then renders or stores
+  scene left as it is until a draw first samples it into an output-sized target (the game may
+  still draw into it: Ken's aura). A draw that copies it into another target of its size (the
+  bloom's blend) moves it there (`[upscale] the scene is composited into a copy`); one that moves
+  it back into a target it was in this frame is the game blending in earlier frames (its
+  afterimage effect), and such frames run the upscaler without its history, which would pile up
+  the ghosts. The output-sized draw runs the upscaler into an image at the output size, and it
+  and later draws of the frame sample that image wherever they sample the scene
+  (`resolveImageUncached`, with the UV scale mapping the scene's part of the texture onto it). A draw that then renders or stores
   into the scene ends that for the frame (logged once). `[upscale] ... first read by` says which
   pass that was. Mipmapped textures get a mip bias of log2(scene / output).
 - Depth: the depth buffer bound to the SMAA blend (the scene's). FSR gets an R32F copy the motion

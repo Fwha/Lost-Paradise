@@ -5199,6 +5199,7 @@ void main() {
         // Upscaling: the scene stays as it is (the game may still draw into it, Ken's aura) until a
         // draw first reads it (upscaleTouch), which then reads the upscaled picture instead.
         upIn_ = in;
+        upFollowed_.assign(1, in.colorAddr);
         return true;
     }
 
@@ -5311,7 +5312,7 @@ void main() {
         f.outW = ow, f.outH = oh;
         f.jitterX = jitterOn_ ? jitterX_ * jitterSign_[0] : 0;
         f.jitterY = jitterOn_ ? jitterY_ * jitterSign_[1] : 0;
-        f.reset = !moved;
+        f.reset = !moved || upEffect_;
         f.quality = inPlace ? UpscaleQuality::Native : displaySettings().upscaleQuality;
         if (f.quality == UpscaleQuality::Native && !inPlace) f.quality = UpscaleQuality::Quality;
         // The last camera's range, kept across frames without one (FSR remakes its context when
@@ -5415,6 +5416,17 @@ void main() {
             const VkFormat vf = colorFormat(fmt, num);
             if (addr != scene && targetW == upIn_.pitch && vf == upIn_.format &&
                 uint32_t(std::lround(std::fabs(v[0]) * 2)) == upIn_.w && uint32_t(std::lround(std::fabs(v[2]) * 2)) == upIn_.h) {
+                // Back into a target the scene was in before this frame: the game blends copies of
+                // the scene with earlier frames' (its afterimage effect). The upscaler's history
+                // would pile up those ghosts: it starts over for such frames.
+                if (std::find(upFollowed_.begin(), upFollowed_.end(), addr) != upFollowed_.end()) {
+                    if (!upEffect_ && !upEffectLogged_) {
+                        upEffectLogged_ = true;
+                        std::fprintf(stderr, "[upscale] the game blends earlier frames into the scene (an afterimage): no upscaler history in such frames\n");
+                    }
+                    upEffect_ = true;
+                } else
+                    upFollowed_.push_back(addr);
                 upIn_.colorAddr = addr;
                 upIn_.rows = ((cb[::gpu::ctx::kCbColorSlice] & 0x3FFFFF) + 1) * 64 / upIn_.pitch;
                 if (!upFollowLogged_) {
@@ -5500,6 +5512,7 @@ void main() {
         upRanLast_ = upRan_;
         upRan_ = false;
         upscaleDiagEnd();
+        upEffect_ = false;
         if (upDiag_ == 1) upDiag_ = 2; // one frame logged
         if (upIn_.on && ++upUnread_ == 120) { // waiting since the SMAA blend: nothing read the scene
             std::fprintf(stderr, "[upscale] the scene was not read by a draw after SMAA: left at its size\n");
@@ -5539,6 +5552,8 @@ void main() {
     std::string upDiagShape_;
     std::set<std::string> upDiagShapes_;
     bool upFollowLogged_ = false;
+    std::vector<uint64_t> upFollowed_; // where the scene was this frame (upscaleTouch)
+    bool upEffect_ = false, upEffectLogged_ = false;
     float jitterX_ = 0, jitterY_ = 0;
     // LPN_DLSS_JITTER_SIGN=<x>,<y> (each 1 or -1): flips the jitter the upscaler is told (debugging).
     float jitterSign_[2] = {1, 1};
