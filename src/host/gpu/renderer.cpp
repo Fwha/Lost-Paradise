@@ -5473,13 +5473,16 @@ void main() {
                 std::snprintf(buf, sizeof buf, "; %s 0x%" PRIx64 "%s %ux%u", t.storage ? "stores" : "reads", t.base(),
                               t.base() == scene ? " (scene)" : "", t.width(), t.height());
                 line += buf;
-                upDiagShape_ += (t.storage ? "s" : "r") + std::to_string(t.width()) + "x" + std::to_string(t.height());
+                // The shape: images at the scene's size only (textures vary from frame to frame).
+                if (t.width() == upIn_.w || t.storage) upDiagShape_ += t.storage ? "s" : "r";
             }
         upDiagShape_ += d.kind == DrawCall::kDispatch ? "D;" : ";";
         upDiagFrame_.push_back(std::move(line));
     }
     void upscaleDiagEnd() {
-        const bool newShape = upTrace_ && !upDiagFrame_.empty() && upDiagShapes_.size() < 16 && upDiagShapes_.insert(upDiagShape_).second;
+        // (Once upscaling runs: menus before it have many shapes of their own.)
+        const bool newShape = upTrace_ && upRanLast_ && !upDiagFrame_.empty() && upDiagShapes_.size() < 32 &&
+                              upDiagShapes_.insert(upDiagShape_).second;
         if ((upDiag_ == 1 || newShape) && !upDiagFrame_.empty()) {
             std::fprintf(stderr, "[upscale] frame %" PRIu64 ": %zu draws after SMAA\n", frame_, upDiagFrame_.size());
             for (const std::string& l : upDiagFrame_) std::fprintf(stderr, "[upscale] after SMAA: %s\n", l.c_str());
