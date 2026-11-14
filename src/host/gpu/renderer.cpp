@@ -5165,11 +5165,12 @@ void main() {
 
     // A draw of one of the SMAA shaders with an upscaler on: true when it was handled (skipped,
     // or the blend replaced by the upscaler).
-    bool upscaleSmaa(const DrawRegs& r, uint8_t role) {
+    bool upscaleSmaa(const DrawRegs& r, uint8_t role, const DrawAnalysis& a) {
         if (upKind_ == Upscaler::Off || !upscale::usable(upKind_)) return false;
         smaaSeen_ = true; // later draws are post-processing: not jittered
-        if (role != 3) return true; // edges and weights: the upscaler needs neither
         const uint32_t* cb = &r.ctx[reg::kCbColorBase];
+        if (role == 2) smaaWeights_ = uint64_t(cb[0]) << 8;
+        if (role != 3) return true; // edges and weights: the upscaler needs neither
         const uint32_t info = cb[::gpu::ctx::kCbColorInfo];
         const uint32_t fmt = (info >> 2) & 0x1F, num = (info >> 8) & 7;
         const VkFormat vf = colorFormat(fmt, num);
@@ -5196,6 +5197,36 @@ void main() {
         in.w = std::min(uint32_t(std::lround(std::fabs(v[0]) * 2)), std::min(out->img.width, depth->img.width));
         in.h = std::min(uint32_t(std::lround(std::fabs(v[2]) * 2)), std::min(out->img.height, depth->img.height));
         if (!in.w || !in.h) return false;
+        // The blend reads the scene's colour from another target than it writes (this game: by
+        // turns into two): skipped, its target would keep a frame from before, which the game's
+        // later passes and the upscaler would read. That colour is copied over in its place.
+        uint64_t colour = 0;
+        for (const auto& t : a.ps.images)
+            if (!t.storage && t.base() != smaaWeights_ && t.base() != in.colorAddr && t.width() >= in.w && t.height() >= in.h)
+                colour = t.base();
+        if (colour) {
+            auto it = colors_.find(colour);
+            Surface* src = it != colors_.end() ? &it->second : nullptr;
+            if (!src || src->img.width < in.w || src->img.height < in.h || src->img.format != out->img.format) {
+                warnOnce("[upscale] the SMAA blend's colour is not a render target of the scene's size and format");
+                return false; // the blend runs as the game has it
+            }
+            if (!smaaCopyLogged_) {
+                smaaCopyLogged_ = true;
+                std::fprintf(stderr, "[upscale] the SMAA blend reads the scene from 0x%" PRIx64 " into 0x%" PRIx64 ": copied in its place\n",
+                             colour, in.colorAddr);
+            }
+            if (!ringFits(1 << 12)) flush();
+            begin();
+            fullBarrier();
+            const VkImageCopy copy{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                                   {in.w, in.h, 1}};
+            rec([c = R().cmd_, from = src->img.image, to = out->img.image, copy] {
+                vkCmdCopyImage(c, from, VK_IMAGE_LAYOUT_GENERAL, to, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+            });
+            barrier();
+            gpuWrote(*out);
+        }
         if (!upScaled_) return runUpscaler(in, true); // Native: anti-aliased in place, as the blend would
         // Upscaling: the scene stays as it is (the game may still draw into it, Ken's aura) until a
         // draw first reads it (upscaleTouch), which then reads the upscaled picture instead.
@@ -5566,6 +5597,8 @@ void main() {
     std::string upDiagShape_;
     std::set<std::string> upDiagShapes_;
     bool upFollowLogged_ = false;
+    uint64_t smaaWeights_ = 0; // the SMAA blend weights' target (upscaleSmaa)
+    bool smaaCopyLogged_ = false;
     std::vector<uint64_t> upFollowed_; // where the scene was this frame (upscaleTouch)
     bool upEffect_ = false;
     int upEffectLogged_ = 0;
@@ -6873,7 +6906,7 @@ void main() {
         }
 
         if (!a.ok) return;
-        if (upOn_ && a.psm && a.psm->smaa && upscaleSmaa(r, a.psm->smaa)) return;
+        if (upOn_ && a.psm && a.psm->smaa && upscaleSmaa(r, a.psm->smaa, a)) return;
         const bool wasMergeable = R().lastMergeable_;
         R().lastMergeable_ = false;
         if (fastDraw(d, r, a, wasMergeable) || switchDraw(d, r, a)) return;

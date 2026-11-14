@@ -162,8 +162,9 @@ shaders' code) with a temporal upscaler (`gpu/upscale.h`; `upscaleSmaa` in the r
 - Quality/Balanced/Performance: at boot the game is told to draw its scene 1.5x/1.7x/2x smaller
   (each side, to 8 pixels) while its output keeps the resolution (1080p at least, as the game's
   own). The game already draws its scene smaller than its output on a base PS4 (1600x896 into
-  1920x1080) and scales it up in a later full-screen pass. The SMAA blend is skipped and the
-  scene left as it is until a draw first samples it into an output-sized target (the game may
+  1920x1080) and scales it up in a later full-screen pass. The SMAA blend is skipped (when it
+  reads the colour from another target than it writes, as this game's does, that colour is
+  copied into its target instead) and the scene left as it is until a draw first samples it into an output-sized target (the game may
   still draw into it: Ken's aura). A draw that copies it into another target of its size (the
   bloom's blend) moves it there (`[upscale] the scene is composited into a copy`); one that moves
   it back into a target it was in this frame is the game blending in earlier frames (its
