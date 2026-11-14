@@ -23,6 +23,11 @@ void presentFrame(const Frame& f);
 struct PadState {
     uint32_t buttons = 0; // SCE_PAD_BUTTON_* bits
     uint8_t lx = 0x80, ly = 0x80, rx = 0x80, ry = 0x80, l2 = 0, r2 = 0;
+    // Motion, as a DualShock 4 reports it: x right, y up, z toward the player. Acceleration in g
+    // (1 up when lying flat), angular velocity in rad/s, orientation a quaternion (x, y, z, w).
+    // From the controller's sensors where it has them (DualShock 4, DualSense, Switch Pro);
+    // otherwise the right stick tilts and shakes a virtual pad.
+    float acceleration[3] = {0, 1, 0}, angularVelocity[3] = {0, 0, 0}, orientation[4] = {0, 0, 0, 1};
 };
 PadState padState();
 
