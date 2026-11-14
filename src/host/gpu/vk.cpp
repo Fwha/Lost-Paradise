@@ -30,7 +30,67 @@ uint32_t Vk::memoryType(uint32_t bits, VkMemoryPropertyFlags flags) const {
     return UINT32_MAX;
 }
 
+void Vk::destroy() {
+    if (device) vkDestroyDevice(device, nullptr);
+    if (instance) vkDestroyInstance(instance, nullptr);
+    device = VK_NULL_HANDLE;
+    instance = VK_NULL_HANDLE;
+    phys = VK_NULL_HANDLE;
+    queue = VK_NULL_HANDLE;
+}
+
 bool Vk::init(std::string* error) {
+    if (create(error, {})) return true;
+    if (!dlss::builtIn()) return false;
+    // DLSS adds instance and device extensions, features and queues; a driver that refuses them
+    // must not cost the picture. Find the addition it refuses (play.log says which) and go on
+    // without it, or without DLSS.
+    std::fprintf(stderr, "[gpu] %s with DLSS's Vulkan additions: looking for the one the driver refuses\n",
+                 error->c_str());
+    destroy();
+    const std::vector<std::string> exts = dlssDeviceExts_;
+    DlssAdditions a;
+    a.features = false;
+    if (create(error, a)) {
+        std::fprintf(stderr, "[gpu] the device works without DLSS's Vulkan 1.2/1.3 features\n");
+        return true;
+    }
+    destroy();
+    // Keeping all of DLSS's additions, without one of the renderer's own optional features.
+    struct Own {
+        bool DlssAdditions::*flag;
+        const char* name;
+    };
+    for (const Own& o : {Own{&DlssAdditions::noRobustAccess, "robust buffer access"},
+                         Own{&DlssAdditions::noPipelineLibraries, "pipeline libraries"},
+                         Own{&DlssAdditions::noHostImport, "host memory import"}}) {
+        a = {};
+        a.*o.flag = true;
+        if (create(error, a)) {
+            std::fprintf(stderr, "[gpu] the device works with DLSS's additions without %s\n", o.name);
+            return true;
+        }
+        destroy();
+    }
+    for (const std::string& e : exts) {
+        a = {};
+        a.dropExt = e;
+        if (create(error, a)) {
+            std::fprintf(stderr, "[gpu] the device works without %s\n", e.c_str());
+            return true;
+        }
+        destroy();
+    }
+    std::fprintf(stderr, "[gpu] no single addition: trying again without DLSS\n");
+    dlss::disable();
+    a = {};
+    a.on = false;
+    error->clear();
+    return create(error, a);
+}
+
+bool Vk::create(std::string* error, const DlssAdditions& add) {
+    const bool withDlss = add.on;
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "lpn-host";
     app.apiVersion = VK_API_VERSION_1_3;
@@ -41,7 +101,7 @@ bool Vk::init(std::string* error) {
     vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
     std::vector<VkExtensionProperties> instanceExts(n);
     vkEnumerateInstanceExtensionProperties(nullptr, &n, instanceExts.data());
-    const std::vector<std::string> dlssInstance = dlss::instanceExtensions();
+    const std::vector<std::string> dlssInstance = withDlss ? dlss::instanceExtensions() : std::vector<std::string>{};
     std::vector<const char*> enableInstance;
     for (const std::string& e : dlssInstance)
         for (const auto& have : instanceExts)
@@ -93,14 +153,22 @@ bool Vk::init(std::string* error) {
         return false;
     }
     enable.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
-    hostImport = has(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    hostImport = !add.noHostImport && has(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (hostImport) enable.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     // Pipeline libraries (docs/shader-precompile.md stage 3): checked for the feature below.
     const bool gplExt = has(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) && has(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
     // DLSS's device extensions, those the driver has (none without an NVIDIA driver).
-    const std::vector<std::string> dlssDevice = dlss::deviceExtensions(instance, phys);
+    const std::vector<std::string> dlssDevice =
+        withDlss ? dlss::deviceExtensions(instance, phys) : std::vector<std::string>{};
+    if (withDlss && add.features && add.dropExt.empty()) {
+        dlssDeviceExts_.clear();
+        for (const std::string& e : dlssDevice)
+            if (e != VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME && has(e.c_str())) dlssDeviceExts_.push_back(e);
+    }
     for (const std::string& e : dlssDevice)
-        if (has(e.c_str()) && std::find_if(enable.begin(), enable.end(), [&](const char* x) { return e == x; }) ==
+        // VK_EXT_buffer_device_address must not be enabled with the KHR one (core in 1.2), which
+        // Streamline asks for too: the driver refuses the device with both.
+        if (e != VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME && e != add.dropExt && has(e.c_str()) && std::find_if(enable.begin(), enable.end(), [&](const char* x) { return e == x; }) ==
                                   enable.end())
             enable.push_back(e.c_str());
 
@@ -128,7 +196,8 @@ bool Vk::init(std::string* error) {
     have12.pNext = &have13;
     if (gplExt) have13.pNext = &haveGpl;
     vkGetPhysicalDeviceFeatures2(phys, &have);
-    if (gplExt && haveGpl.graphicsPipelineLibrary) {
+    pipelineLibraries = false;
+    if (gplExt && haveGpl.graphicsPipelineLibrary && !add.noPipelineLibraries) {
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -160,7 +229,7 @@ bool Vk::init(std::string* error) {
     const auto& h = have.features;
     f.geometryShader = VK_TRUE;
     // Out-of-range buffer accesses read zero instead of faulting, as on the PS4.
-    f.robustBufferAccess = h.robustBufferAccess;
+    f.robustBufferAccess = add.noRobustAccess ? VK_FALSE : h.robustBufferAccess;
     f.independentBlend = h.independentBlend;
     f.dualSrcBlend = h.dualSrcBlend;
     f.samplerAnisotropy = h.samplerAnisotropy;
@@ -181,12 +250,24 @@ bool Vk::init(std::string* error) {
     want13.dynamicRendering = VK_TRUE;
     want13.synchronization2 = have13.synchronization2;
     want13.maintenance4 = have13.maintenance4;
+    // FSR's 16-bit shader variants and its subgroup sizes (gpu/fsr.cpp), when the GPU has them.
+    want12.shaderFloat16 = have12.shaderFloat16;
+    want13.subgroupSizeControl = have13.subgroupSizeControl;
+    want13.computeFullSubgroups = have13.computeFullSubgroups;
+    if (withDlss && add.features) dlss::deviceFeatures(have12, have13, &want12, &want13);
+    storageWriteWithoutFormat = h.shaderStorageImageWriteWithoutFormat;
+    shaderFloat16 = have12.shaderFloat16;
+    subgroupSizeControl = have13.subgroupSizeControl;
+    computeFullSubgroups = have13.computeFullSubgroups;
+    synchronization2 = have13.synchronization2;
 
-    const float priority = 1.0f;
+    // Queue 0 is the renderer's; DLSS (Streamline) may want more in the same family after it.
+    const uint32_t queues = std::min(1 + (withDlss ? dlss::extraQueues() : 0), families[family].queueCount);
+    const std::vector<float> priorities(queues, 1.0f);
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = family;
-    qci.queueCount = 1;
-    qci.pQueuePriorities = &priority;
+    qci.queueCount = queues;
+    qci.pQueuePriorities = priorities.data();
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &want;
     dci.queueCreateInfoCount = 1;

@@ -134,7 +134,8 @@ const Row kRows[] = {
     {"Frame Rate Cap", "Set the most frames shown per second. Uncapped follows the monitor's refresh rate."},
     {"VSync", "Show each frame at the monitor's refresh, without tearing. Off can lower input lag."},
     {"FPS Counter", "Show the frame rate in the top right corner of the screen."},
-    {"DLSS", "NVIDIA DLAA: DLSS anti-aliasing in place of the game's. Needs an RTX card; Off on other GPUs."},
+    {"Upscaling", "DLSS (RTX cards) or FSR 3.1 (any GPU) in place of the game's anti-aliasing: Native, or the scene "
+                  "rendered smaller and upscaled."},
     {"Anisotropic Filtering", "Keep textures sharp at a glancing angle, such as the ground ahead. Up to what your GPU supports."},
     {"Skip Intro Logos", "Go straight to the title screen when the game starts."},
     {"Button Icons", "Which controller's buttons to show. Auto matches your controller. Takes effect at the next start."},
@@ -174,7 +175,7 @@ std::string valueName(int row) {
     case 3: return gS.fps ? std::to_string(gS.fps) : "Uncapped";
     case 4: return gS.vsync ? "On" : "Off";
     case 5: return gS.fpsCounter ? "On" : "Off";
-    case 6: return gS.dlss != host::DlssMode::Off ? "DLAA" : "Off";
+    case 6: return host::upscaleLabel(gS.upscaler, gS.upscaleQuality);
     case 7: return host::kAnisoNames[anisoIndex()];
     case 8: return gS.skipIntro ? "On" : "Off";
     case 9: return host::kButtonIconNames[int(gS.buttonIcons)];
@@ -202,7 +203,20 @@ void stepValue(int row, int d) {
     }
     case 4: gS.vsync = !gS.vsync; break;
     case 5: gS.fpsCounter = !gS.fpsCounter; break;
-    case 6: gS.dlss = gS.dlss == host::DlssMode::Off ? host::DlssMode::Dlaa : host::DlssMode::Off; break;
+    case 6: { // Off, then each quality of DLSS, then of FSR
+        constexpr int n = 1 + 2 * host::kUpscaleQualities;
+        const int i = gS.upscaler == host::Upscaler::Off
+                          ? 0
+                          : 1 + (gS.upscaler == host::Upscaler::Fsr ? host::kUpscaleQualities : 0) + int(gS.upscaleQuality);
+        const int j = wrap(i + d, n);
+        if (j == 0) {
+            gS.upscaler = host::Upscaler::Off;
+        } else {
+            gS.upscaler = j > host::kUpscaleQualities ? host::Upscaler::Fsr : host::Upscaler::Dlss;
+            gS.upscaleQuality = host::UpscaleQuality((j - 1) % host::kUpscaleQualities);
+        }
+        break;
+    }
     case 7: gS.anisotropy = host::kAnisoChoices[wrap(anisoIndex() + d, host::kAnisoCount)]; break;
     case 8: gS.skipIntro = !gS.skipIntro; break;
     case 10: gS.precompileShaders = !gS.precompileShaders; break;

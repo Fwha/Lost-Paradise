@@ -22,6 +22,7 @@ jobs:
           update: true
           install: >-
             zip
+            git
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
@@ -31,8 +32,11 @@ jobs:
             mingw-w64-ucrt-x86_64-glslang
             mingw-w64-ucrt-x86_64-zlib
             mingw-w64-ucrt-x86_64-python
-      - name: Import names
-        run: scripts/fetch-nids.sh aerolib.csv
+      - name: Import names, FSR and Streamline
+        run: |
+          scripts/fetch-nids.sh aerolib.csv
+          scripts/fetch-fsr.sh
+          scripts/fetch-streamline.sh
       - name: Build
         run: |
           cmake -S . -B build -G Ninja -DLPN_VERSION="${GITHUB_REF_NAME//\//-}"

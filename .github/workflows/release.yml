@@ -16,10 +16,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build g++ libvulkan-dev glslang-dev glslang-tools libsdl2-dev zlib1g-dev
-      - name: Import names and DLSS SDK
+      - name: Import names, DLSS SDK and FSR
         run: |
           scripts/fetch-nids.sh aerolib.csv
           scripts/fetch-dlss.sh
+          scripts/fetch-fsr.sh
+          scripts/fetch-streamline.sh
       - name: Build
         run: |
           cmake -S . -B build -G Ninja -DLPN_VERSION="${GITHUB_REF_NAME}"
@@ -49,6 +51,7 @@ jobs:
           update: true
           install: >-
             zip
+            git
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
@@ -61,6 +64,8 @@ jobs:
       - name: Build
         run: |
           scripts/fetch-nids.sh aerolib.csv
+          scripts/fetch-fsr.sh
+          scripts/fetch-streamline.sh
           cmake -S . -B build -G Ninja -DLPN_VERSION="${GITHUB_REF_NAME}"
           ninja -C build
           ctest --test-dir build --output-on-failure

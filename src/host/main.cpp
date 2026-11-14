@@ -20,6 +20,7 @@
 #include "host/profile.h"
 #include "host/tls.h"
 #include "host/gpu/renderer.h"
+#include "host/gpu/upscale.h"
 #include "host/videoout.h"
 #include "host/window.h"
 
@@ -136,6 +137,18 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[host] game: %s\n", gameDir.c_str());
     }
 
+#ifdef _WIN32
+    // DLSS's Vulkan extension sets up CUDA, which needs address space the guest's reservation (at
+    // the first module load) would take: make the device first (gpu/renderer.h prepareVulkan).
+    host::loadDisplaySettings();
+    if (gpu && host::displaySettings().upscaler == host::Upscaler::Dlss && host::render::upscale::builtIn(host::Upscaler::Dlss)) {
+        // The guest's thread pointer needs one of the TEB's 64 inline TLS slots: take it before
+        // the driver's DLLs take theirs.
+        host::guestThreadPointerSlot();
+        host::render::prepareVulkan();
+    }
+#endif
+
     std::string error;
     ps4elf::NidDb nids;
     if (!nids.load(nidPath, &error)) {
@@ -183,7 +196,10 @@ int main(int argc, char** argv) {
     {
         uint32_t w, h; // with the Aspect Ratio's width
         host::renderSize(host::displaySettings(), &w, &h);
-        host::patchRenderResolution(*modules[0], w, h);
+        // An upscaler below Native draws the scene smaller (one this build has).
+        const host::DisplaySettings& ds = host::displaySettings();
+        const double upscale = host::render::upscale::builtIn(ds.upscaler) ? host::upscaleRatio(ds) : 1.0;
+        host::patchRenderResolution(*modules[0], w, h, upscale);
     }
     host::patchDrawSites(*modules[0]);
 

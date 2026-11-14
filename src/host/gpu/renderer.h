@@ -13,6 +13,10 @@ namespace host::render {
 // when no usable Vulkan device exists; the game then runs without rendering.
 // computeOnly runs compute dispatches (whose results the game may read back) but skips draws:
 // much faster on a software Vulkan driver, for runs that only need the game to progress.
+// Makes the Vulkan device now, before the guest's address space is reserved (Windows, with DLSS
+// chosen): NVIDIA's VK_NVX_binary_import, which DLSS needs, sets up CUDA, whose address space the
+// guest's reservation would otherwise take. startRenderer then uses it.
+void prepareVulkan();
 bool startRenderer(bool computeOnly = false);
 
 // Reading back what the GPU rendered at a display buffer's address takes two steps, so the

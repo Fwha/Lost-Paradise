@@ -28,6 +28,8 @@ add_executable(lpn-host
     draw_sites.cpp
     gpu/frame_dump.cpp
     gpu/dlss.cpp
+    gpu/fsr.cpp
+    gpu/upscale.cpp
     gpu/formats.cpp
     gpu/renderer.cpp
     gpu/tiling.cpp
@@ -82,7 +84,7 @@ endif()
 # NVIDIA DLSS: scripts/fetch-dlss.sh puts the SDK in third_party/dlss. Without it the host builds
 # without DLSS. The DLSS runtime goes beside lpn-host, where NGX looks for it.
 set(LPN_DLSS_SDK "${PROJECT_SOURCE_DIR}/third_party/dlss" CACHE PATH "NVIDIA DLSS SDK")
-# Linux only for now: the Windows SDK libraries are built for MSVC.
+# Linux only: the Windows SDK libraries are built for MSVC, so Windows uses Streamline (below).
 if(NOT WIN32 AND EXISTS "${LPN_DLSS_SDK}/include/nvsdk_ngx_vk.h")
     message(STATUS "DLSS SDK: ${LPN_DLSS_SDK}")
     target_include_directories(lpn-host SYSTEM PRIVATE "${LPN_DLSS_SDK}/include")
@@ -91,6 +93,52 @@ if(NOT WIN32 AND EXISTS "${LPN_DLSS_SDK}/include/nvsdk_ngx_vk.h")
     file(GLOB LPN_DLSS_RUNTIME "${LPN_DLSS_SDK}/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.*")
     add_custom_command(TARGET lpn-host POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LPN_DLSS_RUNTIME} $<TARGET_FILE_DIR:lpn-host>)
-else()
+elseif(NOT WIN32)
     message(STATUS "DLSS SDK not found: lpn-host builds without DLSS (scripts/fetch-dlss.sh)")
+endif()
+
+# DLSS on Windows (gpu/dlss_streamline.cpp): scripts/fetch-streamline.sh puts NVIDIA Streamline's
+# headers and DLLs in third_party/streamline. Only the headers are built against; the DLLs are
+# loaded at run time from lpn-host's directory, where the build copies them.
+set(LPN_STREAMLINE_SDK "${PROJECT_SOURCE_DIR}/third_party/streamline" CACHE PATH "NVIDIA Streamline SDK")
+if(WIN32 AND EXISTS "${LPN_STREAMLINE_SDK}/include/sl.h")
+    message(STATUS "Streamline SDK: ${LPN_STREAMLINE_SDK}")
+    target_sources(lpn-host PRIVATE gpu/dlss_streamline.cpp)
+    target_include_directories(lpn-host SYSTEM PRIVATE "${LPN_STREAMLINE_SDK}/include")
+    target_compile_definitions(lpn-host PRIVATE LPN_HAVE_STREAMLINE)
+    file(GLOB LPN_STREAMLINE_RUNTIME "${LPN_STREAMLINE_SDK}/bin/*.dll")
+    add_custom_command(TARGET lpn-host POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LPN_STREAMLINE_RUNTIME} $<TARGET_FILE_DIR:lpn-host>)
+elseif(WIN32)
+    message(STATUS "Streamline SDK not found: lpn-host builds without DLSS (scripts/fetch-streamline.sh)")
+endif()
+
+# AMD FSR 3.1 (vendor-neutral temporal upscaling, gpu/fsr.cpp): scripts/fetch-fsr.sh puts
+# FSR-Vulkan (MIT) in third_party/fsr-vulkan. Only its FSR 3.1 upscaler is built, into lpn-host.
+set(LPN_FSR_DIR "${PROJECT_SOURCE_DIR}/third_party/fsr-vulkan" CACHE PATH "FSR-Vulkan source tree")
+if(EXISTS "${LPN_FSR_DIR}/include/ffx_vk_portable.h")
+    message(STATUS "FSR-Vulkan: ${LPN_FSR_DIR}")
+    enable_language(C) # its C API is C, and its targets ask for C11
+    set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
+    set(FFX_VK_PORTABLE_BUILD_FSR3_3_1_5_SCAFFOLD OFF CACHE BOOL "" FORCE)
+    set(FFX_VK_PORTABLE_BUILD_FSR4_V07_VULKAN OFF CACHE BOOL "" FORCE)
+    set(FFX_VK_PORTABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${LPN_FSR_DIR}" "${CMAKE_BINARY_DIR}/fsr-vulkan" EXCLUDE_FROM_ALL SYSTEM)
+    # Its sources are AMD's and FSR-Vulkan's: built without this project's warnings.
+    foreach(t ffx_vulkan_portable ffx_vulkan_fsr3_host_1_1_4 ffx_vulkan_fsr3_vk_backend_1_1_4)
+        if(TARGET ${t})
+            target_compile_options(${t} PRIVATE -w)
+        endif()
+    endforeach()
+    # MinGW: AMD's sources expect MSVC's CRT declarations (cmake/ffx_mingw_shim.hpp).
+    if(WIN32)
+        foreach(t ffx_vulkan_fsr3_host_1_1_4 ffx_vulkan_fsr3_vk_backend_1_1_4)
+            target_compile_options(${t} PRIVATE -include "${PROJECT_SOURCE_DIR}/cmake/ffx_mingw_shim.hpp")
+        endforeach()
+    endif()
+    target_link_libraries(lpn-host PRIVATE ffx-vulkan::portable)
+    target_compile_definitions(lpn-host PRIVATE LPN_HAVE_FSR)
+else()
+    message(STATUS "FSR-Vulkan not found: lpn-host builds without FSR (scripts/fetch-fsr.sh)")
 endif()

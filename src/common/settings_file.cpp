@@ -13,7 +13,8 @@ const char* modeKey(WindowMode m) {
     return m == WindowMode::Borderless ? "borderless" : m == WindowMode::Fullscreen ? "fullscreen" : "windowed";
 }
 
-const char* const kDlssKeys[kDlssModes] = {"off", "dlaa", "quality", "balanced", "performance"};
+const char* const kUpscalerKeys[kUpscalerChoices] = {"off", "dlss", "fsr"};
+const char* const kQualityKeys[kUpscaleQualities] = {"native", "quality", "balanced", "performance"};
 const char* const kButtonIconKeys[kButtonIconChoices] = {"playstation", "xbox", "switch", "auto"};
 const char* const kAspectKeys[kAspectChoices] = {"16:9", "16:10", "21:9"};
 
@@ -33,9 +34,23 @@ void renderSize(const DisplaySettings& s, uint32_t* width, uint32_t* height) {
     *width = w, *height = h;
 }
 
-const char* dlssModeName(DlssMode m) {
-    static const char* const names[kDlssModes] = {"Off", "DLAA", "Quality", "Balanced", "Performance"};
-    return names[int(m)];
+std::string upscaleLabel(Upscaler u, UpscaleQuality q) {
+    if (u == Upscaler::Off) return "Off";
+    if (u == Upscaler::Dlss) return q == UpscaleQuality::Native ? "DLAA" : std::string("DLSS ") + kUpscaleQualityNames[int(q)];
+    return q == UpscaleQuality::Native ? "FSR Native AA" : std::string("FSR ") + kUpscaleQualityNames[int(q)];
+}
+
+double upscaleRatio(const DisplaySettings& s) {
+    return s.upscaler == Upscaler::Off ? 1.0 : kUpscaleRatios[int(s.upscaleQuality)];
+}
+
+void upscaledSceneSize(uint32_t outW, uint32_t outH, double ratio, uint32_t* w, uint32_t* h) {
+    if (ratio <= 1.0) {
+        *w = outW, *h = outH;
+        return;
+    }
+    *w = std::max<uint32_t>(64, uint32_t(outW / ratio / 8 + 0.5) * 8);
+    *h = std::max<uint32_t>(64, uint32_t(outH / ratio / 8 + 0.5) * 8);
 }
 
 void readSettings(const std::string& path, DisplaySettings& s) {
@@ -59,9 +74,16 @@ void readSettings(const std::string& path, DisplaySettings& s) {
             else if (fps >= 10 && fps <= 240) s.fps = fps;
         } else if (!std::strcmp(key, "fps_counter")) {
             s.fpsCounter = !std::strcmp(value, "on");
-        } else if (!std::strcmp(key, "dlss")) {
-            for (int i = 0; i < kDlssModes; ++i)
-                if (!std::strcmp(value, kDlssKeys[i])) s.dlss = DlssMode(i);
+        } else if (!std::strcmp(key, "upscaler")) {
+            for (int i = 0; i < kUpscalerChoices; ++i)
+                if (!std::strcmp(value, kUpscalerKeys[i])) s.upscaler = Upscaler(i);
+        } else if (!std::strcmp(key, "upscale_quality")) {
+            for (int i = 0; i < kUpscaleQualities; ++i)
+                if (!std::strcmp(value, kQualityKeys[i])) s.upscaleQuality = UpscaleQuality(i);
+        } else if (!std::strcmp(key, "dlss")) { // older files: dlss = off, dlaa, quality, balanced, performance
+            if (!std::strcmp(value, "dlaa")) s.upscaler = Upscaler::Dlss, s.upscaleQuality = UpscaleQuality::Native;
+            for (int i = 1; i < kUpscaleQualities; ++i)
+                if (!std::strcmp(value, kQualityKeys[i])) s.upscaler = Upscaler::Dlss, s.upscaleQuality = UpscaleQuality(i);
         } else if (!std::strcmp(key, "skip_intro")) {
             s.skipIntro = !std::strcmp(value, "on");
         } else if (!std::strcmp(key, "button_icons")) {
@@ -92,7 +114,8 @@ bool writeSettings(const std::string& path, const DisplaySettings& s) {
     if (s.fps) std::fprintf(f, "fps = %d\n", s.fps);
     else std::fprintf(f, "fps = uncapped\n");
     std::fprintf(f, "fps_counter = %s\n", s.fpsCounter ? "on" : "off");
-    std::fprintf(f, "dlss = %s\n", kDlssKeys[int(s.dlss)]);
+    std::fprintf(f, "upscaler = %s\n", kUpscalerKeys[int(s.upscaler)]);
+    std::fprintf(f, "upscale_quality = %s\n", kQualityKeys[int(s.upscaleQuality)]);
     std::fprintf(f, "skip_intro = %s\n", s.skipIntro ? "on" : "off");
     std::fprintf(f, "button_icons = %s\n", kButtonIconKeys[int(s.buttonIcons)]);
     std::fprintf(f, "aspect = %s\n", kAspectKeys[int(s.aspect)]);

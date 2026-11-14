@@ -1,3 +1,5 @@
+// DLSS through NGX (Linux), and the stubs for a build without DLSS. Windows' Streamline backend
+// is gpu/dlss_streamline.cpp.
 #include "host/gpu/dlss.h"
 
 #include "host/gpu/vk.h"
@@ -18,7 +20,17 @@
 
 namespace host::render::dlss {
 
-#ifdef LPN_HAVE_DLSS
+#if defined(LPN_HAVE_DLSS)
+
+void deviceFeatures(const VkPhysicalDeviceVulkan12Features&, const VkPhysicalDeviceVulkan13Features&,
+                    VkPhysicalDeviceVulkan12Features*, VkPhysicalDeviceVulkan13Features*) {}
+uint32_t extraQueues() { return 0; }
+
+namespace {
+bool gDisabled = false;
+} // namespace
+
+void disable() { gDisabled = true; }
 
 namespace {
 
@@ -29,7 +41,7 @@ bool gInit = false, gAvailable = false, gFailed = false;
 NVSDK_NGX_Parameter* gCaps = nullptr;
 NVSDK_NGX_Parameter* gParams = nullptr; // creation and evaluation parameters
 NVSDK_NGX_Handle* gFeature = nullptr;
-uint32_t gFeatureKey[5] = {}; // render w, h, output w, h, mode the feature was made for
+uint32_t gFeatureKey[6] = {}; // render w, h, output w, h, quality, depth inverted: what the feature was made for
 
 // lpn-host's directory: the build puts the DLSS runtime (libnvidia-ngx-dlss.so.*) beside it.
 std::wstring exeDir() {
@@ -79,6 +91,7 @@ std::vector<std::string> names(uint32_t n, const VkExtensionProperties* props) {
 } // namespace
 
 std::vector<std::string> instanceExtensions() {
+    if (gDisabled) return {};
     const NVSDK_NGX_FeatureDiscoveryInfo d = discovery();
     uint32_t n = 0;
     VkExtensionProperties* props = nullptr;
@@ -87,6 +100,7 @@ std::vector<std::string> instanceExtensions() {
 }
 
 std::vector<std::string> deviceExtensions(VkInstance instance, VkPhysicalDevice phys) {
+    if (gDisabled) return {};
     const NVSDK_NGX_FeatureDiscoveryInfo d = discovery();
     uint32_t n = 0;
     VkExtensionProperties* props = nullptr;
@@ -96,6 +110,10 @@ std::vector<std::string> deviceExtensions(VkInstance instance, VkPhysicalDevice 
 }
 
 void init(const Vk& vk) {
+    if (gDisabled) {
+        std::fprintf(stderr, "[dlss] unavailable: off after the Vulkan device failed with it\n");
+        return;
+    }
     NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_Init_with_ProjectID(
         kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", L".", vk.instance, vk.phys, vk.device,
         vkGetInstanceProcAddr, vkGetDeviceProcAddr, featureInfo());
@@ -126,10 +144,10 @@ void init(const Vk& vk) {
         return;
     }
     gAvailable = true;
-    uint32_t w = 0, h = 0;
-    renderSize(2, 2560, 1440, &w, &h);
-    std::fprintf(stderr, "[dlss] available (Quality renders 2560x1440 at %ux%u)\n", w, h);
+    std::fprintf(stderr, "[dlss] available\n");
 }
+
+bool builtIn() { return true; }
 
 bool available() { return gAvailable; }
 bool usable() { return gAvailable && !gFailed; }
@@ -145,42 +163,23 @@ void shutdown() {
     gInit = gAvailable = false;
 }
 
-bool renderSize(int mode, uint32_t outW, uint32_t outH, uint32_t* w, uint32_t* h) {
-    if (!gAvailable || mode <= 0) return false;
-    if (mode == 1) { // DLAA: anti-aliasing at the output size
-        *w = outW, *h = outH;
-        return true;
-    }
-    const NVSDK_NGX_PerfQuality_Value q = mode == 2   ? NVSDK_NGX_PerfQuality_Value_MaxQuality
-                                          : mode == 3 ? NVSDK_NGX_PerfQuality_Value_Balanced
-                                                      : NVSDK_NGX_PerfQuality_Value_MaxPerf;
-    unsigned ow = 0, oh = 0, maxW, maxH, minW, minH;
-    float sharpness;
-    if (NVSDK_NGX_FAILED(NGX_DLSS_GET_OPTIMAL_SETTINGS(gCaps, outW, outH, q, &ow, &oh, &maxW, &maxH, &minW, &minH,
-                                                       &sharpness)) ||
-        !ow || !oh)
-        return false;
-    *w = ow, *h = oh;
-    return true;
-}
-
 namespace {
 
-NVSDK_NGX_PerfQuality_Value quality(int mode) {
-    return mode == 1   ? NVSDK_NGX_PerfQuality_Value_DLAA
-           : mode == 2 ? NVSDK_NGX_PerfQuality_Value_MaxQuality
-           : mode == 3 ? NVSDK_NGX_PerfQuality_Value_Balanced
-                       : NVSDK_NGX_PerfQuality_Value_MaxPerf;
+NVSDK_NGX_PerfQuality_Value quality(UpscaleQuality q) {
+    return q == UpscaleQuality::Native    ? NVSDK_NGX_PerfQuality_Value_DLAA
+           : q == UpscaleQuality::Quality ? NVSDK_NGX_PerfQuality_Value_MaxQuality
+           : q == UpscaleQuality::Balanced ? NVSDK_NGX_PerfQuality_Value_Balanced
+                                           : NVSDK_NGX_PerfQuality_Value_MaxPerf;
 }
 
-NVSDK_NGX_Resource_VK resource(const Image& i, bool write) {
+NVSDK_NGX_Resource_VK resource(const upscale::Image& i, bool write) {
     return NVSDK_NGX_Create_ImageView_Resource_VK(i.view, i.image, {i.aspect, 0, 1, 0, 1}, i.format, i.width, i.height,
                                                   write);
 }
 
 } // namespace
 
-bool evaluate(VkCommandBuffer cmd, VkDevice device, const Frame& f) {
+bool evaluate(VkCommandBuffer cmd, VkDevice device, const upscale::Frame& f) {
     if (!usable()) return false;
     auto fail = [](const char* what, NVSDK_NGX_Result r) {
         std::fprintf(stderr, "[dlss] %s failed (0x%x): DLSS off for this run\n", what, unsigned(r));
@@ -189,7 +188,8 @@ bool evaluate(VkCommandBuffer cmd, VkDevice device, const Frame& f) {
     };
     if (!gParams && NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_AllocateParameters(&gParams)))
         return fail("allocating parameters", NVSDK_NGX_Result_Fail);
-    const uint32_t key[5] = {f.renderW, f.renderH, f.outW, f.outH, uint32_t(f.mode)};
+    const bool inverted = f.depth0 > f.depth1; // the far plane at depth 0
+    const uint32_t key[6] = {f.renderW, f.renderH, f.outW, f.outH, uint32_t(f.quality), inverted};
     if (!gFeature || std::memcmp(key, gFeatureKey, sizeof key) != 0) {
         if (gFeature) NVSDK_NGX_VULKAN_ReleaseFeature(gFeature), gFeature = nullptr;
         NVSDK_NGX_DLSS_Create_Params c{};
@@ -197,13 +197,14 @@ bool evaluate(VkCommandBuffer cmd, VkDevice device, const Frame& f) {
         c.Feature.InHeight = f.renderH;
         c.Feature.InTargetWidth = f.outW;
         c.Feature.InTargetHeight = f.outH;
-        c.Feature.InPerfQualityValue = quality(f.mode);
+        c.Feature.InPerfQualityValue = quality(f.quality);
         // The game's colour is already tone mapped (8-bit); motion vectors are at render size.
         c.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
+        if (inverted) c.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
         const NVSDK_NGX_Result r = NGX_VULKAN_CREATE_DLSS_EXT1(device, cmd, 1, 1, &gFeature, gParams, &c);
         if (NVSDK_NGX_FAILED(r)) return fail("creating the feature", r);
         std::memcpy(gFeatureKey, key, sizeof key);
-        std::fprintf(stderr, "[dlss] %s: %ux%u to %ux%u\n", f.mode == 1 ? "DLAA" : "upscaling", f.renderW, f.renderH, f.outW,
+        std::fprintf(stderr, "[dlss] %s: %ux%u to %ux%u\n", f.quality == UpscaleQuality::Native ? "DLAA" : "upscaling", f.renderW, f.renderH, f.outW,
                      f.outH);
     }
     NVSDK_NGX_Resource_VK color = resource(f.color, false), depth = resource(f.depth, false),
@@ -224,31 +225,27 @@ bool evaluate(VkCommandBuffer cmd, VkDevice device, const Frame& f) {
     return true;
 }
 
-void jitter(uint64_t n, uint32_t renderW, uint32_t outW, float* x, float* y) {
-    const float scale = renderW ? float(outW) / float(renderW) : 1.0f;
-    const uint64_t phases = std::max<uint64_t>(8, uint64_t(8.0f * scale * scale + 0.5f));
-    auto halton = [](uint64_t i, uint32_t base) {
-        float f = 1, r = 0;
-        for (; i; i /= base) f /= float(base), r += f * float(i % base);
-        return r;
-    };
-    const uint64_t i = n % phases + 1; // index 0 of the sequence is 0, 0
-    *x = halton(i, 2) - 0.5f;
-    *y = halton(i, 3) - 0.5f;
-}
+#elif !defined(LPN_HAVE_STREAMLINE)
 
-#else
-
-bool evaluate(VkCommandBuffer, VkDevice, const Frame&) { return false; }
-void jitter(uint64_t, uint32_t, uint32_t, float* x, float* y) { *x = *y = 0; }
+bool evaluate(VkCommandBuffer, VkDevice, const upscale::Frame&) { return false; }
+void deviceFeatures(const VkPhysicalDeviceVulkan12Features&, const VkPhysicalDeviceVulkan13Features&,
+                    VkPhysicalDeviceVulkan12Features*, VkPhysicalDeviceVulkan13Features*) {}
+uint32_t extraQueues() { return 0; }
+void disable() {}
+bool builtIn() { return false; }
 
 std::vector<std::string> instanceExtensions() { return {}; }
 std::vector<std::string> deviceExtensions(VkInstance, VkPhysicalDevice) { return {}; }
-void init(const Vk&) { std::fprintf(stderr, "[dlss] not built in (scripts/fetch-dlss.sh, then re-run cmake)\n"); }
+void init(const Vk&) {
+#ifdef _WIN32
+    std::fprintf(stderr, "[dlss] not built in (scripts/fetch-streamline.sh, then re-run cmake)\n");
+#else
+    std::fprintf(stderr, "[dlss] not built in (scripts/fetch-dlss.sh, then re-run cmake)\n");
+#endif
+}
 bool available() { return false; }
 bool usable() { return false; }
 void shutdown() {}
-bool renderSize(int, uint32_t, uint32_t, uint32_t*, uint32_t*) { return false; }
 
 #endif
 

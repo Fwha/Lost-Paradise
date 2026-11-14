@@ -29,6 +29,9 @@ namespace {
 
 DisplaySettings gSettings;
 uint32_t gActiveW = 0, gActiveH = 0;
+// With an upscaler below Native: its ratio, the scene's size and the output's (upscaleSizes).
+double gUpscale = 1.0;
+uint32_t gSceneW = 0, gSceneH = 0, gUpOutW = 0, gUpOutH = 0;
 
 } // namespace
 
@@ -105,8 +108,10 @@ const uint8_t* gEbootBase = nullptr;
 size_t gEbootSize = 0;
 } // namespace
 
-bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height) {
+bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height, double upscale) {
     gEbootBase = eboot.base(), gEbootSize = eboot.size();
+    const uint32_t askedW = width, askedH = height;
+    if ((!width || !height) && upscale > 1.0) width = 1920, height = 1080; // the game's own output
     if (!width || !height) return true;
     // The eboot's display setup (0x55d5e0, given argc/argv) stores the render width and height
     // (0x239d5ec/ee) and the output size (0x239d5f0/f2) as 16-bit values: 1600x896 on a base
@@ -165,9 +170,15 @@ bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height) {
         }
     }
     if (wide && !patchAspect(text, float(double(width) / height))) return false;
+    // With an upscaler the scene is drawn smaller than the output: when the game keeps its own
+    // 1920x1080 output, smaller than that.
+    if (upscale > 1.0 && !sized) width = 1920, height = 1080;
+    // The scene's size: the picture's, or smaller by the upscale ratio.
+    uint32_t sceneW = width, sceneH = height;
+    upscaledSceneSize(width, height, upscale, &sceneW, &sceneH);
     for (const Store& s : kStores) {
         if (s.output && !sized) continue;
-        const uint16_t v = uint16_t(s.isWidth ? width : height);
+        const uint16_t v = uint16_t(s.output ? (s.isWidth ? width : height) : (s.isWidth ? sceneW : sceneH));
         text[s.at + 3] = uint8_t(v);
         text[s.at + 4] = uint8_t(v >> 8);
     }
@@ -178,9 +189,15 @@ bool patchRenderResolution(Module& eboot, uint32_t width, uint32_t height) {
         for (int i = 0; i < 4; ++i) text[0x55e825 + i] = uint8_t(packed >> (8 * i));
     }
     if (wide) gOutW = width, gOutH = height;
-    gActiveW = width, gActiveH = height;
-    std::fprintf(stderr, "[display] rendering at %ux%u (output %ux%u)%s\n", width, height, sized ? width : 1920,
-                 sized ? height : 1080, wide ? ", 3D view widened to match, HUD kept 16:9" : "");
+    gActiveW = askedW, gActiveH = askedH;
+    if (upscale > 1.0) {
+        gUpscale = upscale;
+        gSceneW = sceneW, gSceneH = sceneH;
+        gUpOutW = sized ? width : 1920, gUpOutH = sized ? height : 1080;
+    }
+    std::fprintf(stderr, "[display] rendering at %ux%u (output %ux%u)%s%s\n", sceneW, sceneH, sized ? width : 1920,
+                 sized ? height : 1080, wide ? ", 3D view widened to match, HUD kept 16:9" : "",
+                 upscale > 1.0 ? ", upscaled by the renderer" : "");
     return true;
 }
 
@@ -254,6 +271,13 @@ bool hudLayout(uint32_t* outWidth, uint32_t* outHeight) {
 void activeRenderResolution(uint32_t* width, uint32_t* height) {
     *width = gActiveW;
     *height = gActiveH;
+}
+
+double activeUpscaleRatio() { return gUpscale; }
+
+bool upscaleSizes(uint32_t* sceneW, uint32_t* sceneH, uint32_t* outW, uint32_t* outH) {
+    *sceneW = gSceneW, *sceneH = gSceneH, *outW = gUpOutW, *outH = gUpOutH;
+    return gUpscale > 1.0;
 }
 
 namespace {

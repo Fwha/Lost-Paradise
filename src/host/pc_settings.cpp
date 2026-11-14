@@ -3,6 +3,7 @@
 #include "host/display_menu.h"
 #include "host/display_settings.h"
 #include "host/gpu/dlss.h"
+#include "host/gpu/fsr.h"
 #include "host/gpu/renderer.h"
 
 #include <algorithm>
@@ -23,17 +24,35 @@ template <int R> constexpr PcSetting display(const char* label, const char* desc
     return {label, description, &displayChoices<R>, &displayValue<R>, &displayChoose<R>};
 }
 
-// Off and DLAA (upscaling is not done yet); only Off without an RTX card and NVIDIA's driver
-// (or a build without the DLSS SDK).
-std::vector<std::string> dlssChoices() {
-    std::vector<std::string> out{dlssModeName(DlssMode::Off)};
-    if (render::dlss::available()) out.push_back(dlssModeName(DlssMode::Dlaa));
+// Off and the upscalers this GPU runs: DLSS needs an RTX card and NVIDIA's driver (and a build
+// with the DLSS SDK), FSR runs on any GPU (a build with FSR-Vulkan).
+std::vector<Upscaler> upscalers() {
+    std::vector<Upscaler> out{Upscaler::Off};
+    if (render::dlss::available()) out.push_back(Upscaler::Dlss);
+    if (render::fsr::available()) out.push_back(Upscaler::Fsr);
     return out;
 }
-int dlssValue() { return render::dlss::available() && displaySettings().dlss != DlssMode::Off ? 1 : 0; }
-void dlssChoose(int i) {
-    if (!render::dlss::available() || i < 0 || i > 1) return;
-    displaySettings().dlss = i ? DlssMode::Dlaa : DlssMode::Off;
+std::vector<std::string> upscalerChoices() {
+    std::vector<std::string> out;
+    for (Upscaler u : upscalers()) out.push_back(kUpscalerNames[int(u)]);
+    return out;
+}
+int upscalerValue() {
+    const std::vector<Upscaler> u = upscalers();
+    const auto it = std::find(u.begin(), u.end(), displaySettings().upscaler);
+    return it == u.end() ? 0 : int(it - u.begin());
+}
+void upscalerChoose(int i) {
+    const std::vector<Upscaler> u = upscalers();
+    if (i < 0 || i >= int(u.size())) return;
+    displaySettings().upscaler = u[i];
+    saveDisplaySettings();
+}
+std::vector<std::string> qualityChoices() { return {std::begin(kUpscaleQualityNames), std::end(kUpscaleQualityNames)}; }
+int qualityValue() { return int(displaySettings().upscaleQuality); }
+void qualityChoose(int i) {
+    if (i < 0 || i >= kUpscaleQualities) return;
+    displaySettings().upscaleQuality = UpscaleQuality(i);
     saveDisplaySettings();
 }
 
@@ -86,28 +105,31 @@ void buttonIconsChoose(int i) {
 
 } // namespace
 
+// Descriptions stay on one line under the menu (about 90 characters): the game does not wrap them.
 const std::vector<PcSetting>& pcSettings() {
     static const std::vector<PcSetting> settings = {
         display<0>("Window Mode", "Play in a window, a borderless window or fullscreen."),
         display<1>("Resolution", "Set the 3D rendering resolution. Takes effect after restarting the game."),
         {"Aspect Ratio",
-         "Match your monitor's shape: the 3D view widens to fit, the HUD stays 16:9 in the middle. Takes effect "
-         "after restarting the game.",
+         "Match your monitor's shape; the HUD stays 16:9. Takes effect after restarting the game.",
          &aspectChoices, &aspectSetting, &aspectChoose},
         display<2>("Frame Rate Cap",
                    "Set the most frames shown per second. Uncapped follows the monitor's refresh rate."),
         {"VSync", "Show each frame at the monitor's refresh, without tearing. Off can lower input lag.", &onOff,
          &vsyncValue, &vsyncChoose},
         display<3>("FPS Counter", "Show the frame rate in the top right corner of the screen."),
-        {"DLSS",
-         "NVIDIA DLAA: DLSS anti-aliasing in place of the game's. Needs an RTX card; Off on other GPUs.",
-         &dlssChoices, &dlssValue, &dlssChoose},
-        {"Anisotropic Filtering", "Keep textures sharp at a glancing angle, such as the ground ahead. Off: as the game sets them.",
+        {"Upscaler",
+         "Swap the game's anti-aliasing for NVIDIA DLSS (RTX cards) or AMD FSR 3.1 (any GPU).",
+         &upscalerChoices, &upscalerValue, &upscalerChoose},
+        {"Upscale Quality",
+         "Native: anti-aliasing only. Others render smaller, faster. Takes effect after a restart.",
+         &qualityChoices, &qualityValue, &qualityChoose},
+        {"Anisotropic Filtering", "Keep textures sharp at glancing angles, like the ground ahead. Off: as the game sets them.",
          &anisoChoices, &anisoValue, &anisoChoose},
         {"Skip Intro Logos", "Go straight to the title screen when the game starts. Takes effect at the next start.",
          &onOff, &skipIntroValue, &skipIntroChoose},
         {"Button Icons",
-         "Which controller's buttons to show. Auto matches your controller. Takes effect at the next start.",
+         "Controller buttons to show. Auto matches your controller. Takes effect at the next start.",
          &buttonIconChoices, &buttonIconsValue, &buttonIconsChoose},
         display<4>("Exit Game", "Close the game. Progress since your last save is lost."),
     };

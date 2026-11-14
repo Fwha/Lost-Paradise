@@ -10,6 +10,10 @@ add_executable(game_dir_test game_dir_test.cpp)
 target_link_libraries(game_dir_test PRIVATE lpn-common)
 add_test(NAME game_dir_test COMMAND game_dir_test)
 
+add_executable(settings_test settings_test.cpp)
+target_link_libraries(settings_test PRIVATE lpn-common)
+add_test(NAME settings_test COMMAND settings_test)
+
 add_executable(mods_test mods_test.cpp)
 target_link_libraries(mods_test PRIVATE lpn-common)
 add_test(NAME mods_test COMMAND mods_test)
