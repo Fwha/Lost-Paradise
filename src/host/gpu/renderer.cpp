@@ -6601,6 +6601,21 @@ void main() {
         if (cbMode > 1 || (dbRender & 0x1C)) return;
         const uint32_t prim = r.uconfig[reg::kPrimitiveType];
         if (prim == 0 || prim == 8 || prim == 13) return;
+        // Debugging: draws with these pixel shaders (LPN_SKIP_PS=0x...,0x...) are left out, to
+        // tell which pass draws something.
+        static const std::vector<uint64_t> skipPs = [] {
+            std::vector<uint64_t> v;
+            if (const char* e = getenv("LPN_SKIP_PS"))
+                for (const char* c = e; *c;) {
+                    char* end;
+                    const uint64_t a = std::strtoull(c, &end, 16);
+                    if (end == c) break;
+                    if (a) v.push_back(a);
+                    c = *end ? end + 1 : end;
+                }
+            return v;
+        }();
+        if (!skipPs.empty() && std::find(skipPs.begin(), skipPs.end(), shaderAddress(r, reg::kPgmLoPs)) != skipPs.end()) return;
         j.vs = launch(r, gcn::Stage::Vertex);
         j.kind = DrawJob::kDraw;
         j.hasPs = shaderAddress(r, reg::kPgmLoPs) != 0;
