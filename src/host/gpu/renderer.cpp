@@ -5067,13 +5067,11 @@ layout(set = 0, binding = 2, r32f) uniform writeonly image2D depthCopy; // FSR's
 layout(set = 0, binding = 3, r32f) uniform readonly image2D lastDistance; // the last frame's view distances
 layout(set = 0, binding = 4, r32f) uniform writeonly image2D distance;    // this frame's
 layout(set = 0, binding = 5, rgba8) uniform writeonly image2D moved;        // 1: favour this frame's colour
-layout(set = 0, binding = 6) uniform sampler2D before; // the scene at the SMAA blend
-layout(set = 0, binding = 7) uniform sampler2D after;  // and once the game's later passes drew into it
 layout(push_constant) uniform P {
     mat4 reproject; // current NDC (x, y, depth, 1) to the previous clip position
     vec4 vp;        // viewport offset x, y and scale x, y: pixel = ndc * scale + offset
     vec4 z;         // depth offset, scale; this frame's viewport jitter x, y (pixels)
-    ivec4 size;     // z: 1 when before and after are the scene's
+    ivec4 size;
     vec4 proj;      // this projection's A, B, s (view z from NDC depth); w: 1 when lastDistance is usable
 } p;
 // The view distance at NDC depth n: (z * A + B) / (z * s) = n.
@@ -5104,12 +5102,6 @@ void main() {
             m = best > 0.03 * expect ? 1.0 : 0.0;
         }
     }
-    // What the game drew after the anti-aliasing (sparks, its hit and knockout blurs and zooms):
-    // no depth or motion of its own, so the upscaler's history would show it twice.
-    if (p.size.z != 0) {
-        vec3 e = abs(texelFetch(after, c, 0).rgb - texelFetch(before, c, 0).rgb);
-        m = max(m, clamp((max(e.r, max(e.g, e.b)) - 0.02) * 20.0, 0.0, 1.0));
-    }
     imageStore(moved, c, vec4(m));
 }
 )";
@@ -5120,7 +5112,7 @@ void main() {
         float proj[4];
     };
 
-    static constexpr uint32_t kMotionBindings = 8;
+    static constexpr uint32_t kMotionBindings = 6;
     bool motionPipeline() {
         if (mvPipe_) return true;
         const VkShaderModule sm = module(kMotionGlsl, gcn::GlslStage::Compute);
@@ -5131,9 +5123,7 @@ void main() {
         VK_CHECK(vkCreateSampler(vk_.device, &sci, nullptr, &mvSampler_));
         VkDescriptorSetLayoutBinding b[kMotionBindings]{};
         b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-        for (uint32_t i = 1; i < kMotionBindings; ++i)
-            b[i] = {i, i >= 6 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT,
-                    nullptr};
+        for (uint32_t i = 1; i < kMotionBindings; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
         dl.bindingCount = kMotionBindings;
@@ -5238,27 +5228,11 @@ void main() {
             gpuWrote(*out);
         }
         if (!upScaled_) return runUpscaler(in, true); // Native: anti-aliased in place, as the blend would
-        upBeforeTaken_ = upAfterTaken_ = false;
-        if (upReactive_) upBeforeTaken_ = upscaleSnapshot(upBefore_, *out, in.w, in.h);
         // Upscaling: the scene stays as it is (the game may still draw into it, Ken's aura) until a
         // draw first reads it (upscaleTouch), which then reads the upscaled picture instead.
         upIn_ = in;
         upFollowed_.assign(1, in.colorAddr);
         if (upThisScene_ != in.colorAddr) upLastScene_ = upThisScene_, upThisScene_ = in.colorAddr;
-        return true;
-    }
-
-    // A copy of the scene's w x h in dst (made at the target's size): true when made.
-    bool upscaleSnapshot(Image& dst, Surface& src, uint32_t w, uint32_t h) {
-        if (!upscaleImage(dst, src.img.format, src.img.width, src.img.height)) return false;
-        if (!ringFits(1 << 12)) flush();
-        begin();
-        fullBarrier();
-        const VkImageCopy copy{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
-        rec([c = R().cmd_, from = src.img.image, to = dst.image, copy] {
-            vkCmdCopyImage(c, from, VK_IMAGE_LAYOUT_GENERAL, to, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
-        });
-        barrier();
         return true;
     }
 
@@ -5326,35 +5300,19 @@ void main() {
         const VkImageView lastDistView = view(lastDist, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
         const VkImageView distView = view(curDist, VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
         const VkImageView movedView = view(upMoved_, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
-        // The scene at the SMAA blend and as the game left it (upscaleBefore, upscaleAfter): what
-        // its later passes changed is masked too. Native has none of them in its input.
-        const bool reactive = !inPlace && upReactive_ && upBeforeTaken_ && upBefore_.width == upColor_.width &&
-                              upBefore_.height == upColor_.height && upBefore_.format == vf;
-        Image& after = upAfterTaken_ ? upAfter_ : upColor_;
-        mp.size[2] = reactive ? 1 : 0;
-        const VkImageView beforeView = view(reactive ? upBefore_ : upColor_, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
-        const VkImageView afterView = view(reactive ? after : upColor_, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity);
-        if (reactive && !upReactiveLogged_) {
-            upReactiveLogged_ = true;
-            std::fprintf(stderr, "[upscale] masking what the game drew after the anti-aliasing (%s)\n",
-                         upAfterTaken_ ? "before its composite" : "up to the output");
-        }
-        upBeforeTaken_ = upAfterTaken_ = false;
-        rec([this, c = R().cmd_, mp, depthView, mvView, depthCopyView, lastDistView, distView, movedView, beforeView, afterView] {
+        rec([this, c = R().cmd_, mp, depthView, mvView, depthCopyView, lastDistView, distView, movedView] {
             const VkDescriptorImageInfo di[kMotionBindings] = {{mvSampler_, depthView, VK_IMAGE_LAYOUT_GENERAL},
                                                                {VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL},
                                                                {VK_NULL_HANDLE, depthCopyView, VK_IMAGE_LAYOUT_GENERAL},
                                                                {VK_NULL_HANDLE, lastDistView, VK_IMAGE_LAYOUT_GENERAL},
                                                                {VK_NULL_HANDLE, distView, VK_IMAGE_LAYOUT_GENERAL},
-                                                               {VK_NULL_HANDLE, movedView, VK_IMAGE_LAYOUT_GENERAL},
-                                                               {mvSampler_, beforeView, VK_IMAGE_LAYOUT_GENERAL},
-                                                               {mvSampler_, afterView, VK_IMAGE_LAYOUT_GENERAL}};
+                                                               {VK_NULL_HANDLE, movedView, VK_IMAGE_LAYOUT_GENERAL}};
             VkWriteDescriptorSet wr[kMotionBindings]{};
             for (uint32_t i = 0; i < kMotionBindings; ++i) {
                 wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 wr[i].dstBinding = i;
                 wr[i].descriptorCount = 1;
-                wr[i].descriptorType = i && i < 6 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                wr[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                 wr[i].pImageInfo = &di[i];
             }
             vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, mvPipe_);
@@ -5377,7 +5335,7 @@ void main() {
         else
             f.depth = {upDepth_.image, depthCopyView, VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, w, h, kUpscaleUsage};
         f.motion = {upMotion_.image, mvView, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, w, h, kUpscaleUsage};
-        if (upMask_ || reactive) f.moved = {upMoved_.image, movedView, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, w, h, kUpscaleUsage};
+        if (upMask_) f.moved = {upMoved_.image, movedView, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, w, h, kUpscaleUsage};
         if (inPlace)
             f.output = {out->img.image, view(out->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), vf, VK_IMAGE_ASPECT_COLOR_BIT, w, h,
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | kUpscaleUsage};
@@ -5498,11 +5456,6 @@ void main() {
                     afterimage("the scene went back into a target it was in");
                 } else
                     upFollowed_.push_back(addr);
-                // The scene with what the game drew after the anti-aliasing, before the composite
-                // (its bloom, which the upscaler takes as it is).
-                if (upBeforeTaken_ && !upAfterTaken_)
-                    if (Surface* cur = colorSurface(upIn_.colorAddr, upIn_.pitch, upIn_.rows, upIn_.format, upIn_.bytes))
-                        upAfterTaken_ = upscaleSnapshot(upAfter_, *cur, upIn_.w, upIn_.h);
                 upIn_.colorAddr = addr;
                 upIn_.rows = ((cb[::gpu::ctx::kCbColorSlice] & 0x3FFFFF) + 1) * 64 / upIn_.pitch;
                 if (!upFollowLogged_) {
@@ -5660,11 +5613,6 @@ void main() {
     Image upDistance_[2], upMoved_;
     uint32_t upDistanceNext_ = 0, upDistanceW_ = 0, upDistanceH_ = 0;
     bool upMask_ = !getenv("LPN_UPSCALE_NO_MASK");
-    // The scene at the SMAA blend (upBefore_) and before the game composited it into a copy
-    // (upAfter_), when upscaling: the pixels its passes after the anti-aliasing changed.
-    Image upBefore_, upAfter_;
-    bool upBeforeTaken_ = false, upAfterTaken_ = false, upReactiveLogged_ = false;
-    bool upReactive_ = !getenv("LPN_UPSCALE_NO_REACTIVE");
     // Every frame without the upscaler's history: to tell its ghosts from the game's.
     bool upNoHistory_ = getenv("LPN_UPSCALE_NO_HISTORY") != nullptr;
     VkPipeline mvPipe_ = VK_NULL_HANDLE;
