@@ -4870,21 +4870,6 @@ private:
                           swz);
             b.scale[0] = float(t.width()) / float(s.img.width);
             b.scale[1] = float(t.height()) / float(s.img.height);
-            // Upscaling: a texture of the output's width or height over a render target of the
-            // scene's (the game sizes some effects from the display) would read past the scene,
-            // a stretched second copy of it. It reads the scene instead.
-            if (upScaled_ && upSceneW_ && upSceneH_ && s.img.width < upOutW_ && s.img.height < upOutH_ &&
-                s.img.width >= upSceneW_ && s.img.height >= upSceneH_ &&
-                (t.width() > s.img.width || t.height() > s.img.height)) {
-                if (t.width() > s.img.width) b.scale[0] = float(upSceneW_) / float(s.img.width);
-                if (t.height() > s.img.height) b.scale[1] = float(upSceneH_) / float(s.img.height);
-                if (oversizeLogged_.insert(addr).second && oversizeLogged_.size() <= 16)
-                    std::fprintf(stderr, "[upscale] a %ux%u texture over the %ux%u target 0x%" PRIx64 ": read as the %ux%u scene\n",
-                                 t.width(), t.height(), s.img.width, s.img.height, addr, upSceneW_, upSceneH_);
-            } else if ((t.width() > s.img.width || t.height() > s.img.height) && oversizeLogged_.insert(addr).second &&
-                       oversizeLogged_.size() <= 16)
-                std::fprintf(stderr, "[gpu] a %ux%u texture over the %ux%u render target 0x%" PRIx64 "\n", t.width(), t.height(),
-                             s.img.width, s.img.height, addr);
             return b;
         }
         if (t.storage) {
@@ -5680,7 +5665,6 @@ void main() {
     Image upBefore_, upAfter_;
     bool upBeforeTaken_ = false, upAfterTaken_ = false, upReactiveLogged_ = false;
     bool upReactive_ = !getenv("LPN_UPSCALE_NO_REACTIVE");
-    std::set<uint64_t> oversizeLogged_; // render targets read by a texture bigger than them
     // Every frame without the upscaler's history: to tell its ghosts from the game's.
     bool upNoHistory_ = getenv("LPN_UPSCALE_NO_HISTORY") != nullptr;
     VkPipeline mvPipe_ = VK_NULL_HANDLE;
