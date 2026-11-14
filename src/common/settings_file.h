@@ -94,7 +94,7 @@ constexpr int kResCount = int(sizeof kResolutions / sizeof kResolutions[0]);
 // The game runs at 60 and drops itself to 30 in cutscenes and 20 on loading screens. Above 60
 // (90, or uncapped at the monitor's refresh rate) the frame clock is patched to keep its speed,
 // and the pad history keeps one entry per 1/60 s so mashing moves still count (input_history.h).
-// Uncapped, the title screen runs at the monitor's rate too; cutscenes stay at 30.
+// At 60, 90 or uncapped the title screen follows the cap too; cutscenes stay at 30.
 constexpr int kFpsChoices[] = {30, 60, 90, 0};
 constexpr int kFpsCount = int(sizeof kFpsChoices / sizeof kFpsChoices[0]);
 

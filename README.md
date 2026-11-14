@@ -23,7 +23,8 @@ and known issues.
   21:9) with its 3D view widened to match (same vertical field of view, so 21:9 shows more to the
   sides and 16:10 a little less), and the HUD stays 16:9 in the middle. Not stretched.
 - **Frame rate:** cap at 30, 60 or 90 fps, or uncapped, with the game still running at normal
-  speed. The title screen, menus and real-time cutscenes go uncapped too. Optional FPS counter.
+  speed. The title screen and menus follow the cap too. Cutscenes stay at the game's 30 fps
+  (the one before the Shin fight flashes faster). Optional FPS counter.
 - **Upscaling:** NVIDIA DLSS (RTX cards) or AMD FSR 3.1 (any GPU) in place of the game's SMAA,
   either as anti-aliasing at full resolution (Native, DLAA) or rendering the 3D scene smaller
   and upscaling it (Quality, Balanced, Performance). See Build.

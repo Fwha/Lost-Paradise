@@ -93,7 +93,8 @@ Last updated 2026-10-16.
    the object's vtable is no sign of life (freed memory keeps it). Flip rate 1 is shown at the
    monitor's rate only while the title runs: the cutscene before the Shin fight asks for 30 fps
    with measured steps (event request 0x80000002 from 0x9c455b) and flashed when shown faster.
-   `LPN_KEEP_30FPS_SCENES=1` keeps the title screen at 30 too. `[clock]` lines count fixed / bit-2 / floored / capped / override steps.
+   Since issue #86 the title does the same at a 60 or 90 cap (at 60 with the game's own clock:
+   the step off, measured steps floored at 1/60 by the game). `LPN_KEEP_30FPS_SCENES=1` keeps the title screen at 30 too. `[clock]` lines count fixed / bit-2 / floored / capped / override steps.
 3. Fight glitches: a one-frame black wedge over the HP bar (gone with `LPN_GPU_SYNC=1`, so likely
    a race between the game rewriting HUD data and our asynchronous GPU); the kick trail and torch
    flames sometimes draw green (particle colour tables; parked, see the 2026-10-17 session notes).

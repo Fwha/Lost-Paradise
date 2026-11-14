@@ -314,7 +314,7 @@ constexpr uint32_t kStepAt = 0xd9ee98;
 const std::vector<uint8_t> kStepWas = {0x49, 0x8b, 0x8e, 0x90, 0, 0, 0, 0x85, 0xc9, 0x74, 0x28, 0x48, 0xc1, 0xe9, 0x20,
                                        0xc5, 0xf9, 0x6e, 0xc9, 0xb9, 0x00, 0xc2, 0xeb, 0x0b, 0xc5, 0xf2, 0x5a, 0xc9,
                                        0xc5, 0xf3};
-// The title screen's 30 fps flip rate, kept when uncapped with LPN_KEEP_30FPS_SCENES=1.
+// The title screen's 30 fps flip rate, kept at any cap with LPN_KEEP_30FPS_SCENES=1.
 bool keep30FpsScenes() {
     static const bool keep = [] {
         const char* v = std::getenv("LPN_KEEP_30FPS_SCENES");
@@ -571,26 +571,30 @@ bool skippingIntro() {
 
 namespace {
 
-// Uncapped, the title menu runs with its 1/30 step turned off, as the clock's own off switch
+// Above a 30 fps cap, the title menu runs with its 1/30 step turned off, as the clock's own off switch
 // (0xd9f0f0, patched to clear the step too) leaves it: measured steps and no 30 fps flip
 // interval. (Measured steps with the fixed step still on stopped the menu's options appearing.)
 // The title's pop makes 0xd4f00 set the step of the scene below again.
-void titleStep(bool uncapped) {
+void titleStep(bool follow) {
     Clock& c = clock();
-    if (uncapped && titleRunning() && c.fixedOn && c.fixedDt == 1.0f / 30) c.fixedOn = 0, c.fixedDt = 0;
+    if (follow && titleRunning() && c.fixedOn && c.fixedDt == 1.0f / 30) c.fixedOn = 0, c.fixedDt = 0;
 }
 
 } // namespace
 
+// At a 30 fps cap (clock mode 1) the title already runs at the cap; at 60, 90 or uncapped it
+// follows the cap.
+static bool titleFollowsCap(int mode) { return mode != 1 && !keep30FpsScenes(); }
+
 bool uncap30FpsScenes() {
-    return frameClockUncapped() && !keep30FpsScenes() && titleRunning();
+    return titleFollowsCap(gClockActive.load(std::memory_order_relaxed)) && titleRunning();
 }
 
 void syncFrameClock() {
     if (gEbootText) clockStats();
     // Skipping the intro, the host picks every step (stepNs), whatever the cap.
     const int want = skippingIntro() ? std::max(1, gClockWanted.load()) : gClockWanted.load();
-    if (gEbootText) titleStep(want == 2 && gClockActive == want && !keep30FpsScenes());
+    if (gEbootText) titleStep(gClockActive == want && titleFollowsCap(want));
     if (!gEbootText || want == gClockActive) return;
     write(kMeasured[0], want >= 1);
     write(kMeasured[1], want >= 1);
