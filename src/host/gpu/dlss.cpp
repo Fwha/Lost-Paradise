@@ -27,6 +27,12 @@ void deviceFeatures(const VkPhysicalDeviceVulkan12Features&, const VkPhysicalDev
 uint32_t extraQueues() { return 0; }
 
 namespace {
+bool gDisabled = false;
+} // namespace
+
+void disable() { gDisabled = true; }
+
+namespace {
 
 // NGX asks a custom engine for a GUID of its own.
 constexpr const char* kProjectId = "6c1f5a8e-2b47-4d3a-9e61-0f8c3a5d7b24";
@@ -85,6 +91,7 @@ std::vector<std::string> names(uint32_t n, const VkExtensionProperties* props) {
 } // namespace
 
 std::vector<std::string> instanceExtensions() {
+    if (gDisabled) return {};
     const NVSDK_NGX_FeatureDiscoveryInfo d = discovery();
     uint32_t n = 0;
     VkExtensionProperties* props = nullptr;
@@ -93,6 +100,7 @@ std::vector<std::string> instanceExtensions() {
 }
 
 std::vector<std::string> deviceExtensions(VkInstance instance, VkPhysicalDevice phys) {
+    if (gDisabled) return {};
     const NVSDK_NGX_FeatureDiscoveryInfo d = discovery();
     uint32_t n = 0;
     VkExtensionProperties* props = nullptr;
@@ -102,6 +110,10 @@ std::vector<std::string> deviceExtensions(VkInstance instance, VkPhysicalDevice 
 }
 
 void init(const Vk& vk) {
+    if (gDisabled) {
+        std::fprintf(stderr, "[dlss] unavailable: off after the Vulkan device failed with it\n");
+        return;
+    }
     NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_Init_with_ProjectID(
         kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", L".", vk.instance, vk.phys, vk.device,
         vkGetInstanceProcAddr, vkGetDeviceProcAddr, featureInfo());
@@ -219,6 +231,7 @@ bool evaluate(VkCommandBuffer, VkDevice, const upscale::Frame&) { return false; 
 void deviceFeatures(const VkPhysicalDeviceVulkan12Features&, const VkPhysicalDeviceVulkan13Features&,
                     VkPhysicalDeviceVulkan12Features*, VkPhysicalDeviceVulkan13Features*) {}
 uint32_t extraQueues() { return 0; }
+void disable() {}
 bool builtIn() { return false; }
 
 std::vector<std::string> instanceExtensions() { return {}; }

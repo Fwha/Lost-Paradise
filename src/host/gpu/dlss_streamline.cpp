@@ -41,7 +41,7 @@ struct Api {
 };
 
 Api gSl;
-bool gLoaded = false, gInit = false, gAvailable = false, gFailed = false;
+bool gLoaded = false, gInit = false, gAvailable = false, gFailed = false, gDisabled = false;
 sl::FeatureRequirements gReqs;
 bool gHaveReqs = false;
 uint32_t gExtraCompute = 0, gExtraGraphics = 0;
@@ -144,6 +144,22 @@ void start() {
     if (gHaveReqs) {
         gExtraCompute = gReqs.vkNumComputeQueuesRequired;
         gExtraGraphics = gReqs.vkNumGraphicsQueuesRequired;
+        // What Streamline adds to the Vulkan instance and device, for play.log.
+        auto list = [](uint32_t n, const char** s) {
+            std::string out;
+            for (uint32_t i = 0; i < n; ++i)
+                if (s && s[i]) out += (out.empty() ? "" : " ") + std::string(s[i]);
+            return out.empty() ? std::string("none") : out;
+        };
+        std::fprintf(stderr, "[dlss] Streamline asks for instance extensions: %s\n",
+                     list(gReqs.vkNumInstanceExtensions, gReqs.vkInstanceExtensions).c_str());
+        std::fprintf(stderr, "[dlss] device extensions: %s\n",
+                     list(gReqs.vkNumDeviceExtensions, gReqs.vkDeviceExtensions).c_str());
+        std::fprintf(stderr, "[dlss] 1.2 features: %s; 1.3 features: %s; queues: %u compute, %u graphics\n",
+                     list(gReqs.vkNumFeatures12, gReqs.vkFeatures12).c_str(),
+                     list(gReqs.vkNumFeatures13, gReqs.vkFeatures13).c_str(), gExtraCompute, gExtraGraphics);
+    } else {
+        std::fprintf(stderr, "[dlss] Streamline gave no Vulkan requirements for DLSS\n");
     }
 }
 
@@ -213,7 +229,18 @@ void deviceFeatures(const VkPhysicalDeviceVulkan12Features& have12, const VkPhys
 
 uint32_t extraQueues() { return gInit ? gExtraCompute + gExtraGraphics : 0; }
 
+void disable() {
+    if (gInit) gSl.shutdown();
+    gInit = gHaveReqs = false;
+    gExtraCompute = gExtraGraphics = 0;
+    gDisabled = true;
+}
+
 void init(const Vk& vk) {
+    if (gDisabled) {
+        std::fprintf(stderr, "[dlss] unavailable: off after the Vulkan device failed with Streamline's additions\n");
+        return;
+    }
     if (!gInit) return;
     sl::VulkanInfo info{};
     info.device = vk.device;

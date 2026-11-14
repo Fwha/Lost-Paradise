@@ -28,6 +28,8 @@ void deviceFeatures(const VkPhysicalDeviceVulkan12Features& have12, const VkPhys
                     VkPhysicalDeviceVulkan12Features* want12, VkPhysicalDeviceVulkan13Features* want13);
 // Queues DLSS wants beside the renderer's, in the renderer's family (they follow its queue 0).
 uint32_t extraQueues();
+// Turns DLSS off for the run (vk.cpp, when the device could not be made with DLSS's additions).
+void disable();
 
 // After the device is made: starts NGX and asks the driver whether DLSS can run. Logs why not.
 void init(const Vk& vk);

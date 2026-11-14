@@ -25,9 +25,14 @@ struct Vk {
     PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSet = nullptr;
     PFN_vkGetMemoryHostPointerPropertiesEXT getMemoryHostPointerProperties = nullptr;
 
+    // Makes the instance and device. When that fails with DLSS's additions (gpu/dlss.h), tries
+    // again without them and turns DLSS off.
     bool init(std::string* error);
     // Index of a memory type in `bits` with `flags`, or UINT32_MAX.
     uint32_t memoryType(uint32_t bits, VkMemoryPropertyFlags flags) const;
+
+private:
+    bool create(std::string* error, bool withDlss);
 };
 
 const char* vkResultName(VkResult r);

@@ -31,6 +31,23 @@ uint32_t Vk::memoryType(uint32_t bits, VkMemoryPropertyFlags flags) const {
 }
 
 bool Vk::init(std::string* error) {
+    if (create(error, true)) return true;
+    if (!dlss::builtIn()) return false;
+    // DLSS adds instance and device extensions, features and queues; a driver that refuses them
+    // must not cost the picture, so try once more without DLSS.
+    std::fprintf(stderr, "[gpu] %s with DLSS's Vulkan additions: trying again without DLSS\n", error->c_str());
+    dlss::disable();
+    if (device) vkDestroyDevice(device, nullptr);
+    if (instance) vkDestroyInstance(instance, nullptr);
+    device = VK_NULL_HANDLE;
+    instance = VK_NULL_HANDLE;
+    phys = VK_NULL_HANDLE;
+    queue = VK_NULL_HANDLE;
+    error->clear();
+    return create(error, false);
+}
+
+bool Vk::create(std::string* error, bool withDlss) {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "lpn-host";
     app.apiVersion = VK_API_VERSION_1_3;
@@ -41,7 +58,7 @@ bool Vk::init(std::string* error) {
     vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
     std::vector<VkExtensionProperties> instanceExts(n);
     vkEnumerateInstanceExtensionProperties(nullptr, &n, instanceExts.data());
-    const std::vector<std::string> dlssInstance = dlss::instanceExtensions();
+    const std::vector<std::string> dlssInstance = withDlss ? dlss::instanceExtensions() : std::vector<std::string>{};
     std::vector<const char*> enableInstance;
     for (const std::string& e : dlssInstance)
         for (const auto& have : instanceExts)
@@ -98,7 +115,8 @@ bool Vk::init(std::string* error) {
     // Pipeline libraries (docs/shader-precompile.md stage 3): checked for the feature below.
     const bool gplExt = has(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) && has(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
     // DLSS's device extensions, those the driver has (none without an NVIDIA driver).
-    const std::vector<std::string> dlssDevice = dlss::deviceExtensions(instance, phys);
+    const std::vector<std::string> dlssDevice =
+        withDlss ? dlss::deviceExtensions(instance, phys) : std::vector<std::string>{};
     for (const std::string& e : dlssDevice)
         if (has(e.c_str()) && std::find_if(enable.begin(), enable.end(), [&](const char* x) { return e == x; }) ==
                                   enable.end())
@@ -185,7 +203,7 @@ bool Vk::init(std::string* error) {
     want12.shaderFloat16 = have12.shaderFloat16;
     want13.subgroupSizeControl = have13.subgroupSizeControl;
     want13.computeFullSubgroups = have13.computeFullSubgroups;
-    dlss::deviceFeatures(have12, have13, &want12, &want13);
+    if (withDlss) dlss::deviceFeatures(have12, have13, &want12, &want13);
     storageWriteWithoutFormat = h.shaderStorageImageWriteWithoutFormat;
     shaderFloat16 = have12.shaderFloat16;
     subgroupSizeControl = have13.subgroupSizeControl;
@@ -193,7 +211,7 @@ bool Vk::init(std::string* error) {
     synchronization2 = have13.synchronization2;
 
     // Queue 0 is the renderer's; DLSS (Streamline) may want more in the same family after it.
-    const uint32_t queues = std::min(1 + dlss::extraQueues(), families[family].queueCount);
+    const uint32_t queues = std::min(1 + (withDlss ? dlss::extraQueues() : 0), families[family].queueCount);
     const std::vector<float> priorities(queues, 1.0f);
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = family;
