@@ -1072,6 +1072,7 @@ public:
         // ~10% of the recorder at 8,000 draws a frame.
         std::unique_ptr<DrawAnalysis>& held = taken_[takenNext_++];
         if ((upDiag_ == 1 || upTrace_) && smaaSeen_) upscaleDiag(d, r, *held);
+        if (upOn_ && upScaled_) upscaleWritten(d, r, *held);
         if (upPrevScene_ && !smaaSeen_) upscalePrevWritten(d, r, *held);
         if (upIn_.on && smaaSeen_ && !upEffect_ && upLastScene_) upscaleEffect(d, r, *held);
         if (recordThreads_) {
@@ -5456,8 +5457,16 @@ void main() {
                 // Back into a target the scene was in before this frame: the game blends copies of
                 // the scene with earlier frames' (its afterimage effect). The upscaler's history
                 // would pile up those ghosts: it starts over for such frames.
+                // Only with an earlier frame's picture in it: a target of the scene's size this frame
+                // has not written. A copy blended straight back (the game's glow, every frame) is not.
+                bool earlier = false;
+                for (const gcn::Program* p : {&a.vs, &a.ps})
+                    for (const auto& t : p->images)
+                        if (!t.storage && t.width() == upIn_.w && t.height() == upIn_.h &&
+                            std::find(upWritten_.begin(), upWritten_.end(), t.base()) == upWritten_.end())
+                            earlier = true;
                 if (std::find(upFollowed_.begin(), upFollowed_.end(), addr) != upFollowed_.end()) {
-                    afterimage("the scene went back into a target it was in");
+                    if (earlier) afterimage("the scene went back into a target it was in, with an earlier frame's");
                 } else
                     upFollowed_.push_back(addr);
                 upIn_.colorAddr = addr;
@@ -5554,6 +5563,21 @@ void main() {
                 if (t.storage && t.base() == addr) return true;
         return false;
     }
+    // The scene-sized targets the frame has written so far (rendered into or stored to).
+    void upscaleWritten(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
+        auto add = [&](uint64_t addr) {
+            if (std::find(upWritten_.begin(), upWritten_.end(), addr) == upWritten_.end()) upWritten_.push_back(addr);
+        };
+        if (d.kind != DrawCall::kDispatch)
+            for (uint32_t i = 0; i < 8; ++i) {
+                const uint32_t* cb = &r.ctx[reg::kCbColorBase + i * reg::kCbColorStride];
+                const uint32_t pitch = ((cb[::gpu::ctx::kCbColorPitch] & 0x7FF) + 1) * 8;
+                if (((cb[::gpu::ctx::kCbColorInfo] >> 2) & 0x1F) && pitch >= upSceneW_) add(uint64_t(cb[0]) << 8);
+            }
+        for (const gcn::Program* p : {&a.vs, &a.ps})
+            for (const auto& t : p->images)
+                if (t.storage && t.width() >= upSceneW_) add(t.base());
+    }
     // Before SMAA: a draw that writes last frame's scene target makes it this frame's picture.
     void upscalePrevWritten(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
         if (writes(d, r, a, upPrevScene_)) upPrevScene_ = 0;
@@ -5583,6 +5607,7 @@ void main() {
         prevCam_ = cam_;
         cam_.valid = false;
         upPrevScene_ = smaaSeen_ ? upThisScene_ : 0;
+        upWritten_.clear();
         upThisScene_ = upLastScene_ = 0;
         smaaSeen_ = false;
         camTries_ = 0;
@@ -5637,6 +5662,7 @@ void main() {
     uint64_t upThisScene_ = 0, upLastScene_ = 0; // the SMAA blend's target this frame and last frame's, if another
     uint64_t upPrevScene_ = 0;                    // the SMAA blend's target last frame, until written
     std::vector<uint64_t> upEffectPs_;            // shaders logged reading it
+    std::vector<uint64_t> upWritten_;             // scene-sized targets written this frame (upscaleWritten)
     float jitterX_ = 0, jitterY_ = 0;
     // LPN_DLSS_JITTER_SIGN=<x>,<y> (each 1 or -1): flips the jitter the upscaler is told (debugging).
     float jitterSign_[2] = {1, 1};
