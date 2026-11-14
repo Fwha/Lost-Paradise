@@ -1072,7 +1072,7 @@ public:
         // ~10% of the recorder at 8,000 draws a frame.
         std::unique_ptr<DrawAnalysis>& held = taken_[takenNext_++];
         if ((upDiag_ == 1 || upTrace_) && smaaSeen_) upscaleDiag(d, r, *held);
-        if (upIn_.on && smaaSeen_ && !upEffect_ && upLastScene_) upscaleEffect(*held);
+        if (upIn_.on && smaaSeen_ && !upEffect_ && upLastScene_) upscaleEffect(d, r, *held);
         if (recordThreads_) {
             if (segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
                 addToSegment(d, r, held);
@@ -5232,7 +5232,10 @@ void main() {
         // draw first reads it (upscaleTouch), which then reads the upscaled picture instead.
         upIn_ = in;
         upFollowed_.assign(1, in.colorAddr);
-        if (upThisScene_ != in.colorAddr) upLastScene_ = upThisScene_, upThisScene_ = in.colorAddr;
+        // The last frame's scene when it was another target: a game that renders into one every
+        // frame has none (an address kept from frames before was the bloom's copy, read each frame).
+        upThisScene_ = in.colorAddr;
+        upLastScene_ = upPrevScene_ != in.colorAddr ? upPrevScene_ : 0;
         return true;
     }
 
@@ -5542,7 +5545,12 @@ void main() {
         upEffect_ = true;
     }
     // A draw after SMAA that reads the last frame's scene (the game renders into two by turns).
-    void upscaleEffect(const DrawAnalysis& a) {
+    // A draw that renders into that target first makes it this frame's picture.
+    void upscaleEffect(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
+        if (rendersInto(d, r, upLastScene_)) {
+            upLastScene_ = 0;
+            return;
+        }
         for (const gcn::Program* p : {&a.vs, &a.ps})
             for (const auto& t : p->images)
                 if (!t.storage && t.base() == upLastScene_) return afterimage("the last frame's scene was read");
@@ -5552,6 +5560,8 @@ void main() {
     void upscaleFrameEnd() {
         prevCam_ = cam_;
         cam_.valid = false;
+        upPrevScene_ = smaaSeen_ ? upThisScene_ : 0;
+        upThisScene_ = upLastScene_ = 0;
         smaaSeen_ = false;
         camTries_ = 0;
         upRanLast_ = upRan_;
@@ -5602,7 +5612,8 @@ void main() {
     std::vector<uint64_t> upFollowed_; // where the scene was this frame (upscaleTouch)
     bool upEffect_ = false;
     int upEffectLogged_ = 0;
-    uint64_t upThisScene_ = 0, upLastScene_ = 0; // the SMAA blend's target this frame and the one before it
+    uint64_t upThisScene_ = 0, upLastScene_ = 0; // the SMAA blend's target this frame and last frame's, if another
+    uint64_t upPrevScene_ = 0;                    // the SMAA blend's target last frame
     float jitterX_ = 0, jitterY_ = 0;
     // LPN_DLSS_JITTER_SIGN=<x>,<y> (each 1 or -1): flips the jitter the upscaler is told (debugging).
     float jitterSign_[2] = {1, 1};
