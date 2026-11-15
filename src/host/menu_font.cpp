@@ -3,6 +3,7 @@
 #ifdef LPN_HAVE_SDL2
 #include <stb_truetype.h>
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -21,7 +22,7 @@ struct Font {
     stbtt_fontinfo info{};
     bool ok = false;
 };
-Font gRegular, gBold;
+Font gRegular, gBold, gUi;
 bool gLoaded = false;
 
 std::string fcMatch(const char* pattern) {
@@ -99,6 +100,28 @@ bool loadFirst(Font& f, bool bold, const char* env) {
     return false;
 }
 
+// The desktop's own UI font, for the launcher's native-style buttons: Segoe UI on Windows, the
+// font fontconfig gives "sans-serif" on Linux. Only one that loads and has Latin letters is taken;
+// otherwise the regular menu font is used, with its fallbacks down to the Liberation Sans we ship
+// (SteamOS 3).
+bool loadUi(Font& f) {
+    if (const char* env = std::getenv("LPN_UI_FONT"); env && *env) return load(f, env);
+    auto latin = [&] { return f.ok && stbtt_FindGlyphIndex(&f.info, 'A') && stbtt_FindGlyphIndex(&f.info, 'g'); };
+#ifdef _WIN32
+    const char* win = std::getenv("WINDIR");
+    const std::string fonts = std::string(win && *win ? win : "C:\\Windows") + "\\Fonts\\";
+    return load(f, fonts + "segoeui.ttf") && latin();
+#else
+    const std::string path = fcMatch("sans-serif");
+    std::string ext = std::filesystem::path(path).extension().string();
+    for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
+    if (ext != ".ttf" && ext != ".otf" && ext != ".ttc") return false;
+    if (load(f, path) && latin()) return true;
+    f.ok = false;
+    return false;
+#endif
+}
+
 void ensureLoaded() {
     if (gLoaded) return;
     gLoaded = true;
@@ -107,7 +130,16 @@ void ensureLoaded() {
     if (!loadFirst(gBold, true, std::getenv("LPN_MENU_FONT_BOLD"))) gBold.ok = false;
 }
 
+bool gUiLoaded = false;
+void ensureUiLoaded() {
+    ensureLoaded();
+    if (gUiLoaded) return;
+    gUiLoaded = true;
+    if (!loadUi(gUi)) gUi.ok = false;
+}
+
 const Font& pick(bool bold) { return bold && gBold.ok ? gBold : gRegular; }
+const Font& pickUi() { return gUi.ok ? gUi : gRegular; }
 
 std::vector<int> codepoints(const std::string& s) {
     std::vector<int> out;
@@ -140,7 +172,7 @@ struct Tex {
     SDL_Texture* tex = nullptr;
     int w = 0, h = 0;
 };
-std::map<std::tuple<bool, int, std::string>, Tex> gCache;
+std::map<std::tuple<int, int, std::string>, Tex> gCache; // style (0 regular, 1 bold, 2 UI), size, text
 SDL_Renderer* gCacheRen = nullptr;
 
 void clearCache() {
@@ -219,17 +251,17 @@ std::string fit(const std::string& s, int size, int maxW, bool bold) {
     return "";
 }
 
-void draw(SDL_Renderer* ren, int x, int y, int size, const std::string& s, bool bold) {
-    if (s.empty() || size <= 0 || !available()) return;
+namespace {
+
+void drawWith(SDL_Renderer* ren, int x, int y, int size, const std::string& s, int style, const Font& f) {
     if (ren != gCacheRen) {
         clearCache();
         gCacheRen = ren;
     }
     if (gCache.size() > 400) clearCache(); // menus show few distinct strings; start over now and then
-    bold = bold && gBold.ok;
-    auto key = std::make_tuple(bold, size, s);
+    auto key = std::make_tuple(style, size, s);
     auto it = gCache.find(key);
-    if (it == gCache.end()) it = gCache.emplace(key, render(ren, pick(bold), size, s)).first;
+    if (it == gCache.end()) it = gCache.emplace(key, render(ren, f, size, s)).first;
     const Tex& t = it->second;
     if (!t.tex) return;
     Uint8 r, g, b, a;
@@ -238,6 +270,27 @@ void draw(SDL_Renderer* ren, int x, int y, int size, const std::string& s, bool 
     SDL_SetTextureAlphaMod(t.tex, a);
     SDL_Rect dst{x - 1, y - 1, t.w, t.h};
     SDL_RenderCopy(ren, t.tex, nullptr, &dst);
+}
+
+} // namespace
+
+void draw(SDL_Renderer* ren, int x, int y, int size, const std::string& s, bool bold) {
+    if (s.empty() || size <= 0 || !available()) return;
+    bold = bold && gBold.ok;
+    drawWith(ren, x, y, size, s, bold ? 1 : 0, pick(bold));
+}
+
+void drawUi(SDL_Renderer* ren, int x, int y, int size, const std::string& s) {
+    if (s.empty() || size <= 0 || !available()) return;
+    ensureUiLoaded();
+    drawWith(ren, x, y, size, s, gUi.ok ? 2 : 0, pickUi());
+}
+
+int widthUi(const std::string& s, int size) {
+    if (!available()) return 0;
+    ensureUiLoaded();
+    const Font& f = pickUi();
+    return int(std::ceil(measure(f, codepoints(s), stbtt_ScaleForPixelHeight(&f.info, float(size)))));
 }
 
 } // namespace host::menufont
