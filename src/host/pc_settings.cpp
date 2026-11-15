@@ -48,21 +48,6 @@ void upscalerChoose(int i) {
     displaySettings().upscaler = u[i];
     saveDisplaySettings();
 }
-std::vector<std::string> qualityChoices() { return {std::begin(kUpscaleQualityNames), std::end(kUpscaleQualityNames)}; }
-int qualityValue() { return int(displaySettings().upscaleQuality); }
-void qualityChoose(int i) {
-    if (i < 0 || i >= kUpscaleQualities) return;
-    displaySettings().upscaleQuality = UpscaleQuality(i);
-    saveDisplaySettings();
-}
-
-std::vector<std::string> aspectChoices() { return {std::begin(kAspectNames), std::end(kAspectNames)}; }
-int aspectSetting() { return int(displaySettings().aspect); }
-void aspectChoose(int i) {
-    if (i < 0 || i >= kAspectChoices) return;
-    displaySettings().aspect = AspectRatio(i);
-    saveDisplaySettings();
-}
 
 // The levels the GPU does (render::maxAnisotropy): Off and up to its most.
 std::vector<std::string> anisoChoices() {
@@ -95,30 +80,15 @@ void uncapCutscenesChoose(int i) {
     refreshFrameClock(); // at a 60 cap the clock now needs the host's step
     saveDisplaySettings();
 }
-int skipIntroValue() { return displaySettings().skipIntro ? 1 : 0; }
-void skipIntroChoose(int i) {
-    displaySettings().skipIntro = i != 0;
-    saveDisplaySettings();
-}
-
-std::vector<std::string> buttonIconChoices() { return {std::begin(kButtonIconNames), std::end(kButtonIconNames)}; }
-int buttonIconsValue() { return int(displaySettings().buttonIcons); }
-void buttonIconsChoose(int i) {
-    if (i < 0 || i >= kButtonIconChoices) return;
-    displaySettings().buttonIcons = ButtonIcons(i);
-    saveDisplaySettings();
-}
 
 } // namespace
 
 // Descriptions stay on one line under the menu (about 90 characters): the game does not wrap them.
+// Only what takes effect while the game runs: Resolution, Aspect Ratio, Upscale Quality, Skip
+// Intro Logos and Button Icons, which wait for the next start, are in the launcher's Settings.
 const std::vector<PcSetting>& pcSettings() {
     static const std::vector<PcSetting> settings = {
         display<0>("Window Mode", "Play in a window, a borderless window or fullscreen."),
-        display<1>("Resolution", "Set the 3D rendering resolution. Takes effect after restarting the game."),
-        {"Aspect Ratio",
-         "Match your monitor's shape; the HUD stays 16:9. Takes effect after restarting the game.",
-         &aspectChoices, &aspectSetting, &aspectChoose},
         display<2>("Frame Rate Cap",
                    "Set the most frames shown per second. Uncapped follows the monitor's refresh rate."),
         {"Uncap Cutscenes", "Real-time cutscenes follow the cap instead of 30 fps. Videos stay at 30. Experimental.",
@@ -129,17 +99,8 @@ const std::vector<PcSetting>& pcSettings() {
         {"Upscaler",
          "Swap the game's anti-aliasing for NVIDIA DLSS (RTX cards) or AMD FSR 3.1 (any GPU).",
          &upscalerChoices, &upscalerValue, &upscalerChoose},
-        {"Upscale Quality",
-         "Native: anti-aliasing only. Others render smaller, faster. Takes effect after a restart.",
-         &qualityChoices, &qualityValue, &qualityChoose},
         {"Anisotropic Filtering", "Keep textures sharp at glancing angles, like the ground ahead. Off: as the game sets them.",
          &anisoChoices, &anisoValue, &anisoChoose},
-        {"Skip Intro Logos", "Go straight to the title screen when the game starts. Takes effect at the next start.",
-         &onOff, &skipIntroValue, &skipIntroChoose},
-        {"Button Icons",
-         "Controller buttons to show. Auto matches your controller. Takes effect at the next start.",
-         &buttonIconChoices, &buttonIconsValue, &buttonIconsChoose},
-        display<4>("Exit Game", "Close the game. Progress since your last save is lost."),
     };
     return settings;
 }
