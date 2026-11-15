@@ -97,8 +97,13 @@ Last updated 2026-10-16.
    the step off, measured steps floored at 1/60 by the game). The cutscene before the Shin fight
    is a pre-rendered video (2026-11-13 log: a 1920x1080 and two 960x540 targets made at its
    request, no 3D camera, steady streaming reads), so the "Uncap Cutscenes" setting (off by
-   default) measures the fixed 1/30 step of real-time cutscenes and shows them at the cap, while
-   a scene with flip rate 1 and no fixed step (a video) stays at 30. At a 60 cap the setting puts
+   default) shows events' 30 fps at the cap, measuring a fixed 1/30 step, while no video plays.
+   Real-time scenes such as Reminisce's (2026-11-15 log: ~130 MB loaded, full-size 3D targets)
+   go through the same script request 0x80000002 (handler 0x9c44e0) as the Shin video, so the
+   request can't tell them apart: the event movie player can (task at 0x247e630+0x448, player at
+   +0x168, state +0x9c 1-3 while loading/playing; `[step] movie starts/ends` lines). A second
+   movie manager (0x247e630+0x450, check 0x811740) plays the title video, captions and promos
+   and is not watched. At a 60 cap the setting puts
    the clock in mode 1 so `stepNs` runs. `LPN_KEEP_30FPS_SCENES=1` keeps the title screen at 30 too. `[clock]` lines count fixed / bit-2 / floored / capped / override steps.
 3. Fight glitches: a one-frame black wedge over the HP bar (gone with `LPN_GPU_SYNC=1`, so likely
    a race between the game rewriting HUD data and our asynchronous GPU); the kick trail and torch
