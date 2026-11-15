@@ -3575,6 +3575,14 @@ private:
             for (const auto& e : std::filesystem::directory_iterator(spirvDir_, ec))
                 if (e.path().extension() == ".gcn") names.push_back(e.path().stem().string());
             const auto start = std::chrono::steady_clock::now();
+            if (!names.empty())
+                std::fprintf(stderr, "[gpu] saved shaders' libraries: building for %zu shaders in the background\n", names.size());
+            // Shown in the corner as the boot compile is (the driver's own cache may be cold: a
+            // driver update leaves every library to build again).
+            bootCount_ = 0;
+            bootTotal_ = names.size();
+            bootStart_ = start;
+            bootRunning_ = !names.empty();
             std::atomic<size_t> next{0};
             std::vector<std::thread> pool;
             for (unsigned i = 0; i < n; ++i)
@@ -3583,9 +3591,11 @@ private:
                     for (size_t k; (k = next++) < names.size();) {
                         yieldToDraws();
                         warmLibraries(currentShader(names[k]));
+                        ++bootCount_;
                     }
                 });
             for (auto& t : pool) t.join();
+            bootRunning_ = false;
             if (!names.empty())
                 std::fprintf(stderr, "[gpu] saved shaders' libraries: %zu shaders in %.1f s (%zu built)\n", names.size(),
                              std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), librariesBuilt_.load());
@@ -3601,6 +3611,7 @@ private:
         }
         std::fprintf(stderr, "[gpu] boot compile started: %zu registered shaders on %u threads\n", shaders.size(), n);
         const auto start = std::chrono::steady_clock::now();
+        bootCount_ = 0;
         bootStart_ = start;
         bootTotal_ = shaders.size();
         bootRunning_ = true;
