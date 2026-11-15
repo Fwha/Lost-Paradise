@@ -480,6 +480,7 @@ struct Image {
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0, layers = 1, levels = 1;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    VkDeviceSize bytes = 0; // its memory (counted in imageBytes_)
     std::map<std::array<uint32_t, 8>, VkImageView> views;
 };
 
@@ -497,6 +498,7 @@ struct Surface {
     uint64_t checkedFrame = ~0ull;
     uint64_t addr = 0, memBytes = 0; // the memory memSample covers
     uint64_t loggedFrame = ~0ull;    // writtenFrame of the last "[gpu] stale target" line
+    uint64_t lastUse = 0;            // last frame it was rendered to, sampled or shown (see evictImages)
 };
 
 // A texture's full hash, computed off the recorder (see Renderer::guestTexture).
@@ -514,6 +516,7 @@ struct GuestTexture {
     uint64_t sample = 0;       // sampleHash at the last full check
     uint32_t uses = 0;         // frames it was used in while unchanged
     uint32_t phase = 0;        // which of every 8 uses gets the full check (spread across textures)
+    uint64_t lastUse = 0;      // last frame a draw bound it, remembered bindings included (see evictImages)
     // Unchanged for 60 frames and checked by the sweep once a frame (see sweepVram), so image
     // bindings of it stay good from frame to frame. What the sweep reads: base, span, tiled.
     bool settled = false, swept = false, sweptChanged = false;
@@ -1281,6 +1284,7 @@ public:
         if (R().prof_.on) reportSlowFrame();
         savePipelineCache();
         upscaleFrameEnd();
+        evictImages();
         sweepVram();
         trace_ = false; // recorder threads read it (a traced frame is recorded here, in order)
         // Anisotropic Filtering changed: remembered bindings hold the old samplers.
@@ -1504,6 +1508,7 @@ public:
             return false;
         }
         Surface& s = it->second;
+        touch(s.lastUse);
         if (s.elementBytes != 4 || c.slot < 0 || c.slot >= kDisplaySlots) return false;
         c.w = std::min(width, s.img.width), c.h = std::min(height, s.img.height);
         DisplaySlot& d = displays_[c.slot];
@@ -2520,8 +2525,35 @@ private:
         mai.allocationSize = req.size;
         mai.memoryTypeIndex = vk_.memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (mai.memoryTypeIndex == UINT32_MAX) mai.memoryTypeIndex = vk_.memoryType(req.memoryTypeBits, 0);
-        VK_CHECK(vkAllocateMemory(vk_.device, &mai, nullptr, &img.memory));
-        VK_CHECK(vkBindImageMemory(vk_.device, img.image, img.memory, 0));
+        VkResult r = vkAllocateMemory(vk_.device, &mai, nullptr, &img.memory);
+        if (r != VK_SUCCESS) {
+            // Out of VRAM: the next frame's end frees images left unused (evictImages), and this
+            // one goes to system memory, slower to sample but still drawn. Images bound to no
+            // memory were used anyway before, and the device was lost a few frames later.
+            vramPressure_.store(true, std::memory_order_relaxed);
+            for (uint32_t i = 0; r != VK_SUCCESS && i < vk_.mem.memoryTypeCount; ++i) {
+                if (!((req.memoryTypeBits >> i) & 1) || (vk_.mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+                    continue;
+                mai.memoryTypeIndex = i;
+                r = vkAllocateMemory(vk_.device, &mai, nullptr, &img.memory);
+            }
+            if (r != VK_SUCCESS || vkBindImageMemory(vk_.device, img.image, img.memory, 0) != VK_SUCCESS) {
+                if (img.memory) vkFreeMemory(vk_.device, img.memory, nullptr);
+                vkDestroyImage(vk_.device, img.image, nullptr);
+                img = Image{};
+                warnOnce("out of GPU memory: an image could not be created");
+                return false;
+            }
+            warnOnce("out of GPU memory: images go to system memory until unused ones are freed");
+        } else if (vkBindImageMemory(vk_.device, img.image, img.memory, 0) != VK_SUCCESS) {
+            vkFreeMemory(vk_.device, img.memory, nullptr);
+            vkDestroyImage(vk_.device, img.image, nullptr);
+            img = Image{};
+            warnOnce("an image could not be bound to its memory");
+            return false;
+        }
+        img.bytes = req.size;
+        imageBytes_.fetch_add(req.size, std::memory_order_relaxed);
         img.format = format;
         img.width = w;
         img.height = h;
@@ -2566,6 +2598,7 @@ private:
         if (!img.image) return;
         // The command buffer may still reference it: release after the next flush.
         Image copy = img;
+        imageBytes_.fetch_sub(img.bytes, std::memory_order_relaxed);
         R().afterFlush_.push_back([this, copy] {
             for (auto& [k, v] : copy.views) vkDestroyImageView(vk_.device, v, nullptr);
             vkDestroyImage(vk_.device, copy.image, nullptr);
@@ -2607,11 +2640,17 @@ private:
     static constexpr VkComponentMapping kIdentity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
                                                   VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
 
+    // Marks a texture or surface used in this frame (recorder threads too, under the shared lock).
+    void touch(uint64_t& use) const {
+        std::atomic_ref<uint64_t> a(use);
+        if (a.load(std::memory_order_relaxed) != frame_) a.store(frame_, std::memory_order_relaxed);
+    }
+
     Surface* colorSurface(uint64_t addr, uint32_t w, uint32_t h, VkFormat format, uint32_t bytes) {
         auto it = colors_.find(addr);
         if (it != colors_.end()) {
             Surface& s = it->second;
-            if (s.img.width == w && s.img.height == h && s.elementBytes == bytes) return &s;
+            if (s.img.width == w && s.img.height == h && s.elementBytes == bytes) return touch(s.lastUse), &s;
             if (sharedMiss()) return nullptr;
             destroyImage(s.img);
             colors_.erase(it);
@@ -2630,6 +2669,7 @@ private:
         std::fprintf(stderr, "[gpu] render target 0x%" PRIx64 " %ux%u format %d\n", addr, w, h, int(format));
         s.addr = addr;
         s.memBytes = uint64_t(w) * h * bytes;
+        s.lastUse = frame_;
         return &(colors_[addr] = std::move(s));
     }
 
@@ -2637,7 +2677,7 @@ private:
         auto it = depths_.find(addr);
         if (it != depths_.end()) {
             Surface& s = it->second;
-            if (s.img.width == w && s.img.height == h && s.img.format == format) return &s;
+            if (s.img.width == w && s.img.height == h && s.img.format == format) return touch(s.lastUse), &s;
             if (sharedMiss()) return nullptr;
             destroyImage(s.img);
             depths_.erase(it);
@@ -2654,6 +2694,7 @@ private:
             return nullptr;
         }
         std::fprintf(stderr, "[gpu] depth buffer 0x%" PRIx64 " %ux%u\n", addr, w, h);
+        s.lastUse = frame_;
         return &(depths_[addr] = std::move(s));
     }
 
@@ -4510,6 +4551,7 @@ private:
         const uint32_t layers = t.type() == 11 ? 6 : (t.type() == 13 || t.type() == 10) ? t.lastArray() + 1 : 1;
         const uint32_t slices = t.type() == 10 ? t.depth() : layers;
         GuestTexture& tex = textures_[{t.t[0], t.t[1], t.t[2], t.t[3] & ~0xFFFu, t.t[4], t.t[5]}];
+        tex.lastUse = frame_;
         if (tex.img.image && tex.checkedFrame == frame_) {
             R().lastTexture_ = &tex;
             return &tex;
@@ -4768,6 +4810,7 @@ private:
         uint64_t frame = ~0ull, gen = 0;
         ImageBinding b;
         VkImage sampled; // the render target it samples, if any (for feedback checks)
+        uint64_t* use = nullptr; // its texture's lastUse (evicting one moves imageGen_, so it is live while the memo is)
     };
     // Two ways of 4,096 sets: a city view resolves thousands of pairs a frame, and with 1,024
     // single entries they evicted each other.
@@ -4803,6 +4846,7 @@ private:
         const ImageMemo* m = &imageMemos_[set + 1];
         if (!memoHit(*m, t)) m = &imageMemos_[set];
         if (!memoHit(*m, t) || m->sampled) return false;
+        if (m->use) touch(*m->use);
         b = m->b;
         return true;
     }
@@ -4814,17 +4858,20 @@ private:
             if (!memoHit(*m, t)) m = &imageMemos_[set];
             if (!memoHit(*m, t)) return sharedMiss(), ImageBinding{};
             if (m->sampled) R().sampledSurfaces_.push_back(m->sampled);
+            if (m->use) touch(*m->use);
             return m->b;
         }
         if (t.storage || trace_) return resolveImageUncached(t); // storage: marks the target written
         ImageMemo& m = imageMemo(t);
         if (memoHit(m, t)) {
             if (m.sampled) R().sampledSurfaces_.push_back(m.sampled);
+            if (m.use) touch(*m.use);
             return m.b;
         }
         const size_t before = R().sampledSurfaces_.size();
         ++R().prof_.imageMisses;
         R().lastTexture_ = nullptr;
+        R().boundUse_ = nullptr;
         const ImageBinding b = resolveImageUncached(t);
         std::copy(t.t, t.t + 8, m.t);
         std::copy(t.s, t.s + 4, m.s);
@@ -4832,6 +4879,7 @@ private:
         m.frame = frame_;
         m.gen = imageGen_;
         m.b = b;
+        m.use = R().boundUse_;
         m.sampled = R().sampledSurfaces_.size() > before ? R().sampledSurfaces_.back() : VK_NULL_HANDLE;
         // A settled texture's binding holds until the sweep finds it changed (which moves imageGen_).
         m.persist = !m.sampled && R().lastTexture_ && R().lastTexture_->settled;
@@ -4848,6 +4896,7 @@ private:
         const VkComponentMapping swz = t.storage ? kIdentity : swizzle(t.dstSel());
 
         if (auto it = depths_.find(addr); it != depths_.end()) {
+            touch(it->second.lastUse);
             Image& img = it->second.img;
             R().sampledSurfaces_.push_back(img.image);
             b.view = view(img, img.format == VK_FORMAT_D32_SFLOAT_S8_UINT ? img.format : img.format, vt,
@@ -4878,6 +4927,7 @@ private:
                                           bytesPerElement(t.dataFormat()) == it->second.elementBytes &&
                                           !cpuWritten(it->second, t)) {
             Surface& s = it->second;
+            touch(s.lastUse);
             R().sampledSurfaces_.push_back(s.img.image);
             b.view = view(s.img, format, vt == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
                           swz);
@@ -4900,6 +4950,7 @@ private:
             // the placeholder without a warning.
             if (t.dataFormat() || addr || (t.t[3] & 0x0FFFFFFF)) warnOnce("texture format " + std::to_string(t.dataFormat()) + "/" + std::to_string(nf) + " unsupported");
         } else if (GuestTexture* g = guestTexture(t, format)) {
+            R().boundUse_ = &g->lastUse;
             b.view = view(g->img, format, vt, swz, 0, t.baseLevel(), t.lastLevel() + 1 - std::min(t.baseLevel(), t.lastLevel()));
         }
         if (!b.view) b.view = dummyView(vt, kind, false);
@@ -6086,6 +6137,103 @@ void main() {
         }
         sweepCv_.notify_one();
     }
+    // ---- image eviction ------------------------------------------------------------------------
+    // Every T# the game binds keeps an image, and every address it renders to a surface, so a long
+    // session kept piling them up: a tester's 5 GB card ran out after ~2 hours of play (vkAllocateMemory
+    // failed, then the device was lost). At a frame's end, once images take more than their budget
+    // (or an allocation failed), the ones used longest ago go, after the GPU is done with them
+    // (destroyImage). Textures unused for a while are uploaded again at their next use; a surface
+    // reads as its memory then, so only ones unused for longer go. Textures unused for minutes go
+    // whatever the budget, checked every few seconds.
+    static constexpr uint64_t kTexIdleFrames = 120, kSurfaceIdleFrames = 1800, kTexStaleFrames = 18000;
+    std::atomic<uint64_t> imageBytes_{0};    // every Image's memory (createImage, destroyImage)
+    std::atomic<bool> vramPressure_{false};  // an image allocation failed since the last frame's end
+    uint64_t evictNoneFrame_ = 0;
+    uint64_t imageBudget() const {
+        // Half of the largest device-local heap (VRAM copies take up to a quarter): ~2.5 GB on a 5 GB card.
+        static const uint64_t budget = [&] {
+            VkDeviceSize heap = 0;
+            for (uint32_t i = 0; i < vk_.mem.memoryHeapCount; ++i)
+                if (vk_.mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) heap = std::max(heap, vk_.mem.memoryHeaps[i].size);
+            if (const char* e = getenv("LPN_IMAGE_BUDGET_MB")) return uint64_t(std::max(64, std::atoi(e))) << 20;
+            return std::max<uint64_t>(heap / 2, 512ull << 20);
+        }();
+        return budget;
+    }
+    void evictImages() { // m_ held exclusively, after the frame's flush
+        const bool pressure = vramPressure_.exchange(false, std::memory_order_relaxed);
+        const uint64_t bytes = imageBytes_.load(std::memory_order_relaxed);
+        const bool over = bytes > imageBudget();
+        const bool stale = frame_ % 300 == 0;
+        if (!pressure && !over && !stale) return;
+        // Over budget with nothing idle enough: not scanned again for a second.
+        if (!pressure && !stale && evictNoneFrame_ + 60 > frame_ && evictNoneFrame_) return;
+        // Settled textures are in the sweep's lists: those are left alone while the sweep runs.
+        std::unique_lock sweepLock(sweepMutex_);
+        if (!sweepDone_) return;
+        // The target: well under the budget (so this does not run every frame), or a quarter less
+        // than now when an allocation failed.
+        const uint64_t target = pressure ? std::min(bytes / 4 * 3, imageBudget() / 10 * 8)
+                                : over   ? imageBudget() / 10 * 8
+                                         : ~0ull;
+        const uint64_t texIdle = pressure ? 3 : kTexIdleFrames, surfIdle = pressure ? 300 : kSurfaceIdleFrames;
+        struct Victim {
+            uint64_t use;
+            const std::array<uint32_t, 6>* tex; // or a surface:
+            uint64_t addr;
+            bool depth;
+        };
+        std::vector<Victim> victims;
+        for (auto& [k, t] : textures_)
+            if (t.lastUse + (target == ~0ull ? kTexStaleFrames : texIdle) < frame_) victims.push_back({t.lastUse, &k, 0, false});
+        if (target != ~0ull)
+            for (auto* m : {&colors_, &depths_})
+                for (auto& [a, sf] : *m) {
+                    const uint64_t use = std::max(sf.lastUse, sf.writtenFrame);
+                    if (use + surfIdle < frame_) victims.push_back({use, nullptr, a, m == &depths_});
+                }
+        if (victims.empty()) {
+            if (target != ~0ull) evictNoneFrame_ = frame_;
+            if (pressure || over)
+                std::fprintf(stderr, "[gpu] images take %" PRIu64 " MB (budget %" PRIu64 " MB): none unused long enough to free\n",
+                             bytes >> 20, imageBudget() >> 20);
+            return;
+        }
+        std::sort(victims.begin(), victims.end(), [](const Victim& a, const Victim& b) { return a.use < b.use; });
+        std::unordered_set<const GuestTexture*> gone;
+        size_t texs = 0, surfs = 0;
+        for (const Victim& v : victims) {
+            if (target != ~0ull && imageBytes_.load(std::memory_order_relaxed) <= target) break;
+            if (v.tex) {
+                auto it = textures_.find(*v.tex);
+                gone.insert(&it->second);
+                destroyImage(it->second.img);
+                textures_.erase(it);
+                ++texs;
+            } else {
+                auto& m = v.depth ? depths_ : colors_;
+                auto it = m.find(v.addr);
+                destroyImage(it->second.img);
+                m.erase(it);
+                ++surfs;
+            }
+        }
+        if (!gone.empty()) {
+            std::erase_if(sweptTextures_, [&](GuestTexture* t) { return gone.count(t) != 0; });
+            std::erase_if(sweep_, [&](const SweepItem& it) { return it.tex && gone.count(it.tex) != 0; });
+        }
+        sweepLock.unlock();
+        // Remembered bindings (and fastDraw's) may name a freed image.
+        ++imageGen_, ++R().prof_.imageGens;
+        rec0_.lastTexture_ = pro_.lastTexture_ = nullptr;
+        for (auto& w : workerRecs_) w->lastTexture_ = nullptr;
+        if (texs + surfs >= 16 || surfs || pressure || over)
+            std::fprintf(stderr, "[gpu] frame %" PRIu64 ": freed %zu textures and %zu render targets unused for a while; images now take %" PRIu64
+                                 " MB (budget %" PRIu64 " MB)%s\n",
+                         frame_, texs, surfs, imageBytes_.load(std::memory_order_relaxed) >> 20, imageBudget() >> 20,
+                         pressure ? ", after an allocation failed" : "");
+    }
+
     void sweepThread() {
         profile::nameThread("lpn-sweep");
         std::vector<SweepItem> items;
@@ -8349,6 +8497,7 @@ private:
         std::array<uint64_t, kFastSlots> slotUsed_{}; // fastSlots_[i].used, for the LRU scan
         uint64_t fastUse_ = 0;
         GuestTexture* lastTexture_ = nullptr; // the one resolveImageUncached bound, if any
+        uint64_t* boundUse_ = nullptr;        // that texture's lastUse (for the memo of its binding)
         std::vector<std::unique_ptr<DrawAnalysis>> returned_; // used analyses to hand back
         struct {
             uint64_t draws = 0, dispatches = 0;
