@@ -308,11 +308,10 @@ struct Box {
 };
 
 // Main screen
-const Box kPlay{kW - 340, kH - 196, 300, 64};
-const Box kSettings{kW - 340, kH - 116, 300, 52};
-const Box kSkip{40, kH - 64, 300, 32};
-const Box kUpdate{kW - 260, 24, 236, 40};
-const Box kGear{kW - 84, kH - 56, 44, 44};
+const Box kPlay{kW - 300, kH - 172, 260, 52};
+const Box kSettings{kW - 300, kH - 108, 260, 40};
+const Box kUpdate{kW - 224, 24, 200, 34};
+const Box kGear{kW - 84, kH - 60, 44, 44}; // the area that takes the click; the gear is drawn smaller in it
 // Settings screen
 const Box kPanel{176, 40, kW - 352, 512};
 constexpr int kRowY0 = 110, kRowH = 34;
@@ -345,15 +344,26 @@ void button(const Box& b, const std::string& label, bool focus, bool primary, bo
     textCentered(b.x + b.w / 2, b.y + (b.h - size) / 2, size, label, true);
 }
 
-void checkbox(const Box& b, const std::string& label, bool on, bool focus) {
-    const int s = b.h - 6;
-    color(0, 0, 0, 170);
-    fillR(b.x, b.y + 3, s, s, 6);
-    color(ui::kAccent.line);
-    outlineR(b.x, b.y + 3, s, s, 6, focus ? 3 : 2);
-    if (on) fillR(b.x + 6, b.y + 9, s - 12, s - 12, 3);
-    color(245, 240, 228);
-    text(b.x + s + 12, b.y + (b.h - 20) / 2, 20, label, focus);
+// A push button as the desktop draws them (the Settings window's Set To Default, Ok and Cancel):
+// light grey with a thin grey border and slightly rounded corners, the label in the desktop's UI
+// font; blue when focused or under the mouse. The default button (Play) has a blue border.
+void nativeButton(const Box& b, const std::string& label, bool focus, bool isDefault, bool enabled = true) {
+    SDL_SetRenderDrawBlendMode(gRen, SDL_BLENDMODE_BLEND);
+    // A faint shadow, so the light button sits on the art rather than floating over it.
+    color(0, 0, 0, 70);
+    fillR(b.x, b.y + 2, b.w, b.h, 5);
+    if (!enabled) color(244, 244, 244);
+    else if (focus) color(224, 238, 249);
+    else color(253, 253, 253);
+    fillR(b.x, b.y, b.w, b.h, 4);
+    if (!enabled) color(214, 214, 214);
+    else if (focus || isDefault) color(0, 120, 215);
+    else color(208, 208, 208);
+    outlineR(b.x, b.y, b.w, b.h, 4, focus && enabled ? 2 : 1);
+    const int size = std::max(14, b.h * 2 / 5);
+    if (enabled) color(26, 26, 26);
+    else color(160, 160, 160);
+    font::drawUi(gRen, b.x + (b.w - font::widthUi(label, size)) / 2, b.y + (b.h - size) / 2, size, label);
 }
 
 // A gear, white on clear, rasterised once at the size it is drawn: eight teeth round a ring.
@@ -395,16 +405,19 @@ SDL_Texture* gearTexture(int size) {
     return gGear;
 }
 
+// The gear alone, no box round it: light, and the accent colour when focused.
 void gearButton(const Box& b, bool focus) {
-    color(0, 0, 0, focus ? 200 : 150);
-    fillR(b.x, b.y, b.w, b.h, 8);
-    color(ui::kAccent.line);
-    outlineR(b.x, b.y, b.w, b.h, 8, focus ? 3 : 1);
-    const int s = b.h * 6 / 10;
+    const int s = b.h * 3 / 4;
     if (SDL_Texture* t = gearTexture(s)) {
+        SDL_Rect dst{b.x + (b.w - s) / 2, b.y + (b.h - s) / 2, s, s};
+        // A soft dark copy under it keeps it readable on light art.
+        SDL_SetTextureColorMod(t, 0, 0, 0);
+        SDL_SetTextureAlphaMod(t, 140);
+        SDL_Rect shadow{dst.x + 1, dst.y + 2, s, s};
+        SDL_RenderCopy(gRen, t, nullptr, &shadow);
         const ui::Rgb c = focus ? ui::kAccent.bright : ui::Rgb{245, 240, 228};
         SDL_SetTextureColorMod(t, c.r, c.g, c.b);
-        SDL_Rect dst{b.x + (b.w - s) / 2, b.y + (b.h - s) / 2, s, s};
+        SDL_SetTextureAlphaMod(t, 255);
         SDL_RenderCopy(gRen, t, nullptr, &dst);
     }
 }
@@ -645,14 +658,13 @@ void drawNoGameDialog() {
 
 void drawMain(int focus) {
     drawBackground(false);
-    button(kPlay, "Play", focus == 0, true, canPlay());
-    button(kSettings, "Settings", focus == 1, false);
-    checkbox(kSkip, "Skip intro logos", gS.skipIntro, focus == 2);
+    nativeButton(kPlay, "Play", focus == 0, true, canPlay());
+    nativeButton(kSettings, "Settings", focus == 1, false);
     // Check for updates, top right, with what it found under it.
     const launcher::UpdateStatus u = launcher::updateStatus();
     const bool busy = u.state == launcher::UpdateState::Checking || u.state == launcher::UpdateState::Downloading;
     const bool canApply = u.state == launcher::UpdateState::Available && launcher::canSelfUpdate();
-    button(kUpdate, canApply ? "Update to " + u.latest : "Check for updates", focus == 3, canApply, !busy);
+    nativeButton(kUpdate, canApply ? "Update to " + u.latest : "Check for Updates", focus == 2, canApply, !busy);
     SDL_SetRenderDrawBlendMode(gRen, SDL_BLENDMODE_BLEND);
     const std::string line = u.message.empty() ? std::string("Version ") + launcher::version() : u.message;
     const std::string fitted = font::fit(line, 16, 520);
@@ -661,7 +673,7 @@ void drawMain(int focus) {
     fillR(kUpdate.x + kUpdate.w - lw - 12, kUpdate.y + kUpdate.h + 8, lw + 12, 24, 6);
     color(245, 240, 228, 230);
     text(kUpdate.x + kUpdate.w - lw - 6, kUpdate.y + kUpdate.h + 12, 16, fitted);
-    gearButton(kGear, focus == 4);
+    gearButton(kGear, focus == 3);
     padHints(40, 24, "Quit");
     std::string status = gStatus;
     if (gUnpack->state == Unpack::Working) {
@@ -958,7 +970,7 @@ int main(int argc, char** argv) {
     SDL_GameController* pad = nullptr;
 
     enum Screen { Main, Settings, Tools, Versions } screen = Main;
-    // main: 0 play, 1 settings, 2 skip, 3 update, 4 tools; settings: rows, defaults, back;
+    // main: 0 play, 1 settings, 2 update, 3 tools; settings: rows, defaults, back;
     // tools: 0 unpack, 1 update from .pkg, 2 update from folder, 3 back; versions: rows, back
     int focus = canPlay() ? 0 : 1;
     // For docs: "main.bmp", "settings:x.bmp", "tools:x.bmp" or "versions:x.bmp"
@@ -1007,12 +1019,11 @@ int main(int argc, char** argv) {
         if (screen == Main) {
             if (focus == 0 && canPlay()) return play_();
             if (focus == 1) return openSettings(), false;
-            if (focus == 2) gS.skipIntro = !gS.skipIntro, save();
-            if (focus == 3) updateButton();
-            if (focus == 4) screen = Tools, focus = 0;
+            if (focus == 2) updateButton();
+            if (focus == 3) screen = Tools, focus = 0;
         } else if (screen == Tools) {
             if (focus < 3) toolButton(focus);
-            else screen = Main, focus = 4;
+            else screen = Main, focus = 3;
         } else if (screen == Versions) {
             if (focus < versionCount()) return pickVersion(focus);
             screen = Main, focus = 0;
@@ -1023,11 +1034,11 @@ int main(int argc, char** argv) {
     };
     auto back = [&] {
         if (screen == Settings) screen = Main, focus = 1;
-        else if (screen == Tools) screen = Main, focus = 4;
+        else if (screen == Tools) screen = Main, focus = 3;
         else if (screen == Versions) screen = Main, focus = 0;
     };
     auto move = [&](int d) {
-        const int n = screen == Settings ? kRowCount + 2 : screen == Tools ? 4 : screen == Versions ? versionCount() + 1 : 5;
+        const int n = screen == Settings ? kRowCount + 2 : screen == Tools ? 4 : screen == Versions ? versionCount() + 1 : 4;
         focus = ((focus + d) % n + n) % n;
         if (screen == Main && focus == 0 && !canPlay()) focus = (focus + d + n) % n;
     };
@@ -1069,9 +1080,8 @@ int main(int argc, char** argv) {
                 if (screen == Main) {
                     if (kPlay.in(x, y) && canPlay()) focus = 0;
                     else if (kSettings.in(x, y)) focus = 1;
-                    else if (kSkip.in(x, y)) focus = 2;
-                    else if (kUpdate.in(x, y)) focus = 3;
-                    else if (kGear.in(x, y)) focus = 4;
+                    else if (kUpdate.in(x, y)) focus = 2;
+                    else if (kGear.in(x, y)) focus = 3;
                 } else if (screen == Tools) {
                     for (int b = 0; b < 3; ++b)
                         if (kToolButtons[b].in(x, y)) focus = b;
@@ -1091,13 +1101,12 @@ int main(int argc, char** argv) {
                 if (screen == Main) {
                     if (kPlay.in(x, y) && canPlay()) start = play_();
                     else if (kSettings.in(x, y)) fromPad = false, openSettings();
-                    else if (kSkip.in(x, y)) gS.skipIntro = !gS.skipIntro, save();
                     else if (kUpdate.in(x, y)) updateButton();
                     else if (kGear.in(x, y)) screen = Tools, focus = 0;
                 } else if (screen == Tools) {
                     for (int b = 0; b < 3; ++b)
                         if (kToolButtons[b].in(x, y)) toolButton(b);
-                    if (kToolsBack.in(x, y)) screen = Main, focus = 4;
+                    if (kToolsBack.in(x, y)) screen = Main, focus = 3;
                 } else if (screen == Versions) {
                     for (int r = 0; r < versionCount(); ++r)
                         if (rowBox(r).in(x, y)) start = pickVersion(r);

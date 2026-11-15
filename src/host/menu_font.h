@@ -20,5 +20,11 @@ int width(const std::string& s, int size, bool bold = false);
 // s, cut short with "..." so it is at most maxW pixels wide.
 std::string fit(const std::string& s, int size, int maxW, bool bold = false);
 
+// The same in the desktop's own UI font (Segoe UI on Windows, fontconfig's "sans-serif" on Linux,
+// or LPN_UI_FONT), for controls drawn to look like the desktop's. Where that font is missing or
+// cannot be read, the menu font above, with all its fallbacks (SteamOS 3 included).
+void drawUi(SDL_Renderer* ren, int x, int y, int size, const std::string& s);
+int widthUi(const std::string& s, int size);
+
 } // namespace host::menufont
 #endif

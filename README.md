@@ -35,7 +35,7 @@ and known issues.
   On the title it also holds Download Info, whose title row makes room for EXIT GAME.
 - **Exit Game:** in the pause menu under Return to Title (with a Yes/No prompt) and on the title
   menu.
-- **Launcher:** an AppImage with Play, Settings, Skip intro logos and a .pkg unpacker.
+- **Launcher:** an AppImage with Play, Settings, Check for Updates and a .pkg unpacker.
 - **Sharper image:** full texture mipmaps, anisotropic filtering and smooth scaling to the window.
 - **Performance:** draws recorded on several threads, shader analysis ahead of the frame, and a
   pipeline cache that removes stutter on later runs.
@@ -140,8 +140,10 @@ different files inside one archive both apply. The log lists the mods found at s
 `scripts/make-appimage.sh "<install folder>"` packs the launcher, `lpn-host` and `aerolib.csv` into
 `Lost_Paradise-x86_64.AppImage` (it downloads appimagetool the first time) and copies it there.
 The launcher has **Play**, **Settings** (the in-game PC Settings: the same `lpn-display.ini`, so a
-change in one shows in the other) and a **Skip intro logos** box, which runs the boot as fast as
-it draws until the title screen.
+change in one shows in the other) and **Check for Updates**, drawn as the desktop's own buttons in
+its UI font (Segoe UI on Windows, fontconfig's sans-serif on Linux, else the shipped Liberation
+Sans, as on SteamOS 3). Skip Intro Logos is in Settings, on the Extras tab. The gear at the bottom
+right opens Tools.
 
 Settings opens a separate window of the desktop's own controls, in tabs (Display, Graphics,
 Controller, Extras), with **Set To Default**, **Ok** and **Cancel**: Win32 controls on Windows, GTK 3
