@@ -140,8 +140,9 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     // DLSS's Vulkan extension sets up CUDA, which needs address space the guest's reservation (at
     // the first module load) would take: make the device first (gpu/renderer.h prepareVulkan).
-    host::loadDisplaySettings();
-    if (gpu && host::displaySettings().upscaler == host::Upscaler::Dlss && host::render::upscale::builtIn(host::Upscaler::Dlss)) {
+    // Whatever upscaler is chosen: the device is made with Streamline's additions either way (the
+    // F11 menu can switch to DLSS in game), and made after the reservation they crash (#111).
+    if (gpu && host::render::upscale::builtIn(host::Upscaler::Dlss)) {
         // The guest's thread pointer needs one of the TEB's 64 inline TLS slots: take it before
         // the driver's DLLs take theirs.
         host::guestThreadPointerSlot();

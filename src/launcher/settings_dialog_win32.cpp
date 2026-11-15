@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <commctrl.h>
 
+#include <cstring>
 #include <string>
 
 namespace launcher::settings {
@@ -54,6 +55,20 @@ void fill(const Row& r, const host::DisplaySettings& s) {
     SendMessageW(r.control, CB_SETCURSEL, WPARAM(r.option->get(s)), 0);
 }
 
+// Greys out each row whose `needs` row is at its first choice (Off).
+void updateEnabled(const State& st) {
+    for (const Row& r : st.rows) {
+        if (!r.option->needs) continue;
+        bool on = true;
+        for (const Row& o : st.rows)
+            if (o.tab == r.tab && !std::strcmp(o.option->label, r.option->needs))
+                on = (o.option->checkbox() ? SendMessageW(o.control, BM_GETCHECK, 0, 0) == BST_CHECKED
+                                           : SendMessageW(o.control, CB_GETCURSEL, 0, 0) > 0);
+        if (r.label) EnableWindow(r.label, on);
+        EnableWindow(r.control, on);
+    }
+}
+
 void showTab(State& st, int tab) {
     for (const Row& r : st.rows) {
         if (r.label) ShowWindow(r.label, r.tab == tab ? SW_SHOW : SW_HIDE);
@@ -74,8 +89,11 @@ LRESULT CALLBACK wndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         if (!st) break;
         if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) st->result = LOWORD(wp);
-        else if (LOWORD(wp) == kDefaultsId)
+        else if (LOWORD(wp) == kDefaultsId) {
             for (const Row& r : st->rows) fill(r, host::DisplaySettings{});
+            updateEnabled(*st);
+        } else if (HIWORD(wp) == CBN_SELCHANGE || HIWORD(wp) == BN_CLICKED)
+            updateEnabled(*st);
         return 0;
     case WM_NOTIFY:
         if (st && reinterpret_cast<NMHDR*>(lp)->idFrom == kTabId && reinterpret_cast<NMHDR*>(lp)->code == TCN_SELCHANGE)
@@ -252,6 +270,7 @@ Result show(host::DisplaySettings& s, void* parent, const Image& art, const std:
     const int first = gLastTab < tabCount ? gLastTab : 0;
     SendMessageW(st.tabCtl, TCM_SETCURSEL, WPARAM(first), 0);
     showTab(st, first);
+    updateEnabled(st);
 
     if (owner) EnableWindow(owner, FALSE);
     ShowWindow(st.wnd, SW_SHOW);

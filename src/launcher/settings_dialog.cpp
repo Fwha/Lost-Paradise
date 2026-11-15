@@ -89,7 +89,8 @@ const std::vector<Tab> kTabs = {
           [](const DisplaySettings& s) { return int(s.upscaleQuality); },
           [](DisplaySettings& s, int i) {
               s.upscaleQuality = host::UpscaleQuality(std::clamp(i, 0, host::kUpscaleQualities - 1));
-          }},
+          },
+          "Upscaler"},
          {"Anisotropic Filtering", "Keep textures sharp at a glancing angle, such as the ground ahead. Up to what your GPU supports.",
           false, [](const DisplaySettings&) { return names(host::kAnisoNames, host::kAnisoCount); }, anisoIndex,
           [](DisplaySettings& s, int i) { s.anisotropy = host::kAnisoChoices[std::clamp(i, 0, host::kAnisoCount - 1)]; }},

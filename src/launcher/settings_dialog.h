@@ -24,6 +24,9 @@ struct Option {
     std::vector<std::string> (*choices)(const host::DisplaySettings&);
     int (*get)(const host::DisplaySettings&);
     void (*set)(host::DisplaySettings&, int);
+    // The label of another row on the tab that this one only matters with: greyed out while that
+    // row is at its first choice (Upscale Quality with the Upscaler Off).
+    const char* needs = nullptr;
     bool checkbox() const { return !choices; }
 };
 
