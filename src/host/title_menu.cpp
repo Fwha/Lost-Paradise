@@ -43,16 +43,15 @@ constexpr char kExitDesc[] = "Close the game.";
 constexpr uint64_t kPcItem = kKind | 1ull << 32, kExitItem = kKind | 2ull << 32;
 
 // DOWNLOAD INFO (kind 4) leaves the title for PC SETTINGS and EXIT GAME; the PC SETTINGS screen
-// opened from the title gets a Download Info row instead, which closes that screen as Back does
-// and then starts the title's DOWNLOAD INFO state (0xb4ca80, the kind's in the table at
-// 0x246bc00) as confirming its row did: from the title's menu input (0xb43800, title vtable
-// +0x80), once its own checks pass (its vtable +0x70 and 0x811650 on +0x430), the state at +0x218
-// (+0x228 set), the kind at +0x4850 and +0x438 set.
+// opened from the title gets a Download Info row instead, which closes that screen as Back does.
+// The title's state for a closed settings screen (0xb4e170: it frees the screen, +0x2b0, and
+// picks the next state) is then followed by DOWNLOAD INFO's (0xb4df10, kind 4's in the table at
+// 0x246bc00), set as confirming its row did: the state at +0x218 (+0x228 set), the kind at
+// +0x4850 and +0x438 set. Anything else clears the request (a new screen, the title rebuilt).
 constexpr uint32_t kDownloadKind = 4;
-constexpr uint32_t kDownloadState = 0xb4ca80;
-constexpr uint32_t kMenuInput = 0xb43800;
-constexpr uint32_t kMenuReady = 0x811650;
-constexpr size_t kState = 0x218, kStateSet = 0x228, kBusy = 0x438, kChosenKind = 0x4850, kReadyArg = 0x430;
+constexpr uint32_t kDownloadState = 0xb4df10;
+constexpr uint32_t kScreenClosed = 0xb4e170;
+constexpr size_t kState = 0x218, kStateSet = 0x228, kBusy = 0x438, kChosenKind = 0x4850;
 constexpr char kDownloadLabel[] = "Download Info";
 constexpr char kDownloadDesc[] = "View Online Services and the download history.";
 constexpr char kDownloadOpen[] = "Open";
@@ -87,6 +86,7 @@ constexpr uint32_t kLabelId = 0, kBadgeId = 5;
 uint8_t* gEboot = nullptr;
 uint8_t* gLayout = nullptr; // the title layout, as decompressed (then loaded in place)
 uint8_t* gTitle = nullptr;  // the title sequence (the game thread's)
+std::atomic<bool> gDownloadPending{false}; // Download Info chosen: the title opens DOWNLOAD INFO
 int32_t (LPN_GUEST* gDecompress)(uint8_t*, uint32_t, const uint8_t*) = nullptr;
 void (LPN_GUEST* gBuildItems)(uint8_t*) = nullptr;
 void** (LPN_GUEST* gText)(void**, uint32_t, uint32_t) = nullptr;
@@ -138,6 +138,7 @@ void buildItems(uint8_t* self) {
     traceFirst("build items", seen);
     gBuildItems(self);
     gTitle = self;
+    gDownloadPending = false;
     int64_t& n = at<int64_t>(self, kItemCount);
     static_assert(kMaxRows <= kMaxItems);
     if (n < 0 || n > kMaxItems) return;
@@ -238,9 +239,8 @@ uint32_t (LPN_GUEST* gCancelEdit)(uint8_t*, void*) = nullptr;
 
 std::atomic<bool> gPcPending{false}; // PC SETTINGS chosen: the next screen built is ours
 std::atomic<bool> gPcTitle{false};   // and chosen on the title (it gets the Download Info row)
-std::atomic<bool> gDownloadPending{false}; // Download Info chosen: the title opens DOWNLOAD INFO
 int gDownloadRow = -1;               // the PC screen's Download Info row
-uint64_t (LPN_GUEST* gMenuInput)(uint8_t*, uint64_t, uint64_t, uint64_t) = nullptr;
+void (LPN_GUEST* gScreenClosed)(uint8_t*) = nullptr;
 // The screen's decide (vtable +0xd0) and Back (+0xd8); our screen's vtable is a copy with decide
 // replaced (screenDecide), as the pause menu does for its box.
 constexpr uint32_t kScreenDecide = 0x8b9810, kScreenBack = 0x8b9cb0;
@@ -338,23 +338,15 @@ uint32_t screenDecide(uint8_t* self, uint8_t* e) {
     return reinterpret_cast<Handler>(gEboot + kScreenDecide)(self, e);
 }
 
-uint64_t menuInput(uint8_t* self, uint64_t a, uint64_t b, uint64_t c) {
-    if (gDownloadPending) {
-        using Check = uint32_t (LPN_GUEST*)(uint8_t*);
-        const bool active = (*reinterpret_cast<Check**>(self))[0x70 / 8](self) != 0 &&
-                            reinterpret_cast<uint32_t (LPN_GUEST*)(uint32_t)>(gEboot + kMenuReady)(at<uint32_t>(self, kReadyArg)) != 0;
-        if (active) {
-            gDownloadPending = false;
-            std::fprintf(stderr, "[title] DOWNLOAD INFO\n");
-            at<uint32_t>(self, kChosenKind) = kDownloadKind;
-            at<const void*>(self, kState) = gEboot + kDownloadState;
-            at<uint64_t>(self, kState + 8) = 0;
-            at<uint64_t>(self, kStateSet) = 1;
-            at<uint32_t>(self, kBusy) = 1;
-            return 0;
-        }
-    }
-    return gMenuInput(self, a, b, c);
+void screenClosed(uint8_t* self) {
+    gScreenClosed(self);
+    if (!gDownloadPending.exchange(false)) return;
+    std::fprintf(stderr, "[title] DOWNLOAD INFO\n");
+    at<uint32_t>(self, kChosenKind) = kDownloadKind;
+    at<const void*>(self, kState) = gEboot + kDownloadState;
+    at<uint64_t>(self, kState + 8) = 0;
+    at<uint64_t>(self, kStateSet) = 1;
+    at<uint32_t>(self, kBusy) = 1;
 }
 
 void screenInit(uint8_t* self) {
@@ -363,6 +355,7 @@ void screenInit(uint8_t* self) {
     gScreenInit(self);
     const bool pc = gPcPending.exchange(false);
     const bool fromTitle = gPcTitle.exchange(false);
+    gDownloadPending = false;
     gPcScreen = pc ? self : nullptr;
     gDownloadRow = -1;
     if (!pc) return setRanges(false);
@@ -635,8 +628,8 @@ bool patchTitleMenu(Module& eboot) {
          guestEntry<&chosen>(), nullptr},
         {kAddRow, {0x48, 0x8b, 0x7f, 0x48, 0x48, 0x85, 0xff, 0x74, 0x0f, 0x85, 0xd2, 0x74, 0x0c},
          guestEntry<&addRow>(), nullptr},
-        {kMenuInput, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x48},
-         guestEntry<&menuInput>(), reinterpret_cast<void**>(&gMenuInput)},
+        {kScreenClosed, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0xbb, 0xa8, 0x02, 0x00, 0x00},
+         guestEntry<&screenClosed>(), reinterpret_cast<void**>(&gScreenClosed)},
         {kSettingsState, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0xbb, 0xa8, 0x02, 0x00, 0x00},
          guestEntry<&settingsState>(), reinterpret_cast<void**>(&gSettingsState)},
         {kScreenInit, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53},
