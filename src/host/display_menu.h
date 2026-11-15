@@ -18,6 +18,7 @@ bool displayMenuOpen();
 // choice's index; a setting none of them names (a size or cap from the ini or the command line)
 // is a last choice of its own.
 constexpr int kDisplayOptions = 5;
+constexpr int kDisplayExit = 4; // setDisplayOption(kDisplayExit, 1): exit as the menu's Exit Game does
 int displayOptionCount(int row);
 std::string displayOptionName(int row, int i);
 int displayOptionValue(int row); // a choice set but not applied yet counts
