@@ -58,9 +58,9 @@ void syncFrameClock();
 bool frameClockUncapped();
 // Whether the game's 30 fps flip rate is shown at the cap (or the monitor's rate, uncapped), at a
 // 60 or 90 cap or uncapped: on the title (its 1/30 step is then turned off), and with Uncap
-// Cutscenes in real-time cutscenes (a fixed 1/30 step, then stepped by the measured time). Never
-// with LPN_KEEP_30FPS_SCENES=1. Pre-rendered videos, like the one before the Shin fight, ask for
-// 30 fps with measured steps and no fixed step; they flash when shown faster, so they stay at 30.
+// Cutscenes in real-time cutscenes (a fixed 1/30 step is then stepped by the measured time). Never
+// with LPN_KEEP_30FPS_SCENES=1, nor while the event movie player has a video (like the one before
+// the Shin fight): those flash when shown faster, so they stay at 30.
 bool uncap30FpsScenes();
 
 // With Skip intro logos on: from boot until the title sequence starts, the game is run as fast as

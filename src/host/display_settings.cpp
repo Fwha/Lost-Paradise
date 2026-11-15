@@ -375,13 +375,38 @@ bool gStepHooks = false;            // pushStep is in place, so the title can be
 // this same float.
 bool fixedStepKept(const Clock& c) { return c.fixedOn && c.fixedDt > 1.0f / 60; }
 
-// Uncap Cutscenes: a real-time cutscene's fixed 1/30 step (outside the title) takes the measured
-// time instead, and its 30 fps flip rate is shown at the cap. Pre-rendered videos (the one before
-// the Shin fight: 0x80000002 from 0x9c455b, decoded into a 1920x1080 and two 960x540 targets) ask
-// for measured steps with no fixed step, so they keep 30 fps. The 1/20 loading step stays.
-bool cutsceneFollowsCap(const Clock& c) {
-    return gSettings.uncapCutscenes && gCapAbove30.load(std::memory_order_relaxed) && c.fixedOn &&
-           c.fixedDt == 1.0f / 30 && !titleRunning();
+// The event system's full-screen movie player (CRI Mana, data/movie/*.usm): the task at
+// 0x247e630+0x448 holds it at +0x168 (made by 0xa0fc60, started by 0xa116c0) and frees it and
+// clears the pointer when the video ends. Its state at +0x9c: 1 loading, 2 ready, 3 playing,
+// 4 stopped. Read on the game's thread as it flips (syncFrameClock).
+constexpr uint32_t kMovieTask = 0x247e630 + 0x448, kMoviePlayer = 0x168, kMovieState = 0x9c;
+std::atomic<bool> gMoviePlaying{false};
+
+bool movieNow() {
+    const uint8_t* task = *reinterpret_cast<uint8_t* const*>(gEbootText + kMovieTask);
+    if (!task) return false;
+    const uint8_t* player = *reinterpret_cast<uint8_t* const*>(task + kMoviePlayer);
+    if (!player) return false;
+    const uint32_t state = *reinterpret_cast<const uint32_t*>(player + kMovieState);
+    return state >= 1 && state <= 3;
+}
+
+void trackMovie() {
+    const bool now = movieNow();
+    if (now == gMoviePlaying.load(std::memory_order_relaxed)) return;
+    gMoviePlaying = now;
+    std::fprintf(stderr, "[step] movie %s at flip %llu\n", now ? "starts" : "ends", (unsigned long long)flipCount());
+}
+
+// Uncap Cutscenes: outside the title and while no pre-rendered video plays, an event's 30 fps
+// is shown at the cap. Real-time cutscenes ask for it either with a fixed 1/30 step (which then
+// takes the measured time) or, like the Reminisce scenes, with measured steps through the event
+// script's request 0x80000002 (0x9c44e0). Videos go through that same request (the one before
+// the Shin fight), so only the movie player tells them apart; they keep 30. The 1/20 loading step
+// stays.
+bool cutsceneFollowsCap() {
+    return gSettings.uncapCutscenes && gCapAbove30.load(std::memory_order_relaxed) && !titleRunning() &&
+           !gMoviePlaying.load(std::memory_order_relaxed);
 }
 
 constexpr uint32_t kNs60 = 16666666, kMaxFixedNs = 200000000, kMaxNs = 50000000;
@@ -399,7 +424,7 @@ extern "C" uint32_t stepNs(uint32_t measured) {
     const bool uncapped = gClockActive.load(std::memory_order_relaxed) == 2;
     if (c.overrideDt > 0) ++gSteps.override; // the clock replaces this step after the call
     if (skippingIntro()) return std::max<uint32_t>(kMaxNs, fixedStepKept(c) ? uint32_t(double(c.fixedDt) * 1e9) : 0);
-    if (fixedStepKept(c) && !cutsceneFollowsCap(c)) {
+    if (fixedStepKept(c) && !(c.fixedDt == 1.0f / 30 && cutsceneFollowsCap())) {
         ++gSteps.fixed;
         const double ns = double(c.fixedDt) * 1e9;
         return ns <= kMaxFixedNs ? uint32_t(ns) : kMaxFixedNs;
@@ -606,11 +631,11 @@ bool uncap30FpsScenes() {
     if (!gEbootText || keep30FpsScenes()) return false;
     if (titleRunning()) return titleFollowsCap();
     // Only once the host picks the clock's step, so a cutscene is never shown faster than it steps.
-    return gClockActive.load(std::memory_order_relaxed) >= 1 && cutsceneFollowsCap(clock());
+    return gClockActive.load(std::memory_order_relaxed) >= 1 && cutsceneFollowsCap();
 }
 
 void syncFrameClock() {
-    if (gEbootText) clockStats();
+    if (gEbootText) clockStats(), trackMovie();
     // Skipping the intro, the host picks every step (stepNs), whatever the cap.
     const int want = skippingIntro() ? std::max(1, gClockWanted.load()) : gClockWanted.load();
     if (gEbootText) titleStep(gClockActive == want && titleFollowsCap());
