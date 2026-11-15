@@ -42,6 +42,21 @@ constexpr char kExitDesc[] = "Close the game.";
 // game only tests for 0 (a disabled row). Ours is 2, which marks the row as EXIT GAME.
 constexpr uint64_t kPcItem = kKind | 1ull << 32, kExitItem = kKind | 2ull << 32;
 
+// DOWNLOAD INFO (kind 4) leaves the title for PC SETTINGS and EXIT GAME; the PC SETTINGS screen
+// opened from the title gets a Download Info row instead, which closes that screen as Back does
+// and then starts the title's DOWNLOAD INFO state (0xb4ca80, the kind's in the table at
+// 0x246bc00) as confirming its row did: from the title's menu input (0xb43800, title vtable
+// +0x80), once its own checks pass (its vtable +0x70 and 0x811650 on +0x430), the state at +0x218
+// (+0x228 set), the kind at +0x4850 and +0x438 set.
+constexpr uint32_t kDownloadKind = 4;
+constexpr uint32_t kDownloadState = 0xb4ca80;
+constexpr uint32_t kMenuInput = 0xb43800;
+constexpr uint32_t kMenuReady = 0x811650;
+constexpr size_t kState = 0x218, kStateSet = 0x228, kBusy = 0x438, kChosenKind = 0x4850, kReadyArg = 0x430;
+constexpr char kDownloadLabel[] = "Download Info";
+constexpr char kDownloadDesc[] = "View Online Services and the download history.";
+constexpr char kDownloadOpen[] = "Open";
+
 // The title sequence (rdi of the states above).
 constexpr size_t kItems = 0x338, kItemCount = 0x340;
 constexpr size_t kMenu = 0x168; // its list menu: (kMenu, 1) -> the rows' list, the cursor at +0x20
@@ -125,7 +140,13 @@ void buildItems(uint8_t* self) {
     gTitle = self;
     int64_t& n = at<int64_t>(self, kItemCount);
     static_assert(kMaxRows <= kMaxItems);
-    if (n < 0 || n >= kMaxRows) return;
+    if (n < 0 || n > kMaxItems) return;
+    uint64_t* items = at<uint64_t*>(self, kItems);
+    int64_t kept = 0;
+    for (int64_t i = 0; i < n; ++i)
+        if (uint32_t(items[i]) != kDownloadKind) items[kept++] = items[i];
+    n = kept;
+    if (n >= kMaxRows) return;
     at<uint64_t*>(self, kItems)[n++] = kPcItem;
     if (n < kMaxRows) at<uint64_t*>(self, kItems)[n++] = kExitItem;
 }
@@ -216,6 +237,15 @@ uint32_t (LPN_GUEST* gCommit)(uint8_t*, void*) = nullptr;
 uint32_t (LPN_GUEST* gCancelEdit)(uint8_t*, void*) = nullptr;
 
 std::atomic<bool> gPcPending{false}; // PC SETTINGS chosen: the next screen built is ours
+std::atomic<bool> gPcTitle{false};   // and chosen on the title (it gets the Download Info row)
+std::atomic<bool> gDownloadPending{false}; // Download Info chosen: the title opens DOWNLOAD INFO
+int gDownloadRow = -1;               // the PC screen's Download Info row
+uint64_t (LPN_GUEST* gMenuInput)(uint8_t*, uint64_t, uint64_t, uint64_t) = nullptr;
+// The screen's decide (vtable +0xd0) and Back (+0xd8); our screen's vtable is a copy with decide
+// replaced (screenDecide), as the pause menu does for its box.
+constexpr uint32_t kScreenDecide = 0x8b9810, kScreenBack = 0x8b9cb0;
+constexpr size_t kVtDecide = 0xd0, kVtHead = 0x10, kVtSize = 0x400, kEventKind = 0x1c;
+alignas(16) void* gScreenVtable[(kVtHead + kVtSize) / sizeof(void*)];
 uint8_t* gPcScreen = nullptr;        // the game thread's, as all below
 int gPcRows = 0;
 int32_t gOldLast[kMaxPcSettings];
@@ -233,7 +263,7 @@ void setRanges(bool pc) {
         saved = true;
     }
     for (int i = 0; i < kMaxPcSettings; ++i) {
-        const int32_t last = pc && i < gPcRows ? int32_t(gNames[i].size()) - 1 : gOldLast[i];
+        const int32_t last = pc && i < gPcRows ? int32_t(gNames[i].size()) - 1 : pc && i == gDownloadRow ? 0 : gOldLast[i];
         writeData(r + kRangeSize * kPcIds[i], &last, 4);
     }
 }
@@ -286,7 +316,45 @@ void chosen(uint8_t* self) {
     }
     std::fprintf(stderr, "[title] PC SETTINGS\n");
     gPcPending = true;
+    gPcTitle = true;
     settingsState(self);
+}
+
+// The screen's index under its cursor.
+uint32_t screenCursor(uint8_t* screen) {
+    uint8_t* list = reinterpret_cast<uint8_t* (LPN_GUEST*)(uint8_t*, uint32_t)>(gEboot + kListOf)(screen, 0);
+    using Cursor = uint32_t (LPN_GUEST*)(uint8_t*);
+    return (*reinterpret_cast<Cursor**>(list))[2](list);
+}
+
+uint32_t screenDecide(uint8_t* self, uint8_t* e) {
+    using Handler = uint32_t (LPN_GUEST*)(uint8_t*, uint8_t*);
+    if (self == gPcScreen && gDownloadRow >= 0 && at<uint32_t>(e, kEventKind) == 0 &&
+        screenCursor(self) == uint32_t(gDownloadRow)) {
+        std::fprintf(stderr, "[title] Download Info\n");
+        gDownloadPending = true;
+        return reinterpret_cast<Handler>(gEboot + kScreenBack)(self, e);
+    }
+    return reinterpret_cast<Handler>(gEboot + kScreenDecide)(self, e);
+}
+
+uint64_t menuInput(uint8_t* self, uint64_t a, uint64_t b, uint64_t c) {
+    if (gDownloadPending) {
+        using Check = uint32_t (LPN_GUEST*)(uint8_t*);
+        const bool active = (*reinterpret_cast<Check**>(self))[0x70 / 8](self) != 0 &&
+                            reinterpret_cast<uint32_t (LPN_GUEST*)(uint32_t)>(gEboot + kMenuReady)(at<uint32_t>(self, kReadyArg)) != 0;
+        if (active) {
+            gDownloadPending = false;
+            std::fprintf(stderr, "[title] DOWNLOAD INFO\n");
+            at<uint32_t>(self, kChosenKind) = kDownloadKind;
+            at<const void*>(self, kState) = gEboot + kDownloadState;
+            at<uint64_t>(self, kState + 8) = 0;
+            at<uint64_t>(self, kStateSet) = 1;
+            at<uint32_t>(self, kBusy) = 1;
+            return 0;
+        }
+    }
+    return gMenuInput(self, a, b, c);
 }
 
 void screenInit(uint8_t* self) {
@@ -294,7 +362,9 @@ void screenInit(uint8_t* self) {
     traceFirst("screen init", seen);
     gScreenInit(self);
     const bool pc = gPcPending.exchange(false);
+    const bool fromTitle = gPcTitle.exchange(false);
     gPcScreen = pc ? self : nullptr;
+    gDownloadRow = -1;
     if (!pc) return setRanges(false);
     const std::vector<PcSetting>& settings = pcSettings();
     const int n = std::min(int(settings.size()), kMaxPcSettings);
@@ -322,11 +392,31 @@ void screenInit(uint8_t* self) {
         at<uint32_t>(r, kRowValue) = v;
         self[kCommitted + kPcFields[i]] = uint8_t(v);
     }
-    at<uint32_t>(self, kRowCount) = uint32_t(n);
+    int rows = n;
+    void** vt = at<void**>(self, 0);
+    if (fromTitle && n < kMaxPcSettings && at<uint32_t>(self, kRowCap) > uint32_t(n) &&
+        vt[kVtDecide / sizeof(void*)] == gEboot + kScreenDecide) {
+        // Download Info: one name, never edited (screenDecide takes it).
+        uint8_t* r = row(self, n);
+        std::memset(r, 0, kRowSize);
+        r[kRowField] = kPcFields[n];
+        r[kRowId] = kPcIds[n];
+        at<const char*>(r, kRowLabel) = kDownloadLabel;
+        at<const char*>(r, kRowDesc) = kDownloadDesc;
+        at<const char*>(r, kRowNames) = kDownloadOpen;
+        self[kCommitted + kPcFields[n]] = 0;
+        gDownloadRow = n;
+        rows = n + 1;
+        std::memcpy(gScreenVtable, reinterpret_cast<uint8_t*>(vt) - kVtHead, sizeof(gScreenVtable));
+        void** ours = gScreenVtable + kVtHead / sizeof(void*);
+        ours[kVtDecide / sizeof(void*)] = guestEntry<&screenDecide>();
+        at<void**>(self, 0) = ours;
+    }
+    at<uint32_t>(self, kRowCount) = uint32_t(rows);
     setRanges(true);
     auto list = reinterpret_cast<uint8_t* (LPN_GUEST*)(uint8_t*, uint32_t)>(gEboot + kListOf);
     auto listSize = reinterpret_cast<void (LPN_GUEST*)(uint8_t*, uint32_t, uint32_t)>(gEboot + kListSize);
-    listSize(list(self, 0), 0xb, uint32_t(n));
+    listSize(list(self, 0), 0xb, uint32_t(rows));
 }
 
 // Keeps the rows as the settings are, which the F11 menu can change too (not while one is edited).
@@ -545,6 +635,8 @@ bool patchTitleMenu(Module& eboot) {
          guestEntry<&chosen>(), nullptr},
         {kAddRow, {0x48, 0x8b, 0x7f, 0x48, 0x48, 0x85, 0xff, 0x74, 0x0f, 0x85, 0xd2, 0x74, 0x0c},
          guestEntry<&addRow>(), nullptr},
+        {kMenuInput, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x48},
+         guestEntry<&menuInput>(), reinterpret_cast<void**>(&gMenuInput)},
         {kSettingsState, {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0xbb, 0xa8, 0x02, 0x00, 0x00},
          guestEntry<&settingsState>(), reinterpret_cast<void**>(&gSettingsState)},
         {kScreenInit, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53},
@@ -559,9 +651,17 @@ bool patchTitleMenu(Module& eboot) {
          guestEntry<&cancelEdit>(), reinterpret_cast<void**>(&gCancelEdit)},
     };
     uint8_t* base = eboot.base();
+    // The screen's decide and Back, called as they are from our copy of its vtable.
+    static const uint8_t kDecide[] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x8b, 0x4e, 0x1c, 0x48, 0x89, 0xfb};
+    static const uint8_t kBack[] = {0x8b, 0x4e, 0x1c, 0x83, 0xf9, 0x01, 0x74, 0x27, 0x31, 0xc0, 0x85, 0xc9};
+    if (std::memcmp(base + kScreenDecide, kDecide, sizeof(kDecide)) != 0 ||
+        std::memcmp(base + kScreenBack, kBack, sizeof(kBack)) != 0) {
+        std::fprintf(stderr, "[title] unexpected eboot code at the settings screen: not patched\n");
+        return false;
+    }
     if (!installHooks(base, hooks, std::size(hooks), "title")) return false;
     gEboot = base;
-    std::fprintf(stderr, "[title] PC SETTINGS and EXIT GAME rows on the title menu\n");
+    std::fprintf(stderr, "[title] PC SETTINGS and EXIT GAME rows (DOWNLOAD INFO in PC SETTINGS)\n");
     return true;
 }
 
