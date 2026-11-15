@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 
 #include <cstdio>
+#include <cstring>
 
 namespace launcher::settings {
 
@@ -58,6 +59,7 @@ using gboolean = int;
     X(void, gtk_widget_set_tooltip_text, (W, const char*))                                                 \
     X(void, gtk_widget_set_size_request, (W, int, int))                                                    \
     X(void, gtk_widget_set_hexpand, (W, gboolean))                                                         \
+    X(void, gtk_widget_set_sensitive, (W, gboolean))                                                       \
     X(void, gtk_widget_set_margin_start, (W, int))                                                         \
     X(void, gtk_widget_set_margin_end, (W, int))                                                           \
     X(void, gtk_widget_set_margin_top, (W, int))                                                           \
@@ -112,8 +114,31 @@ constexpr int kBannerW = 600, kBannerH = 80;
 
 struct Row {
     const Option* option;
-    W control; // a GtkComboBoxText or a GtkCheckButton
+    W control;          // a GtkComboBoxText or a GtkCheckButton
+    W label = nullptr;  // a drop-down's label
+    const Tab* tab = nullptr;
 };
+
+struct Rows {
+    const Gtk* g;
+    std::vector<Row> rows;
+};
+
+// Greys out each row whose `needs` row is at its first choice (Off).
+void updateEnabled(const Rows& rs) {
+    const Gtk& g = *rs.g;
+    for (const Row& r : rs.rows) {
+        if (!r.option->needs) continue;
+        bool on = true;
+        for (const Row& o : rs.rows)
+            if (o.tab == r.tab && !std::strcmp(o.option->label, r.option->needs))
+                on = o.option->checkbox() ? g.gtk_toggle_button_get_active(o.control) != 0
+                                          : g.gtk_combo_box_get_active(o.control) > 0;
+        if (r.label) g.gtk_widget_set_sensitive(r.label, on);
+        g.gtk_widget_set_sensitive(r.control, on);
+    }
+}
+void onChanged(W, void* rows) { updateEnabled(*static_cast<const Rows*>(rows)); }
 
 void fill(const Gtk& g, const Row& r, const host::DisplaySettings& s) {
     if (r.option->checkbox()) {
@@ -168,7 +193,8 @@ Result show(host::DisplaySettings& s, void*, const Image& art, const std::functi
     g.gtk_widget_set_margin_top(notebook, 10);
     g.gtk_box_pack_start(content, notebook, true, true, 0);
 
-    std::vector<Row> rows;
+    Rows rs{&g, {}};
+    std::vector<Row>& rows = rs.rows;
     for (const Tab& t : tabs()) {
         W page = g.gtk_box_new(kVertical, 12);
         g.gtk_widget_set_size_request(page, kBannerW - 34, 300);
@@ -182,12 +208,12 @@ Result show(host::DisplaySettings& s, void*, const Image& art, const std::functi
         g.gtk_box_pack_start(page, grid, false, false, 0);
         int y = 0;
         for (const Option& o : t.options) {
-            W control;
+            W control, label = nullptr;
             if (o.checkbox()) {
                 control = g.gtk_check_button_new_with_label(o.label);
                 g.gtk_grid_attach(grid, control, 1, y, 1, 1);
             } else {
-                W label = g.gtk_label_new(o.label);
+                label = g.gtk_label_new(o.label);
                 g.gtk_label_set_xalign(label, 0);
                 g.gtk_widget_set_tooltip_text(label, o.tip);
                 g.gtk_grid_attach(grid, label, 0, y, 1, 1);
@@ -196,7 +222,7 @@ Result show(host::DisplaySettings& s, void*, const Image& art, const std::functi
                 g.gtk_grid_attach(grid, control, 1, y, 1, 1);
             }
             g.gtk_widget_set_tooltip_text(control, o.tip);
-            rows.push_back({&o, control});
+            rows.push_back({&o, control, label, &t});
             fill(g, rows.back(), s);
             ++y;
         }
@@ -219,6 +245,12 @@ Result show(host::DisplaySettings& s, void*, const Image& art, const std::functi
     g.gtk_dialog_add_button(dialog, "Ok", kOk);
     g.gtk_dialog_add_button(dialog, "Cancel", kCancel);
     g.gtk_dialog_set_default_response(dialog, kOk);
+
+    // Connected once the rows are all made (the vector no longer grows) and filled.
+    for (const Row& r : rows)
+        g.g_signal_connect_data(r.control, r.option->checkbox() ? "toggled" : "changed",
+                                reinterpret_cast<void (*)()>(&onChanged), &rs, nullptr, 0);
+    updateEnabled(rs);
 
     int response = 0;
     g.g_signal_connect_data(dialog, "response", reinterpret_cast<void (*)()>(&onResponse), &response, nullptr, 0);
