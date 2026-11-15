@@ -10,12 +10,10 @@
 //  - its description (text table 7, row 8) is swapped for one of ours.
 //  - its confirm state (0xb4f090) opens the game's settings screen as SETTINGS does, with the
 //    rows of pc_settings.h (the F11 menu's settings) and the menu label as its header.
-// "EXIT GAME" is a second kind-7 row after it (marked by its item's enabled word, 2): a 9th
-// frame per label slot shows its label (rect 13, drawn from the letters of SETTINGS, NEW GAME
-// and CARRYOVER's V in another empty band of the atlas), its description is ours too, and
-// confirming it exits the game as the F11 menu's Exit Game does. The title has room for six
-// rows (the layout's row anchors), so the two are added only while there is room: both after the
-// game's 2 rows, PC SETTINGS alone after its usual 5, neither after the 6 of New Game+.
+// DOWNLOAD INFO (kind 4) is taken off the title, so PC SETTINGS fits after the New Game+ menu's
+// six rows too (the layout places six); the PC SETTINGS screen opened from the title gets a
+// Download Info row that opens DOWNLOAD INFO, and an Exit Game row that exits the game as the F11
+// menu's Exit Game does.
 // LPN_PC_SETTINGS=0 leaves the title menu as the game's.
 #pragma once
 

@@ -32,9 +32,9 @@ and known issues.
 - **PC Settings:** these options from the F11 menu, from a PC SETTINGS entry in the title
   and pause menus, or from the launcher. In game it lists only what takes effect right away;
   Resolution, Aspect Ratio, Upscale Quality and the other next-start options are in the launcher.
-  On the title it also holds Download Info, whose title row makes room for EXIT GAME.
-- **Exit Game:** in the pause menu under Return to Title (with a Yes/No prompt) and on the title
-  menu.
+  On the title it also holds Download Info (taken off the title menu) and Exit Game.
+- **Exit Game:** in the pause menu under Return to Title (with a Yes/No prompt) and in PC Settings
+  on the title.
 - **Launcher:** an AppImage with Play, Settings, Check for Updates and a .pkg unpacker.
 - **Sharper image:** full texture mipmaps, anisotropic filtering and smooth scaling to the window.
 - **Performance:** draws recorded on several threads, shader analysis ahead of the frame, and a
