@@ -50,10 +50,13 @@ constexpr uint32_t kScreenClosed = 0xb4e170;
 constexpr size_t kState = 0x218, kStateSet = 0x228, kBusy = 0x438, kChosenKind = 0x4850;
 constexpr char kDownloadLabel[] = "Download Info";
 constexpr char kDownloadDesc[] = "View Online Services and the download history.";
-constexpr char kOpen[] = "Open"; // the one value of either row
-// And an Exit Game row, which exits as the F11 menu's Exit Game does.
+constexpr char kOpen[] = "Open"; // Download Info's one value
+// And an Exit Game row, a No/Yes choice (No shown first): committing Yes exits as the F11 menu's
+// Exit Game does. The settings screen opens no boxes of its own, so the pause menu's Yes/No box is
+// not used here.
 constexpr char kExitLabel[] = "Exit Game";
-constexpr char kExitDesc[] = "Close the game.";
+constexpr char kExitDesc[] = "Choose Yes and confirm to close the game.";
+constexpr char kNo[] = "No", kYes[] = "Yes";
 
 // The title sequence (rdi of the states above).
 constexpr size_t kItems = 0x338, kItemCount = 0x340;
@@ -197,7 +200,8 @@ void setRanges(bool pc) {
     for (int i = 0; i < kMaxPcSettings; ++i) {
         int32_t last = gOldLast[i];
         if (pc && i < gPcRows) last = int32_t(gNames[i].size()) - 1;
-        else if (pc && (i == gDownloadRow || i == gExitRow)) last = 0;
+        else if (pc && i == gDownloadRow) last = 0;
+        else if (pc && i == gExitRow) last = 1;
         writeData(r + kRangeSize * kPcIds[i], &last, 4);
     }
 }
@@ -257,14 +261,6 @@ uint32_t screenDecide(uint8_t* self, uint8_t* e) {
         gDownloadPending = true;
         return reinterpret_cast<Handler>(gEboot + kScreenBack)(self, e);
     }
-    if (i >= 0 && i == gExitRow) {
-        static std::atomic<bool> asked{false};
-        if (!asked.exchange(true)) {
-            std::fprintf(stderr, "[title] Exit Game\n");
-            setDisplayOption(kDisplayExit, 1); // the window thread exits as from the F11 menu
-        }
-        return 1;
-    }
     return reinterpret_cast<Handler>(gEboot + kScreenDecide)(self, e);
 }
 
@@ -319,19 +315,20 @@ void screenInit(uint8_t* self) {
     void** vt = at<void**>(self, 0);
     if (fromTitle && n + 2 <= kMaxPcSettings && at<uint32_t>(self, kRowCap) >= uint32_t(n + 2) &&
         vt[kVtDecide / sizeof(void*)] == gEboot + kScreenDecide) {
-        // Download Info and Exit Game: one name each, never edited (screenDecide takes them).
-        auto action = [&](int i, const char* label, const char* desc) {
+        // Download Info: one name, never edited (screenDecide takes it). Exit Game: No and Yes.
+        auto action = [&](int i, const char* label, const char* desc, const char* name, const char* name2) {
             uint8_t* r = row(self, i);
             std::memset(r, 0, kRowSize);
             r[kRowField] = kPcFields[i];
             r[kRowId] = kPcIds[i];
             at<const char*>(r, kRowLabel) = label;
             at<const char*>(r, kRowDesc) = desc;
-            at<const char*>(r, kRowNames) = kOpen;
+            at<const char*>(r, kRowNames) = name;
+            at<const char*>(r, kRowNames + 8) = name2;
             self[kCommitted + kPcFields[i]] = 0;
         };
-        action(n, kDownloadLabel, kDownloadDesc);
-        action(n + 1, kExitLabel, kExitDesc);
+        action(n, kDownloadLabel, kDownloadDesc, kOpen, nullptr);
+        action(n + 1, kExitLabel, kExitDesc, kNo, kYes);
         gDownloadRow = n;
         gExitRow = n + 1;
         rows = n + 2;
@@ -396,6 +393,13 @@ uint32_t commit(uint8_t* self, void* e) {
             const int v = int(at<uint32_t>(row(self, i), kRowValue));
             if (v != pcSettings()[i].value()) pcSettings()[i].choose(v);
         }
+    if (self == gPcScreen && gExitRow >= 0 && at<uint32_t>(row(self, gExitRow), kRowValue) == 1) {
+        static std::atomic<bool> asked{false};
+        if (!asked.exchange(true)) {
+            std::fprintf(stderr, "[title] Exit Game\n");
+            setDisplayOption(kDisplayExit, 1); // the window thread exits as from the F11 menu
+        }
+    }
     return r;
 }
 
