@@ -104,25 +104,46 @@ bool init() {
     // Every free stretch of the range becomes a placeholder. Whatever Windows already put there
     // (with address space layout randomisation, a heap can land in it) is left out, and mmap
     // steps past it as it would past a host mapping on Linux.
-    uint64_t reserved = 0;
+    // NVIDIA's driver (CUDA, set up for DLSS before this runs) can hold hundreds of GiB of it,
+    // more on PCs with a lot of RAM and VRAM (#119), so all that's needed is room for the game:
+    // its 5 GiB of direct memory, flexible memory and modules fit many times over in kMinimum.
+    constexpr uint64_t kMinimum = 0x1000000000ull; // 64 GiB
+    uint64_t reserved = 0, taken = 0;
+    DWORD lastError = 0;
     for (uint64_t a = kWindowStart; a < kWindowEnd;) {
         MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof mbi)) break;
+        if (!VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof mbi)) {
+            lastError = GetLastError();
+            break;
+        }
         const uint64_t end = std::min(kWindowEnd, uint64_t(mbi.BaseAddress) + mbi.RegionSize);
         if (mbi.State == MEM_FREE) {
             const uint64_t s = alignUp(a, kGranule), e = alignDown(end, kGranule);
-            if (s < e && pVirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(s), e - s,
-                                        MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0)) {
-                gHoles[s] = e - s;
-                reserved += e - s;
+            if (s < e) {
+                if (pVirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(s), e - s,
+                                   MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0)) {
+                    gHoles[s] = e - s;
+                    reserved += e - s;
+                } else {
+                    lastError = GetLastError();
+                }
             }
+        } else {
+            taken += end - a;
         }
         a = end;
     }
-    if (reserved < (kWindowEnd - kWindowStart) / 2) {
-        std::fprintf(stderr, "[mman] cannot reserve the guest address range (error %lu)\n", GetLastError());
+    if (reserved < kMinimum) {
+        std::fprintf(stderr,
+                     "[mman] cannot reserve the guest address range: %llu MiB free of %llu MiB, %llu MiB "
+                     "already in use by other components (error %lu)\n",
+                     (unsigned long long)(reserved >> 20), (unsigned long long)((kWindowEnd - kWindowStart) >> 20),
+                     (unsigned long long)(taken >> 20), lastError);
         std::abort();
     }
+    if (taken)
+        std::fprintf(stderr, "[mman] guest range: %llu GiB reserved, %llu GiB already in use by other components\n",
+                     (unsigned long long)(reserved >> 30), (unsigned long long)(taken >> 30));
     gReady = true;
     return true;
 }
