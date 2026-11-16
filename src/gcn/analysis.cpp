@@ -937,9 +937,11 @@ struct ReplayPlan {
         uint8_t base = 0, n = 0; // SGPR pair, dwords
         uint32_t off = 0;        // bytes
         uint32_t step = 0;       // in the trace
+        bool buf = false;        // s_buffer_load: the address is a V# (four user SGPRs)
     };
     bool pointersOk = false; // the trace has only steps whose SGPR use is known
     uint16_t pure = 0, pointers = 0;
+    uint16_t liveAtCall = 0; // user SGPRs still holding the launch's value at the fetch shader call
     // LPN_PROFILE: per user SGPR, the trace step that keeps it from being a table pointer (~0u none).
     uint32_t why[16] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
     std::vector<BaseLoad> baseLoads;
@@ -948,23 +950,48 @@ struct ReplayPlan {
 namespace {
 
 // Which user SGPRs the trace uses only as the address of a scalar load with a fixed offset (see
-// sameReads): a register it writes, or reads in any other way, depends on its value. Steps whose
-// replay only marks registers unknown (vector ALU) read nothing that matters.
+// sameReads). A user SGPR is followed while it still holds the launch's value: in a trace that
+// never forks (every branch ends its path, so each work item starts where the last ended) until
+// the first step that writes it, otherwise for the whole trace. A read of it then other than as a
+// load address makes its value matter. Reads after it was overwritten see a value worked out from
+// the rest, which sameReads keeps equal. Steps whose replay only marks registers unknown (vector
+// ALU) read nothing that matters.
 void findPointers(const std::vector<Program::TraceStep>& trace, uint32_t userSgprs, ReplayPlan& plan) {
-    bool written[128] = {}, other[128] = {};
+    const uint32_t user = std::min<uint32_t>(userSgprs, 16);
+    // Linear: as many work items after the first as steps that ended a path with a branch.
+    size_t starts = 0, ends = 0;
+    for (const Program::TraceStep& t : trace) {
+        if (t.start) {
+            ++starts;
+            continue;
+        }
+        if (t.result) continue;
+        if (t.in.format == Format::SOPP && t.in.op != 1) ++ends;
+        if (t.in.format == Format::SOP1 && (t.in.op == 32 || t.in.op == 33)) ++ends;
+    }
+    const bool linear = starts == ends + 1;
+    bool written[16] = {}, impure[16] = {};
     uint32_t cur = 0;
-    auto mark = [&](bool* m, uint32_t r, unsigned n) {
+    auto bad = [&](uint32_t r) {
+        if (r < 16 && !impure[r]) impure[r] = true, plan.why[r] = cur;
+    };
+    auto live = [&](uint32_t r) { return r < user && !written[r]; };
+    auto read = [&](uint32_t r, unsigned n) {
         for (unsigned i = 0; i < n; ++i)
-            if (r + i < 128) {
-                m[r + i] = true;
-                if (r + i < 16 && plan.why[r + i] == ~0u) plan.why[r + i] = cur;
+            if (live(r + i)) bad(r + i);
+    };
+    auto write = [&](uint32_t r, unsigned n) {
+        for (unsigned i = 0; i < n; ++i)
+            if (r + i < 16 && !written[r + i]) {
+                written[r + i] = true;
+                if (!linear) bad(r + i); // a forked trace may read it later from before the write
             }
     };
     auto readSrc = [&](uint32_t code) {
-        if (code < 104) mark(other, code, 2); // a pair: 64-bit forms read two
+        if (code < 104) read(code, 2); // a pair: 64-bit forms read two
     };
     static const unsigned kCount[] = {1, 2, 4, 8, 16};
-    std::vector<ReplayPlan::BaseLoad> loads;
+    uint16_t liveAtCall = 0xFFFF;
     for (; cur < trace.size(); ++cur) {
         const Program::TraceStep& t = trace[cur];
         if (t.start) continue;
@@ -972,50 +999,61 @@ void findPointers(const std::vector<Program::TraceStep>& trace, uint32_t userSgp
         switch (t.in.format) {
         case Format::SOPP: break;
         case Format::SOP1:
+            if (t.in.op == 33) { // s_swappc: the fetch shader reads its V# table pointers here
+                uint16_t m = 0;
+                for (uint32_t i = 0; i < 16; ++i)
+                    if (live(i)) m |= uint16_t(1u << i);
+                liveAtCall &= m;
+            }
             readSrc(w & 0xFF);
-            mark(written, (w >> 16) & 0x7F, 2);
+            write((w >> 16) & 0x7F, 2);
             break;
         case Format::SOP2:
             readSrc(w & 0xFF), readSrc((w >> 8) & 0xFF);
-            mark(written, (w >> 16) & 0x7F, 2);
+            write((w >> 16) & 0x7F, 2);
             break;
         case Format::SOPC: readSrc(w & 0xFF), readSrc((w >> 8) & 0xFF); break;
         case Format::SOPK:
-            mark(other, (w >> 16) & 0x7F, 2);
-            mark(written, (w >> 16) & 0x7F, 2);
+            read((w >> 16) & 0x7F, 2);
+            write((w >> 16) & 0x7F, 2);
             break;
         case Format::SMRD: {
             if (t.in.op >= 29 || (t.in.op & 7) > 4) break; // s_memtime, cache control
             const unsigned n = kCount[t.in.op & 7];
             const uint32_t base = ((w >> 9) & 0x3F) * 2;
             const bool buf = t.in.op >= 8;
-            mark(written, (w >> 15) & 0x7F, n);
             int64_t off = -1;
             if ((w >> 8) & 1) off = (w & 0xFF) * 4;
             else if ((w & 0xFF) == 255) off = int64_t(t.in.literal) * 4;
             else readSrc(w & 0xFF);
-            if (!buf && off >= 0 && off <= 0xFFFFFFFFll) loads.push_back({uint8_t(base), uint8_t(n), uint32_t(off), cur});
-            else mark(other, base, buf ? 4 : 2);
+            const bool addrLive = live(base) || live(base + 1);
+            if (addrLive && off >= 0 && off <= 0xFFFFFFFFll && live(base) && live(base + 1) &&
+                (!buf || (live(base + 2) && live(base + 3)))) {
+                plan.baseLoads.push_back({uint8_t(base), uint8_t(n), uint32_t(off), cur, buf});
+                if (buf) read(base + 2, 2); // the V#'s size and format must stay the same
+            } else {
+                read(base, buf ? 4 : 2);
+            }
+            write((w >> 15) & 0x7F, n);
             break;
         }
-        case Format::VOP1: if (t.in.op == 2) mark(written, (w >> 17) & 0xFF, 1); break;
+        case Format::VOP1: if (t.in.op == 2) write((w >> 17) & 0xFF, 1); break;
         case Format::VOP2:
-            if (t.in.op == 1) mark(written, (w >> 17) & 0xFF, 1);
-            if (t.in.op >= 37 && t.in.op <= 42) mark(written, kVcc, 2);
+            if (t.in.op == 1) write((w >> 17) & 0xFF, 1);
             break;
-        case Format::VOPC: mark(written, kVcc, 2); break;
+        case Format::VOPC: break; // vcc
         case Format::VOP3:
-            if (t.in.op < 256) mark(written, w & 0xFF, 2);
-            else mark(written, (w >> 8) & 0x7F, 2); // VOP3b's SGPR pair (others write none, marked anyway)
+            if (t.in.op < 256) write(w & 0xFF, 2);
+            else write((w >> 8) & 0x7F, 2); // VOP3b's SGPR pair (others write none, marked anyway)
             break;
         case Format::MUBUF:
         case Format::MTBUF:
-            mark(other, ((w1 >> 16) & 0x1F) * 4, 4);
+            read(((w1 >> 16) & 0x1F) * 4, 4);
             readSrc(w1 >> 24);
             break;
         case Format::MIMG:
-            mark(other, ((w1 >> 16) & 0x1F) * 4, 8);
-            mark(other, ((w1 >> 21) & 0x1F) * 4, 4);
+            read(((w1 >> 16) & 0x1F) * 4, 8);
+            read(((w1 >> 21) & 0x1F) * 4, 4);
             break;
         case Format::EXP:
         case Format::VINTRP:
@@ -1023,20 +1061,23 @@ void findPointers(const std::vector<Program::TraceStep>& trace, uint32_t userSgp
         default: return; // not known: no shortcut
         }
     }
-    const uint32_t user = std::min<uint32_t>(userSgprs, 16);
     uint16_t cand = 0;
     for (uint32_t i = 0; i < user; ++i)
-        if (!written[i] && !other[i]) cand |= uint16_t(1u << i);
-    // A load needs both words of its address as the launch gave them.
-    for (const auto& l : loads)
-        if (l.base < user && ((cand >> l.base) & 3) != 3) {
-            for (uint32_t i = l.base; i < l.base + 2u && i < 16; ++i)
-                if (plan.why[i] == ~0u) plan.why[i] = l.step;
-            cand &= uint16_t(~(3u << l.base));
+        if (!impure[i]) cand |= uint16_t(1u << i);
+    // The loads whose address words are still candidates (a pair one of whose words is read
+    // otherwise keeps the other's value from mattering only through the load: both must stay).
+    std::vector<ReplayPlan::BaseLoad> keep;
+    for (const auto& l : plan.baseLoads) {
+        if (((cand >> l.base) & 3) != 3) {
+            for (uint32_t i = l.base; i < l.base + 2u; ++i)
+                if (i < 16 && !impure[i]) impure[i] = true, plan.why[i] = l.step, cand &= uint16_t(~(1u << i));
+            continue;
         }
-    for (const auto& l : loads)
-        if (l.base < user && ((cand >> l.base) & 3) == 3) plan.baseLoads.push_back(l);
+        keep.push_back(l);
+    }
+    plan.baseLoads = std::move(keep);
     plan.pointers = cand;
+    plan.liveAtCall = liveAtCall;
     plan.pure = uint16_t(cand | (0xFFFFu & ~((1u << user) - 1))); // words past the user SGPRs reach no SGPR
     plan.pointersOk = true;
 }
@@ -1518,11 +1559,36 @@ bool sameReads(const Program& p, const LaunchState& prev, const LaunchState& nex
         }
         return true;
     };
-    for (const ReplayPlan::BaseLoad& l : plan->baseLoads)
-        if (((diff >> l.base) & 3) && !same(l.base, l.off, l.n * 4u)) return false;
-    // The fetch shader's loads (inside the call step, which findPointers does not see into).
+    for (const ReplayPlan::BaseLoad& l : plan->baseLoads) {
+        if (!((diff >> l.base) & 3)) continue;
+        if (!l.buf) {
+            if (!same(l.base, l.off, l.n * 4u)) return false;
+            continue;
+        }
+        // s_buffer_load from a V# in user data (its words 2 and 3 are the same, see findPointers):
+        // the same base moved, read up to the same bound.
+        auto bound = [&](const uint32_t* u) {
+            const uint32_t stride = (u[l.base + 1] >> 16) & 0x3FFF, records = u[l.base + 2];
+            return stride ? uint32_t(std::min<uint64_t>(uint64_t(stride) * records, ~0u)) : records;
+        };
+        const uint32_t limit = bound(prev.userData);
+        if (limit != bound(next.userData)) return false;
+        const unsigned inside = l.off >= limit ? 0 : std::min<unsigned>(l.n, (limit - l.off) / 4);
+        if (!inside) continue;
+        auto vaddr = [&](const uint32_t* u) { return u[l.base] | (uint64_t(u[l.base + 1] & 0xFFF) << 32); };
+        uint32_t x[16], y[16];
+        if (!readData(vaddr(prev.userData) + l.off, x, inside * 4) || !readData(vaddr(next.userData) + l.off, y, inside * 4))
+            return false;
+        if (std::memcmp(x, y, inside * 4)) {
+            if (bytesDiffer) *bytesDiffer = true;
+            return false;
+        }
+    }
+    // The fetch shader's loads (inside the call step, which findPointers does not see into): only
+    // from registers still holding the launch's value there.
     for (const auto& [base, off] : p.fetchReads) {
-        if (base >= 16 || !((diff >> base) & 3)) continue;
+        if (base >= 16 || !((diff >> base) & 3) || !((plan->liveAtCall >> base) & 3)) continue;
+        if (((plan->liveAtCall >> base) & 3) != 3) return false; // half of the address worked out
         if (((plan->pointers >> base) & 3) != 3 || !same(base, off, 16)) return false;
     }
     return true;

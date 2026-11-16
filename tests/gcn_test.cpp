@@ -189,6 +189,59 @@ int main() {
                          refreshed, gcn::sameResult(replayed, expect) ? "equal" : "differ");
             ++failures;
         }
+        // A table pointer its own load overwrites (s_load_dwordx4 s[0:3], s[0:1]) still is one.
+        const std::vector<uint32_t> over = {
+            0xc0800100,             // s_load_dwordx4 s[0:3], s[0:1], 0x0
+            0xebf31030, 0x8000000d, // tbuffer_load_format_xyzw v0, v13, s[0:3], 0 offset:48 offen
+            0xbf810000,             // s_endpgm
+        };
+        auto readOver = [&](uint64_t addr, void* dst, size_t size) {
+            if (addr >= ll.entry && addr + size <= ll.entry + over.size() * 4) {
+                std::memcpy(dst, reinterpret_cast<const char*>(over.data()) + (addr - ll.entry), size);
+                return true;
+            }
+            return readTabs(addr, dst, size);
+        };
+        const gcn::Program o = gcn::analyze(a, readOver);
+        if (!gcn::sameReads(o, a, b, readOver) || gcn::sameReads(o, a, c, readOver)) {
+            std::fprintf(stderr, "same tables: a pointer its load overwrites (%s)\n", gcn::tableWordUse(o, 0).c_str());
+            ++failures;
+        }
+        // A constant buffer's V# in user data (s[4:7]) moved to a copy of the constants.
+        {
+            const std::vector<uint32_t> cb = {
+                0xc2040501, // s_buffer_load_dword s8, s[4:7], 0x1 (dwords)
+                0xbf810000, // s_endpgm
+            };
+            uint32_t consts[3][4] = {{1, 2, 3, 4}, {1, 2, 3, 4}, {1, 9, 3, 4}};
+            auto readCb = [&](uint64_t addr, void* dst, size_t size) {
+                if (addr >= ll.entry && addr + size <= ll.entry + cb.size() * 4) {
+                    std::memcpy(dst, reinterpret_cast<const char*>(cb.data()) + (addr - ll.entry), size);
+                    return true;
+                }
+                if (addr >= 0xa000 && addr + size <= 0xa000 + sizeof(consts)) {
+                    std::memcpy(dst, reinterpret_cast<const char*>(consts) + (addr - 0xa000), size);
+                    return true;
+                }
+                return false;
+            };
+            gcn::LaunchState x = ll;
+            x.rsrc2 = 8 << 1;
+            x.userData[4] = 0xa000, x.userData[5] = 0, x.userData[6] = 16, x.userData[7] = 0x2000c004;
+            gcn::LaunchState y = x, z = x;
+            y.userData[4] = 0xa010, z.userData[4] = 0xa020;
+            const gcn::Program k = gcn::analyze(x, readCb);
+            bool zd = false;
+            const bool ky = gcn::sameReads(k, x, y, readCb), kz = gcn::sameReads(k, x, z, readCb, &zd);
+            gcn::LaunchState bigger = y; // another size: not the same
+            bigger.userData[6] = 32;
+            const bool kb = gcn::sameReads(k, x, bigger, readCb);
+            if (!ky || kz || !zd || kb) {
+                std::fprintf(stderr, "same constants: moved %d, other %d (bytes %d), other size %d (%s)\n", ky, kz, zd, kb,
+                             gcn::tableWordUse(k, 4).c_str());
+                ++failures;
+            }
+        }
         // A pointer the code also adds to is no table pointer.
         const std::vector<uint32_t> add = {
             0x80008400, // s_add_u32 s0, s0, 4
