@@ -53,44 +53,6 @@ It was built for the PS4's AMD Jaguar, which also has BMI1, LZCNT, MOVBE and F16
 without them (Sandy Bridge and Ivy Bridge, Bulldozer and Piledriver) those instructions run in
 software, slower, and the log says so with `[cpu]` lines. No AVX2 is needed.
 
-## Build
-
-Needs CMake, Ninja, a C++20 compiler, and the Vulkan, glslang, zlib and SDL2 development packages
-(without SDL2 there is no window).
-
-```sh
-cmake -S . -B build -G Ninja
-ninja -C build
-scripts/fetch-nids.sh aerolib.csv     # import names, needed to run
-```
-
-Optional, for the upscalers: `scripts/fetch-fsr.sh` (AMD FSR 3.1) and `scripts/fetch-dlss.sh`
-(NVIDIA DLSS), then the two build commands again.
-
-### Windows (experimental)
-
-Each push builds a Windows zip: open the commit's **Windows** workflow run on GitHub and download
-`Lost_Paradise-windows` under Artifacts. Unzip it, put the dump in the `game` folder next to
-`Lost Paradise.exe` (the launcher makes the folder on its first start) and press Play; the
-game's log goes to `play.log` in that folder. Releases carry the same zip. Needs Windows 10 1803
-or later and a Vulkan driver. FSR and DLSS work there too: the zip carries both (to build them
-yourself, run `scripts/fetch-fsr.sh` and `scripts/fetch-streamline.sh` first). On Windows, DLSS
-goes through NVIDIA Streamline, whose DLLs sit beside `lpn-host.exe`.
-
-To build it yourself, in an [MSYS2](https://www.msys2.org) UCRT64 shell:
-
-```sh
-pacman -S --needed zip mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,SDL2,vulkan-headers,vulkan-loader,glslang,zlib}
-cmake -S . -B build -G Ninja && ninja -C build
-scripts/fetch-nids.sh aerolib.csv
-scripts/make-windows-zip.sh           # build/Lost_Paradise-windows.zip
-```
-
-Or cross-compile from Linux with MinGW-w64: `cmake/mingw-w64-x86_64.cmake` is the toolchain file.
-How the port works: the game's code calls ours through System V thunks (`src/host/guest_abi.h`),
-guest memory is built on placeholders (`src/host/mman_win.cpp`), and the thread pointer is a
-TEB slot read through `%gs` (`src/host/tls.cpp`).
-
 ## Run
 
 Lay out an install folder like this, with the dump (the folder with `eboot.bin` and
@@ -106,14 +68,7 @@ Lost Paradise/
 Saves go to `lpn-data/savedata/<title ID>` (one folder per version, e.g. `CUSA12776`, read from
 the dump's `sce_sys/param.sfo`), the PC settings to `lpn-display.ini` and the log to `play.log`, all
 in that folder. Saves from before the split are moved into `lpn-data/savedata/CUSA12776` on the
-first run. `lpn-host` looks for the game in `game/` of the folder it runs in, or takes its path
-first:
-
-```sh
-build/src/host/lpn-host /path/to/CUSA12776 --nids aerolib.csv
-```
-
-`--data DIR` changes the save folder; `lpn-host` with no arguments lists every option.
+first run. `lpn-host` looks for the game in `game/` of the folder it runs in.
 
 ### Mods
 
