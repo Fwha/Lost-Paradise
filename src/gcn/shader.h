@@ -127,6 +127,9 @@ struct Program {
     // v4, whose draw data is the four words, V# word 3, then index VGPR | components << 2 | offset << 8.
     uint64_t fetchSite = 0;
     uint32_t fetchSlots = 0;
+    // The fetch shader's V# loads as this launch made them: the SGPR its address came from and
+    // the byte offset (16 bytes each), for sameReads().
+    std::vector<std::pair<uint8_t, uint16_t>> fetchReads;
     bool controlFlow = false;
     bool writesExec = false;
     std::map<uint64_t, uint32_t> smrd; // pc -> dword offset of its result in `data`
@@ -210,6 +213,19 @@ ReplayStats takeReplayStats();
 bool adopt(Program& program, Program& replayed);
 // replay() then adopt(): re-targets `program` to the launch, or returns false leaving it unchanged.
 bool refresh(Program& program, const LaunchState& launch, const ReadMemory& readData);
+
+// Whether `next`, a launch of `program` that differs from `prev` (the launch `program` holds the
+// replay of) only in user data, replays to the same data and resources but for the user data
+// words themselves. True when every differing word is a pointer the trace only loads from with
+// fixed offsets (the per-draw tables the engine copies to a fresh place each draw, s2 and s12),
+// and the bytes those loads read are the same at both places. Everything else the replay reads
+// then comes out the same too: memory does not change within a submission. The caller patches
+// the user data words (data[0..15] and launch) instead of replaying.
+// `bytesDiffer`: false was for the bytes, not for how the words are used.
+bool sameReads(const Program& program, const LaunchState& prev, const LaunchState& next, const ReadMemory& readData,
+               bool* bytesDiffer = nullptr);
+// Whether two replays came out the same (data and resources), for checking shortcuts.
+bool sameResult(const Program& a, const Program& b);
 
 struct Translation {
     std::string glsl;

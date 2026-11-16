@@ -163,3 +163,19 @@ draw self 12% and switchDraw self 6%, both stalling on the first load of fields 
 workers wrote (cross-core misses), pushDescriptors 9% (CmdChunk::alloc 6%), compareResources 4%,
 switchDraw's 64-slot linear search ~2%. No single item left is worth more than a few percent;
 the next real step is recording on more than one thread.
+
+## Same tables, another place (2026-11-16)
+
+The engine copies each draw's flat tables to a fresh place in its ring, so user data s2/s12 change
+on nearly every launch (~6,500 of ~12,300 launches a frame at a 6,175-draw spot) even when the
+tables hold the same descriptors: what milestone 3's hook would have reported as "not dirty".
+Without a hook: per traced program, `gcn::sameReads` finds the user SGPRs the trace never writes
+and only uses as the address of a fixed-offset `s_load` (or the fetch shader's V# loads). When a
+launch differs from the stage's last only in such words and the bytes those loads read are the
+same at both places, the replay would come out the same (memory does not change within a
+submission), so the worker patches data[0..15] and reuses the last program without replaying.
+`LPN_NO_TABLE_REPEATS=1` turns it off; `LPN_TABLE_REPEATS=check` replays anyway, logs
+`[tables]` differences and counts check mismatches. `LPN_PROFILE` prints per frame
+`same tables: N reused without a replay, M with a word read otherwise, K with other bytes` on
+the `launches not repeating the last` line: K large means the tables really differ per draw
+(per-draw constants), and a hook would not help either.

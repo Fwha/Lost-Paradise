@@ -188,6 +188,7 @@ public:
         p_.data.assign(prior.data.size(), 0);
         p_.buffers = prior.buffers;
         p_.images = prior.images;
+        p_.fetchReads.clear();
         seenBuffers_.assign(p_.buffers.size(), false);
         seenImages_.assign(p_.images.size(), false);
         WorkQueue work{Work{p_.launch.entry, start()}};
@@ -754,6 +755,8 @@ private:
     struct FetchLoad {
         uint32_t slot = 0, count = 0, index = 0, offset = 0;
         uint64_t sharp = 0;
+        uint8_t base = 0;    // the SGPR pair the V#'s address came from
+        uint16_t sharpOff = 0; // and the load's byte offset
     };
 
     // Reads the fetch shader at `callee` when it has the shape every one the game makes has had
@@ -761,6 +764,8 @@ private:
     // for anything else, which is then walked and inlined as before.
     bool parseFetch(uint64_t callee, const State& st, std::vector<FetchLoad>& loads) {
         uint64_t from[128] = {}; // SGPR -> address of the V# an s_load_dwordx4 put there
+        uint8_t fromBase[128] = {};
+        uint16_t fromOff[128] = {};
         uint64_t pc = callee;
         for (int n = 0; n < 128; ++n) {
             uint32_t words[3] = {};
@@ -779,6 +784,8 @@ private:
                 const uint64_t addr = ((st.s[base] | (uint64_t(st.s[base + 1] & 0xFFFF) << 32)) & ~3ull) + (w & 0xFF) * 4;
                 for (uint32_t i = 0; i < 4; ++i) from[d + i] = 0;
                 from[d] = addr;
+                fromBase[d] = uint8_t(base);
+                fromOff[d] = uint16_t((w & 0xFF) * 4);
             } else if (in.format == Format::MUBUF && in.op <= 3) { // buffer_load_format_x..xyzw
                 const bool offen = (w >> 12) & 1, idxen = (w >> 13) & 1, lds = (w >> 16) & 1;
                 const uint32_t vaddr = w1 & 0xFF, vdata = (w1 >> 8) & 0xFF, srsrc = ((w1 >> 16) & 0x1F) * 4, soff = w1 >> 24;
@@ -791,6 +798,8 @@ private:
                 l.index = vaddr;
                 l.offset = w & 0xFFF;
                 l.sharp = from[srsrc];
+                l.base = fromBase[srsrc];
+                l.sharpOff = fromOff[srsrc];
                 if (l.slot >= 16) return false;
                 for (const auto& o : loads)
                     if (o.slot == l.slot) return false;
@@ -866,6 +875,7 @@ private:
             r.pc = site;
             r.data = at;
             r.known = l && readData_(l->sharp, r.sharp, sizeof r.sharp);
+            if (l) p_.fetchReads.emplace_back(l->base, l->sharpOff);
             if (!r.known) std::memset(r.sharp, 0, sizeof r.sharp);
             r.dfmt = (r.sharp[3] >> 15) & 0xF;
             r.nfmt = (r.sharp[3] >> 12) & 7;
@@ -920,12 +930,109 @@ struct ReplayOp {
 struct ReplayPlan {
     std::vector<ReplayOp> ops;
     uint32_t direct = 0; // ops run without stepping
+    // For sameReads(): the user data words a launch may change without changing the replay but
+    // through the bytes they point at (bit per word), the user SGPRs the trace never writes and
+    // reads only as the address of a load with a fixed offset, and those loads.
+    struct BaseLoad {
+        uint8_t base = 0, n = 0; // SGPR pair, dwords
+        uint32_t off = 0;        // bytes
+    };
+    bool pointersOk = false; // the trace has only steps whose SGPR use is known
+    uint16_t pure = 0, pointers = 0;
+    std::vector<BaseLoad> baseLoads;
 };
 
 namespace {
 
-std::shared_ptr<const ReplayPlan> makePlan(const std::vector<Program::TraceStep>& trace) {
+// Which user SGPRs the trace uses only as the address of a scalar load with a fixed offset (see
+// sameReads): a register it writes, or reads in any other way, depends on its value. Steps whose
+// replay only marks registers unknown (vector ALU) read nothing that matters.
+void findPointers(const std::vector<Program::TraceStep>& trace, uint32_t userSgprs, ReplayPlan& plan) {
+    bool written[128] = {}, other[128] = {};
+    auto mark = [](bool* m, uint32_t r, unsigned n) {
+        for (unsigned i = 0; i < n; ++i)
+            if (r + i < 128) m[r + i] = true;
+    };
+    auto readSrc = [&](uint32_t code) {
+        if (code < 104) mark(other, code, 2); // a pair: 64-bit forms read two
+    };
+    static const unsigned kCount[] = {1, 2, 4, 8, 16};
+    std::vector<ReplayPlan::BaseLoad> loads;
+    for (const Program::TraceStep& t : trace) {
+        if (t.start) continue;
+        const uint32_t w = t.in.words[0], w1 = t.in.words[1];
+        switch (t.in.format) {
+        case Format::SOPP: break;
+        case Format::SOP1:
+            readSrc(w & 0xFF);
+            mark(written, (w >> 16) & 0x7F, 2);
+            break;
+        case Format::SOP2:
+            readSrc(w & 0xFF), readSrc((w >> 8) & 0xFF);
+            mark(written, (w >> 16) & 0x7F, 2);
+            break;
+        case Format::SOPC: readSrc(w & 0xFF), readSrc((w >> 8) & 0xFF); break;
+        case Format::SOPK:
+            mark(other, (w >> 16) & 0x7F, 2);
+            mark(written, (w >> 16) & 0x7F, 2);
+            break;
+        case Format::SMRD: {
+            if (t.in.op >= 29 || (t.in.op & 7) > 4) break; // s_memtime, cache control
+            const unsigned n = kCount[t.in.op & 7];
+            const uint32_t base = ((w >> 9) & 0x3F) * 2;
+            const bool buf = t.in.op >= 8;
+            mark(written, (w >> 15) & 0x7F, n);
+            int64_t off = -1;
+            if ((w >> 8) & 1) off = (w & 0xFF) * 4;
+            else if ((w & 0xFF) == 255) off = int64_t(t.in.literal) * 4;
+            else readSrc(w & 0xFF);
+            if (!buf && off >= 0 && off <= 0xFFFFFFFFll) loads.push_back({uint8_t(base), uint8_t(n), uint32_t(off)});
+            else mark(other, base, buf ? 4 : 2);
+            break;
+        }
+        case Format::VOP1: if (t.in.op == 2) mark(written, (w >> 17) & 0xFF, 1); break;
+        case Format::VOP2:
+            if (t.in.op == 1) mark(written, (w >> 17) & 0xFF, 1);
+            if (t.in.op >= 37 && t.in.op <= 42) mark(written, kVcc, 2);
+            break;
+        case Format::VOPC: mark(written, kVcc, 2); break;
+        case Format::VOP3:
+            if (t.in.op < 256) mark(written, w & 0xFF, 2);
+            else mark(written, (w >> 8) & 0x7F, 2); // VOP3b's SGPR pair (others write none, marked anyway)
+            break;
+        case Format::MUBUF:
+        case Format::MTBUF:
+            mark(other, ((w1 >> 16) & 0x1F) * 4, 4);
+            readSrc(w1 >> 24);
+            break;
+        case Format::MIMG:
+            mark(other, ((w1 >> 16) & 0x1F) * 4, 8);
+            mark(other, ((w1 >> 21) & 0x1F) * 4, 4);
+            break;
+        case Format::EXP:
+        case Format::VINTRP:
+        case Format::DS: break;
+        default: return; // not known: no shortcut
+        }
+    }
+    const uint32_t user = std::min<uint32_t>(userSgprs, 16);
+    uint16_t cand = 0;
+    for (uint32_t i = 0; i < user; ++i)
+        if (!written[i] && !other[i]) cand |= uint16_t(1u << i);
+    // A load needs both words of its address as the launch gave them.
+    for (const auto& l : loads)
+        if (l.base < user && ((cand >> l.base) & 3) != 3) cand &= uint16_t(~(3u << l.base));
+    for (const auto& l : loads)
+        if (l.base < user && ((cand >> l.base) & 3) == 3) plan.baseLoads.push_back(l);
+    plan.pointers = cand;
+    plan.pure = uint16_t(cand | (0xFFFFu & ~((1u << user) - 1))); // words past the user SGPRs reach no SGPR
+    plan.pointersOk = true;
+}
+
+std::shared_ptr<const ReplayPlan> makePlan(const Program& program) {
+    const std::vector<Program::TraceStep>& trace = program.trace;
     auto plan = std::make_shared<ReplayPlan>();
+    findPointers(trace, program.launch.userSgprs(), *plan);
     plan->ops.reserve(trace.size());
     static const unsigned kCount[] = {1, 2, 4, 8, 16};
     for (size_t i = 0; i < trace.size(); ++i) {
@@ -969,6 +1076,15 @@ std::shared_ptr<const ReplayPlan> makePlan(const std::vector<Program::TraceStep>
     return plan;
 }
 
+std::shared_ptr<const ReplayPlan> planFor(const Program& p) {
+    std::shared_ptr<const ReplayPlan> plan = p.plan.get();
+    if (!plan) {
+        plan = makePlan(p);
+        p.plan.set(plan);
+    }
+    return plan;
+}
+
 int fastReplayMode() { // 0 off, 1 on, 2 check
     static const int mode = [] {
         const char* e = std::getenv("LPN_FAST_REPLAY");
@@ -1008,6 +1124,7 @@ bool Analyzer::replayOps(const ReplayPlan& plan) {
     p_.data.assign(prior.data.size(), 0);
     p_.buffers = prior.buffers;
     p_.images = prior.images;
+    p_.fetchReads.clear();
     seenBuffers_.assign(p_.buffers.size(), false);
     seenImages_.assign(p_.images.size(), false);
     WorkQueue work{Work{p_.launch.entry, start()}};
@@ -1304,11 +1421,7 @@ bool replay(const Program& p, const LaunchState& launch, const ReadMemory& readD
     const int mode = fastReplayMode();
     std::shared_ptr<const ReplayPlan> plan;
     if (mode) {
-        plan = p.plan.get();
-        if (!plan) {
-            plan = makePlan(p.trace);
-            p.plan.set(plan);
-        }
+        plan = planFor(p);
         gPlanned.fetch_add(1, std::memory_order_relaxed);
         gSteps.fetch_add(p.trace.size(), std::memory_order_relaxed);
         gKept.fetch_add(plan->direct, std::memory_order_relaxed);
@@ -1319,6 +1432,7 @@ bool replay(const Program& p, const LaunchState& launch, const ReadMemory& readD
     q.data.swap(out.data);
     q.buffers.swap(out.buffers);
     q.images.swap(out.images);
+    q.fetchReads.swap(out.fetchReads);
     bool ok = a.replay(plan.get());
     if (mode == 2) {
         Analyzer full(launch, readData, readData, &p);
@@ -1343,6 +1457,7 @@ bool replay(const Program& p, const LaunchState& launch, const ReadMemory& readD
     out.data.swap(q.data);
     out.buffers.swap(q.buffers);
     out.images.swap(q.images);
+    out.fetchReads.swap(q.fetchReads);
     return ok;
 }
 
@@ -1367,8 +1482,41 @@ bool adopt(Program& p, Program& r) {
     p.data.swap(r.data);
     p.buffers.swap(r.buffers);
     p.images.swap(r.images);
+    p.fetchReads.swap(r.fetchReads);
     return true;
 }
+
+bool sameReads(const Program& p, const LaunchState& prev, const LaunchState& next, const ReadMemory& readData, bool* bytesDiffer) {
+    if (bytesDiffer) *bytesDiffer = false;
+    if (p.trace.empty()) return false;
+    uint32_t diff = 0;
+    for (uint32_t i = 0; i < 16; ++i)
+        if (prev.userData[i] != next.userData[i]) diff |= 1u << i;
+    if (!diff) return false;
+    const std::shared_ptr<const ReplayPlan> plan = planFor(p);
+    if (!plan->pointersOk || (diff & ~uint32_t(plan->pure))) return false;
+    auto addr = [](const uint32_t* u, uint32_t b) { return (u[b] | (uint64_t(u[b + 1] & 0xFFFF) << 32)) & ~3ull; };
+    auto same = [&](uint32_t base, uint32_t off, uint32_t bytes) {
+        uint32_t a[16], b[16];
+        if (!readData(addr(prev.userData, base) + off, a, bytes) || !readData(addr(next.userData, base) + off, b, bytes))
+            return false;
+        if (std::memcmp(a, b, bytes)) {
+            if (bytesDiffer) *bytesDiffer = true;
+            return false;
+        }
+        return true;
+    };
+    for (const ReplayPlan::BaseLoad& l : plan->baseLoads)
+        if (((diff >> l.base) & 3) && !same(l.base, l.off, l.n * 4u)) return false;
+    // The fetch shader's loads (inside the call step, which findPointers does not see into).
+    for (const auto& [base, off] : p.fetchReads) {
+        if (base >= 16 || !((diff >> base) & 3)) continue;
+        if (((plan->pointers >> base) & 3) != 3 || !same(base, off, 16)) return false;
+    }
+    return true;
+}
+
+bool sameResult(const Program& a, const Program& b) { return sameReplay(a, b); }
 
 bool refresh(Program& p, const LaunchState& launch, const ReadMemory& readData) {
     Program r;

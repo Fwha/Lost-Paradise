@@ -158,6 +158,58 @@ int main() {
         ++failures;
     }
 
+    // A launch whose table pointer moved to a copy of the table replays alike (gcn::sameReads):
+    // the renderer then patches the user data instead of replaying.
+    {
+        uint32_t tabs[3][8] = {{0x10000, 0, 64, 0x2000c004, 1}, {0x10000, 0, 64, 0x2000c004, 1}, {0x30000, 0, 64, 0x2000c004, 1}};
+        auto readTabs = [&](uint64_t addr, void* dst, size_t size) {
+            if (addr >= ll.entry && addr + size <= ll.entry + loads.size() * 4) {
+                std::memcpy(dst, reinterpret_cast<const char*>(loads.data()) + (addr - ll.entry), size);
+                return true;
+            }
+            if (addr >= 0x9000 && addr + size <= 0x9000 + sizeof(tabs)) {
+                std::memcpy(dst, reinterpret_cast<const char*>(tabs) + (addr - 0x9000), size);
+                return true;
+            }
+            return false;
+        };
+        gcn::LaunchState a = ll, b = ll, c = ll;
+        a.userData[0] = 0x9000;
+        b.userData[0] = 0x9000 + sizeof(tabs[0]);     // the same bytes
+        c.userData[0] = 0x9000 + 2 * sizeof(tabs[0]); // another V#
+        const gcn::Program p = gcn::analyze(a, readTabs);
+        bool differ = false;
+        const bool same = gcn::sameReads(p, a, b, readTabs);
+        const bool other = gcn::sameReads(p, a, c, readTabs, &differ);
+        gcn::Program replayed = p, expect = p;
+        const bool refreshed = gcn::refresh(replayed, b, readTabs);
+        std::memcpy(expect.data.data() + gcn::data::kUserData, b.userData, sizeof(b.userData));
+        if (!same || other || !differ || !refreshed || !gcn::sameResult(replayed, expect)) {
+            std::fprintf(stderr, "same tables: same %d, other %d (bytes %d), refresh %d, results %s\n", same, other, differ,
+                         refreshed, gcn::sameResult(replayed, expect) ? "equal" : "differ");
+            ++failures;
+        }
+        // A pointer the code also adds to is no table pointer.
+        const std::vector<uint32_t> add = {
+            0x80008400, // s_add_u32 s0, s0, 4
+            0xc0040100, // s_load_dword s8, s[0:1], 0x0
+            0xbf810000, // s_endpgm
+        };
+        auto readAdd = [&](uint64_t addr, void* dst, size_t size) {
+            if (addr >= ll.entry && addr + size <= ll.entry + add.size() * 4) {
+                std::memcpy(dst, reinterpret_cast<const char*>(add.data()) + (addr - ll.entry), size);
+                return true;
+            }
+            return readTabs(addr, dst, size);
+        };
+        const gcn::Program q = gcn::analyze(a, readAdd);
+        differ = false;
+        if (gcn::sameReads(q, a, b, readAdd, &differ) || differ) {
+            std::fprintf(stderr, "same tables: a pointer the code adds to was taken as a table pointer\n");
+            ++failures;
+        }
+    }
+
     // Cross-lane and wide integer ops seen in gameplay shaders: a depth-slope pixel shader's quad
     // swizzles, an integer division's 64-bit multiply-add, and a 4-bit offset conversion.
     const std::vector<uint32_t> misc = {
@@ -373,6 +425,34 @@ int main() {
                          four.fetchSlots, four.calls.size(), four.buffers.size(), four.key() == three.key() ? "equal" : "differ",
                          ctl(three), refreshed, error.c_str(), glsl.c_str());
             ++failures;
+        }
+        // The fetch shader's V# table moved to a copy: the same reads (see sameReads).
+        {
+            constexpr uint64_t kTable2 = 0x42100;
+            uint32_t vsharp2[4];
+            std::memcpy(vsharp2, vsharp, sizeof vsharp2);
+            auto readF2 = [&](uint64_t addr, void* dst, size_t size) {
+                if (addr >= kTable2 && addr + size <= kTable2 + sizeof vsharp2) {
+                    std::memcpy(dst, reinterpret_cast<const char*>(vsharp2) + (addr - kTable2), size);
+                    return true;
+                }
+                return bool(readFetch(addr, dst, size));
+            };
+            gcn::LaunchState vl2 = vl;
+            vl2.userData[2] = uint32_t(kTable2);
+            const gcn::Program f = gcn::analyze(vl, readF2);
+            const bool same = gcn::sameReads(f, vl, vl2, readF2);
+            vsharp2[2] = 99; // another vertex count
+            bool differ = false;
+            const bool other = gcn::sameReads(f, vl, vl2, readF2, &differ);
+            gcn::LaunchState moved = vl; // another fetch shader: not a table pointer (the call reads it)
+            moved.userData[0] += 0x100;
+            const bool callee = gcn::sameReads(f, vl, moved, readF2);
+            if (!same || other || !differ || callee || f.fetchReads.size() != 1) {
+                std::fprintf(stderr, "same fetch tables: same %d, other %d (bytes %d), callee %d, %zu reads\n", same, other,
+                             differ, callee, f.fetchReads.size());
+                ++failures;
+            }
         }
         // A vertex shader reading more inputs than this mesh's fetch shader loads (v8, slot 2)
         // takes the slots its code reads, as the boot compile does without a draw.

@@ -578,6 +578,10 @@ struct Profiler {
     uint64_t feedbackOn[2] = {}; // a draw sampled the open pass's depth / color attachment
     uint64_t missWhy[4] = {}; // a launch not repeating the stage's last: shader, submission, user data, other
     uint64_t missUser[16] = {}; // the user data words that differed
+    // Launches differing from the stage's last only in user data that point at the same bytes
+    // (gcn::sameReads): reused without a replay; not reused as a word was read otherwise, as the
+    // bytes differed; LPN_TABLE_REPEATS=check: replays that came out otherwise.
+    uint64_t tableRepeats = 0, tableOther = 0, tableDiffer = 0, tableMismatches = 0;
     uint64_t fastMiss[8] = {}; // a draw not taking fastDraw, by FastMiss
     uint64_t fastKind[3] = {}; // of kFastKind: other draw kind, other shaders, other prim/instances/index type
     uint64_t fastRes[3] = {}; // of kFastResources: resource counts, a buffer, an image
@@ -1409,6 +1413,10 @@ public:
             for (int i : {kProfAnalyze, kProfShaderLookup, kProfLaunch}) R().prof_.ns[i] += std::exchange(a.ns[i], 0);
             R().prof_.analysisHits += std::exchange(a.analysisHits, 0);
             R().prof_.repeats += std::exchange(a.repeats, 0);
+            R().prof_.tableRepeats += std::exchange(a.tableRepeats, 0);
+            R().prof_.tableOther += std::exchange(a.tableOther, 0);
+            R().prof_.tableDiffer += std::exchange(a.tableDiffer, 0);
+            R().prof_.tableMismatches += std::exchange(a.tableMismatches, 0);
             for (int i = 0; i < 4; ++i) R().prof_.missWhy[i] += std::exchange(a.missWhy[i], 0);
             for (int i = 0; i < 16; ++i) R().prof_.missUser[i] += std::exchange(a.missUser[i], 0);
             R().prof_.analyses += std::exchange(a.analyses, 0);
@@ -1441,6 +1449,10 @@ public:
                      profile::seconds(), R().prof_.missWhy[0] / n, R().prof_.missWhy[1] / n, R().prof_.missWhy[2] / n, R().prof_.missWhy[3] / n);
         for (int i = 0; i < 16; ++i)
             if (R().prof_.missUser[i]) std::fprintf(stderr, " s%d %.0f", i, R().prof_.missUser[i] / n);
+        std::fprintf(stderr, "; same tables: %.0f reused without a replay, %.0f with a word read otherwise, %.0f with other bytes",
+                     R().prof_.tableRepeats / n, R().prof_.tableOther / n, R().prof_.tableDiffer / n);
+        if (tableRepeatMode() == 2) std::fprintf(stderr, ", %" PRIu64 " check mismatches", R().prof_.tableMismatches);
+        R().prof_.tableRepeats = R().prof_.tableOther = R().prof_.tableDiffer = R().prof_.tableMismatches = 0;
         std::fprintf(stderr, "\n[prof] t=%.1f draws recorded in full:", profile::seconds());
         for (int i = 0; i < kFastMissCount; ++i) std::fprintf(stderr, " %s %.0f", kFastMissNames[i], R().prof_.fastMiss[i] / n);
         std::fprintf(stderr, " (kind %.0f, shaders %.0f, prim %.0f; resource counts %.0f, buffer %.0f, image %.0f); fast draws binding a buffer again %.0f, other textures %.0f, switching shaders %.0f",
@@ -6636,6 +6648,24 @@ void main() {
             return last.program;
         }
         c.memoHit = false;
+        // The engine copies a draw's resource tables to a fresh place for each draw (user data
+        // s2/s12 change on nearly every launch), often with the same contents: then the replay
+        // would come out as the last one but for those words.
+        if (const int mode = tableRepeatMode(); mode && last.program && last.submit == submit_ &&
+                                                last.bindingBase == bindingBase && sameLaunchButUserData(last.launch, l)) {
+            gcn::Program& prog = last.program->prog;
+            bool differ = false;
+            if (gcn::sameReads(prog, last.launch, l, c.read, &differ)) {
+                if (mode == 2) return checkTableRepeat(c, last, l, bindingBase);
+                prog.launch = l;
+                std::memcpy(prog.data.data() + gcn::data::kUserData, l.userData, sizeof(l.userData));
+                last.launch = l;
+                ++c.prof.analysisHits, ++c.prof.tableRepeats;
+                c.memoHit = true; // the same programs: what prefetchPipeline() needs to know
+                return last.program;
+            }
+            if (c.prof.on) ++(differ ? c.prof.tableDiffer : c.prof.tableOther);
+        }
         if (c.prof.on && last.program) { // LPN_PROFILE: why the launch did not repeat
             if (last.launch.entry != l.entry) ++c.prof.missWhy[0];
             else if (last.submit != submit_) ++c.prof.missWhy[1];
@@ -6651,6 +6681,49 @@ void main() {
         last.bindingBase = bindingBase;
         last.submit = submit_;
         return last.program;
+    }
+    // 0 off (LPN_NO_TABLE_REPEATS=1), 1 on, 2 check (LPN_TABLE_REPEATS=check: replay anyway and log differences).
+    static int tableRepeatMode() {
+        static const int mode = [] {
+            if (const char* e = getenv("LPN_NO_TABLE_REPEATS"); e && *e && *e != '0') return 0;
+            const char* e = getenv("LPN_TABLE_REPEATS");
+            if (e && !std::strcmp(e, "check")) return 2;
+            return e && *e == '0' ? 0 : 1;
+        }();
+        return mode;
+    }
+    // Check mode: the shortcut's answer next to a replay's; the replay's stands.
+    CachedProgram* checkTableRepeat(AnalysisCtx& c, LastLaunch& last, const gcn::LaunchState& l, uint32_t bindingBase) {
+        gcn::Program expect;
+        expect.launch = l;
+        expect.data = last.program->prog.data;
+        expect.buffers = last.program->prog.buffers;
+        expect.images = last.program->prog.images;
+        std::memcpy(expect.data.data() + gcn::data::kUserData, l.userData, sizeof(l.userData));
+        CachedProgram* p = analyzedUncached(c, l, bindingBase);
+        last.program = p;
+        last.launch = l;
+        last.bindingBase = bindingBase;
+        last.submit = submit_;
+        if (p && !gcn::sameResult(p->prog, expect)) {
+            ++c.prof.tableMismatches;
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 20) {
+                size_t word = 0;
+                while (word < p->prog.data.size() && word < expect.data.size() && p->prog.data[word] == expect.data[word]) ++word;
+                std::fprintf(stderr, "[tables] shortcut differs from the replay for shader 0x%" PRIx64 " (first data word %zu of %zu, buffers %zu/%zu, images %zu/%zu)\n",
+                             l.entry, word, p->prog.data.size(), p->prog.buffers.size(), expect.buffers.size(),
+                             p->prog.images.size(), expect.images.size());
+            }
+        } else if (p) {
+            ++c.prof.tableRepeats;
+        }
+        return p;
+    }
+    static bool sameLaunchButUserData(const gcn::LaunchState& a, const gcn::LaunchState& b) {
+        gcn::LaunchState x = b;
+        std::memcpy(x.userData, a.userData, sizeof(a.userData));
+        return sameLaunch(a, x);
     }
     static bool sameLaunch(const gcn::LaunchState& a, const gcn::LaunchState& b) {
         return a.stage == b.stage && a.entry == b.entry && !std::memcmp(a.userData, b.userData, sizeof(a.userData)) &&
