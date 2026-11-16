@@ -204,7 +204,8 @@ int main() {
         };
         const gcn::Program q = gcn::analyze(a, readAdd);
         differ = false;
-        if (gcn::sameReads(q, a, b, readAdd, &differ) || differ) {
+        if (gcn::sameReads(q, a, b, readAdd, &differ) || differ || gcn::tableWordUse(q, 0).find("s_add") == std::string::npos ||
+            !gcn::tableWordUse(p, 0).empty()) {
             std::fprintf(stderr, "same tables: a pointer the code adds to was taken as a table pointer\n");
             ++failures;
         }

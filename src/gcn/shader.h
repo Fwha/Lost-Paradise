@@ -224,6 +224,9 @@ bool refresh(Program& program, const LaunchState& launch, const ReadMemory& read
 // `bytesDiffer`: false was for the bytes, not for how the words are used.
 bool sameReads(const Program& program, const LaunchState& prev, const LaunchState& next, const ReadMemory& readData,
                bool* bytesDiffer = nullptr);
+// LPN_PROFILE: the trace step that keeps user data word `word` from being a table pointer, disassembled
+// (empty when it is one).
+std::string tableWordUse(const Program& program, uint32_t word);
 // Whether two replays came out the same (data and resources), for checking shortcuts.
 bool sameResult(const Program& a, const Program& b);
 

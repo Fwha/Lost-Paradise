@@ -936,9 +936,12 @@ struct ReplayPlan {
     struct BaseLoad {
         uint8_t base = 0, n = 0; // SGPR pair, dwords
         uint32_t off = 0;        // bytes
+        uint32_t step = 0;       // in the trace
     };
     bool pointersOk = false; // the trace has only steps whose SGPR use is known
     uint16_t pure = 0, pointers = 0;
+    // LPN_PROFILE: per user SGPR, the trace step that keeps it from being a table pointer (~0u none).
+    uint32_t why[16] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
     std::vector<BaseLoad> baseLoads;
 };
 
@@ -949,16 +952,21 @@ namespace {
 // replay only marks registers unknown (vector ALU) read nothing that matters.
 void findPointers(const std::vector<Program::TraceStep>& trace, uint32_t userSgprs, ReplayPlan& plan) {
     bool written[128] = {}, other[128] = {};
-    auto mark = [](bool* m, uint32_t r, unsigned n) {
+    uint32_t cur = 0;
+    auto mark = [&](bool* m, uint32_t r, unsigned n) {
         for (unsigned i = 0; i < n; ++i)
-            if (r + i < 128) m[r + i] = true;
+            if (r + i < 128) {
+                m[r + i] = true;
+                if (r + i < 16 && plan.why[r + i] == ~0u) plan.why[r + i] = cur;
+            }
     };
     auto readSrc = [&](uint32_t code) {
         if (code < 104) mark(other, code, 2); // a pair: 64-bit forms read two
     };
     static const unsigned kCount[] = {1, 2, 4, 8, 16};
     std::vector<ReplayPlan::BaseLoad> loads;
-    for (const Program::TraceStep& t : trace) {
+    for (; cur < trace.size(); ++cur) {
+        const Program::TraceStep& t = trace[cur];
         if (t.start) continue;
         const uint32_t w = t.in.words[0], w1 = t.in.words[1];
         switch (t.in.format) {
@@ -986,7 +994,7 @@ void findPointers(const std::vector<Program::TraceStep>& trace, uint32_t userSgp
             if ((w >> 8) & 1) off = (w & 0xFF) * 4;
             else if ((w & 0xFF) == 255) off = int64_t(t.in.literal) * 4;
             else readSrc(w & 0xFF);
-            if (!buf && off >= 0 && off <= 0xFFFFFFFFll) loads.push_back({uint8_t(base), uint8_t(n), uint32_t(off)});
+            if (!buf && off >= 0 && off <= 0xFFFFFFFFll) loads.push_back({uint8_t(base), uint8_t(n), uint32_t(off), cur});
             else mark(other, base, buf ? 4 : 2);
             break;
         }
@@ -1021,7 +1029,11 @@ void findPointers(const std::vector<Program::TraceStep>& trace, uint32_t userSgp
         if (!written[i] && !other[i]) cand |= uint16_t(1u << i);
     // A load needs both words of its address as the launch gave them.
     for (const auto& l : loads)
-        if (l.base < user && ((cand >> l.base) & 3) != 3) cand &= uint16_t(~(3u << l.base));
+        if (l.base < user && ((cand >> l.base) & 3) != 3) {
+            for (uint32_t i = l.base; i < l.base + 2u && i < 16; ++i)
+                if (plan.why[i] == ~0u) plan.why[i] = l.step;
+            cand &= uint16_t(~(3u << l.base));
+        }
     for (const auto& l : loads)
         if (l.base < user && ((cand >> l.base) & 3) == 3) plan.baseLoads.push_back(l);
     plan.pointers = cand;
@@ -1517,6 +1529,18 @@ bool sameReads(const Program& p, const LaunchState& prev, const LaunchState& nex
 }
 
 bool sameResult(const Program& a, const Program& b) { return sameReplay(a, b); }
+
+std::string tableWordUse(const Program& p, uint32_t word) {
+    if (word >= 16 || p.trace.empty()) return {};
+    const std::shared_ptr<const ReplayPlan> plan = planFor(p);
+    if (!plan->pointersOk) return "a step of unknown kind";
+    const uint32_t i = plan->why[word];
+    if (i >= p.trace.size()) return (plan->pure >> word) & 1 ? std::string() : "?";
+    const Program::TraceStep& t = p.trace[i];
+    char b[48];
+    std::snprintf(b, sizeof b, "0x%llx: ", (unsigned long long)t.pc);
+    return b + disassemble(t.in, uint32_t(t.pc));
+}
 
 bool refresh(Program& p, const LaunchState& launch, const ReadMemory& readData) {
     Program r;

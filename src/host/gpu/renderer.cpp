@@ -6664,7 +6664,10 @@ void main() {
                 c.memoHit = true; // the same programs: what prefetchPipeline() needs to know
                 return last.program;
             }
-            if (c.prof.on) ++(differ ? c.prof.tableDiffer : c.prof.tableOther);
+            if (c.prof.on) {
+                ++(differ ? c.prof.tableDiffer : c.prof.tableOther);
+                if (!differ) logTableWords(prog, last.launch, l);
+            }
         }
         if (c.prof.on && last.program) { // LPN_PROFILE: why the launch did not repeat
             if (last.launch.entry != l.entry) ++c.prof.missWhy[0];
@@ -6691,6 +6694,24 @@ void main() {
             return e && *e == '0' ? 0 : 1;
         }();
         return mode;
+    }
+    // LPN_PROFILE: why a launch's changed user data words are not table pointers, once per shader
+    // and word (the first 80), so the shortcut can be widened where it misses most.
+    void logTableWords(const gcn::Program& prog, const gcn::LaunchState& prev, const gcn::LaunchState& next) {
+        static std::mutex m;
+        static std::set<std::pair<uint64_t, uint32_t>> seen;
+        for (uint32_t i = 0; i < 16; ++i) {
+            if (prev.userData[i] == next.userData[i]) continue;
+            {
+                std::lock_guard lock(m);
+                if (seen.size() >= 80 || !seen.insert({next.entry, i}).second) continue;
+            }
+            const std::string use = gcn::tableWordUse(prog, i);
+            if (use.empty()) continue;
+            std::fprintf(stderr, "[tables] %s 0x%" PRIx64 ": s%u (0x%x -> 0x%x) is no table pointer, for %s\n",
+                         next.stage == gcn::Stage::Vertex ? "vs" : next.stage == gcn::Stage::Pixel ? "ps" : "cs", next.entry, i,
+                         prev.userData[i], next.userData[i], use.c_str());
+        }
     }
     // Check mode: the shortcut's answer next to a replay's; the replay's stands.
     CachedProgram* checkTableRepeat(AnalysisCtx& c, LastLaunch& last, const gcn::LaunchState& l, uint32_t bindingBase) {
