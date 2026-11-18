@@ -111,6 +111,16 @@ std::string dirOfFd(int32_t fd) {
 }
 #endif
 
+// sceKernelGetdirentries' place in each open folder, by descriptor; forgotten when the descriptor
+// is closed, so a folder opened later on the same number starts from its first entry.
+std::mutex gDirMutex;
+std::map<int32_t, size_t> gDirPositions; // fd -> entries already returned
+
+void forgetDirPosition(int32_t fd) {
+    std::lock_guard lock(gDirMutex);
+    gDirPositions.erase(fd);
+}
+
 int32_t sceKernelOpen(const char* path, int32_t flags, uint16_t mode) {
     const std::string h = hostPath(path);
 #ifdef _WIN32
@@ -118,6 +128,7 @@ int32_t sceKernelOpen(const char* path, int32_t flags, uint16_t mode) {
     if (fs::is_directory(h, dec)) {
         const int dfd = ::open("NUL", O_RDONLY | O_BINARY);
         if (dfd >= 0) {
+            forgetDirPosition(dfd);
             std::lock_guard lock(gDirFdMutex);
             gDirFds[dfd] = h;
         }
@@ -125,12 +136,13 @@ int32_t sceKernelOpen(const char* path, int32_t flags, uint16_t mode) {
     }
 #endif
     const int fd = ::open(h.c_str(), hostOpenFlags(flags), mode ? mode : 0644);
-    if (fd >= 0) profile::io().opens.fetch_add(1, std::memory_order_relaxed);
+    if (fd >= 0) forgetDirPosition(fd), profile::io().opens.fetch_add(1, std::memory_order_relaxed);
     if (fd < 0) std::fprintf(stderr, "[file] open %s failed: %s\n", path, std::strerror(errno));
     else if (process().traceFiles) std::fprintf(stderr, "[file] open %s (flip %llu)\n", path, (unsigned long long)flipCount());
     return check(fd);
 }
 int32_t sceKernelClose(int32_t fd) {
+    forgetDirPosition(fd);
 #ifdef _WIN32
     {
         std::lock_guard lock(gDirFdMutex);
@@ -174,7 +186,10 @@ void logReadError(const char* what, int32_t fd, uint64_t n, int64_t off) {
 int64_t sceKernelRead(int32_t fd, void* buf, uint64_t n) {
     WaitLog w{"file read", -1, __builtin_frame_address(0)};
     const uint64_t t0 = nowNs();
-    const int64_t got = ::read(fd, buf, n);
+    const int64_t got = [&] {
+        LPN_FD_POSITION_LOCK(fd);
+        return int64_t(::read(fd, buf, n));
+    }();
     if (got < 0) logReadError("read", fd, n, -1);
     const int64_t r = check64(got);
     ioStat(r, nowNs() - t0);
@@ -182,6 +197,7 @@ int64_t sceKernelRead(int32_t fd, void* buf, uint64_t n) {
 }
 int64_t sceKernelWrite(int32_t fd, const void* buf, uint64_t n) {
     if (fd == 1 || fd == 2) return ::write(fd, buf, n);
+    LPN_FD_POSITION_LOCK(fd);
     return check64(::write(fd, buf, n));
 }
 int64_t sceKernelPread(int32_t fd, void* buf, uint64_t n, int64_t off) {
@@ -196,7 +212,10 @@ int64_t sceKernelPread(int32_t fd, void* buf, uint64_t n, int64_t off) {
 int64_t sceKernelPwrite(int32_t fd, const void* buf, uint64_t n, int64_t off) {
     return check64(::pwrite(fd, buf, n, off));
 }
-int64_t sceKernelLseek(int32_t fd, int64_t off, int32_t whence) { return check64(::lseek(fd, off, whence)); }
+int64_t sceKernelLseek(int32_t fd, int64_t off, int32_t whence) {
+    LPN_FD_POSITION_LOCK(fd);
+    return check64(::lseek(fd, off, whence));
+}
 int32_t sceKernelFsync(int32_t fd) { return check(::fsync(fd)); }
 int32_t sceKernelFtruncate(int32_t fd, int64_t len) { return check(::ftruncate(fd, len)); }
 int32_t sceKernelTruncate(const char* path, int64_t len) {
@@ -231,8 +250,6 @@ int32_t sceKernelRename(const char* from, const char* to) {
 }
 
 // FreeBSD dirent records: { u32 fileno; u16 reclen; u8 type; u8 namlen; char name[]; }, 4-aligned.
-std::mutex gDirMutex;
-std::map<int32_t, size_t> gDirPositions; // fd -> entries already returned
 
 int32_t sceKernelGetdirentries(int32_t fd, char* buf, int32_t nbytes, int64_t* basep) {
     std::vector<std::pair<std::string, uint8_t>> entries;

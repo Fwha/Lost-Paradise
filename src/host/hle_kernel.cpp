@@ -1,6 +1,7 @@
 // libkernel: process info, errno, time, sleeping, console output and other small calls.
 #include "host/equeue.h"
 #include "host/hle.h"
+#include "common/compat.h"
 #include "host/videoout.h"
 #include "host/kernel.h"
 #include "host/module.h"
@@ -78,13 +79,19 @@ int64_t write_(int fd, const void* buf, size_t n) {
         std::fflush(fd == 1 ? stdout : stderr);
         return int64_t(n);
     }
-    const ssize_t r = ::write(fd, buf, n);
+    const ssize_t r = [&] {
+        LPN_FD_POSITION_LOCK(fd);
+        return ::write(fd, buf, n);
+    }();
     if (r < 0) *guestErrno() = toPs4Errno(errno);
     return r;
 }
 
 int64_t read_(int fd, void* buf, size_t n) {
-    const ssize_t r = ::read(fd, buf, n);
+    const ssize_t r = [&] {
+        LPN_FD_POSITION_LOCK(fd);
+        return ::read(fd, buf, n);
+    }();
     if (r < 0) *guestErrno() = toPs4Errno(errno);
     return r;
 }

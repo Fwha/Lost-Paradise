@@ -624,8 +624,9 @@ vec3 cubeDir(vec3 c) {
         switch (in.op) {
         case 0: out(fmt("{ uint a_ = %s; uint r_ = a_ + %s; scc = r_ < a_; ", a.c_str(), b.c_str()) + sreg(d) + " = r_; }\n"); break;
         case 1: out(fmt("{ uint a_ = %s; uint b_ = %s; scc = b_ > a_; ", a.c_str(), b.c_str()) + sreg(d) + " = a_ - b_; }\n"); break;
-        case 2: writeS(d, a + " + " + b); break;
-        case 3: writeS(d, a + " - " + b); break;
+        // s_add_i32 / s_sub_i32: SCC is the signed overflow (as analysis.cpp evaluates it).
+        case 2: out(fmt("{ uint a_ = %s; uint b_ = %s; uint r_ = a_ + b_; scc = ((~(a_ ^ b_) & (a_ ^ r_)) >> 31) != 0u; ", a.c_str(), b.c_str()) + sreg(d) + " = r_; }\n"); break;
+        case 3: out(fmt("{ uint a_ = %s; uint b_ = %s; uint r_ = a_ - b_; scc = (((a_ ^ b_) & (a_ ^ r_)) >> 31) != 0u; ", a.c_str(), b.c_str()) + sreg(d) + " = r_; }\n"); break;
         case 4: out(fmt("{ uint a_ = %s; uint r_ = a_ + %s + uint(scc); scc = r_ < a_ || (scc && r_ == a_); ", a.c_str(), b.c_str()) + sreg(d) + " = r_; }\n"); break;
         case 5: out(fmt("{ uint a_ = %s; uint b_ = %s; uint c_ = uint(scc); scc = b_ > a_ || (c_ != 0u && b_ == a_); ", a.c_str(), b.c_str()) + sreg(d) + " = a_ - b_ - c_; }\n"); break;
         case 6: writeS(d, "uint(min(int(" + a + "), int(" + b + ")))"); break;

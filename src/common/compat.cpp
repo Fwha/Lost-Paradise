@@ -12,6 +12,12 @@
 #include <cerrno>
 #include <cstdio>
 
+// A few locks shared out by descriptor number: two descriptors rarely share one.
+std::mutex& lpnFdPositionMutex(int fd) {
+    static std::mutex locks[64];
+    return locks[unsigned(fd) % 64];
+}
+
 namespace {
 
 int64_t positioned(int fd, void* buf, size_t n, int64_t off, bool write) {
@@ -26,6 +32,7 @@ int64_t positioned(int fd, void* buf, size_t n, int64_t off, bool write) {
     DWORD done = 0;
     const DWORD len = n > 0x7fffffff ? 0x7fffffff : DWORD(n);
     // An offset in OVERLAPPED moves the file position on a synchronous handle; POSIX keeps it.
+    LPN_FD_POSITION_LOCK(fd);
     const int64_t pos = _lseeki64(fd, 0, SEEK_CUR);
     const BOOL ok = write ? WriteFile(h, buf, len, &done, &ov) : ReadFile(h, buf, len, &done, &ov);
     if (pos >= 0) _lseeki64(fd, pos, SEEK_SET);
