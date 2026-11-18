@@ -74,6 +74,11 @@ void vsyncChoose(int i) {
     displaySettings().vsync = i != 0; // the window thread applies it (window.cpp)
     saveDisplaySettings();
 }
+int nativeValue() { return displaySettings().nativeRenderer ? 1 : 0; }
+void nativeChoose(int i) {
+    displaySettings().nativeRenderer = i != 0; // the renderer reads it at each frame's end
+    saveDisplaySettings();
+}
 int uncapCutscenesValue() { return displaySettings().uncapCutscenes ? 1 : 0; }
 void uncapCutscenesChoose(int i) {
     displaySettings().uncapCutscenes = i != 0;
@@ -101,6 +106,8 @@ const std::vector<PcSetting>& pcSettings() {
          &upscalerChoices, &upscalerValue, &upscalerChoose},
         {"Anisotropic Filtering", "Keep textures sharp at glancing angles, like the ground ahead. Off: as the game sets them.",
          &anisoChoices, &anisoValue, &anisoChoose},
+        {"Native Renderer", "Draw the passes rebuilt for PC with their own shaders. Off: all as the game's own.", &onOff,
+         &nativeValue, &nativeChoose},
     };
     return settings;
 }

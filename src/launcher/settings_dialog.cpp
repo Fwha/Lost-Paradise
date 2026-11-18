@@ -99,6 +99,11 @@ const std::vector<Tab> kTabs = {
           false, [](const DisplaySettings&) { return std::vector<std::string>{"At Startup", "In Background"}; },
           [](const DisplaySettings& s) { return int(!s.precompileShaders); },
           [](DisplaySettings& s, int i) { s.precompileShaders = i == 0; }},
+         {"Native Renderer",
+          "Draw the passes rebuilt for PC (so far the game's own anti-aliasing, with the Upscaler off) with their own "
+          "shaders instead of the game's recompiled ones. Off draws everything as before.",
+          false, nullptr, [](const DisplaySettings& s) { return int(s.nativeRenderer); },
+          [](DisplaySettings& s, int v) { s.nativeRenderer = v; }},
      }},
     {"Controller",
      {

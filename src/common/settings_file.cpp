@@ -89,6 +89,8 @@ void readSettings(const std::string& path, DisplaySettings& s) {
         } else if (!std::strcmp(key, "button_icons")) {
             for (int i = 0; i < kButtonIconChoices; ++i)
                 if (!std::strcmp(value, kButtonIconKeys[i])) s.buttonIcons = ButtonIcons(i);
+        } else if (!std::strcmp(key, "renderer")) {
+            s.nativeRenderer = std::strcmp(value, "translated") != 0;
         } else if (!std::strcmp(key, "precompile_shaders")) {
             s.precompileShaders = !std::strcmp(value, "on");
         } else if (!std::strcmp(key, "anisotropy")) {
@@ -126,6 +128,7 @@ bool writeSettings(const std::string& path, const DisplaySettings& s) {
     std::fprintf(f, "vsync = %s\n", s.vsync ? "on" : "off");
     std::fprintf(f, "uncap_cutscenes = %s\n", s.uncapCutscenes ? "on" : "off");
     std::fprintf(f, "precompile_shaders = %s\n", s.precompileShaders ? "on" : "off");
+    std::fprintf(f, "renderer = %s\n", s.nativeRenderer ? "native" : "translated");
     return std::fclose(f) == 0;
 }
 

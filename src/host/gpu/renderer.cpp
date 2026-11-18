@@ -22,6 +22,9 @@
 #include "host/kernel.h"
 #include "host/memory.h"
 #include "host/module.h"
+#include "host/native/native.h"
+#include "host/native/pass_map.h"
+#include "host/native/shader_names.h"
 #include "host/videoout.h"
 #include "host/pm4.h"
 #include "host/profile.h"
@@ -535,6 +538,11 @@ struct ShaderModule {
     gcn::Translation translation;
     uint32_t id = 0;
     uint8_t smaa = 0; // one of the game's SMAA pixel shaders: 1 edges, 2 weights, 3 blend (see upscaleSmaa)
+    // The native pass that draws this pixel shader's draws instead (nativeClaimed), once looked up.
+    bool nativeChecked = false;
+    int nativeRole = 0;
+    native::Pass* nativePass = nullptr;
+    const std::string* gameName = nullptr; // its archive entry (shader_names.h)
     std::string name; // its SPIR-V cache name: a hash of the GLSL, the same in every run
 };
 
@@ -1078,8 +1086,11 @@ public:
         if (upOn_ && upScaled_) upscaleWritten(d, r, *held);
         if (upPrevScene_ && !smaaSeen_) upscalePrevWritten(d, r, *held);
         if (upIn_.on && smaaSeen_ && !upEffect_ && upLastScene_) upscaleEffect(d, r, *held);
+        if (passMap_.active()) passMap_.onDraw(d, r, &readGuest);
+        // A draw a native pass takes is recorded here, in order (see nativeDraw).
+        const bool native = nativeOn_ && d.kind != DrawCall::kDispatch && nativeClaimed(*held);
         if (recordThreads_) {
-            if (segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
+            if (!native && segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
                 addToSegment(d, r, held);
                 return;
             }
@@ -1093,9 +1104,13 @@ public:
         ++drawIndex_;
         trace_ = frame_ == traceFrame_;
         if (trace_)
-            std::fprintf(traceOut_, "[trace] #%" PRIu64 " %s vs 0x%" PRIx64 " ps 0x%" PRIx64 " cs 0x%" PRIx64 "\n", drawIndex_,
+            std::fprintf(traceOut_, "[trace] #%" PRIu64 " %s vs 0x%" PRIx64 " ps 0x%" PRIx64 " cs 0x%" PRIx64 " (%s)\n", drawIndex_,
                          d.kind == DrawCall::kDispatch ? "dispatch" : "draw", shaderAddress(r, reg::kPgmLoVs),
-                         shaderAddress(r, reg::kPgmLoPs), shaderAddress(r, reg::kPgmLoCs));
+                         shaderAddress(r, reg::kPgmLoPs), shaderAddress(r, reg::kPgmLoCs),
+                         d.kind == DrawCall::kDispatch
+                             ? native::shaderNameAt(shaderAddress(r, reg::kPgmLoCs), &readGuest).c_str()
+                             : (native::shaderNameAt(shaderAddress(r, reg::kPgmLoVs), &readGuest) + " | " +
+                                native::shaderNameAt(shaderAddress(r, reg::kPgmLoPs), &readGuest)).c_str());
         if (raceCheck_) raceShader_ = shaderAddress(r, d.kind == DrawCall::kDispatch ? reg::kPgmLoCs : reg::kPgmLoPs);
         const uint64_t passesBefore = R().prof_.passes;
         if (upscaleTouches(d, r, a)) upscaleTouch(d, r, a);
@@ -1287,6 +1302,9 @@ public:
         evictImages();
         sweepVram();
         trace_ = false; // recorder threads read it (a traced frame is recorded here, in order)
+        for (native::Pass* np : native::passes()) np->frameEnd();
+        passMap_.onFrameEnd(frame_, pendingCapture_); // F12: the next frame's pass map beside its trace
+        nativeOn_ = displaySettings().nativeRenderer;
         // Anisotropic Filtering changed: remembered bindings hold the old samplers.
         if (const int a = displaySettings().anisotropy; a != anisoSeen_) anisoSeen_ = a, ++imageGen_;
         ++frame_;
@@ -5229,6 +5247,128 @@ void main() {
 
     // A draw of one of the SMAA shaders with an upscaler on: true when it was handled (skipped,
     // or the blend replaced by the upscaler).
+    // ---- native passes (host/native) -----------------------------------------------------------
+    // A draw whose pixel shader a native pass claims (by its name in the game's shader archives)
+    // is recorded on this thread, in order, and nativeDraw hands it to that pass, which draws it
+    // into the same targets with its own pipeline. PC Settings > Native Renderer turns them off.
+    bool nativeClaimed(DrawAnalysis& a) {
+        if (!a.ok || !a.psm) return false;
+        ShaderModule& m = *a.psm;
+        if (!m.nativeChecked) {
+            if (!native::shaderNamesReady()) return false;
+            m.nativeChecked = true;
+            const std::string& name = native::shaderNameAt(a.ps.launch.entry, &readGuest);
+            if (name != "?") m.gameName = &name;
+            const native::Claim c = native::claim(name);
+            m.nativePass = c.pass, m.nativeRole = c.role;
+            if (c.pass) std::fprintf(stderr, "[native] %s is drawn by the native pass %s\n", name.c_str(), c.pass->name());
+        }
+        return m.nativePass != nullptr;
+    }
+
+    class NativeGpu final : public native::Gpu {
+    public:
+        explicit NativeGpu(Renderer& r) : r_(r) {}
+        VkDevice device() const override { return r_.vk_.device; }
+        PFN_vkCmdPushDescriptorSetKHR pushDescriptorSet() const override { return r_.vk_.cmdPushDescriptorSet; }
+        VkShaderModule shader(const std::string& glsl, Stage stage) override {
+            const gcn::GlslStage s = stage == Stage::Vertex     ? gcn::GlslStage::Vertex
+                                     : stage == Stage::Compute ? gcn::GlslStage::Compute
+                                                               : gcn::GlslStage::Fragment;
+            auto it = r_.nativeModules_.find(glsl);
+            if (it != r_.nativeModules_.end()) return it->second;
+            return r_.nativeModules_[glsl] = r_.module(glsl, s);
+        }
+        void record(std::function<void(VkCommandBuffer)> fn) override {
+            r_.rec([c = r_.R().cmd_, fn = std::move(fn)] { fn(c); });
+        }
+
+    private:
+        Renderer& r_;
+    };
+
+    // The draw as a native pass sees it (native::Draw), then the pass's own recording in its place.
+    // False when the pass declines it: the translated path draws it.
+    bool nativeDraw(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
+        const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
+        native::Draw nd;
+        nd.psName = a.psm->gameName;
+        nd.primitive = r.prim;
+        nd.count = d.count;
+        Surface* written[8]{};
+        const uint32_t targetMask = r.ctx[reg::kCbTargetMask] & r.ctx[reg::kCbShaderMask];
+        for (uint32_t i = 0; i < 8 && cbMode == 1; ++i) {
+            const uint32_t* cb = &r.ctx[reg::kCbColorBase + i * reg::kCbColorStride];
+            const uint32_t info = cb[::gpu::ctx::kCbColorInfo];
+            const uint32_t fmt = (info >> 2) & 0x1F, num = (info >> 8) & 7;
+            const uint32_t mask = (targetMask >> (i * 4)) & 0xF;
+            if (!fmt || !mask) continue;
+            const VkFormat vf = colorFormat(fmt, num);
+            if (vf == VK_FORMAT_UNDEFINED) return false;
+            const uint32_t pitch = ((cb[::gpu::ctx::kCbColorPitch] & 0x7FF) + 1) * 8;
+            const uint32_t slice = ((cb[::gpu::ctx::kCbColorSlice] & 0x3FFFFF) + 1) * 64;
+            Surface* s = colorSurface(uint64_t(cb[0]) << 8, pitch, slice / pitch, vf, bytesPerElement(fmt));
+            if (!s) return false;
+            written[i] = s;
+            nd.color[i] = {view(s->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), vf, s->img.width, s->img.height, uint64_t(cb[0]) << 8};
+            nd.colorCount = i + 1;
+            nd.writeMask |= mask << (i * 4);
+            if ((r.ctx[reg::kCbBlendControl + i] >> 30) & 1) nd.blend = true;
+        }
+        const uint32_t depthControl = r.ctx[reg::kDbDepthControl];
+        if (r.ctx[reg::kDbZInfo] & 3) {
+            nd.stencil = depthControl & 1;
+            nd.depthTest = (depthControl >> 1) & 1;
+            nd.depthWrite = (depthControl >> 2) & 1;
+        }
+        const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
+        nd.viewport[0] = v[1] - std::fabs(v[0]), nd.viewport[2] = 2 * std::fabs(v[0]);
+        nd.viewport[1] = v[3] - std::fabs(v[2]), nd.viewport[3] = 2 * std::fabs(v[2]);
+        // The screen scissor, within the first target.
+        const uint32_t tl = r.ctx[reg::kScreenScissorTl], br = r.ctx[reg::kScreenScissorBr];
+        const uint32_t tw = nd.colorCount ? nd.color[0].width : 0, th = nd.colorCount ? nd.color[0].height : 0;
+        const int32_t x0 = int32_t(tl & 0x7FFF), y0 = int32_t((tl >> 16) & 0x7FFF);
+        const int32_t x1 = std::min(int32_t(br & 0x7FFF), int32_t(tw)), y1 = std::min(int32_t((br >> 16) & 0x7FFF), int32_t(th));
+        nd.scissor[0] = x0, nd.scissor[1] = y0, nd.scissor[2] = std::max(0, x1 - x0), nd.scissor[3] = std::max(0, y1 - y0);
+        for (const gcn::ImageResource& im : a.ps.images) {
+            if (im.storage) return false;
+            const ImageBinding b = resolveImage(im);
+            native::Texture t;
+            t.view = b.view, t.sampler = b.sampler;
+            t.scale[0] = b.scale[0], t.scale[1] = b.scale[1];
+            t.address = im.base(), t.width = im.width(), t.height = im.height();
+            t.pc = uint32_t(im.pc - a.ps.launch.entry);
+            nd.textures.push_back(t);
+        }
+        const gcn::Program& ps = a.ps;
+        nd.load = [&ps](uint32_t pc, uint32_t* out, uint32_t n) {
+            auto it = ps.smrd.find(ps.launch.entry + pc);
+            if (it == ps.smrd.end() || it->second + n > ps.data.size()) return false;
+            std::memcpy(out, &ps.data[it->second], n * 4);
+            return true;
+        };
+        if (!ringFits(1 << 12)) flush();
+        begin();
+        fullBarrier();
+        NativeGpu gpu(*this);
+        if (!a.psm->nativePass->draw(a.psm->nativeRole, nd, gpu)) return false;
+        fullBarrier();
+        // The pass bound pipelines and descriptors of its own: everything is set again.
+        R().bound_ = Bound{};
+        ++R().passSerial_;
+        R().fast_.valid = false;
+        for (FastSlot& f : R().fastSlots_) f.f.valid = false;
+        R().lastMergeable_ = false;
+        ++fastEpoch_;
+        for (Surface* s : written)
+            if (s) gpuWrote(*s);
+        return true;
+    }
+
+    native::PassMap passMap_;
+    bool nativeOn_ = false;
+    std::unordered_map<std::string, VkShaderModule> nativeModules_;
+
     bool upscaleSmaa(const DrawRegs& r, uint8_t role, const DrawAnalysis& a) {
         if (upKind_ == Upscaler::Off || !upscale::usable(upKind_)) return false;
         smaaSeen_ = true; // later draws are post-processing: not jittered
@@ -7153,6 +7293,7 @@ void main() {
 
         if (!a.ok) return;
         if (upOn_ && a.psm && a.psm->smaa && upscaleSmaa(r, a.psm->smaa, a)) return;
+        if (nativeOn_ && !R().worker_ && a.psm && a.psm->nativePass && nativeDraw(d, r, a)) return;
         const bool wasMergeable = R().lastMergeable_;
         R().lastMergeable_ = false;
         if (fastDraw(d, r, a, wasMergeable) || switchDraw(d, r, a)) return;

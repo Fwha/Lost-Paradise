@@ -18,6 +18,7 @@
 #include "host/kernel.h"
 #include "host/linker.h"
 #include "host/module.h"
+#include "host/native/shader_names.h"
 #include "host/profile.h"
 #include "host/tls.h"
 #include "host/gpu/renderer.h"
@@ -237,6 +238,8 @@ int main(int argc, char** argv) {
     host::createGuestTls();
     if (headless) host::setAudioEnabled(false);
     host::startPresenter(headless);
+    // The game's shader names, which the native renderer finds its passes by (host/native).
+    if (gpu) host::native::indexShaderNames(host::process().gameDir);
     if (gpu) host::render::startRenderer(computeOnly);
     std::atexit(host::printUnimplementedSummary);
 
