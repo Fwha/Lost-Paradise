@@ -35,6 +35,10 @@ struct Progress {
 // Reads the header and entries; false with err saying why (not a PKG, unreadable).
 bool readInfo(const std::string& path, Info& info, std::string& err);
 
+// Whether s looks like a title ID (CUSA12776): nine letters and digits. Anything else from a PKG
+// or param.sfo is not used in a path.
+bool validTitleId(const std::string& s);
+
 // The folder name the game goes into under game/: the title ID, with -UPDATE for a patch and
 // -DLC for add-on content.
 std::string folderName(const Info& info);

@@ -1,6 +1,7 @@
 // SHA-256 (FIPS 180-4), AES-128 (FIPS 197), XTS (IEEE 1619) and RSA by Montgomery multiplication.
 #include "pkg/crypto.h"
 
+#include <cstdio>
 #include <cstring>
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -78,6 +79,18 @@ struct Sha256 {
 Digest sha256(const void* data, size_t size) {
     Sha256 s;
     s.update(data, size);
+    return s.finish();
+}
+
+Digest sha256File(const std::string& path, bool* ok) {
+    *ok = false;
+    Sha256 s;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return {};
+    std::vector<uint8_t> buf(1 << 20);
+    for (size_t n; (n = std::fread(buf.data(), 1, buf.size(), f)) > 0;) s.update(buf.data(), n);
+    *ok = !std::ferror(f);
+    std::fclose(f);
     return s.finish();
 }
 
