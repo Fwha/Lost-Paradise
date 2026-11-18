@@ -133,12 +133,26 @@ int32_t sceKernelAllocateDirectMemory(int64_t searchStart, int64_t searchEnd, ui
 }
 
 int32_t sceKernelReleaseDirectMemory(int64_t start, uint64_t len) {
+    if (len == 0) return sceError(ps4errno::kEINVAL);
+    const uint64_t a = uint64_t(start), e = a + len;
     std::lock_guard lock(gMutex);
-    auto it = gAllocated.find(uint64_t(start));
-    if (it == gAllocated.end()) return sceError(ps4errno::kENOENT);
-    if (it->second != len) std::fprintf(stderr, "[memory] partial direct memory release not supported\n");
-    gAllocated.erase(it);
-    if (!gAnonymous) releaseSharedMemory(directFd(), uint64_t(start), len);
+    // Every allocation overlapping [a, e) loses that part; what lies outside it stays allocated.
+    bool any = false;
+    auto it = gAllocated.upper_bound(a);
+    if (it != gAllocated.begin()) --it;
+    while (it != gAllocated.end() && it->first < e) {
+        const uint64_t s = it->first, end = s + it->second;
+        if (end <= a) {
+            ++it;
+            continue;
+        }
+        any = true;
+        it = gAllocated.erase(it);
+        if (s < a) gAllocated[s] = a - s;
+        if (end > e) gAllocated[e] = end - e;
+    }
+    if (!any) return sceError(ps4errno::kENOENT);
+    if (!gAnonymous) releaseSharedMemory(directFd(), a, len);
     return 0;
 }
 
@@ -148,10 +162,11 @@ int32_t sceKernelMapDirectMemory(void** addr, uint64_t len, int32_t prot, int32_
     std::unique_lock lock(gMutex);
     gMappedAny = true;
     const bool anonymous = gAnonymous;
+    const int fd = anonymous ? -1 : directFd(); // created under gMutex: one backing for every thread
     if (!anonymous) lock.unlock();
     int hflags = anonymous ? MAP_PRIVATE | MAP_ANONYMOUS : MAP_SHARED;
     if (flags & kMapFixed) hflags |= (flags & kMapNoOverwrite) ? MAP_FIXED_NOREPLACE : MAP_FIXED;
-    void* r = mapAligned(*addr, len, align, hostProt(prot), hflags, anonymous ? -1 : directFd(),
+    void* r = mapAligned(*addr, len, align, hostProt(prot), hflags, fd,
                          anonymous ? 0 : uint64_t(directStart));
     if (r == MAP_FAILED) return sceErrorFromHost(errno);
     *addr = r;

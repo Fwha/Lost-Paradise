@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <new>
 #include <vector>
 
 #include <fcntl.h>
@@ -546,8 +547,11 @@ bool readInfo(const std::string& path, Info& info, std::string& err) {
         return true;
     } catch (const Error& e) {
         err = e.what;
-        return false;
+    } catch (const std::bad_alloc&) {
+        // A corrupt entry size (up to 4 GiB): reported, not thrown on to the launcher's thread.
+        err = "the PKG is corrupt (out of memory reading it)";
     }
+    return false;
 }
 
 bool validTitleId(const std::string& s) {

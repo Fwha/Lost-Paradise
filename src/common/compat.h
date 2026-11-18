@@ -7,6 +7,7 @@
 #include <sys/types.h>
 
 #include <cstdint>
+#include <mutex>
 #include <ctime>
 #include <string>
 
@@ -29,6 +30,11 @@
 
 int64_t pread(int fd, void* buf, size_t n, int64_t off);
 int64_t pwrite(int fd, const void* buf, size_t n, int64_t off);
+// Windows' pread and pwrite move the descriptor's position and put it back, holding this lock:
+// a plain read, write or seek on a descriptor others may pread holds it too
+// (LPN_FD_POSITION_LOCK), so it does not land in between.
+std::mutex& lpnFdPositionMutex(int fd);
+#define LPN_FD_POSITION_LOCK(fd) std::lock_guard lpnFdLock_(lpnFdPositionMutex(fd))
 inline int fsync(int fd) { return _commit(fd); }
 inline std::tm* localtime_r(const std::time_t* t, std::tm* out) { return localtime_s(out, t) == 0 ? out : nullptr; }
 inline std::tm* gmtime_r(const std::time_t* t, std::tm* out) { return gmtime_s(out, t) == 0 ? out : nullptr; }
@@ -43,6 +49,7 @@ long lpnUtcOffset(std::time_t t);
 #else
 #include <unistd.h>
 #define LPN_O_BINARY 0
+#define LPN_FD_POSITION_LOCK(fd) (void)(fd) // pread and pwrite leave the position alone
 inline int lpnMkdir(const char* path, int mode) { return ::mkdir(path, mode); }
 inline long lpnUtcOffset(std::time_t t) {
     std::tm lt{};
