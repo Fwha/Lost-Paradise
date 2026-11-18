@@ -9,6 +9,7 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -325,9 +326,10 @@ private:
     std::vector<Inode> inodes_;
 };
 
-// A name from the PKG or its image as a relative path: no empty, "." or ".." parts.
+// A name from the PKG or its image as a relative path: no empty, "." or ".." parts, and no
+// backslash or colon, which Windows would take as a separator or a drive (..\x, C:\x).
 bool safeName(const std::string& s) {
-    if (s.empty() || s.front() == '/') return false;
+    if (s.empty() || s.front() == '/' || s.find_first_of("\\:") != std::string::npos) return false;
     size_t at = 0;
     while (at <= s.size()) {
         const size_t slash = std::min(s.find('/', at), s.size());
@@ -407,7 +409,7 @@ struct Package {
         const uint32_t count = be32(h + 0x10), table = be32(h + 0x18);
         info.contentId.assign(reinterpret_cast<const char*>(h + 0x40), 0x24);
         info.contentId.resize(std::strlen(info.contentId.c_str()));
-        if (info.contentId.size() >= 16) info.titleId = info.contentId.substr(7, 9);
+        if (info.contentId.size() >= 16 && validTitleId(info.contentId.substr(7, 9))) info.titleId = info.contentId.substr(7, 9);
         pfsFlags = be64(h + 0x408);
         pfsOffset = be64(h + 0x410);
         pfsSize = be64(h + 0x418);
@@ -426,7 +428,7 @@ struct Package {
                 const std::vector<uint8_t> sfo = file.read(e.offset, e.size);
                 info.category = sfoString(sfo, "CATEGORY");
                 info.title = sfoString(sfo, "TITLE");
-                if (const std::string id = sfoString(sfo, "TITLE_ID"); id.size() == 9) info.titleId = id;
+                if (const std::string id = sfoString(sfo, "TITLE_ID"); validTitleId(id)) info.titleId = id;
             }
             // ENTRY_KEYS: a seed digest, 7 digests, then 7 RSA-encrypted keys.
             if (e.id == 0x10 && e.size >= 32 * 8 + 256 * 4) {
@@ -548,8 +550,17 @@ bool readInfo(const std::string& path, Info& info, std::string& err) {
     }
 }
 
+bool validTitleId(const std::string& s) {
+    return s.size() == 9 && std::all_of(s.begin(), s.end(), [](char c) { return std::isalnum(static_cast<unsigned char>(c)); });
+}
+
 std::string folderName(const Info& info) {
-    std::string id = info.titleId.empty() ? info.contentId : info.titleId;
+    // The content ID only when there is no title ID: letters, digits, '-' and '_' kept, so it
+    // stays one folder name under game/.
+    std::string id = info.titleId;
+    if (id.empty())
+        for (char c : info.contentId) id += std::isalnum(static_cast<unsigned char>(c)) || c == '-' ? c : '_';
+    if (id.empty()) id = "unknown";
     if (info.category.rfind("gp", 0) == 0) id += "-UPDATE";
     else if (info.category == "ac") id += "-DLC";
     return id;

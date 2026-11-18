@@ -1,5 +1,7 @@
 #include "launcher/updater.h"
 
+#include "pkg/crypto.h"
+
 #include <atomic>
 #include <cctype>
 #include <cstdio>
@@ -38,6 +40,7 @@ constexpr const char* kRepo = "Fwha/Lost-Paradise";
 std::mutex gM;
 UpdateStatus gStatus;
 std::string gInstall, gAssetUrl, gUpdated; // gUpdated: the AppImage written, ready to start
+std::string gAssetDigest;                   // the asset's SHA-256 as GitHub lists it (64 hex digits)
 std::atomic<bool> gBusy{false}, gRestart{false};
 
 void set(UpdateState s, std::string message = {}) {
@@ -250,7 +253,7 @@ void check() {
 #else
     const std::string suffix = ".appimage";
 #endif
-    std::string asset;
+    std::string asset, assetDigest;
     const size_t assets = j.find("\"assets\"");
     for (size_t pos = assets; assets != std::string::npos;) {
         size_t at = 0;
@@ -262,6 +265,13 @@ void check() {
         if (lower.size() > suffix.size() && lower.compare(lower.size() - suffix.size(), suffix.size(), suffix) == 0) {
             const size_t u = j.rfind("\"url\"", at);
             if (u != std::string::npos && u > assets) asset = jsonString(j, "url", u);
+            // Its "digest" ("sha256:..."), which GitHub computes on upload, comes after the name
+            // and before the asset's last field, browser_download_url.
+            const size_t last = j.find("\"browser_download_url\"", at);
+            size_t d = 0;
+            const std::string digest = jsonString(j, "digest", at, &d);
+            if (!digest.empty() && (last == std::string::npos || d < last) && digest.rfind("sha256:", 0) == 0)
+                assetDigest = digest.substr(7);
             break;
         }
     }
@@ -269,9 +279,37 @@ void check() {
         std::lock_guard lock(gM);
         gStatus.latest = tag;
         gAssetUrl = asset;
+        gAssetDigest = assetDigest;
     }
     if (!newerVersion(tag, version())) set(UpdateState::UpToDate, std::string("Up to date (") + version() + ")");
     else set(UpdateState::Available, "Update " + tag + " is available");
+}
+
+// Whether the downloaded file is the asset GitHub lists: its SHA-256 matches the release's
+// digest, and it starts as an AppImage (ELF) or a zip should. *why says what is wrong.
+bool verifyDownload(const std::string& path, const std::string& digest, bool zip, std::string* why) {
+    if (digest.size() != 64) {
+        *why = "The release lists no SHA-256 for the download: not installing it";
+        return false;
+    }
+    unsigned char magic[4] = {};
+    if (std::FILE* f = std::fopen(path.c_str(), "rb")) {
+        if (std::fread(magic, 1, 4, f) != 4) magic[0] = 0;
+        std::fclose(f);
+    }
+    const bool shape = zip ? std::memcmp(magic, "PK\x03\x04", 4) == 0 : std::memcmp(magic, "\x7f" "ELF", 4) == 0;
+    bool ok = false;
+    const pkg::crypto::Digest d = pkg::crypto::sha256File(path, &ok);
+    static const char* hex = "0123456789abcdef";
+    std::string got;
+    for (uint8_t b : d) got += hex[b >> 4], got += hex[b & 15];
+    std::string want = digest;
+    for (char& c : want) c = char(std::tolower(static_cast<unsigned char>(c)));
+    if (!ok || !shape || got != want) {
+        *why = "The download is damaged (its SHA-256 does not match the release): try again";
+        return false;
+    }
+    return true;
 }
 
 #ifdef _WIN32
@@ -291,10 +329,10 @@ bool replaceFile(const fs::path& from, const fs::path& to) {
 }
 
 void download() {
-    std::string url, tag;
+    std::string url, tag, digest;
     {
         std::lock_guard lock(gM);
-        url = gAssetUrl, tag = gStatus.latest;
+        url = gAssetUrl, tag = gStatus.latest, digest = gAssetDigest;
     }
     if (url.empty()) {
         set(UpdateState::Failed, tag + " has no Windows zip attached");
@@ -307,6 +345,11 @@ void download() {
     if (code != 200 || fs::file_size(zip, ec) < 1024 * 1024) {
         fs::remove(zip, ec);
         set(UpdateState::Failed, code != 200 ? httpError(code) : "The download failed");
+        return;
+    }
+    if (std::string why; !verifyDownload(zip.string(), digest, true, &why)) {
+        fs::remove(zip, ec);
+        set(UpdateState::Failed, why);
         return;
     }
     // Windows 10 and later have bsdtar, which reads zips. The zip holds one folder.
@@ -342,10 +385,10 @@ void download() {
 #else
 void download() {
     const char* app = std::getenv("APPIMAGE");
-    std::string url, tag;
+    std::string url, tag, digest;
     {
         std::lock_guard lock(gM);
-        url = gAssetUrl, tag = gStatus.latest;
+        url = gAssetUrl, tag = gStatus.latest, digest = gAssetDigest;
     }
     if (!app || !*app) {
         set(UpdateState::Available, tag + " is out: git pull in lost-paradise, then rebuild");
@@ -363,6 +406,11 @@ void download() {
     if ((code != 200 && !fileUrl) || fs::file_size(part, ec) < 1024 * 1024) {
         fs::remove(part, ec);
         set(UpdateState::Failed, code != 200 && !fileUrl ? httpError(code) : "The download failed");
+        return;
+    }
+    if (std::string why; !verifyDownload(part, digest, false, &why)) {
+        fs::remove(part, ec);
+        set(UpdateState::Failed, why);
         return;
     }
     chmod(part.c_str(), 0755);

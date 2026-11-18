@@ -1,8 +1,10 @@
 // pkg/crypto against published test vectors, with and without AES-NI.
 #include "pkg/crypto.h"
+#include "pkg/pkg.h"
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 using namespace pkg::crypto;
@@ -65,6 +67,29 @@ int main() {
     // RFC 4231 test case 2.
     const Digest mac = hmacSha256("Jefe", 4, "what do ya want for nothing?", 28);
     check("hmac", hex(mac.data(), 32), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    // sha256File over more than one read buffer (1 MiB).
+    {
+        const std::string path = (std::filesystem::temp_directory_path() / "lpn-pkg-test-sha.bin").string();
+        const std::string big((1 << 20) + 1000, 'a');
+        if (std::FILE* f = std::fopen(path.c_str(), "wb")) std::fwrite(big.data(), 1, big.size(), f), std::fclose(f);
+        bool ok = false;
+        const Digest d = sha256File(path, &ok);
+        check("sha256File", ok ? hex(d.data(), 32) : "unreadable", hex(sha256(big.data(), big.size()).data(), 32).c_str());
+        std::remove(path.c_str());
+        sha256File(path, &ok);
+        check("sha256File missing", ok ? "read" : "unreadable", "unreadable");
+    }
+    // Title IDs and folder names from a PKG stay one folder under game/.
+    check("title id", pkg::validTitleId("CUSA12776") ? "ok" : "no", "ok");
+    check("title id ../", pkg::validTitleId("../../abc") ? "ok" : "no", "no");
+    check("title id ..\\", pkg::validTitleId("..\\..\\ab") ? "ok" : "no", "no");
+    {
+        pkg::Info info;
+        info.contentId = "UP0700-../../x_00";
+        check("folder from content id", pkg::folderName(info), "UP0700-______x_00");
+        info.titleId = "CUSA12776", info.category = "gp";
+        check("folder update", pkg::folderName(info), "CUSA12776-UPDATE");
+    }
     aes();
     useAesNi(false);
     aes();

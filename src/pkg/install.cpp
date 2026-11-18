@@ -154,6 +154,7 @@ bool applyFolder(const std::string& folder, const std::string& gamesDir, bool mo
         const std::string category = host::sfoString(sfo, "CATEGORY"), titleId = host::sfoString(sfo, "TITLE_ID");
         const std::string title = host::sfoString(sfo, "TITLE");
         if (titleId.empty()) throw Failed{"no sce_sys/param.sfo with a title ID in " + src.filename().string()};
+        if (!validTitleId(titleId)) throw Failed{"the title ID in " + src.filename().string() + "'s param.sfo is not one (" + safe(titleId) + ")"};
         const bool update = category.rfind("gp", 0) == 0, dlc = category == "ac";
         if (!update && !dlc)
             throw Failed{src.filename().string() + " is a full game, not an update or DLC: unpack or copy it into the game folder"};

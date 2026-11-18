@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace pkg::crypto {
@@ -13,6 +14,8 @@ namespace pkg::crypto {
 using Digest = std::array<uint8_t, 32>;
 
 Digest sha256(const void* data, size_t size);
+// SHA-256 of a whole file, read in pieces; false in *ok when it cannot be read.
+Digest sha256File(const std::string& path, bool* ok);
 Digest hmacSha256(const void* key, size_t keySize, const void* data, size_t size);
 
 // AES-128 with its round keys; uses AES-NI when the CPU has it.
