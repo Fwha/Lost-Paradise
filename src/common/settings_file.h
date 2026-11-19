@@ -64,6 +64,9 @@ struct DisplaySettings {
     // Build every shader and pipeline the cache knows before the game starts, behind a progress
     // screen, instead of in the background while it plays (gpu/renderer.cpp).
     bool precompileShaders = true;
+    // Draw the passes the native renderer has rebuilt (host/native, docs/native-renderer.md) with
+    // its own shaders instead of the game's recompiled ones. Off draws everything as before.
+    bool nativeRenderer = true;
 };
 
 constexpr const char* kSettingsFile = "lpn-display.ini";
