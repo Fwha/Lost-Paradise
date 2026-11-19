@@ -135,7 +135,9 @@ public:
                 return decline(role, "a vertex format it does not read");
             (v.slot == 0 ? pos : uv) = &v;
         }
-        if (pos && components(pos->dfmt) < 3) return decline(role, "a position of fewer than 3 components");
+        if (pos && (components(pos->dfmt) < 3 || pos->components < 3)) return decline(role, "a position of fewer than 3 components");
+        if (uv && (uv->components < 2 || (uv->dfmt != 5 && uv->dfmt != 11 && uv->dfmt != 14 && uv->dfmt != 13)))
+            return decline(role, "coordinates in a format it does not read");
         if (!pos || (alpha && !uv)) return decline(role, "no position or coordinates");
         Push push{};
         if (!matrix(alpha ? kAlphaLoads : kOpaqueLoads, d, push.m)) return decline(role, "a constant is missing");
