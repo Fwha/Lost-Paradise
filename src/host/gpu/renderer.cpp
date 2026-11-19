@@ -7043,6 +7043,13 @@ void main() {
         return p.prog.launch.entry ? &p : nullptr;
     }
 
+    // Where each scalar load's result is in a program's data: its map, and the loads its trace
+    // replays (a program analysed without its draw, then re-targeted, may have only those).
+    static void loadMap(const gcn::Program& p, std::map<uint64_t, uint32_t>& out) {
+        out = p.smrd;
+        for (const auto& t : p.trace)
+            if (!t.start && t.in.format == gcn::Format::SMRD && t.slot != ~0u) out.emplace(t.pc, t.slot);
+    }
     static void takeDrawPart(gcn::Program& to, const gcn::Program& from) {
         to.launch = from.launch;
         to.fetchSite = from.fetchSite, to.fetchSlots = from.fetchSlots;
@@ -7156,8 +7163,8 @@ void main() {
                 takeDrawPart(a.ps, psc->prog);
                 a.nativeLoads = psc->module && psc->module->nativeLoads.load(std::memory_order_relaxed);
                 if (a.nativeLoads) {
-                    a.ps.smrd = psc->prog.smrd;
-                    a.vs.smrd = vsc->prog.smrd; // native passes read the vertex shader's constants too
+                    loadMap(psc->prog, a.ps.smrd);
+                    loadMap(vsc->prog, a.vs.smrd); // native passes read the vertex shader's constants too
                 }
                 a.repeat = a.repeat && c.memoHit;
                 a.psc = psc;
