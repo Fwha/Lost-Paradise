@@ -5355,7 +5355,7 @@ void main() {
     // False when the pass declines it: the translated path draws it.
     bool nativeDraw(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
         // Analysed before the claim: without its scalar loads (the next draws have them).
-        if (a.ps.smrd.empty()) return false;
+        if (!a.nativeLoads) return false;
         const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
         native::Draw nd;
         nd.psName = a.psm->gameName;
@@ -6796,6 +6796,7 @@ void main() {
         // Its buffers' bindings, resolved on the worker (resolveAhead) at bufferEpoch_ resEpoch.
         std::vector<BufRes> vsRes, psRes;
         uint64_t resEpoch = 0;
+        bool nativeLoads = false; // vs and ps hold their scalar load maps (a native pass claims the draw)
     };
     // A draw's launches as the registers give them, for a worker to analyse.
     struct DrawJob {
@@ -7045,6 +7046,9 @@ void main() {
     static void takeDrawPart(gcn::Program& to, const gcn::Program& from) {
         to.launch = from.launch;
         to.fetchSite = from.fetchSite, to.fetchSlots = from.fetchSlots;
+        // Analyses are recycled: a scalar load map left from another program would give a native
+        // pass another shader's constants (runJob copies it for claimed draws only).
+        if (!to.smrd.empty()) to.smrd.clear();
         to.data = from.data;
         to.buffers = from.buffers;
         to.images = from.images;
@@ -7128,6 +7132,7 @@ void main() {
     // On a worker: analyses one draw or dispatch into its DrawAnalysis.
     void runJob(AnalysisCtx& c, DrawJob& j) {
         DrawAnalysis& a = *j.out;
+        a.nativeLoads = false;
         if (j.kind == DrawJob::kDispatch) {
             CachedProgram* csc = analyzed(c, j.vs, 0);
             if (!csc) return;
@@ -7149,7 +7154,8 @@ void main() {
             if (CachedProgram* psc = analyzed(c, j.ps, kPsBindingBase)) {
                 a.psm = psc->module;
                 takeDrawPart(a.ps, psc->prog);
-                if (psc->module && psc->module->nativeLoads.load(std::memory_order_relaxed)) {
+                a.nativeLoads = psc->module && psc->module->nativeLoads.load(std::memory_order_relaxed);
+                if (a.nativeLoads) {
                     a.ps.smrd = psc->prog.smrd;
                     a.vs.smrd = vsc->prog.smrd; // native passes read the vertex shader's constants too
                 }
