@@ -32,6 +32,7 @@ struct Texture {
 // A render target the draw writes.
 struct Target {
     VkImageView view = VK_NULL_HANDLE;
+    VkImage image = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0; // of the image
     uint64_t address = 0;
@@ -43,6 +44,26 @@ struct Target {
 // Where each of the target's channels comes from among the shader's outputs (x, y, z, w = 0..3),
 // as the GCN colour export orders them.
 void swizzle(const Target& t, int32_t out[4]);
+
+// A buffer of guest memory as a storage buffer: `offset` is aligned for binding, the data starts
+// `byteOffset` bytes into it.
+struct Buffer {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0, range = 0;
+    uint32_t byteOffset = 0;
+};
+// A vertex buffer the vertex shader fetches from (a V#), in the order the shader declares them.
+struct VertexBuffer {
+    Buffer data;
+    uint32_t stride = 0, records = 0;
+    uint32_t dfmt = 0, nfmt = 0; // the V#'s data and number formats
+    uint32_t dstSel = 0;          // its DST_SEL_X/Y/Z/W (0xFAC: x, y, z, w as stored)
+    // A vertex fetch slot (the analysis parses the fetch shader): it loads `components` into
+    // v[4 + 4 * slot] from element `index VGPR` (0: the vertex index) at `offset` bytes in.
+    // slot < 0: a buffer the shader reads otherwise.
+    int32_t slot = -1;
+    uint32_t components = 0, indexVgpr = 0, offset = 0;
+};
 
 // One of the game's draws that a native pass claimed.
 struct Draw {
@@ -63,6 +84,17 @@ struct Draw {
     int32_t scissor[4] = {};     // x, y, width, height
     uint32_t primitive = 0;      // the game's primitive type (17: a rectangle list)
     uint32_t count = 0;          // vertices or indices
+    uint32_t instances = 1;
+    // Indexed draws: the index buffer (from the first index drawn) and its type.
+    bool indexed = false;
+    Buffer index;
+    VkIndexType indexType = VK_INDEX_TYPE_UINT16;
+    VkViewport vkViewport{};     // as the translated draw sets it (depth range included)
+    VkCullModeFlags cull = VK_CULL_MODE_NONE;
+    VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    std::vector<VertexBuffer> vertex;
+    // The vertex shader's scalar loads, as `load` is the pixel shader's.
+    std::function<bool(uint32_t pc, uint32_t* out, uint32_t n)> vsLoad;
     // The pixel shader's sampled images, in the order the shader declares them.
     std::vector<Texture> textures;
     // `n` dwords of the scalar load at `pc` (an offset from the pixel shader's start), as the
@@ -79,8 +111,13 @@ public:
     // A shader module from GLSL (compiled once, kept in the SPIR-V cache); null on an error.
     enum class Stage { Vertex, Fragment, Compute };
     virtual VkShaderModule shader(const std::string& glsl, Stage stage) = 0;
-    // Queues Vulkan commands, in order with the translated draws around them, outside any render
-    // pass and after a full barrier. `fn` runs later, on another thread: it must hold copies of
+    // Starts rendering into these attachments (loaded and stored), or carries on in the native
+    // pass already open on the same ones: consecutive native draws share one render pass, as the
+    // translated ones do. Call it before recording draws; a pass that declines a draw must not.
+    // Depth is attached when `depth.view` is set, as stencil too with `stencil`.
+    virtual void beginRendering(const Target* color, uint32_t colorCount, const Target& depth, bool stencil) = 0;
+    // Queues Vulkan commands, in order with the translated draws around them, inside the render
+    // pass beginRendering opened. `fn` runs later, on another thread: it must hold copies of
     // everything it needs.
     virtual void record(std::function<void(VkCommandBuffer)> fn) = 0;
 };

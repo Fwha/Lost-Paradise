@@ -1,4 +1,5 @@
 #include "host/pm4.h"
+#include "host/native/draw_origin.h"
 
 #include "host/equeue.h"
 #include "host/profile.h"
@@ -28,6 +29,7 @@ using namespace gpu;
 GpuRegs gRecordRegs, gAnalysisRegs;
 thread_local GpuRegs* tRegs = &gRecordRegs;
 thread_local bool tDry = false; // the analysis thread: no side effects, analysis hooks only
+thread_local uint32_t tOrigin[3] = {}; // the next draw's origin, from the NOP ahead of it
 bool commandProcessorIsAsync();
 // Analysis hooks run inline, just before their counterparts: without the command processor
 // thread, or with LPN_NO_ANALYSIS_THREAD=1 (for comparison).
@@ -44,7 +46,12 @@ bool geometryShaderDraw(const DrawCall& d) {
     return d.kind < DrawCall::kDispatch && (tRegs->ctx[ctx::kVgtShaderStagesEn] & (1u << 5));
 }
 
-void draw(const DrawCall& d, Pm4Stats* st) {
+void draw(const DrawCall& dc, Pm4Stats* st) {
+    DrawCall d = dc;
+    if (d.kind < DrawCall::kDispatch) {
+        std::memcpy(d.origin, tOrigin, sizeof tOrigin);
+        std::memset(tOrigin, 0, sizeof tOrigin);
+    }
     if (geometryShaderDraw(d)) {
         if (tDry) return;
         st->draws++;
@@ -256,6 +263,10 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
                 if (op == kOpSetContextReg) ++tRegs->ctxSerial;
                 break;
             }
+            case kOpNop: // a draw's origin, ahead of it (native/draw_origin.h)
+                if (native::isOriginNop(b, count + 1))
+                    for (int i = 0; i < 3; ++i) tOrigin[i] = b[i] & ~native::kOriginMask;
+                break;
             case kOpIndexBase: tRegs->indexBase = address(b[0], b[1]); break;
             case kOpIndexBufferSize: tRegs->indexBufferSize = b[0]; break;
             case kOpIndexType: tRegs->indexType = b[0] & 3; break;
