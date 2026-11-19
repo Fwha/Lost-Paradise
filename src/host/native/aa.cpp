@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <set>
+#include <string>
 #include <tuple>
 
 namespace host::native {
@@ -267,8 +269,7 @@ public:
 
 private:
     bool decline(int role, const char* why) {
-        if (!declined_[role]) {
-            declined_[role] = true;
+        if (declined_[role].insert(why).second) {
             std::fprintf(stderr, "[native] aa: %s left to the translated renderer (%s)\n", kRoles[role].shader, why);
         }
         return false;
@@ -359,7 +360,8 @@ private:
     std::map<std::tuple<int, int, uint32_t, int, uint64_t, uint64_t>, VkPipeline> pipes_;
     VkDescriptorSetLayout setLayouts_[4] = {};
     VkPipelineLayout layouts_[4] = {};
-    bool logged_[4] = {}, declined_[4] = {};
+    bool logged_[4] = {};
+    std::set<std::string> declined_[4];
     uint32_t drawn_ = 0;
 };
 

@@ -19,6 +19,8 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <set>
+#include <string>
 #include <tuple>
 
 namespace host::native {
@@ -131,8 +133,17 @@ public:
             if (v.slot != 0 && v.slot != 1) continue;
             if (!v.components) continue;
             const uint32_t n = components(v.dfmt);
-            if (v.nfmt != 7 || !n || v.stride % 4 || (v.data.byteOffset + v.offset) % 4 || v.dstSel != 0xFAC || v.indexVgpr != 0)
-                return decline(role, "a vertex format it does not read");
+            // DST_SEL of the components it uses: x, y (and z for the position) as stored. The
+            // rest (w is often the constant 1 for a 3-component position) is not read.
+            const uint32_t used = v.slot == 0 ? 3 : 2;
+            bool plain = true;
+            for (uint32_t c = 0; c < used; ++c) plain = plain && ((v.dstSel >> (3 * c)) & 7) == 4 + c;
+            if (v.nfmt != 7 || !n || v.stride % 4 || (v.data.byteOffset + v.offset) % 4 || !plain || v.indexVgpr != 0) {
+                char why[96];
+                std::snprintf(why, sizeof why, "vertex format dfmt %u nfmt %u stride %u offset %u sel 0x%x index v%u", v.dfmt,
+                              v.nfmt, v.stride, v.data.byteOffset + v.offset, v.dstSel, v.indexVgpr);
+                return decline(role, why);
+            }
             (v.slot == 0 ? pos : uv) = &v;
         }
         if (pos && (components(pos->dfmt) < 3 || pos->components < 3)) return decline(role, "a position of fewer than 3 components");
@@ -199,12 +210,11 @@ public:
     }
 
 private:
+    // Logs each reason once.
     bool decline(int role, const char* why) {
-        if (!declined_[role]) {
-            declined_[role] = true;
+        if (declined_[role].insert(why).second && declined_[role].size() <= 16)
             std::fprintf(stderr, "[native] shadow: a %s draw left to the translated renderer (%s)\n",
                          role == kAlphaTest ? "ps_shadowmap_pt" : "ps_shadowmap", why);
-        }
         return false;
     }
 
@@ -317,7 +327,8 @@ private:
     std::map<std::tuple<int, int, bool, VkBool32, VkBool32, int, int, int>, VkPipeline> pipes_;
     VkDescriptorSetLayout setLayouts_[3] = {};
     VkPipelineLayout layouts_[3] = {};
-    bool logged_[3] = {}, declined_[3] = {};
+    bool logged_[3] = {};
+    std::set<std::string> declined_[3];
 };
 
 } // namespace
