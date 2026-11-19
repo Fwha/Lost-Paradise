@@ -5323,10 +5323,31 @@ void main() {
             if ((r.ctx[reg::kCbBlendControl + i] >> 30) & 1) nd.blend = true;
         }
         const uint32_t depthControl = r.ctx[reg::kDbDepthControl];
-        if (r.ctx[reg::kDbZInfo] & 3) {
-            nd.stencil = depthControl & 1;
+        Surface* depthWritten = nullptr;
+        if (const uint32_t zInfo = r.ctx[reg::kDbZInfo]; zInfo & 3) {
+            const bool stencil = r.ctx[reg::kDbStencilInfo] & 1;
+            const VkFormat f = stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : (zInfo & 3) == 1 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
+            const uint32_t size = r.ctx[reg::kDbDepthSize];
+            const uint32_t dw = ((size & 0x7FF) + 1) * 8, dh = (((size >> 11) & 0x7FF) + 1) * 8;
+            Surface* s = depthSurface(uint64_t(r.ctx[reg::kDbZReadBase]) << 8, dw, dh, f);
+            if (!s) return false;
+            nd.depth = {view(s->img, f, VK_IMAGE_VIEW_TYPE_2D, kIdentity, s->img.aspect), f, s->img.width, s->img.height,
+                        uint64_t(r.ctx[reg::kDbZReadBase]) << 8};
+            nd.hasStencil = stencil;
+            nd.stencil = stencil && (depthControl & 1);
             nd.depthTest = (depthControl >> 1) & 1;
             nd.depthWrite = (depthControl >> 2) & 1;
+            GraphicsState gs{};
+            gs.depthFormat = f, gs.stencil = stencil, gs.depthControl = depthControl;
+            gs.stencilControl = r.ctx[reg::kDbStencilControl];
+            depthState(gs, nd.depthStencil);
+            const uint32_t front = r.ctx[reg::kDbStencilRefMask];
+            const uint32_t back = (depthControl >> 7) & 1 ? r.ctx[reg::kDbStencilRefMaskBf] : front;
+            for (int i = 0; i < 2; ++i) {
+                const uint32_t m = i ? back : front;
+                nd.stencilRef[i] = m & 0xFF, nd.stencilCompare[i] = (m >> 8) & 0xFF, nd.stencilWrite[i] = (m >> 16) & 0xFF;
+            }
+            if (nd.depthWrite || (nd.stencil && nd.stencilWrite[0])) depthWritten = s;
         }
         // The viewport and scissor as setViewportScissor makes them (without the HUD's layout).
         const uint32_t tw = nd.colorCount ? nd.color[0].width : 0, th = nd.colorCount ? nd.color[0].height : 0;
@@ -5379,6 +5400,7 @@ void main() {
         ++fastEpoch_;
         for (Surface* s : written)
             if (s) gpuWrote(*s);
+        if (depthWritten) gpuWrote(*depthWritten);
         return true;
     }
 

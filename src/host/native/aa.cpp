@@ -19,6 +19,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <tuple>
@@ -189,7 +190,10 @@ public:
         const RoleInfo& info = kRoles[role];
         if (d.colorCount != 1 || !d.color[0].view) return decline(role, "not one render target");
         if (d.blend) return decline(role, "blending");
-        if (d.depthTest || d.depthWrite || d.stencil) return decline(role, "depth or stencil");
+        // The game marks the edges' pixels in the stencil and blends only those: kept as it has
+        // it. Depth itself is neither tested nor written by these passes.
+        if (d.depthTest || d.depthWrite) return decline(role, "depth test or write");
+        if (d.stencil && !d.depth.view) return decline(role, "stencil without a buffer");
         // Drawn as a triangle over the viewport: only the game's one full-screen rectangle is.
         if (d.primitive != 17 || d.count != 3) return decline(role, "not one rectangle");
         Push push{};
@@ -218,7 +222,7 @@ public:
             ++n;
         }
         const uint32_t mask = d.writeMask & 0xF;
-        VkPipeline pipe = pipeline(gpu, role, d.color[0].format, mask);
+        VkPipeline pipe = pipeline(gpu, role, d.color[0].format, mask, d);
         if (!pipe) return decline(role, "no pipeline");
         if (!logged_[role]) {
             logged_[role] = true;
@@ -228,7 +232,11 @@ public:
         const VkViewport vp{d.viewport[0], d.viewport[1], d.viewport[2], d.viewport[3], 0, 1};
         const VkRect2D sc{{d.scissor[0], d.scissor[1]}, {uint32_t(d.scissor[2]), uint32_t(d.scissor[3])}};
         const Target target = d.color[0];
-        gpu.record([pipe, layout = layouts_[role], push, images, n, vp, sc, target,
+        const Target depth = d.stencil ? d.depth : Target{};
+        const bool hasStencil = d.hasStencil;
+        uint32_t st[6];
+        for (int i = 0; i < 2; ++i) st[i * 3] = d.stencilRef[i], st[i * 3 + 1] = d.stencilCompare[i], st[i * 3 + 2] = d.stencilWrite[i];
+        gpu.record([pipe, layout = layouts_[role], push, images, n, vp, sc, target, depth, hasStencil, st,
                     pushSet = gpu.pushDescriptorSet()](VkCommandBuffer c) {
             VkRenderingAttachmentInfo att{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
             att.imageView = target.view;
@@ -240,7 +248,25 @@ public:
             ri.layerCount = 1;
             ri.colorAttachmentCount = 1;
             ri.pColorAttachments = &att;
+            VkRenderingAttachmentInfo ds{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            if (depth.view) {
+                ds.imageView = depth.view;
+                ds.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                ds.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                ds.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                ri.renderArea.extent.width = std::min(target.width, depth.width);
+                ri.renderArea.extent.height = std::min(target.height, depth.height);
+                ri.pDepthAttachment = &ds;
+                if (hasStencil) ri.pStencilAttachment = &ds;
+            }
             vkCmdBeginRendering(c, &ri);
+            if (depth.view)
+                for (int i = 0; i < 2; ++i) {
+                    const VkStencilFaceFlags face = i ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
+                    vkCmdSetStencilReference(c, face, st[i * 3]);
+                    vkCmdSetStencilCompareMask(c, face, st[i * 3 + 1]);
+                    vkCmdSetStencilWriteMask(c, face, st[i * 3 + 2]);
+                }
             vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             vkCmdSetViewport(c, 0, 1, &vp);
             vkCmdSetScissor(c, 0, 1, &sc);
@@ -272,8 +298,18 @@ private:
         return false;
     }
 
-    VkPipeline pipeline(Gpu& gpu, int role, VkFormat format, uint32_t mask) {
-        const auto key = std::make_tuple(role, int(format), mask);
+    VkPipeline pipeline(Gpu& gpu, int role, VkFormat format, uint32_t mask, const Draw& d) {
+        // With the stencil: its state as the game set it, depth untouched.
+        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        const VkFormat depthFormat = d.stencil ? d.depth.format : VK_FORMAT_UNDEFINED;
+        if (d.stencil) {
+            ds.stencilTestEnable = VK_TRUE;
+            ds.front = d.depthStencil.front, ds.back = d.depthStencil.back;
+        }
+        auto face = [](const VkStencilOpState& f) {
+            return uint64_t(f.failOp) | uint64_t(f.passOp) << 8 | uint64_t(f.depthFailOp) << 16 | uint64_t(f.compareOp) << 24;
+        };
+        const auto key = std::make_tuple(role, int(format), mask, int(depthFormat), face(ds.front), face(ds.back));
         if (auto it = pipes_.find(key); it != pipes_.end()) return it->second;
         VkPipeline& out = pipes_[key];
         const VkDevice dev = gpu.device();
@@ -312,19 +348,21 @@ private:
         rs.lineWidth = 1;
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         VkPipelineColorBlendAttachmentState cba{};
         cba.colorWriteMask = mask;
         VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         cb.attachmentCount = 1;
         cb.pAttachments = &cba;
-        const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        const VkDynamicState dyn[5] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+                                       VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK};
         VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dy.dynamicStateCount = 2;
+        dy.dynamicStateCount = d.stencil ? 5 : 2;
         dy.pDynamicStates = dyn;
         VkPipelineRenderingCreateInfo rinfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
         rinfo.colorAttachmentCount = 1;
         rinfo.pColorAttachmentFormats = &format;
+        rinfo.depthAttachmentFormat = depthFormat;
+        if (d.stencil && d.hasStencil) rinfo.stencilAttachmentFormat = depthFormat;
         VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         pi.pNext = &rinfo;
         pi.stageCount = 2;
@@ -342,7 +380,7 @@ private:
         return out;
     }
 
-    std::map<std::tuple<int, int, uint32_t>, VkPipeline> pipes_;
+    std::map<std::tuple<int, int, uint32_t, int, uint64_t, uint64_t>, VkPipeline> pipes_;
     VkDescriptorSetLayout setLayouts_[4] = {};
     VkPipelineLayout layouts_[4] = {};
     bool logged_[4] = {}, declined_[4] = {};

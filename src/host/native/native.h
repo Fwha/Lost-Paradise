@@ -53,6 +53,12 @@ struct Draw {
     uint32_t writeMask = 0;      // 4 bits per target
     bool blend = false;          // any target blends
     bool depthTest = false, depthWrite = false, stencil = false;
+    // The depth/stencil buffer bound (no view: none) and its state as the translated pipeline
+    // would have it; the masks and reference per face (front, back) are dynamic.
+    Target depth;
+    bool hasStencil = false; // the depth format has a stencil aspect
+    VkPipelineDepthStencilStateCreateInfo depthStencil{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    uint32_t stencilRef[2] = {}, stencilCompare[2] = {}, stencilWrite[2] = {};
     float viewport[4] = {};      // x, y, width, height
     int32_t scissor[4] = {};     // x, y, width, height
     uint32_t primitive = 0;      // the game's primitive type (17: a rectangle list)
