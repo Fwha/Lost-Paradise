@@ -125,10 +125,12 @@ public:
         if (d.instances != 1) return decline(role, "instanced");
         if (d.primitive != 4) return decline(role, "not a triangle list");
         // The vertex buffers: the position (3 or 4 components) and, for _pt, the coordinates (2).
+        if (!d.plainFetch) return decline(role, "a fetch shader with offsets");
         const VertexBuffer *pos = nullptr, *uv = nullptr;
         for (const VertexBuffer& v : d.vertex) {
             const uint32_t n = components(v.dfmt);
-            if (v.nfmt != 7 || !n || v.stride % 4 || v.data.byteOffset % 4) return decline(role, "a vertex format it does not read");
+            if (v.nfmt != 7 || !n || v.stride % 4 || v.data.byteOffset % 4 || v.dstSel != 0xFAC)
+                return decline(role, "a vertex format it does not read");
             (n >= 3 ? pos : uv) = &v;
         }
         if (!pos || (alpha && !uv)) return decline(role, "no position or coordinates");

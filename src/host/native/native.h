@@ -57,6 +57,7 @@ struct VertexBuffer {
     Buffer data;
     uint32_t stride = 0, records = 0;
     uint32_t dfmt = 0, nfmt = 0; // the V#'s data and number formats
+    uint32_t dstSel = 0;          // its DST_SEL_X/Y/Z/W (0xFAC: x, y, z, w as stored)
 };
 
 // One of the game's draws that a native pass claimed.
@@ -87,6 +88,10 @@ struct Draw {
     VkCullModeFlags cull = VK_CULL_MODE_NONE;
     VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     std::vector<VertexBuffer> vertex;
+    // The vertex shader's fetch shader (called through s[0:1]) reads each attribute at the vertex
+    // index times its V#'s stride, from the V#'s base: every buffer load in it indexed, with no
+    // offset register or immediate. False: it does something else, or the shader has none.
+    bool plainFetch = false;
     // The vertex shader's scalar loads, as `load` is the pixel shader's.
     std::function<bool(uint32_t pc, uint32_t* out, uint32_t n)> vsLoad;
     // The pixel shader's sampled images, in the order the shader declares them.

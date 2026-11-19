@@ -5323,7 +5323,11 @@ void main() {
             }
             p.written = p.images;
             Rec& R = r_.R();
-            if (R.pass_.open && r_.nativePassOpen_ && R.pass_.sameTargets(p)) return;
+            // Joined unless the draw samples what a draw in the pass wrote (as draw() decides).
+            bool feedback = false;
+            for (VkImage im : R.sampledSurfaces_)
+                if (std::find(R.drawWritten_.begin(), R.drawWritten_.end(), im) != R.drawWritten_.end()) feedback = true;
+            if (R.pass_.open && r_.nativePassOpen_ && !feedback && R.pass_.sameTargets(p)) return;
             r_.endPass();
             r_.barrier(); // what the draws before wrote or sampled
             VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
@@ -5425,6 +5429,7 @@ void main() {
         clip(r.ctx[reg::kWindowScissorTl], r.ctx[reg::kWindowScissorBr]);
         if ((r.ctx[0x292] >> 1) & 1) clip(r.ctx[reg::kVportScissorTl], r.ctx[reg::kVportScissorBr]);
         nd.scissor[0] = x0, nd.scissor[1] = y0, nd.scissor[2] = std::max(0, x1 - x0), nd.scissor[3] = std::max(0, y1 - y0);
+        R().sampledSurfaces_.clear(); // filled by resolveImage: render targets the draw samples
         for (const gcn::ImageResource& im : a.ps.images) {
             if (im.storage) return false;
             const ImageBinding b = resolveImage(im);
@@ -5448,6 +5453,7 @@ void main() {
         if (a.vsm && a.vsm->gameName) nd.vsName = a.vsm->gameName;
         else nd.vsName = &native::shaderNameAt(a.vs.launch.entry, &readGuest);
         nd.instances = std::max(r.numInstances, 1u);
+        nd.plainFetch = plainFetch((uint64_t(a.vs.launch.userData[1]) << 32) | a.vs.launch.userData[0]);
         // The vertex shader's buffers, as bindBuffer resolves them (without the per-draw words).
         auto buffer = [&](uint64_t base, uint64_t size, native::Buffer& out) {
             VkDeviceSize off = 0;
@@ -5462,6 +5468,7 @@ void main() {
             native::VertexBuffer vb;
             if (!buffer(b.base(), bindSize(b), vb.data)) return false;
             vb.stride = b.stride(), vb.records = b.numRecords(), vb.dfmt = b.dfmt, vb.nfmt = b.nfmt;
+            vb.dstSel = b.sharp[3] & 0xFFF;
             nd.vertex.push_back(vb);
         }
         if (d.kind == DrawCall::kIndexed) {
@@ -5492,8 +5499,11 @@ void main() {
         begin();
         NativeGpu gpu(*this);
         if (!a.psm->nativePass->draw(a.psm->nativeRole, nd, gpu)) return false;
-        // Its writes, for the barrier before whatever follows the pass (see draw()).
+        // Its writes and reads, for the barriers of the draws after it (see draw()): every
+        // attachment counts as written.
         R().needBarrier_ = true;
+        for (VkImage im : R().pass_.images) addOnce(R().drawWritten_, im);
+        for (VkImage im : R().sampledSurfaces_) addOnce(R().drawSampled_, im);
         // The pass bound pipelines and descriptors of its own: everything is set again.
         R().bound_ = Bound{};
         ++R().passSerial_;
@@ -5506,6 +5516,35 @@ void main() {
         if (depthWritten) gpuWrote(*depthWritten);
         return true;
     }
+
+    // Whether the fetch shader at `addr` only loads attributes indexed by the vertex index, with no
+    // offsets (native::Draw::plainFetch). Read once per address: up to its s_setpc_b64.
+    bool plainFetch(uint64_t addr) {
+        if (!addr) return false;
+        auto it = plainFetch_.find(addr);
+        if (it != plainFetch_.end()) return it->second;
+        uint32_t w[64];
+        bool plain = false, loads = false;
+        if (readGuest(addr, w, sizeof w))
+            for (uint32_t i = 0; i < 64; ++i) {
+                const uint32_t top6 = w[i] >> 26;
+                if (top6 == 0x38 || top6 == 0x3A) { // MUBUF, MTBUF (64 bits)
+                    const bool idxen = (w[i] >> 13) & 1, offen = (w[i] >> 12) & 1;
+                    if (!idxen || offen || (w[i] & 0xFFF) || i + 1 == 64) break;
+                    loads = true;
+                    ++i;
+                    continue;
+                }
+                if ((w[i] >> 23) == 0x17D && ((w[i] >> 8) & 0xFF) == 0x20) { // s_setpc_b64: the end
+                    plain = loads;
+                    break;
+                }
+                if ((w[i] >> 27) == 0x18) continue; // SMRD
+                if ((w[i] >> 30) == 2 && (w[i] & 0xFF) == 0xFF) ++i; // a SALU op with a literal
+            }
+        return plainFetch_[addr] = plain;
+    }
+    std::unordered_map<uint64_t, bool> plainFetch_;
 
     native::PassMap passMap_;
     bool nativeOn_ = false;
@@ -7128,7 +7167,10 @@ void main() {
             if (CachedProgram* psc = analyzed(c, j.ps, kPsBindingBase)) {
                 a.psm = psc->module;
                 takeDrawPart(a.ps, psc->prog);
-                if (psc->module && psc->module->nativeLoads.load(std::memory_order_relaxed)) a.ps.smrd = psc->prog.smrd;
+                if (psc->module && psc->module->nativeLoads.load(std::memory_order_relaxed)) {
+                    a.ps.smrd = psc->prog.smrd;
+                    a.vs.smrd = vsc->prog.smrd; // native passes read the vertex shader's constants too
+                }
                 a.repeat = a.repeat && c.memoHit;
                 a.psc = psc;
             }
