@@ -151,7 +151,11 @@ public:
             return decline(role, "coordinates in a format it does not read");
         if (!pos || (alpha && !uv)) return decline(role, "no position or coordinates");
         Push push{};
-        if (!matrix(alpha ? kAlphaLoads : kOpaqueLoads, d, push.m)) return decline(role, "a constant is missing");
+        if (const char* missing = matrix(alpha ? kAlphaLoads : kOpaqueLoads, d, push.m)) {
+            char why[64];
+            std::snprintf(why, sizeof why, "the vertex shader's %s constants are missing", missing);
+            return decline(role, why);
+        }
         push.pos[0] = (pos->data.byteOffset + pos->offset) / 4, push.pos[1] = pos->stride / 4, push.pos[2] = pos->dfmt;
         VkDescriptorBufferInfo bufs[2] = {{pos->data.buffer, pos->data.offset, pos->data.range}, {}};
         VkDescriptorImageInfo image{};
@@ -219,16 +223,19 @@ private:
     }
 
     // projection * rotation * (world + offset - camera), from the vertex shader's loads.
-    static bool matrix(const Loads& l, const Draw& d, float out[16]) {
+    // Null, or the constants that are missing.
+    static const char* matrix(const Loads& l, const Draw& d, float out[16]) {
         float off[4], world[12], rot[12], proj[16];
         uint32_t flags;
         auto get = [&](uint32_t pc, float* v, uint32_t n) { return d.vsLoad(pc, reinterpret_cast<uint32_t*>(v), n); };
-        if (!get(l.offset, off, 4) || !get(l.world, world, 8) || !get(l.world2, world + 8, 4) || !d.vsLoad(l.flags, &flags, 1) ||
-            !get(l.rotation, rot, 8) || !get(l.rotation2, rot + 8, 4) || !get(l.projection, proj, 16))
-            return false;
+        if (!get(l.offset, off, 4)) return "offset";
+        if (!get(l.world, world, 8) || !get(l.world2, world + 8, 4)) return "world matrix";
+        if (!d.vsLoad(l.flags, &flags, 1)) return "flags";
+        if (!get(l.rotation, rot, 8) || !get(l.rotation2, rot + 8, 4)) return "view rotation";
+        if (!get(l.projection, proj, 16)) return "projection";
         float cam[4] = {};
         const bool keepCamera = (flags & 0x80000) && !(flags & 0x100000);
-        if (!keepCamera && !get(l.camera, cam, 4)) return false;
+        if (!keepCamera && !get(l.camera, cam, 4)) return "camera";
         // a: the object to the view's axes (3x4, rows), then p * [a; 0 0 0 1].
         double a[3][4];
         for (int r = 0; r < 3; ++r)
@@ -246,7 +253,7 @@ private:
                 for (int k = 0; k < 3; ++k) s += double(proj[r * 4 + k]) * a[k][c];
                 out[c * 4 + r] = float(s);
             }
-        return true;
+        return nullptr;
     }
 
     VkPipeline pipeline(Gpu& gpu, int role, const Draw& d) {
