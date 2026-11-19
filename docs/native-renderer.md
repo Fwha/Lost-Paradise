@@ -100,3 +100,20 @@ every step leaves a game that plays:
   native passes attach the depth/stencil buffer and keep that state.
 - 2026-11-19: confirmed in play at 2560x1440 (Upscaler Off): all three drawn natively, the
   picture as before.
+
+### Stage 1 (draw origins)
+
+- Every draw carries the engine code that drew it (`native/draw_origin.h`: three return addresses
+  above the Gnm draw wrappers, written as a NOP into the space the game reserves ahead of each
+  draw packet); pass maps list them. `docs/frame-map.md` is the first frame mapped with them.
+
+### Stage 2 (shadow maps, first part)
+
+- `native/shadow.cpp`: the casters of the sun's cascades and the near maps
+  (`vs_shadowmap_normal[_pt]` + `ps_shadowmap[_pt][fp32][bias]`, about 500 draws a frame) in
+  handwritten GLSL: vertices pulled from the game's buffers through the analysis's fetch slots,
+  the matrix chain folded into one matrix, the game's slope bias and alpha test. Works with the
+  Upscaler on too.
+- Native draws now share render passes (`Gpu::beginRendering`) and take part in the translated
+  path's barrier tracking. Still drawn from the game's draws; switching the game's shadow code
+  off and drawing from captured scene data comes next.
