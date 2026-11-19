@@ -5531,6 +5531,8 @@ void main() {
                 if (top6 == 0x38 || top6 == 0x3A) { // MUBUF, MTBUF (64 bits)
                     const bool idxen = (w[i] >> 13) & 1, offen = (w[i] >> 12) & 1;
                     if (!idxen || offen || (w[i] & 0xFFF) || i + 1 == 64) break;
+                    // Indexed by v0 (the vertex index), with SOFFSET the inline constant 0.
+                    if ((w[i + 1] & 0xFF) != 0 || (w[i + 1] >> 24) != 128) break;
                     loads = true;
                     ++i;
                     continue;
@@ -5539,8 +5541,9 @@ void main() {
                     plain = loads;
                     break;
                 }
-                if ((w[i] >> 27) == 0x18) continue; // SMRD
-                if ((w[i] >> 30) == 2 && (w[i] & 0xFF) == 0xFF) ++i; // a SALU op with a literal
+                // Only descriptor loads and waits besides: anything else may change the index.
+                if ((w[i] >> 27) == 0x18 || (w[i] >> 23) == 0x17F) continue; // SMRD, SOPP
+                break;
             }
         return plainFetch_[addr] = plain;
     }
