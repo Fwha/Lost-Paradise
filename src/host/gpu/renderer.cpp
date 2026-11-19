@@ -542,6 +542,9 @@ struct ShaderModule {
     bool nativeChecked = false;
     int nativeRole = 0;
     native::Pass* nativePass = nullptr;
+    // Set once a native pass claims it: analyses then keep the pixel shader's scalar load map,
+    // which the pass reads constants by (takeDrawPart leaves it out for every other draw).
+    std::atomic<bool> nativeLoads{false};
     const std::string* gameName = nullptr; // its archive entry (shader_names.h)
     std::string name; // its SPIR-V cache name: a hash of the GLSL, the same in every run
 };
@@ -5261,6 +5264,7 @@ void main() {
             if (name != "?") m.gameName = &name;
             const native::Claim c = native::claim(name);
             m.nativePass = c.pass, m.nativeRole = c.role;
+            if (c.pass) m.nativeLoads.store(true, std::memory_order_relaxed);
             if (c.pass) std::fprintf(stderr, "[native] %s is drawn by the native pass %s\n", name.c_str(), c.pass->name());
         }
         return m.nativePass != nullptr;
@@ -5290,6 +5294,8 @@ void main() {
     // The draw as a native pass sees it (native::Draw), then the pass's own recording in its place.
     // False when the pass declines it: the translated path draws it.
     bool nativeDraw(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
+        // Analysed before the claim: without its scalar loads (the next draws have them).
+        if (a.ps.smrd.empty()) return false;
         const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
         native::Draw nd;
         nd.psName = a.psm->gameName;
@@ -5310,7 +5316,8 @@ void main() {
             Surface* s = colorSurface(uint64_t(cb[0]) << 8, pitch, slice / pitch, vf, bytesPerElement(fmt));
             if (!s) return false;
             written[i] = s;
-            nd.color[i] = {view(s->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), vf, s->img.width, s->img.height, uint64_t(cb[0]) << 8};
+            nd.color[i] = {view(s->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), vf, s->img.width, s->img.height, uint64_t(cb[0]) << 8,
+                           uint8_t(a.ps.launch.colorSwap[i] & 3), a.ps.launch.colorComps[i]};
             nd.colorCount = i + 1;
             nd.writeMask |= mask << (i * 4);
             if ((r.ctx[reg::kCbBlendControl + i] >> 30) & 1) nd.blend = true;
@@ -5321,14 +5328,24 @@ void main() {
             nd.depthTest = (depthControl >> 1) & 1;
             nd.depthWrite = (depthControl >> 2) & 1;
         }
-        const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
-        nd.viewport[0] = v[1] - std::fabs(v[0]), nd.viewport[2] = 2 * std::fabs(v[0]);
-        nd.viewport[1] = v[3] - std::fabs(v[2]), nd.viewport[3] = 2 * std::fabs(v[2]);
-        // The screen scissor, within the first target.
-        const uint32_t tl = r.ctx[reg::kScreenScissorTl], br = r.ctx[reg::kScreenScissorBr];
+        // The viewport and scissor as setViewportScissor makes them (without the HUD's layout).
         const uint32_t tw = nd.colorCount ? nd.color[0].width : 0, th = nd.colorCount ? nd.color[0].height : 0;
-        const int32_t x0 = int32_t(tl & 0x7FFF), y0 = int32_t((tl >> 16) & 0x7FFF);
-        const int32_t x1 = std::min(int32_t(br & 0x7FFF), int32_t(tw)), y1 = std::min(int32_t((br >> 16) & 0x7FFF), int32_t(th));
+        VkViewport vp = gameViewport(r, tw, th);
+        if (vp.width < 0) vp.x += vp.width, vp.width = -vp.width;
+        if (vp.height < 0) vp.y += vp.height, vp.height = -vp.height;
+        nd.viewport[0] = vp.x, nd.viewport[1] = vp.y, nd.viewport[2] = vp.width, nd.viewport[3] = vp.height;
+        int32_t x0 = 0, y0 = 0, x1 = int32_t(tw), y1 = int32_t(th);
+        auto clip = [&](uint32_t tl, uint32_t br) {
+            if (!br) return; // never programmed
+            x0 = std::max<int32_t>(x0, tl & 0x7FFF);
+            y0 = std::max<int32_t>(y0, (tl >> 16) & 0x7FFF);
+            x1 = std::min<int32_t>(x1, br & 0x7FFF);
+            y1 = std::min<int32_t>(y1, (br >> 16) & 0x7FFF);
+        };
+        clip(r.ctx[reg::kScreenScissorTl], r.ctx[reg::kScreenScissorBr]);
+        clip(r.ctx[reg::kGenericScissorTl], r.ctx[reg::kGenericScissorBr]);
+        clip(r.ctx[reg::kWindowScissorTl], r.ctx[reg::kWindowScissorBr]);
+        if ((r.ctx[0x292] >> 1) & 1) clip(r.ctx[reg::kVportScissorTl], r.ctx[reg::kVportScissorBr]);
         nd.scissor[0] = x0, nd.scissor[1] = y0, nd.scissor[2] = std::max(0, x1 - x0), nd.scissor[3] = std::max(0, y1 - y0);
         for (const gcn::ImageResource& im : a.ps.images) {
             if (im.storage) return false;
@@ -6985,6 +7002,7 @@ void main() {
             if (CachedProgram* psc = analyzed(c, j.ps, kPsBindingBase)) {
                 a.psm = psc->module;
                 takeDrawPart(a.ps, psc->prog);
+                if (psc->module && psc->module->nativeLoads.load(std::memory_order_relaxed)) a.ps.smrd = psc->prog.smrd;
                 a.repeat = a.repeat && c.memoHit;
                 a.psc = psc;
             }

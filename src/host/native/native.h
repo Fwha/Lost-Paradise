@@ -35,7 +35,14 @@ struct Target {
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0; // of the image
     uint64_t address = 0;
+    // CB_COLOR_INFO.COMP_SWAP and the format's components: the shader's outputs go to memory in
+    // the order swizzle() gives.
+    uint8_t swap = 0, comps = 4;
 };
+
+// Where each of the target's channels comes from among the shader's outputs (x, y, z, w = 0..3),
+// as the GCN colour export orders them.
+void swizzle(const Target& t, int32_t out[4]);
 
 // One of the game's draws that a native pass claimed.
 struct Draw {
@@ -48,7 +55,7 @@ struct Draw {
     bool depthTest = false, depthWrite = false, stencil = false;
     float viewport[4] = {};      // x, y, width, height
     int32_t scissor[4] = {};     // x, y, width, height
-    uint32_t primitive = 0;      // the game's primitive type (17: a rectangle)
+    uint32_t primitive = 0;      // the game's primitive type (17: a rectangle list)
     uint32_t count = 0;          // vertices or indices
     // The pixel shader's sampled images, in the order the shader declares them.
     std::vector<Texture> textures;

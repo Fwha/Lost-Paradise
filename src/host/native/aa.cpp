@@ -17,6 +17,7 @@
 #include "host/native/native.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -34,17 +35,21 @@ struct Push {
     float texel[2], threshold[2];
     float scale[3][2];
     float pad[2];
+    int32_t swizzle[4]; // the target's channels from the outputs (native::swizzle)
 };
-static_assert(sizeof(Push) == 48);
+static_assert(sizeof(Push) == 64);
 
 constexpr const char* kHeader = R"(#version 450
 layout(push_constant) uniform P {
     vec4 a; // texel size, thresholds
     vec4 b; // scales of textures 0 and 1
     vec4 c; // scale of texture 2
+    ivec4 s; // the target's channels from the outputs
 } p;
-layout(location = 0) out vec4 o;
+layout(location = 0) out vec4 o_;
 vec2 texel() { return p.a.xy; }
+// The outputs in the target's channel order (CB_COLOR_INFO.COMP_SWAP).
+void put(vec4 v) { o_ = vec4(v[p.s.x], v[p.s.y], v[p.s.z], v[p.s.w]); }
 )";
 
 constexpr const char* kEdgesFs = R"(
@@ -66,7 +71,7 @@ void main() {
     float u = edge(c, tc, at(vec2(uv.x, uv.y - t.y)));
     float l = edge(c, tc, at(vec2(uv.x - t.x, uv.y)));
     if (r + d + l + u < 0.5) discard;
-    o = vec4(l, u, r, d);
+    put(vec4(l, u, r, d));
 }
 )";
 
@@ -130,7 +135,7 @@ void main() {
         float cd = crossing(texture(cross, vec2(x, uv.y + t.y + down * t.y) * p.b.zw).y);
         v = coverage(cu * 9.0 + up, cd * 9.0 + down);
     }
-    o = clamp(vec4(h, v), 0.0, 1.0);
+    put(clamp(vec4(h, v), 0.0, 1.0));
 }
 )";
 
@@ -145,13 +150,13 @@ void main() {
     float right = texture(weights, vec2(uv.x + t.x, uv.y) * p.b.xy).w;
     float sum = w.x + below + w.z + right;
     if (1e-5 > sum) {
-        o = texture(colour, uv * p.b.zw);
+        put(texture(colour, uv * p.b.zw));
     } else {
         float x = right > w.z ? right : -w.z;
         float y = below > w.x ? below : -w.x;
         if (abs(x) > abs(y)) y = 0.0;
         else x = 0.0;
-        o = texture(colour, vec2(uv.x + t.x * x, uv.y + t.y * y) * p.b.zw);
+        put(texture(colour, vec2(uv.x + t.x * x, uv.y + t.y * y) * p.b.zw));
     }
 }
 )";
@@ -185,6 +190,8 @@ public:
         if (d.colorCount != 1 || !d.color[0].view) return decline(role, "not one render target");
         if (d.blend) return decline(role, "blending");
         if (d.depthTest || d.depthWrite || d.stencil) return decline(role, "depth or stencil");
+        // Drawn as a triangle over the viewport: only the game's one full-screen rectangle is.
+        if (d.primitive != 17 || d.count != 3) return decline(role, "not one rectangle");
         Push push{};
         uint32_t words[2];
         if (!d.load(info.texelPc, words, 2)) return decline(role, "no texel size");
@@ -193,6 +200,11 @@ public:
             if (!d.load(info.thresholdPc, words, 2)) return decline(role, "no thresholds");
             std::memcpy(push.threshold, words, 8);
         }
+        // The viewport must be the whole picture the texel size gives.
+        if (!(push.texel[0] > 0) || !(push.texel[1] > 0) || std::fabs(d.viewport[0]) > 0.5f || std::fabs(d.viewport[1]) > 0.5f ||
+            std::fabs(d.viewport[2] - 1 / push.texel[0]) > 1.5f || std::fabs(d.viewport[3] - 1 / push.texel[1]) > 1.5f)
+            return decline(role, "not the whole picture");
+        swizzle(d.color[0], push.swizzle);
         VkDescriptorImageInfo images[3]{};
         uint32_t n = 0;
         for (uint32_t pc : info.texturePcs) {
