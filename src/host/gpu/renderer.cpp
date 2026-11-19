@@ -5286,6 +5286,62 @@ void main() {
         void record(std::function<void(VkCommandBuffer)> fn) override {
             r_.rec([c = r_.R().cmd_, fn = std::move(fn)] { fn(c); });
         }
+        // As the translated draw opens a pass (R().pass_), so that translated draws on the same
+        // targets carry on in it and any others end it. A native draw only joins a pass a native
+        // draw opened: one the translated path opened may hold what the native draw samples.
+        void beginRendering(const native::Target* color, uint32_t colorCount, const native::Target& depth, bool stencil) override {
+            Pass& p = r_.nativeNext_;
+            p.open = true;
+            p.colorCount = colorCount;
+            p.width = p.height = 16384;
+            p.images.clear();
+            p.written.clear();
+            p.depth = depth.view;
+            p.depthImage = depth.image;
+            p.stencil = stencil;
+            VkRenderingAttachmentInfo colors[8]{};
+            for (uint32_t i = 0; i < colorCount; ++i) {
+                p.views[i] = color[i].view;
+                p.formats[i] = uint32_t(color[i].format);
+                colors[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                colors[i].imageView = color[i].view;
+                colors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                colors[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                colors[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                if (!color[i].view) continue;
+                p.images.push_back(color[i].image);
+                p.width = std::min(p.width, color[i].width), p.height = std::min(p.height, color[i].height);
+            }
+            VkRenderingAttachmentInfo ds{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            if (depth.view) {
+                p.images.push_back(depth.image);
+                p.width = std::min(p.width, depth.width), p.height = std::min(p.height, depth.height);
+                ds.imageView = depth.view;
+                ds.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                ds.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                ds.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            }
+            p.written = p.images;
+            Rec& R = r_.R();
+            if (R.pass_.open && r_.nativePassOpen_ && R.pass_.sameTargets(p)) return;
+            r_.endPass();
+            r_.barrier(); // what the draws before wrote or sampled
+            VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            ri.renderArea = {{0, 0}, {p.width, p.height}};
+            ri.layerCount = 1;
+            ri.colorAttachmentCount = colorCount;
+            ri.pColorAttachments = r_.keep(colors, colorCount);
+            if (depth.view) {
+                ri.pDepthAttachment = r_.keep(&ds, 1);
+                if (stencil) ri.pStencilAttachment = ri.pDepthAttachment;
+            }
+            r_.rec([c = R.cmd_, ri] { vkCmdBeginRendering(c, &ri); });
+            std::swap(R.pass_, p);
+            R.pass_.open = true;
+            ++R.passSerial_;
+            ++R.prof_.passes;
+            r_.nativePassOpen_ = true;
+        }
 
     private:
         Renderer& r_;
@@ -5316,8 +5372,8 @@ void main() {
             Surface* s = colorSurface(uint64_t(cb[0]) << 8, pitch, slice / pitch, vf, bytesPerElement(fmt));
             if (!s) return false;
             written[i] = s;
-            nd.color[i] = {view(s->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), vf, s->img.width, s->img.height, uint64_t(cb[0]) << 8,
-                           uint8_t(a.ps.launch.colorSwap[i] & 3), a.ps.launch.colorComps[i]};
+            nd.color[i] = {view(s->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), s->img.image, vf, s->img.width, s->img.height,
+                           uint64_t(cb[0]) << 8, uint8_t(a.ps.launch.colorSwap[i] & 3), a.ps.launch.colorComps[i]};
             nd.colorCount = i + 1;
             nd.writeMask |= mask << (i * 4);
             if ((r.ctx[reg::kCbBlendControl + i] >> 30) & 1) nd.blend = true;
@@ -5331,8 +5387,8 @@ void main() {
             const uint32_t dw = ((size & 0x7FF) + 1) * 8, dh = (((size >> 11) & 0x7FF) + 1) * 8;
             Surface* s = depthSurface(uint64_t(r.ctx[reg::kDbZReadBase]) << 8, dw, dh, f);
             if (!s) return false;
-            nd.depth = {view(s->img, f, VK_IMAGE_VIEW_TYPE_2D, kIdentity, s->img.aspect), f, s->img.width, s->img.height,
-                        uint64_t(r.ctx[reg::kDbZReadBase]) << 8};
+            nd.depth = {view(s->img, f, VK_IMAGE_VIEW_TYPE_2D, kIdentity, s->img.aspect), s->img.image, f, s->img.width,
+                        s->img.height, uint64_t(r.ctx[reg::kDbZReadBase]) << 8};
             nd.hasStencil = stencil;
             nd.stencil = stencil && (depthControl & 1);
             nd.depthTest = (depthControl >> 1) & 1;
@@ -5350,7 +5406,8 @@ void main() {
             if (nd.depthWrite || (nd.stencil && nd.stencilWrite[0])) depthWritten = s;
         }
         // The viewport and scissor as setViewportScissor makes them (without the HUD's layout).
-        const uint32_t tw = nd.colorCount ? nd.color[0].width : 0, th = nd.colorCount ? nd.color[0].height : 0;
+        const native::Target& first = nd.colorCount ? nd.color[0] : nd.depth;
+        const uint32_t tw = first.width, th = first.height;
         VkViewport vp = gameViewport(r, tw, th);
         if (vp.width < 0) vp.x += vp.width, vp.width = -vp.width;
         if (vp.height < 0) vp.y += vp.height, vp.height = -vp.height;
@@ -5378,19 +5435,65 @@ void main() {
             t.pc = uint32_t(im.pc - a.ps.launch.entry);
             nd.textures.push_back(t);
         }
-        const gcn::Program& ps = a.ps;
-        nd.load = [&ps](uint32_t pc, uint32_t* out, uint32_t n) {
-            auto it = ps.smrd.find(ps.launch.entry + pc);
-            if (it == ps.smrd.end() || it->second + n > ps.data.size()) return false;
-            std::memcpy(out, &ps.data[it->second], n * 4);
+        auto loads = [](const gcn::Program& p) {
+            return [&p](uint32_t pc, uint32_t* out, uint32_t n) {
+                auto it = p.smrd.find(p.launch.entry + pc);
+                if (it == p.smrd.end() || it->second + n > p.data.size()) return false;
+                std::memcpy(out, &p.data[it->second], n * 4);
+                return true;
+            };
+        };
+        nd.load = loads(a.ps);
+        nd.vsLoad = loads(a.vs);
+        if (a.vsm && a.vsm->gameName) nd.vsName = a.vsm->gameName;
+        else nd.vsName = &native::shaderNameAt(a.vs.launch.entry, &readGuest);
+        nd.instances = std::max(r.numInstances, 1u);
+        // The vertex shader's buffers, as bindBuffer resolves them (without the per-draw words).
+        auto buffer = [&](uint64_t base, uint64_t size, native::Buffer& out) {
+            VkDeviceSize off = 0;
+            if (!vramBuffer(base, size, out.buffer, off) && !guestBuffer(base, size, out.buffer, off)) return false;
+            out.offset = off & ~(storageAlign_ - 1);
+            out.byteOffset = uint32_t(off - out.offset);
+            out.range = std::min<VkDeviceSize>(size + out.byteOffset, vk_.props.limits.maxStorageBufferRange);
             return true;
         };
+        for (const gcn::BufferResource& b : a.vs.buffers) {
+            if (!b.known || b.store) return false;
+            native::VertexBuffer vb;
+            if (!buffer(b.base(), bindSize(b), vb.data)) return false;
+            vb.stride = b.stride(), vb.records = b.numRecords(), vb.dfmt = b.dfmt, vb.nfmt = b.nfmt;
+            nd.vertex.push_back(vb);
+        }
+        if (d.kind == DrawCall::kIndexed) {
+            const uint32_t isz = r.indexType ? 4 : 2;
+            nd.indexed = true;
+            nd.indexType = r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+            if (!buffer(d.indexAddr + uint64_t(d.indexOffset) * isz, uint64_t(d.count) * isz, nd.index)) return false;
+        } else if (d.kind != DrawCall::kAuto) {
+            return false; // indirect: not yet
+        }
+        {
+            const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
+            const uint32_t vte = r.ctx[reg::kPaClVteCntl];
+            const float zs = (vte & 16) ? v[4] : 1, zo = (vte & 32) ? v[5] : 0;
+            const bool dx = (r.ctx[reg::kPaClClipCntl] >> 19) & 1;
+            nd.vkViewport = gameViewport(r, tw, th);
+            nd.vkViewport.minDepth = std::clamp(dx ? zo : zo - zs, 0.0f, 1.0f);
+            nd.vkViewport.maxDepth = std::clamp(zo + zs, 0.0f, 1.0f);
+            if (nd.vkViewport.width < 0) nd.vkViewport.x += nd.vkViewport.width, nd.vkViewport.width = -nd.vkViewport.width;
+            GraphicsState gs{};
+            gs.topology = r.prim;
+            gs.modeCntl = r.ctx[reg::kPaSuScModeCntl];
+            VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+            rasterState(gs, rs);
+            nd.cull = rs.cullMode, nd.frontFace = rs.frontFace;
+        }
         if (!ringFits(1 << 12)) flush();
         begin();
-        fullBarrier();
         NativeGpu gpu(*this);
         if (!a.psm->nativePass->draw(a.psm->nativeRole, nd, gpu)) return false;
-        fullBarrier();
+        // Its writes, for the barrier before whatever follows the pass (see draw()).
+        R().needBarrier_ = true;
         // The pass bound pipelines and descriptors of its own: everything is set again.
         R().bound_ = Bound{};
         ++R().passSerial_;
@@ -5406,6 +5509,7 @@ void main() {
 
     native::PassMap passMap_;
     bool nativeOn_ = false;
+    bool nativePassOpen_ = false; // R().pass_ was opened by a native draw (NativeGpu::beginRendering)
     std::unordered_map<std::string, VkShaderModule> nativeModules_;
 
     bool upscaleSmaa(const DrawRegs& r, uint8_t role, const DrawAnalysis& a) {
@@ -7615,6 +7719,7 @@ void main() {
             rec([c = R().cmd_, ri] { vkCmdBeginRendering(c, &ri); });
             std::swap(R().pass_, pass); // the old pass's storage is reused by the next draw
             R().pass_.open = true;
+            if (!R().worker_) nativePassOpen_ = false;
             ++R().passSerial_;
             ++R().prof_.passes;
         }
@@ -8156,6 +8261,7 @@ void main() {
 
     void endPass() {
         R().needBarrier_ = true; // something other than a draw comes next
+        if (!R().worker_) nativePassOpen_ = false;
         if (!R().pass_.open) return;
         rec([c = R().cmd_] { vkCmdEndRendering(c); });
         R().pass_.open = false;
@@ -8618,6 +8724,7 @@ private:
                    height == o.height && std::equal(views, views + colorCount, o.views);
         }
     };
+    Pass nativeNext_; // a native pass's storage, swapped with R().pass_ (NativeGpu::beginRendering)
     std::array<ImageMemo, kImageMemos> imageMemos_{};
     uint64_t imageGen_ = 1;
     int anisoSeen_ = 0; // the Anisotropic Filtering setting the bindings were made with

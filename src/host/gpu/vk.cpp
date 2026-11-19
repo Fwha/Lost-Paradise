@@ -262,6 +262,7 @@ bool Vk::create(std::string* error, const DlssAdditions& add) {
     want13.dynamicRendering = VK_TRUE;
     want13.synchronization2 = have13.synchronization2;
     want13.maintenance4 = have13.maintenance4;
+    want13.shaderDemoteToHelperInvocation = have13.shaderDemoteToHelperInvocation; // native shadow casters (host/native/shadow.cpp)
     // FSR's 16-bit shader variants and its subgroup sizes (gpu/fsr.cpp), when the GPU has them.
     want12.shaderFloat16 = have12.shaderFloat16;
     want13.subgroupSizeControl = have13.subgroupSizeControl;

@@ -231,36 +231,13 @@ public:
         }
         const VkViewport vp{d.viewport[0], d.viewport[1], d.viewport[2], d.viewport[3], 0, 1};
         const VkRect2D sc{{d.scissor[0], d.scissor[1]}, {uint32_t(d.scissor[2]), uint32_t(d.scissor[3])}};
-        const Target target = d.color[0];
-        const Target depth = d.stencil ? d.depth : Target{};
-        const bool hasStencil = d.hasStencil;
         uint32_t st[6];
         for (int i = 0; i < 2; ++i) st[i * 3] = d.stencilRef[i], st[i * 3 + 1] = d.stencilCompare[i], st[i * 3 + 2] = d.stencilWrite[i];
-        gpu.record([pipe, layout = layouts_[role], push, images, n, vp, sc, target, depth, hasStencil, st,
+        const bool stencil = d.stencil;
+        gpu.beginRendering(&d.color[0], 1, stencil ? d.depth : Target{}, stencil && d.hasStencil);
+        gpu.record([pipe, layout = layouts_[role], push, images, n, vp, sc, stencil, st,
                     pushSet = gpu.pushDescriptorSet()](VkCommandBuffer c) {
-            VkRenderingAttachmentInfo att{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-            att.imageView = target.view;
-            att.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-            att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-            ri.renderArea = {{0, 0}, {target.width, target.height}};
-            ri.layerCount = 1;
-            ri.colorAttachmentCount = 1;
-            ri.pColorAttachments = &att;
-            VkRenderingAttachmentInfo ds{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-            if (depth.view) {
-                ds.imageView = depth.view;
-                ds.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-                ds.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                ds.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-                ri.renderArea.extent.width = std::min(target.width, depth.width);
-                ri.renderArea.extent.height = std::min(target.height, depth.height);
-                ri.pDepthAttachment = &ds;
-                if (hasStencil) ri.pStencilAttachment = &ds;
-            }
-            vkCmdBeginRendering(c, &ri);
-            if (depth.view)
+            if (stencil)
                 for (int i = 0; i < 2; ++i) {
                     const VkStencilFaceFlags face = i ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
                     vkCmdSetStencilReference(c, face, st[i * 3]);
@@ -281,7 +258,6 @@ public:
             pushSet(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, n, w);
             vkCmdPushConstants(c, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, &push);
             vkCmdDraw(c, 3, 1, 0, 0);
-            vkCmdEndRendering(c);
         });
         ++drawn_;
         return true;
