@@ -1,6 +1,7 @@
 // The pass map: one frame's passes in the order the game draws them, each with its render
-// targets and the names of the shaders of its draws (see shader_names.h). It is the map the
-// native renderer is rebuilt from, a pass at a time.
+// targets and the names of the shaders of its draws (see shader_names.h), and the engine code
+// that drew them (eboot offsets of the return addresses above the Gnm draw wrapper, innermost
+// first: draw_origin.h). It is the map the native renderer is rebuilt from, a pass at a time.
 //
 // LPN_PASS_MAP=1 writes one every 10 seconds (LPN_PASS_MAP=<seconds> sets the interval) to
 // lpn-captures/passmap-<frame>.txt; F12's frame capture writes one beside its trace.

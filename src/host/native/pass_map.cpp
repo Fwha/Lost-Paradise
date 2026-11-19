@@ -91,6 +91,10 @@ void PassMap::onDraw(const DrawCall& d, const GpuRegs& r, ReadGuest read) {
     std::string pair;
     if (dispatch) pair = "cs " + shaderNameAt(pgm(r, sh::kComputePgmLo), read);
     else pair = shaderNameAt(pgm(r, sh::kSpiShaderPgmLoVs), read) + " | " + shaderNameAt(pgm(r, sh::kSpiShaderPgmLoPs), read);
+    if (d.origin[0]) { // the engine code that drew it, innermost first (draw_origin.h)
+        pair += "  @";
+        for (int i = 0; i < 3 && d.origin[i]; ++i) pair += (i ? " < " : "") + hex(d.origin[i]);
+    }
     if (pair != cur_.lastPair) {
         closeRun(cur_);
         cur_.lastPair = pair;
