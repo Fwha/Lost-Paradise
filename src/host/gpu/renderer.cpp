@@ -5453,7 +5453,6 @@ void main() {
         if (a.vsm && a.vsm->gameName) nd.vsName = a.vsm->gameName;
         else nd.vsName = &native::shaderNameAt(a.vs.launch.entry, &readGuest);
         nd.instances = std::max(r.numInstances, 1u);
-        nd.plainFetch = plainFetch((uint64_t(a.vs.launch.userData[1]) << 32) | a.vs.launch.userData[0]);
         // The vertex shader's buffers, as bindBuffer resolves them (without the per-draw words).
         auto buffer = [&](uint64_t base, uint64_t size, native::Buffer& out) {
             VkDeviceSize off = 0;
@@ -5463,9 +5462,20 @@ void main() {
             out.range = std::min<VkDeviceSize>(size + out.byteOffset, vk_.props.limits.maxStorageBufferRange);
             return true;
         };
+        int32_t slot = 0;
         for (const gcn::BufferResource& b : a.vs.buffers) {
-            if (!b.known || b.store) return false;
             native::VertexBuffer vb;
+            if (a.vs.fetchSite && b.pc == a.vs.fetchSite) { // a fetch slot: its control word (gcn analysis fetch())
+                vb.slot = slot++;
+                if (b.data + 5 >= a.vs.data.size()) return false;
+                const uint32_t c = a.vs.data[b.data + 5];
+                vb.components = (c >> 2) & 7, vb.indexVgpr = c & 3, vb.offset = c >> 8;
+                if (!vb.components) { // not loaded by this mesh's fetch shader
+                    nd.vertex.push_back(vb);
+                    continue;
+                }
+            }
+            if (!b.known || b.store) return false;
             if (!buffer(b.base(), bindSize(b), vb.data)) return false;
             vb.stride = b.stride(), vb.records = b.numRecords(), vb.dfmt = b.dfmt, vb.nfmt = b.nfmt;
             vb.dstSel = b.sharp[3] & 0xFFF;
@@ -5516,38 +5526,6 @@ void main() {
         if (depthWritten) gpuWrote(*depthWritten);
         return true;
     }
-
-    // Whether the fetch shader at `addr` only loads attributes indexed by the vertex index, with no
-    // offsets (native::Draw::plainFetch). Read once per address: up to its s_setpc_b64.
-    bool plainFetch(uint64_t addr) {
-        if (!addr) return false;
-        auto it = plainFetch_.find(addr);
-        if (it != plainFetch_.end()) return it->second;
-        uint32_t w[64];
-        bool plain = false, loads = false;
-        if (readGuest(addr, w, sizeof w))
-            for (uint32_t i = 0; i < 64; ++i) {
-                const uint32_t top6 = w[i] >> 26;
-                if (top6 == 0x38 || top6 == 0x3A) { // MUBUF, MTBUF (64 bits)
-                    const bool idxen = (w[i] >> 13) & 1, offen = (w[i] >> 12) & 1;
-                    if (!idxen || offen || (w[i] & 0xFFF) || i + 1 == 64) break;
-                    // Indexed by v0 (the vertex index), with SOFFSET the inline constant 0.
-                    if ((w[i + 1] & 0xFF) != 0 || (w[i + 1] >> 24) != 128) break;
-                    loads = true;
-                    ++i;
-                    continue;
-                }
-                if ((w[i] >> 23) == 0x17D && ((w[i] >> 8) & 0xFF) == 0x20) { // s_setpc_b64: the end
-                    plain = loads;
-                    break;
-                }
-                // Only descriptor loads and waits besides: anything else may change the index.
-                if ((w[i] >> 27) == 0x18 || (w[i] >> 23) == 0x17F) continue; // SMRD, SOPP
-                break;
-            }
-        return plainFetch_[addr] = plain;
-    }
-    std::unordered_map<uint64_t, bool> plainFetch_;
 
     native::PassMap passMap_;
     bool nativeOn_ = false;
@@ -7066,6 +7044,7 @@ void main() {
 
     static void takeDrawPart(gcn::Program& to, const gcn::Program& from) {
         to.launch = from.launch;
+        to.fetchSite = from.fetchSite, to.fetchSlots = from.fetchSlots;
         to.data = from.data;
         to.buffers = from.buffers;
         to.images = from.images;

@@ -125,22 +125,25 @@ public:
         if (d.instances != 1) return decline(role, "instanced");
         if (d.primitive != 4) return decline(role, "not a triangle list");
         // The vertex buffers: the position (3 or 4 components) and, for _pt, the coordinates (2).
-        if (!d.plainFetch) return decline(role, "a fetch shader with offsets");
+        // The fetch slots: the position into v4 (slot 0) and, for _pt, the coordinates into v8.
         const VertexBuffer *pos = nullptr, *uv = nullptr;
         for (const VertexBuffer& v : d.vertex) {
+            if (v.slot != 0 && v.slot != 1) continue;
+            if (!v.components) continue;
             const uint32_t n = components(v.dfmt);
-            if (v.nfmt != 7 || !n || v.stride % 4 || v.data.byteOffset % 4 || v.dstSel != 0xFAC)
+            if (v.nfmt != 7 || !n || v.stride % 4 || (v.data.byteOffset + v.offset) % 4 || v.dstSel != 0xFAC || v.indexVgpr != 0)
                 return decline(role, "a vertex format it does not read");
-            (n >= 3 ? pos : uv) = &v;
+            (v.slot == 0 ? pos : uv) = &v;
         }
+        if (pos && components(pos->dfmt) < 3) return decline(role, "a position of fewer than 3 components");
         if (!pos || (alpha && !uv)) return decline(role, "no position or coordinates");
         Push push{};
         if (!matrix(alpha ? kAlphaLoads : kOpaqueLoads, d, push.m)) return decline(role, "a constant is missing");
-        push.pos[0] = pos->data.byteOffset / 4, push.pos[1] = pos->stride / 4, push.pos[2] = pos->dfmt;
+        push.pos[0] = (pos->data.byteOffset + pos->offset) / 4, push.pos[1] = pos->stride / 4, push.pos[2] = pos->dfmt;
         VkDescriptorBufferInfo bufs[2] = {{pos->data.buffer, pos->data.offset, pos->data.range}, {}};
         VkDescriptorImageInfo image{};
         if (alpha) {
-            push.uv[0] = uv->data.byteOffset / 4, push.uv[1] = uv->stride / 4, push.uv[2] = uv->dfmt;
+            push.uv[0] = (uv->data.byteOffset + uv->offset) / 4, push.uv[1] = uv->stride / 4, push.uv[2] = uv->dfmt;
             bufs[1] = {uv->data.buffer, uv->data.offset, uv->data.range};
             const Texture* t = nullptr;
             for (const Texture& x : d.textures)
