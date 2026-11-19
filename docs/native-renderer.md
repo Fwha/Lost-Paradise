@@ -95,3 +95,8 @@ every step leaves a game that plays:
   rectangle's own vertices are not checked (the upscaler path assumes the same full-screen draw);
   the game's fp16 round-toward-zero export is not reproduced.
 - PC Settings > Native Renderer (`renderer = native | translated`), applied at the next frame.
+- The game's MLAA writes the edge pixels into the stencil (DB_DEPTH_CONTROL 0x771, ref 0x40)
+  and runs weights and blend only there (0x571); the blend writes over the scene in place. The
+  native passes attach the depth/stencil buffer and keep that state.
+- 2026-11-19: confirmed in play at 2560x1440 (Upscaler Off): all three drawn natively, the
+  picture as before.
