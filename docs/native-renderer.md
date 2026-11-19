@@ -90,5 +90,8 @@ every step leaves a game that plays:
   then forgets what it had bound and marks the targets written.
 - `native/aa.cpp`: the game's MLAA (edges, blend weights, blend) in handwritten GLSL from the
   disassembly. It only runs with the Upscaler off (with one on, DLSS/FSR replace those draws).
-  It declines a draw with blending, depth or stencil, or more than one target, and logs why once.
+  It declines a draw with blending, depth or stencil, more than one target, anything but one
+  3-vertex rectangle, or a viewport other than the whole picture, and logs why once. Open: the
+  rectangle's own vertices are not checked (the upscaler path assumes the same full-screen draw);
+  the game's fp16 round-toward-zero export is not reproduced.
 - PC Settings > Native Renderer (`renderer = native | translated`), applied at the next frame.
