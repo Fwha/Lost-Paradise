@@ -65,9 +65,11 @@ layout(set = 0, binding = 1, std430) readonly buffer V1 { uint w[]; } v1;
 #ifdef ALPHA_TEST
 layout(set = 0, binding = 2, std430) readonly buffer V2 { uint w[]; } v2;
 #endif
-layout(location = 0) out vec3 n;
+// As the game's shader exports them (param0: the normal and clip w; param1: the coordinates and
+// zeros): interpolated through another interface, a share of the _pt pixels came out a step off.
+layout(location = 0) out vec4 n;
 #ifdef ALPHA_TEST
-layout(location = 1) out vec2 t;
+layout(location = 1) out vec4 t;
 #endif
 uint word(uint b, uint i) {
 #ifdef ALPHA_TEST
@@ -126,33 +128,27 @@ void main() {
     const float k = uintBitsToFloat(0x40008102u); // the shader's literal: 255/127, not 2
     m = vec3(mac(k, m.x, -1.0), mac(k, m.y, -1.0), mac(k, m.z, -1.0));
     vec3 o = vec3(dot3(p.world[0], m), dot3(p.world[1], m), dot3(p.world[2], m));
-    n = vec3(dot3(p.rot[0], o), dot3(p.rot[1], o), dot3(p.rot[2], o));
+    n = vec4(dot3(p.rot[0], o), dot3(p.rot[1], o), dot3(p.rot[2], o), c.w);
 #ifdef ALPHA_TEST
-    t = fetch(2u, p.uv).xy;
+    t = vec4(fetch(2u, p.uv).xy, 0.0, 0.0);
 #endif
 }
 )";
 
 constexpr const char* kFs = R"(
-layout(location = 0) in vec3 n;
+layout(location = 0) in vec4 n;
 #ifdef ALPHA_TEST
-layout(location = 1) in vec2 t;
+layout(location = 1) in vec4 t;
 layout(set = 0, binding = 3) uniform sampler2D mask0;
 layout(set = 0, binding = 4) uniform sampler2D mask1;
 #endif
 layout(location = 0) out vec4 color;
 void main() {
 #ifdef ALPHA_TEST
-    if (0.0 > texture(mask1, t).w * texture(mask0, t).z - p.off.w) discard;
+    if (0.0 > texture(mask1, t.xy).w * texture(mask0, t.xy).z - p.off.w) discard;
 #endif
     const float k = 0.49803922;
-#ifdef ALPHA_TEST
-    // Unfused here: the translated _pt shader's branches keep its multiply and add apart (fused,
-    // a share of its pixels came out a step off in LPN_NATIVE_COMPARE).
-    precise vec3 e = n * k + k;
-#else
-    vec3 e = n * k + k;
-#endif
+    vec3 e = n.xyz * k + k;
     // v_cvt_pkrtz_f16_f32 before the compressed export, as the translator rounds it.
     vec4 v = vec4(unpackHalf2x16(packHalf2x16(e.xy)), unpackHalf2x16(packHalf2x16(vec2(e.z, 0.0))));
     uint s = p.pos.w;
