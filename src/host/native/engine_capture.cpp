@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <mutex>
@@ -60,6 +61,10 @@ void readAlphaInputs(uint64_t ctx, uint64_t s, EngineDraw& d) {
     if (readable(f)) {
         const uint64_t t = *reinterpret_cast<const uint64_t*>(f + 0x10);
         const uint32_t n = *reinterpret_cast<const uint32_t*>(f + 0x18);
+        if (readable(t)) {
+            d.attributeCount = std::min<uint32_t>(n, 16);
+            std::memcpy(d.attributes, reinterpret_cast<const void*>(t), 8 * d.attributeCount);
+        }
         if (readable(t) && n >= 2) {
             const uint32_t a = *reinterpret_cast<const uint32_t*>(t + 8);
             d.uvOffset = (a & 0xFF) * 4, d.uvStream = (a >> 8) & 0xFF;

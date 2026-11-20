@@ -36,6 +36,8 @@ struct EngineDraw {
     // state +0x698: its byte offset in the vertex, stream, and V# word 3 (formats, DST_SEL).
     uint32_t uvOffset = 0, uvStream = 0, uvWord3 = 0;
     bool uvKnown = false;
+    uint32_t attributes[16][2] = {}; // the fetch metadata's table (for finding the coordinates' entry)
+    uint32_t attributeCount = 0;
     // The pixel shader's texture read from user SGPR 0 (state +0x8e8 by the slot whose entry in
     // the shader's table at *(context+0xb8)+0x1c maps to it): its T#.
     uint32_t texture[8] = {};
