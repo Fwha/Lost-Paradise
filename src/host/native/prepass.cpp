@@ -146,7 +146,13 @@ void main() {
     if (0.0 > texture(mask1, t).w * texture(mask0, t).z - p.off.w) discard;
 #endif
     const float k = 0.49803922;
+#ifdef ALPHA_TEST
+    // Unfused here: the translated _pt shader's branches keep its multiply and add apart (fused,
+    // a share of its pixels came out a step off in LPN_NATIVE_COMPARE).
+    precise vec3 e = n * k + k;
+#else
     vec3 e = n * k + k;
+#endif
     // v_cvt_pkrtz_f16_f32 before the compressed export, as the translator rounds it.
     vec4 v = vec4(unpackHalf2x16(packHalf2x16(e.xy)), unpackHalf2x16(packHalf2x16(vec2(e.z, 0.0))));
     uint s = p.pos.w;
