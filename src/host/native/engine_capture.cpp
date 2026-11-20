@@ -151,8 +151,12 @@ bool installEngineCapture(Module& eboot) {
         const char* e = std::getenv(name);
         return e && *e && *e != '0';
     };
-    gShadows = on("LPN_ENGINE_SHADOWS");
-    if (!on("LPN_ENGINE_CHECK") && !gShadows) return false;
+    // On by default (with Native Renderer on, checked at each draw); LPN_ENGINE_SHADOWS=0 turns it off.
+    // LPN_ENGINE_CHECK alone checks the game's draws instead, which then still run.
+    const char* es = std::getenv("LPN_ENGINE_SHADOWS");
+    const bool check = on("LPN_ENGINE_CHECK");
+    gShadows = es ? *es && *es != '0' : !check;
+    if (!check && !gShadows) return false;
     // push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov eax, ecx
     const Hook hooks[] = {
         {kDrawIndex, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x89, 0xc8}, guestHook<&drawIndex>(),

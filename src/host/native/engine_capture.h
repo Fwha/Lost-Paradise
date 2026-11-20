@@ -37,7 +37,7 @@ struct EngineDraw {
     std::shared_ptr<std::vector<uint8_t>> context, state;
 };
 
-// LPN_ENGINE_SHADOWS=1 (with Native Renderer on): the stage's opaque shadow casters (the first
+// With Native Renderer on (LPN_ENGINE_SHADOWS=0 turns it off): the stage's opaque shadow casters (the first
 // class: sites 0xa5177a and 0xa518fe) are drawn from the engine's description alone. The game's
 // state commit still runs, but in place of the draw packet the packet helper writes a NOP
 // carrying the capture's id (kEngineTag), and the renderer draws the capture natively there.
