@@ -123,7 +123,8 @@ void main() {
     if (p.nrm.w != 0u) c.z = (c.z + c.w) * 0.5;
     gl_Position = c;
     vec3 m = fetch(1u, p.nrm).xyz;
-    m = vec3(mac(2.0078431, m.x, -1.0), mac(2.0078431, m.y, -1.0), mac(2.0078431, m.z, -1.0));
+    const float k = uintBitsToFloat(0x40008102u); // the shader's literal: 255/127, not 2
+    m = vec3(mac(k, m.x, -1.0), mac(k, m.y, -1.0), mac(k, m.z, -1.0));
     vec3 o = vec3(dot3(p.world[0], m), dot3(p.world[1], m), dot3(p.world[2], m));
     n = vec3(dot3(p.rot[0], o), dot3(p.rot[1], o), dot3(p.rot[2], o));
 #ifdef ALPHA_TEST
