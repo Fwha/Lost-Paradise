@@ -3,6 +3,7 @@
 
 #include "host/hooks.h"
 #include "host/module.h"
+#include "host/native/draw_origin.h"
 #include "host/videoout.h"
 
 #include <algorithm>
@@ -83,6 +84,8 @@ void report(std::chrono::steady_clock::time_point now) {
 
 // `frame` is this hook's own frame: [frame] holds the game caller's %rbp, [frame+8] the return
 // address into it. The game is built with frame pointers, so its %rbp chain continues from there.
+bool gCounting = false; // LPN_DRAW_SITES
+
 void count(Kind kind, const uint64_t* frame) {
     Key k;
     k.kind = kind;
@@ -96,6 +99,9 @@ void count(Kind kind, const uint64_t* frame) {
         if (!k.at[i]) break;
         fp = reinterpret_cast<const uint64_t*>(fp[0]);
     }
+    // The draw's origin, for the packet the wrapper writes next (native/draw_origin.h).
+    if (kind != kDispatch) native::tPendingOrigin = {{k.at[0], k.at[1], k.at[2]}};
+    if (!gCounting) return;
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard lock(gMutex);
     ++gCounts[k];
@@ -119,8 +125,9 @@ uint64_t dispatch(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, ui
 } // namespace
 
 bool patchDrawSites(Module& eboot) {
+    // Always hooked: every draw carries its origin to the renderer. LPN_DRAW_SITES also counts.
     const char* e = std::getenv("LPN_DRAW_SITES");
-    if (!e || !*e || *e == '0') return false;
+    gCounting = e && *e && *e != '0';
     // First instructions of each wrapper, moved to the trampoline (none are rip-relative).
     const Hook hooks[] = {
         {kDrawIndexAuto, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x89, 0xfb, 0x41, 0x89, 0xf6},
@@ -133,7 +140,7 @@ bool patchDrawSites(Module& eboot) {
     gBase = eboot.base();
     gLast = std::chrono::steady_clock::now();
     if (!installHooks(gBase, hooks, std::size(hooks), "sites")) return false;
-    std::fprintf(stderr, "[sites] counting draws by call chain (LPN_DRAW_SITES)\n");
+    if (gCounting) std::fprintf(stderr, "[sites] counting draws by call chain (LPN_DRAW_SITES)\n");
     return true;
 }
 

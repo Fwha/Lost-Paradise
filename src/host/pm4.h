@@ -40,6 +40,7 @@ struct DrawCall {
     uint64_t indexAddr = 0;          // index buffer for kIndexed
     uint32_t groups[3] = {};         // thread groups for kDispatch
     uint32_t indirectOffset = 0;     // into GpuRegs::indirectBase
+    uint32_t origin[3] = {};         // eboot offsets of the engine code that drew it (native/draw_origin.h)
 };
 
 class DrawListener {

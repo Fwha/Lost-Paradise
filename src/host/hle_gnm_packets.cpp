@@ -5,6 +5,7 @@
 #include "host/hle.h"
 #include "host/kernel.h"
 #include "host/pm4.h"
+#include "host/native/draw_origin.h"
 
 #include <cstdio>
 #include <initializer_list>
@@ -30,6 +31,18 @@ public:
     template <typename... V> void sh(uint32_t reg, V... v) { packet(kOpSetShReg, {reg, uint32_t(v)...}); }
     template <typename... V> void shCompute(uint32_t reg, V... v) { packet(kOpSetShReg, {reg, uint32_t(v)...}, true); }
 
+    // A draw's origin (native/draw_origin.h) as a NOP ahead of it, when its wrapper's hook left one
+    // and the space reserved holds `need` more dwords after it.
+    void origin(uint32_t need) {
+        native::Origin& o = native::tPendingOrigin;
+        if (!o.at[0]) return;
+        if (p_ && p_ + 4 + need <= end_) {
+            *p_++ = (3u << 30) | (2u << 16) | (kOpNop << 8);
+            for (uint32_t a : o.at) *p_++ = native::kOriginTag | (a & ~native::kOriginMask);
+        }
+        o = {};
+    }
+
     // Pad the rest of the reserved space. Returns 0 (s_ok) like the driver, or -1 on overflow.
     int32_t finish(const char* fn) {
         if (!ok_) {
@@ -51,11 +64,13 @@ constexpr uint32_t kSourceDma = 0, kSourceAuto = 2, kUseOpaque = 0x8;
 
 int32_t sceGnmDrawIndex(uint32_t* cmd, uint32_t size, uint32_t count, uint64_t indexAddr, uint32_t, uint32_t) {
     Writer w(cmd, size);
+    w.origin(6);
     w.packet(kOpDrawIndex2, {0x7FFFFFFF, uint32_t(indexAddr), uint32_t(indexAddr >> 32), count, kSourceDma});
     return w.finish(__func__);
 }
 int32_t sceGnmDrawIndexAuto(uint32_t* cmd, uint32_t size, uint32_t count, uint32_t) {
     Writer w(cmd, size);
+    w.origin(3);
     w.packet(kOpDrawIndexAuto, {count, kSourceAuto});
     return w.finish(__func__);
 }
