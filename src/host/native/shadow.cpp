@@ -315,10 +315,11 @@ public:
     // A stage caster from the engine's capture: world-space positions (the stage's casters have
     // an identity world matrix, no offset, and subtract the camera: checked with LPN_ENGINE_CHECK).
     bool drawEngine(const EngineCaster& c, const Draw& d, Gpu& gpu) {
-        const int role = kOpaque;
+        const int role = c.alpha ? kAlphaTest : kOpaque;
         if (d.colorCount || !d.depth.view || d.blend || d.stencil || d.vertex.empty() || !d.indexed) return false;
         const VertexBuffer& pos = d.vertex[0];
         if (pos.stride % 4 || pos.data.byteOffset % 4) return false;
+        if (c.alpha && (d.vertex.size() < 2 || d.textures.empty() || (d.vertex[1].data.byteOffset + d.vertex[1].offset) % 4)) return false;
         Push push{};
         for (int r = 0; r < 4; ++r) // projection * rotation
             for (int col = 0; col < 4; ++col) {
@@ -330,28 +331,43 @@ public:
         for (int a = 0; a < 3; ++a) push.origin[a] = c.camera[a];
         push.pos[0] = pos.data.byteOffset / 4, push.pos[1] = pos.stride / 4, push.pos[2] = 13;
         push.bias[0] = lastBias_[0], push.bias[1] = lastBias_[1];
+        VkDescriptorImageInfo image{};
+        VkDescriptorBufferInfo uvBuf{};
+        if (c.alpha) { // as the alpha-tested casters: bias without scale, capped at 0.01
+            const VertexBuffer& uv = d.vertex[1];
+            push.uv[0] = (uv.data.byteOffset + uv.offset) / 4, push.uv[1] = uv.stride / 4, push.uv[2] = uv.dfmt;
+            uvBuf = {uv.data.buffer, uv.data.offset, uv.data.range};
+            const Texture& t = d.textures[0];
+            image = {t.sampler, t.view, VK_IMAGE_LAYOUT_GENERAL};
+            push.uvScale[0] = t.scale[0], push.uvScale[1] = t.scale[1];
+            push.bias[0] = 1, push.bias[1] = 0.01f;
+        }
         VkPipeline pipe = pipeline(gpu, role, d);
         if (!pipe) return false;
-        if (!engineLogged_) {
-            engineLogged_ = true;
-            std::fprintf(stderr, "[native] shadow: drawing stage casters from the engine's captures (depth 0x%" PRIx64 ")\n", d.depth.address);
+        if (!engineLogged_[c.alpha]) {
+            engineLogged_[c.alpha] = true;
+            std::fprintf(stderr, "[native] shadow: drawing %s stage casters from the engine's captures (depth 0x%" PRIx64 ")\n",
+                         c.alpha ? "alpha-tested" : "opaque", d.depth.address);
         }
         gpu.beginRendering(nullptr, 0, d.depth, d.hasStencil);
         const VkViewport vp = d.vkViewport;
         const VkRect2D sc{{d.scissor[0], d.scissor[1]}, {uint32_t(d.scissor[2]), uint32_t(d.scissor[3])}};
         const VkDescriptorBufferInfo buf{pos.data.buffer, pos.data.offset, pos.data.range};
         const Buffer index = d.index;
-        gpu.record([pipe, layout = layouts_[role], push, buf, vp, sc, index, indexType = d.indexType, count = d.count,
-                    pushSet = gpu.pushDescriptorSet()](VkCommandBuffer cb) {
+        gpu.record([pipe, layout = layouts_[role], push, buf, uvBuf, image, alpha = c.alpha, vp, sc, index, indexType = d.indexType,
+                    count = d.count, pushSet = gpu.pushDescriptorSet()](VkCommandBuffer cb) {
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             vkCmdSetViewport(cb, 0, 1, &vp);
             vkCmdSetScissor(cb, 0, 1, &sc);
-            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            w.dstBinding = 0;
-            w.descriptorCount = 1;
-            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            w.pBufferInfo = &buf;
-            pushSet(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &w);
+            VkWriteDescriptorSet w[3]{};
+            for (uint32_t i = 0; i < 3; ++i) {
+                w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w[i].dstBinding = i;
+                w[i].descriptorCount = 1;
+                w[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            }
+            w[0].pBufferInfo = &buf, w[1].pBufferInfo = &uvBuf, w[2].pImageInfo = &image;
+            pushSet(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, alpha ? 3 : 1, w);
             vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, &push);
             vkCmdBindIndexBuffer(cb, index.buffer, index.offset + index.byteOffset, indexType);
             vkCmdDrawIndexed(cb, count, 1, 0, 0, 0);
@@ -362,7 +378,7 @@ public:
 private:
     float lastBias_[2] = {1.0f, 0.01f}; // the opaque casters' bias constants, as last seen
     uint32_t biasChanges_ = 0;
-    bool engineLogged_ = false;
+    bool engineLogged_[2] = {};
 
     // A fetch slot in a format the skinned shader decodes (32-, 16- or 8-bit channels).
     static bool decodable(const VertexBuffer& v) {

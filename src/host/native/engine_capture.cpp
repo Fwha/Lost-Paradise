@@ -65,11 +65,24 @@ void readAlphaInputs(uint64_t ctx, uint64_t s, EngineDraw& d) {
             d.attributeCount = std::min<uint32_t>(n, 16);
             std::memcpy(d.attributes, reinterpret_cast<const void*>(t), 8 * d.attributeCount);
         }
-        if (readable(t) && n >= 2) {
-            const uint32_t a = *reinterpret_cast<const uint32_t*>(t + 8);
+        // The coordinates: the one attribute after the position in a two-channel float format
+        // (16_16 or 32_32; the table has unused all-zero entries between: Fwha's check runs).
+        int found = -1;
+        for (uint32_t i = 1; i < d.attributeCount; ++i) {
+            const uint32_t w3 = d.attributes[i][1], dfmt = (w3 >> 15) & 0xF, nfmt = (w3 >> 12) & 7;
+            if ((dfmt == 5 || dfmt == 11) && nfmt == 7) {
+                if (found >= 0) {
+                    found = -2; // two of them: not known which
+                    break;
+                }
+                found = int(i);
+            }
+        }
+        if (found >= 0) {
+            const uint32_t a = d.attributes[found][0];
             d.uvOffset = (a & 0xFF) * 4, d.uvStream = (a >> 8) & 0xFF;
-            d.uvWord3 = *reinterpret_cast<const uint32_t*>(t + 12);
-            d.uvKnown = !(a & 0xFF0000);
+            d.uvWord3 = d.attributes[found][1];
+            d.uvKnown = !(a & 0xFF0000) && d.uvStream == 0;
         }
     }
     const uint64_t h = *reinterpret_cast<const uint64_t*>(ctx + 0xb8);
@@ -148,11 +161,15 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
             }
         }
         const bool opaqueClass = site == 0xa5177a || site == 0xa518fe;
-        if (gShadows && opaqueClass && displaySettingsNative()) {
+        // The alpha-tested class needs the coordinates and texture as well; without them the
+        // game's draw stays.
+        const bool alpha = site == 0xa51b79 || site == 0xa51d37;
+        if (gShadows && (opaqueClass || (alpha && d.uvKnown && d.textureSlot >= 0)) && displaySettingsNative()) {
             EngineCaster c;
             c.draw = d;
             c.vertices = at<uint32_t>(s + 0x294);
             c.index32 = (ib >> 31) != 0;
+            c.alpha = alpha;
             const uint64_t view = d.view & 0xFFFFFFFFFFull;
             if (readGuestFloats(view, c.projection, 16) && readGuestFloats(view + 0x40, c.rotation, 12) &&
                 readGuestFloats(view + 0x220, c.camera, 4)) {
