@@ -5603,6 +5603,26 @@ void main() {
         const uint64_t vbytes = std::max<uint64_t>(uint64_t(c.vertices) * c.draw.stride, 16);
         if (!buffer(c.draw.vertexBase, vbytes, vb.data)) return;
         nd.vertex.push_back(vb);
+        if (c.alpha) { // the coordinates (slot 1) in the same buffer, and the texture
+            native::VertexBuffer uv = vb;
+            uv.slot = 1, uv.components = 2, uv.offset = c.draw.uvOffset;
+            uv.dfmt = (c.draw.uvWord3 >> 15) & 0xF, uv.nfmt = (c.draw.uvWord3 >> 12) & 7, uv.dstSel = c.draw.uvWord3 & 0xFFF;
+            nd.vertex.push_back(uv);
+            gcn::ImageResource im;
+            std::memcpy(im.t, c.draw.texture, sizeof im.t);
+            // The sampler the game's casters had in every check run (wrap, the filters it sets): the
+            // engine's own is not read yet.
+            static constexpr uint32_t kCasterSampler[4] = {0x00000000, 0x00f00000, 0x0a500000, 0x00000000};
+            std::memcpy(im.s, kCasterSampler, sizeof im.s);
+            im.pc = 0x24;
+            R().sampledSurfaces_.clear();
+            const ImageBinding b = resolveImage(im);
+            if (!b.view || !b.sampler) return;
+            native::Texture t;
+            t.view = b.view, t.sampler = b.sampler, t.scale[0] = b.scale[0], t.scale[1] = b.scale[1];
+            t.address = im.base(), t.width = im.width(), t.height = im.height(), t.pc = 0x24;
+            nd.textures.push_back(t);
+        }
         nd.indexed = true;
         nd.indexType = c.index32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
         if (!buffer(c.draw.indexAddr, uint64_t(c.draw.count) * (c.index32 ? 4 : 2), nd.index)) return;
@@ -5615,6 +5635,7 @@ void main() {
         }
         R().needBarrier_ = true;
         for (VkImage im : R().pass_.images) addOnce(R().drawWritten_, im);
+        for (VkImage im : R().sampledSurfaces_) addOnce(R().drawSampled_, im);
         R().bound_ = Bound{};
         ++R().passSerial_;
         R().fast_.valid = false;
@@ -5647,7 +5668,7 @@ void main() {
                          "[native] engine check: differs at 0x%x/0x%x: indices 0x%" PRIx64 " x%u, engine 0x%" PRIx64 " x%u; vertices 0x%" PRIx64
                          ", engine 0x%" PRIx64 " (stride %u)\n",
                          d.origin[0], e.site, index, d.count, e.indexAddr, e.count, vertex, e.vertexBase, e.stride);
-        if (same && engineStats_[0] <= 3) {
+        if (same && e.state) { // the draws that kept copies of the state (three of each class)
             // Where the view constants are: the vertex stage's slots against the V# the shader read.
             uint64_t view = 0;
             for (const auto& [pc, at] : a.vs.smrd) {
@@ -5678,6 +5699,31 @@ void main() {
             };
             search(e.context, "context");
             search(e.state, "state");
+            // The alpha-tested casters' texture (pc 0x24 of ps_shadowmap_pt): its T# and S# words.
+            // The alpha-tested casters' texture (pc 0x24 of ps_shadowmap_pt) and the vertex shader's
+            // fetch shader (s[0:1]): where the context, its state block or its user-data table hold them.
+            const uint64_t fetch = (uint64_t(a.vs.launch.userData[1]) << 32) | a.vs.launch.userData[0];
+            for (const gcn::ImageResource& im : a.ps.images) {
+                if (im.pc - a.ps.launch.entry != 0x24) continue;
+                std::fprintf(stderr, "[native] engine check:   alpha texture T# %08x %08x %08x %08x S# %08x %08x %08x %08x, fetch shader 0x%" PRIx64 "\n",
+                             im.t[0], im.t[1], im.t[2], im.t[3], im.s[0], im.s[1], im.s[2], im.s[3], fetch);
+                auto find = [&](const std::shared_ptr<std::vector<uint8_t>>& block, const char* what) {
+                    if (!block) return;
+                    const auto& b = *block;
+                    for (size_t o = 0; o + 16 <= b.size(); o += 4) {
+                        if (std::memcmp(b.data() + o, im.t, 16) == 0) std::fprintf(stderr, "[native] engine check:   %s+0x%zx = the T#\n", what, o);
+                        if (std::memcmp(b.data() + o, im.s, 8) == 0 && (im.s[0] | im.s[1]))
+                            std::fprintf(stderr, "[native] engine check:   %s+0x%zx = the S#\n", what, o);
+                        uint64_t v;
+                        std::memcpy(&v, b.data() + o, 8);
+                        if (fetch && (v == fetch || (v & 0xFFFFFFFFFFull) == fetch))
+                            std::fprintf(stderr, "[native] engine check:   %s+0x%zx = the fetch shader\n", what, o);
+                    }
+                };
+                find(e.context, "context");
+                find(e.state, "state");
+                find(e.table, "table");
+            }
         }
         // What a draw from the engine alone needs to know: does the view V# agree, and which
         // offsets, flags and position formats do the casters' shaders read (each kind once).
@@ -5691,15 +5737,19 @@ void main() {
             };
             const bool got = load(0x10, off, 4) && load(0x20, &flags, 1);
             uint32_t dfmt = 0, nfmt = 0, foff = 0;
+            int64_t uvAt = -1; // the coordinates' slot: where in the vertex, and its format
+            uint32_t uvFmt = 0, slotIndex = 0;
             for (const gcn::BufferResource& b : a.vs.buffers)
                 if (a.vs.fetchSite && b.pc == a.vs.fetchSite && b.data + 5 < a.vs.data.size()) {
-                    dfmt = b.dfmt, nfmt = b.nfmt, foff = a.vs.data[b.data + 5] >> 8;
-                    break;
+                    if (slotIndex == 0) dfmt = b.dfmt, nfmt = b.nfmt, foff = a.vs.data[b.data + 5] >> 8;
+                    if (slotIndex == 1 && b.known) uvAt = int64_t(b.base() + (a.vs.data[b.data + 5] >> 8)) - int64_t(e.vertexBase), uvFmt = b.dfmt | b.nfmt << 4 | (b.sharp[3] & 0xFFF) << 8;
+                    ++slotIndex;
                 }
-            char key[160];
-            std::snprintf(key, sizeof key, "site 0x%x vs %s off %g %g %g flags 0x%x pos dfmt %u nfmt %u offset %u fmt 0x%x view %s", e.site,
+            char key[200];
+            std::snprintf(key, sizeof key, "site 0x%x vs %s off %g %g %g flags 0x%x pos dfmt %u nfmt %u offset %u fmt 0x%x uv at %lld fmt 0x%x stride %u view %s", e.site,
                           native::shaderNameAt(a.vs.launch.entry, &readGuest).c_str(), got ? std::bit_cast<float>(off[0]) : -1.0f,
                           std::bit_cast<float>(off[1]), std::bit_cast<float>(off[2]), flags, dfmt, nfmt, foff, e.vertexFormat & 0xF,
+                          (long long)uvAt, uvFmt, e.stride,
                           [&] {
                               for (const auto& [pc, at] : a.vs.smrd) {
                                   const uint32_t o = uint32_t(pc - a.vs.launch.entry);
@@ -5709,6 +5759,27 @@ void main() {
                               return "?";
                           }());
             if (engineKinds_.insert(key).second && engineKinds_.size() <= 32) std::fprintf(stderr, "[native] engine check: kind %s\n", key);
+            if (uvAt >= 0) { // an alpha-tested caster: the engine's coordinates and texture against the game's
+                bool tex = false;
+                for (const gcn::ImageResource& im : a.ps.images)
+                    if (im.pc - a.ps.launch.entry == 0x24) tex = std::memcmp(im.t, e.texture, 32) == 0;
+                const bool uv = e.uvKnown && e.uvStream == 0 && int64_t(e.uvOffset) == uvAt && (e.uvWord3 & 0x7FFFF) == (((uvFmt >> 8) & 0xFFF) | (((uvFmt >> 4) & 7) << 12) | ((uvFmt & 0xF) << 15));
+                ++engineAlpha_[(uv ? 0 : 1) + (tex ? 0 : 2)];
+                if ((!uv || !tex) && engineAlpha_[1] + engineAlpha_[2] + engineAlpha_[3] <= 10) {
+                    std::fprintf(stderr, "[native] engine check:   alpha inputs differ: coordinates %s (engine offset %u stream %u word3 0x%x known %d, game at %lld fmt 0x%x), texture %s (slot %d)\n",
+                                 uv ? "same" : "differ", e.uvOffset, e.uvStream, e.uvWord3, e.uvKnown, (long long)uvAt, uvFmt, tex ? "same" : "differs", e.textureSlot);
+                    std::string t;
+                    for (uint32_t i = 0; i < e.attributeCount; ++i) {
+                        char b[48];
+                        std::snprintf(b, sizeof b, " [%u] %08x %08x", i, e.attributes[i][0], e.attributes[i][1]);
+                        t += b;
+                    }
+                    std::fprintf(stderr, "[native] engine check:   attribute table (%u):%s\n", e.attributeCount, t.c_str());
+                }
+                if ((engineAlpha_[0] + engineAlpha_[1] + engineAlpha_[2] + engineAlpha_[3]) % 50000 == 0)
+                    std::fprintf(stderr, "[native] engine check: alpha casters: %" PRIu64 " both match, %" PRIu64 " coordinates differ, %" PRIu64 " texture differs, %" PRIu64 " both\n",
+                                 engineAlpha_[0], engineAlpha_[1], engineAlpha_[2], engineAlpha_[3]);
+            }
         }
         if (engineStats_[0] + engineStats_[1] == 3000)
             std::fprintf(stderr, "[native] engine check: %" PRIu64 " of 3000 stage shadow draws match the engine's (%" PRIu64 " without one)\n",
@@ -5716,6 +5787,7 @@ void main() {
     }
     uint64_t engineStats_[3] = {}; // matched, differing, uncaptured
     std::set<std::string> engineKinds_;
+    uint64_t engineAlpha_[4] = {}; // alpha casters: both inputs match, coordinates differ, texture differs, both differ
 
     native::PassMap passMap_;
     bool nativeOn_ = false;

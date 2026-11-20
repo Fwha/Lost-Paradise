@@ -4,11 +4,13 @@
 #include "host/hooks.h"
 #include "host/module.h"
 #include "host/native/draw_origin.h"
+#include "host/crash.h"
 #include "host/display_settings.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <mutex>
@@ -47,6 +49,71 @@ bool readGuestFloats(uint64_t addr, float* out, size_t n) {
 }
 
 bool displaySettingsNative() { return displaySettings().nativeRenderer; }
+
+bool readable(uint64_t a) { return a > 0x100000000ull && a < (1ull << 40); }
+
+// What the alpha-tested casters need besides the opaque ones' (Codex's reading of eabdb0 and
+// e61ae0): fetch slot 1 through the metadata at S+0x698 (table at +0x10 of 8-byte entries:
+// offset/4 in bits 0-7, stream in 8-15, then V# word 3), and the texture through the pixel
+// shader's slot table and S+0x8e8.
+void readAlphaInputsNow(uint64_t ctx, uint64_t s, EngineDraw& d) {
+    const uint64_t f = *reinterpret_cast<const uint64_t*>(s + 0x698);
+    if (readable(f)) {
+        const uint64_t t = *reinterpret_cast<const uint64_t*>(f + 0x10);
+        const uint32_t n = *reinterpret_cast<const uint32_t*>(f + 0x18);
+        if (readable(t)) {
+            d.attributeCount = std::min<uint32_t>(n, 16);
+            std::memcpy(d.attributes, reinterpret_cast<const void*>(t), 8 * d.attributeCount);
+        }
+        // The coordinates: the one attribute after the position in a two-channel float format
+        // (16_16 or 32_32; the table has unused all-zero entries between: Fwha's check runs).
+        int found = -1;
+        for (uint32_t i = 1; i < d.attributeCount; ++i) {
+            const uint32_t w3 = d.attributes[i][1], dfmt = (w3 >> 15) & 0xF, nfmt = (w3 >> 12) & 7;
+            if ((dfmt == 5 || dfmt == 11) && nfmt == 7) {
+                if (found >= 0) {
+                    found = -2; // two of them: not known which
+                    break;
+                }
+                found = int(i);
+            }
+        }
+        if (found >= 0) {
+            const uint32_t a = d.attributes[found][0];
+            d.uvOffset = (a & 0xFF) * 4, d.uvStream = (a >> 8) & 0xFF;
+            d.uvWord3 = d.attributes[found][1];
+            // As stored: x and y (the shader reads them raw).
+            d.uvKnown = !(a & 0xFF0000) && d.uvStream == 0 && (d.uvWord3 & 0x3F) == (4 | 5 << 3);
+        }
+    }
+    const uint64_t h = *reinterpret_cast<const uint64_t*>(ctx + 0xb8);
+    if (!readable(h)) return;
+    for (int j = 0; j < 16; ++j) {
+        const uint16_t m = *reinterpret_cast<const uint16_t*>(h + 0x1c + 2 * j);
+        if (m == 0xFFFF || !(m & 0x8000) || (m & 0x3FFF) != 0) continue;
+        const uint64_t p = *reinterpret_cast<const uint64_t*>(s + 0x8e8 + 8 * j);
+        if (!readable(p)) return;
+        std::memcpy(d.texture, reinterpret_cast<const void*>(p), 32);
+        d.textureSlot = j;
+        return;
+    }
+}
+
+// Guarded: a pointer the engine left stale must not crash the game; the inputs are then unknown
+// and the game draws the caster itself.
+void readAlphaInputs(uint64_t ctx, uint64_t s, EngineDraw& d) {
+    struct Args {
+        uint64_t ctx, s;
+        EngineDraw* d;
+    } a{ctx, s, &d};
+    if (!guarded([](void* p) {
+            auto* k = static_cast<Args*>(p);
+            readAlphaInputsNow(k->ctx, k->s, *k->d);
+        }, &a)) {
+        d.uvKnown = false;
+        d.textureSlot = -1;
+    }
+}
 
 template <typename T> T at(uint64_t a) {
     T v;
@@ -87,19 +154,39 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
         for (int i = 0; i < 4; ++i) d.constants[i] = at<uint64_t>(s + 0x6c8 + 8 * i);
         d.view = at<uint64_t>(s + 0x20c8);
         d.vertexFormat = at<uint32_t>(s + 0x298);
-        static std::atomic<int> copies{0};
-        if (copies.fetch_add(1) < 3) {
+        readAlphaInputs(ctx, s, d);
+        // Three of each class (the alpha-tested class's textures are looked for too).
+        static std::atomic<int> copies[2]{};
+        const bool alphaClass = site == 0xa51b79 || site == 0xa51d37;
+        if (copies[alphaClass].fetch_add(1) < 3) {
             d.context = std::make_shared<std::vector<uint8_t>>(0x400);
             d.state = std::make_shared<std::vector<uint8_t>>(0x4000);
             std::memcpy(d.context->data(), reinterpret_cast<const void*>(ctx), 0x400);
             std::memcpy(d.state->data(), reinterpret_cast<const void*>(s), 0x4000);
+            if (const uint64_t t = at<uint64_t>(ctx + 0x68); t > 0x100000000ull && t < (1ull << 40)) {
+                d.table = std::make_shared<std::vector<uint8_t>>(0x3000);
+                struct Copy {
+                    void* dst;
+                    uint64_t src;
+                } cp{d.table->data(), t};
+                // Guarded: a table shorter than this at the end of a mapping must not crash the game.
+                if (!guarded([](void* c) {
+                        auto* k = static_cast<Copy*>(c);
+                        std::memcpy(k->dst, reinterpret_cast<const void*>(k->src), 0x3000);
+                    }, &cp))
+                    d.table.reset();
+            }
         }
         const bool opaqueClass = site == 0xa5177a || site == 0xa518fe;
-        if (gShadows && opaqueClass && displaySettingsNative()) {
+        // The alpha-tested class needs the coordinates and texture as well; without them the
+        // game's draw stays.
+        const bool alpha = site == 0xa51b79 || site == 0xa51d37;
+        if (gShadows && (opaqueClass || (alpha && d.uvKnown && d.textureSlot >= 0)) && displaySettingsNative()) {
             EngineCaster c;
             c.draw = d;
             c.vertices = at<uint32_t>(s + 0x294);
             c.index32 = (ib >> 31) != 0;
+            c.alpha = alpha;
             const uint64_t view = d.view & 0xFFFFFFFFFFull;
             if (readGuestFloats(view, c.projection, 16) && readGuestFloats(view + 0x40, c.rotation, 12) &&
                 readGuestFloats(view + 0x220, c.camera, 4)) {
