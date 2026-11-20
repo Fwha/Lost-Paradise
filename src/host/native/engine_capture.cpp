@@ -3,6 +3,7 @@
 #include "host/guest_abi.h"
 #include "host/hooks.h"
 #include "host/module.h"
+#include "host/native/draw_origin.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -39,8 +40,21 @@ template <typename T> T at(uint64_t a) {
 // first index, ecx: base vertex.
 uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVertex, uint64_t r8, uint64_t r9) {
     const auto* frame = static_cast<const uint64_t*>(LPN_GUEST_FRAME());
-    const uint64_t ret = frame[1], base = reinterpret_cast<uint64_t>(gBase);
-    const uint32_t site = ret >= base && ret < base + kTextSize ? uint32_t(ret - base) : 0;
+    const uint64_t base = reinterpret_cast<uint64_t>(gBase);
+    auto text = [&](uint64_t a) { return a >= base && a < base + kTextSize ? uint32_t(a - base) : 0u; };
+    const uint32_t site = text(frame[1]);
+    // The draw's origin as the wrapper would have seen it had eac430 run as the game's code (it
+    // tail-calls the wrapper; called from here, the wrapper's return address is ours).
+    Origin o;
+    o.at[0] = site;
+    const uint64_t* fp = reinterpret_cast<const uint64_t*>(frame[0]);
+    for (int i = 1; i < 3 && fp && o.at[i - 1]; ++i) {
+        const uint64_t f = reinterpret_cast<uint64_t>(fp), lo = reinterpret_cast<uint64_t>(frame);
+        if (f <= lo || f - lo > (1u << 20) || (f & 7)) break;
+        o.at[i] = text(fp[1]);
+        fp = reinterpret_cast<const uint64_t*>(fp[0]);
+    }
+    tForcedOrigin = o;
     if (engineSite(site)) {
         const uint64_t s = at<uint64_t>(ctx + 0x320);
         EngineDraw d;
@@ -49,13 +63,16 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
         d.vertexBase = at<uint64_t>(s + 0x288) + uint64_t(uint32_t(baseVertex)) * d.stride;
         // eac430: first << (1 + bit 31 of +0x690), plus its low bits and +0x688.
         const uint32_t ib = at<uint32_t>(s + 0x690);
-        d.indexAddr = at<uint64_t>(s + 0x688) + (ib & 0x7FFFFFFF) + (uint64_t(uint32_t(first)) << ((ib >> 31) + 1));
+        // In 32 bits, as eac475-eac477 compute it, then added to the 64-bit base.
+        d.indexAddr = at<uint64_t>(s + 0x688) + uint32_t((uint32_t(first) << ((ib >> 31) + 1)) + (ib & 0x7FFFFFFF));
         d.count = uint32_t(count);
         for (int i = 0; i < 4; ++i) d.constants[i] = at<uint64_t>(s + 0x6c8 + 8 * i);
         std::lock_guard lock(gMutex);
         if (gQueue.size() < kMaxQueued) gQueue.push_back(d);
     }
-    return gDrawIndex(ctx, count, first, baseVertex, r8, r9);
+    const uint64_t r = gDrawIndex(ctx, count, first, baseVertex, r8, r9);
+    tForcedOrigin = {}; // not left for another draw when this one wrote none
+    return r;
 }
 
 } // namespace
