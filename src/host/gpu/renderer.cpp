@@ -22,6 +22,7 @@
 #include "host/kernel.h"
 #include "host/memory.h"
 #include "host/module.h"
+#include "host/native/engine_capture.h"
 #include "host/native/native.h"
 #include "host/native/pass_map.h"
 #include "host/native/shader_names.h"
@@ -1090,6 +1091,7 @@ public:
         if (upPrevScene_ && !smaaSeen_) upscalePrevWritten(d, r, *held);
         if (upIn_.on && smaaSeen_ && !upEffect_ && upLastScene_) upscaleEffect(d, r, *held);
         if (passMap_.active()) passMap_.onDraw(d, r, &readGuest);
+        if (native::engineCheckOn() && d.kind == DrawCall::kIndexed && native::engineSite(d.origin[0])) engineCheck(d, r, *held);
         // A draw a native pass takes is recorded here, in order (see nativeDraw).
         const bool native = nativeOn_ && d.kind != DrawCall::kDispatch && nativeClaimed(*held);
         if (recordThreads_) {
@@ -5527,6 +5529,46 @@ void main() {
         if (depthWritten) gpuWrote(*depthWritten);
         return true;
     }
+
+    // LPN_ENGINE_CHECK (native/engine_capture.h): a draw of the stage shadow casters against the
+    // engine's own description of it, kept at its drawIndex call.
+    void engineCheck(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
+        native::EngineDraw e;
+        if (!native::takeEngineDraw(e)) {
+            if (engineStats_[2]++ < 5) std::fprintf(stderr, "[native] engine check: draw from 0x%x without a captured one\n", d.origin[0]);
+            return;
+        }
+        const uint64_t index = d.indexAddr + uint64_t(d.indexOffset) * (r.indexType ? 4 : 2);
+        uint64_t vertex = 0;
+        for (const gcn::BufferResource& b : a.vs.buffers)
+            if (a.vs.fetchSite && b.pc == a.vs.fetchSite && b.known) {
+                vertex = b.base();
+                break;
+            }
+        const bool same = e.site == d.origin[0] && e.indexAddr == index && e.count == d.count && (!vertex || e.vertexBase == vertex);
+        ++engineStats_[same ? 0 : 1];
+        if (!same && engineStats_[1] <= 20)
+            std::fprintf(stderr,
+                         "[native] engine check: differs at 0x%x/0x%x: indices 0x%" PRIx64 " x%u, engine 0x%" PRIx64 " x%u; vertices 0x%" PRIx64
+                         ", engine 0x%" PRIx64 " (stride %u)\n",
+                         d.origin[0], e.site, index, d.count, e.indexAddr, e.count, vertex, e.vertexBase, e.stride);
+        if (same && engineStats_[0] <= 3) {
+            // Where the view constants are: the vertex stage's slots against the V# the shader read.
+            uint64_t view = 0;
+            for (const auto& [pc, at] : a.vs.smrd) {
+                const uint32_t off = uint32_t(pc - a.vs.launch.entry);
+                if ((off == 0xbc || off == 0xb0 || off == 0x2c0) && at + 2 <= a.vs.data.size())
+                    view = (a.vs.data[at] | (uint64_t(a.vs.data[at + 1] & 0xFFF) << 32));
+            }
+            std::fprintf(stderr, "[native] engine check: draw at 0x%x matches; view constants V# 0x%" PRIx64
+                                 ", state slots 0x%" PRIx64 " 0x%" PRIx64 " 0x%" PRIx64 " 0x%" PRIx64 "\n",
+                         e.site, view, e.constants[0], e.constants[1], e.constants[2], e.constants[3]);
+        }
+        if (engineStats_[0] + engineStats_[1] == 3000)
+            std::fprintf(stderr, "[native] engine check: %" PRIu64 " of 3000 stage shadow draws match the engine's (%" PRIu64 " without one)\n",
+                         engineStats_[0], engineStats_[2]);
+    }
+    uint64_t engineStats_[3] = {}; // matched, differing, uncaptured
 
     native::PassMap passMap_;
     bool nativeOn_ = false;
