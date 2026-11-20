@@ -56,7 +56,7 @@ bool readable(uint64_t a) { return a > 0x100000000ull && a < (1ull << 40); }
 // e61ae0): fetch slot 1 through the metadata at S+0x698 (table at +0x10 of 8-byte entries:
 // offset/4 in bits 0-7, stream in 8-15, then V# word 3), and the texture through the pixel
 // shader's slot table and S+0x8e8.
-void readAlphaInputs(uint64_t ctx, uint64_t s, EngineDraw& d) {
+void readAlphaInputsNow(uint64_t ctx, uint64_t s, EngineDraw& d) {
     const uint64_t f = *reinterpret_cast<const uint64_t*>(s + 0x698);
     if (readable(f)) {
         const uint64_t t = *reinterpret_cast<const uint64_t*>(f + 0x10);
@@ -82,7 +82,8 @@ void readAlphaInputs(uint64_t ctx, uint64_t s, EngineDraw& d) {
             const uint32_t a = d.attributes[found][0];
             d.uvOffset = (a & 0xFF) * 4, d.uvStream = (a >> 8) & 0xFF;
             d.uvWord3 = d.attributes[found][1];
-            d.uvKnown = !(a & 0xFF0000) && d.uvStream == 0;
+            // As stored: x and y (the shader reads them raw).
+            d.uvKnown = !(a & 0xFF0000) && d.uvStream == 0 && (d.uvWord3 & 0x3F) == (4 | 5 << 3);
         }
     }
     const uint64_t h = *reinterpret_cast<const uint64_t*>(ctx + 0xb8);
@@ -95,6 +96,22 @@ void readAlphaInputs(uint64_t ctx, uint64_t s, EngineDraw& d) {
         std::memcpy(d.texture, reinterpret_cast<const void*>(p), 32);
         d.textureSlot = j;
         return;
+    }
+}
+
+// Guarded: a pointer the engine left stale must not crash the game; the inputs are then unknown
+// and the game draws the caster itself.
+void readAlphaInputs(uint64_t ctx, uint64_t s, EngineDraw& d) {
+    struct Args {
+        uint64_t ctx, s;
+        EngineDraw* d;
+    } a{ctx, s, &d};
+    if (!guarded([](void* p) {
+            auto* k = static_cast<Args*>(p);
+            readAlphaInputsNow(k->ctx, k->s, *k->d);
+        }, &a)) {
+        d.uvKnown = false;
+        d.textureSlot = -1;
     }
 }
 
