@@ -5679,15 +5679,29 @@ void main() {
             search(e.context, "context");
             search(e.state, "state");
             // The alpha-tested casters' texture (pc 0x24 of ps_shadowmap_pt): its T# and S# words.
+            // The alpha-tested casters' texture (pc 0x24 of ps_shadowmap_pt) and the vertex shader's
+            // fetch shader (s[0:1]): where the context, its state block or its user-data table hold them.
+            const uint64_t fetch = (uint64_t(a.vs.launch.userData[1]) << 32) | a.vs.launch.userData[0];
             for (const gcn::ImageResource& im : a.ps.images) {
-                if (im.pc - a.ps.launch.entry != 0x24 || !e.state) continue;
-                std::fprintf(stderr, "[native] engine check:   alpha texture T# %08x %08x %08x %08x S# %08x %08x\n", im.t[0], im.t[1], im.t[2],
-                             im.t[3], im.s[0], im.s[1]);
-                const auto& b = *e.state;
-                for (size_t o = 0; o + 16 <= b.size(); o += 4) {
-                    if (std::memcmp(b.data() + o, im.t, 16) == 0) std::fprintf(stderr, "[native] engine check:   state+0x%zx = the T#\n", o);
-                    if (std::memcmp(b.data() + o, im.s, 8) == 0) std::fprintf(stderr, "[native] engine check:   state+0x%zx = the S#\n", o);
-                }
+                if (im.pc - a.ps.launch.entry != 0x24) continue;
+                std::fprintf(stderr, "[native] engine check:   alpha texture T# %08x %08x %08x %08x S# %08x %08x, fetch shader 0x%" PRIx64 "\n",
+                             im.t[0], im.t[1], im.t[2], im.t[3], im.s[0], im.s[1], fetch);
+                auto find = [&](const std::shared_ptr<std::vector<uint8_t>>& block, const char* what) {
+                    if (!block) return;
+                    const auto& b = *block;
+                    for (size_t o = 0; o + 16 <= b.size(); o += 4) {
+                        if (std::memcmp(b.data() + o, im.t, 16) == 0) std::fprintf(stderr, "[native] engine check:   %s+0x%zx = the T#\n", what, o);
+                        if (std::memcmp(b.data() + o, im.s, 8) == 0 && (im.s[0] | im.s[1]))
+                            std::fprintf(stderr, "[native] engine check:   %s+0x%zx = the S#\n", what, o);
+                        uint64_t v;
+                        std::memcpy(&v, b.data() + o, 8);
+                        if (fetch && (v == fetch || (v & 0xFFFFFFFFFFull) == fetch))
+                            std::fprintf(stderr, "[native] engine check:   %s+0x%zx = the fetch shader\n", what, o);
+                    }
+                };
+                find(e.context, "context");
+                find(e.state, "state");
+                find(e.table, "table");
             }
         }
         // What a draw from the engine alone needs to know: does the view V# agree, and which

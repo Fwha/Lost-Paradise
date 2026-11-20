@@ -34,7 +34,7 @@ struct EngineDraw {
     uint32_t vertexFormat = 0; // state block +0x298 (stride in bits 4-19, low 4 bits from the buffer)
     // For finding the view constants: the first draws keep copies of the Gnm context (0x400
     // bytes) and its state block (0x4000) as they were at the call.
-    std::shared_ptr<std::vector<uint8_t>> context, state;
+    std::shared_ptr<std::vector<uint8_t>> context, state, table; // table: *(context+0x68), 0x3000 bytes
 };
 
 // With Native Renderer on (LPN_ENGINE_SHADOWS=0 turns it off): the stage's opaque shadow casters (the first
