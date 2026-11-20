@@ -52,8 +52,8 @@ layout(push_constant) uniform P {
 
 // Skinned casters: 128 bytes of constants (the least a device offers).
 struct SkinPush {
-    float m[16];     // clip = m * (world, 1): projection * rotation * (minus the camera)
-    float off[4];    // the offset added to the blended translation (0x170 of s[4:7]); w: bias scale
+    float m[16];     // clip = m * (world, 1): projection * rotation
+    float off[4];    // the offset added to the blended translation (0x170 of s[4:7]) minus the camera; w: bias scale
     uint32_t pos[4];  // first word, stride in words, format (dfmt | nfmt << 4); w: the palette's first word
     uint32_t wgt[4];  // the weights' slot; w: the palette's stride in words
     uint32_t idx[4];  // the bone indices' slot; w: the bias cap (float bits)
@@ -95,10 +95,11 @@ uint conv(uint raw, uint bits, uint nfmt) {
 }
 uvec4 fetch(uint b, uvec4 s) {
     uint i = s.x + uint(gl_VertexIndex) * s.y, dfmt = s.z & 15u, nfmt = (s.z >> 4) & 7u;
-    uvec4 e = uvec4(0u, 0u, 0u, floatBitsToUint(1.0));
-    if (dfmt == 4u || dfmt == 11u || dfmt == 13u || dfmt == 14u) {
+    // Missing channels read 0, and w 1 (an integer 1 for integer formats).
+    uvec4 e = uvec4(0u, 0u, 0u, nfmt == 4u || nfmt == 5u ? 1u : floatBitsToUint(1.0));
+    if (dfmt == 4u || dfmt == 11u || dfmt == 13u || dfmt == 14u) { // 32-bit channels as they are
         uint n = dfmt == 4u ? 1u : dfmt == 11u ? 2u : dfmt == 13u ? 3u : 4u;
-        for (uint c = 0u; c < n; ++c) e[c] = conv(word(b, i + c), 32u, nfmt);
+        for (uint c = 0u; c < n; ++c) e[c] = word(b, i + c);
     } else if (dfmt == 2u || dfmt == 5u || dfmt == 12u) {
         uint n = dfmt == 2u ? 1u : dfmt == 5u ? 2u : 4u;
         for (uint c = 0u; c < n; ++c) e[c] = conv((word(b, i + c / 2u) >> (16u * (c & 1u))) & 0xffffu, 16u, nfmt);
@@ -119,12 +120,12 @@ void main() {
         int b = (int(bi[k]) * 48) >> 4;
         r[k][0] = row(b), r[k][1] = row(b + 1), r[k][2] = row(b + 2);
     }
-    vec3 world;
+    precise vec3 world;
     for (int a = 0; a < 3; ++a) {
         float f = floor(r[0][a].w);
-        float t = p.off[a] + f;
+        precise float t = p.off[a] + f;
         for (int k = 0; k < 4; ++k) t += w[k] * (r[k][a].w - f);
-        vec3 m = r[0][a].xyz * w[0];
+        precise vec3 m = r[0][a].xyz * w[0];
         for (int k = 1; k < 4; ++k) m += w[k] * r[k][a].xyz;
         world[a] = t + m.x * x.x + m.y * x.y + m.z * x.z;
     }
@@ -349,22 +350,19 @@ private:
             !get(0x2cc, proj, 16))
             return decline(role, "the vertex shader's constants are missing");
         if (!((flags & 0x80000) && !(flags & 0x100000)) && !get(0x2a8, cam, 4)) return decline(role, "no camera constants");
-        // projection * rotation * (x - camera)
+        // projection * rotation; the camera goes into the offset, so the shader subtracts it from
+        // the blended translation before rotating (a translation of -rotation * camera in the
+        // matrix lost the precision of positions far from the origin).
         for (int r = 0; r < 4; ++r)
             for (int c = 0; c < 4; ++c) {
                 double s = c == 3 ? proj[r * 4 + 3] : 0;
-                for (int k = 0; k < 3; ++k) {
-                    double a = 0; // row k of rotation * [I | -cam], column c
-                    if (c < 3) a = rot[k * 4 + c];
-                    else
-                        for (int j = 0; j < 3; ++j) a -= double(rot[k * 4 + j]) * cam[j];
-                    s += double(proj[r * 4 + k]) * a;
-                }
+                if (c < 3)
+                    for (int k = 0; k < 3; ++k) s += double(proj[r * 4 + k]) * rot[k * 4 + c];
                 push.m[c * 4 + r] = float(s);
             }
         uint32_t w[2];
         if (!d.load(0xc, w, 2)) return decline(role, "no bias constants");
-        push.off[0] = off[0], push.off[1] = off[1], push.off[2] = off[2];
+        for (int a = 0; a < 3; ++a) push.off[a] = float(double(off[a]) - cam[a]);
         std::memcpy(&push.off[3], &w[0], 4);
         push.idx[3] = w[1];
         auto put = [](const VertexBuffer& v, uint32_t* s) {
