@@ -5286,6 +5286,13 @@ void main() {
         VkDevice device() const override { return r_.vk_.device; }
         PFN_vkCmdPushDescriptorSetKHR pushDescriptorSet() const override { return r_.vk_.cmdPushDescriptorSet; }
         uint32_t maxPushConstants() const override { return r_.vk_.props.limits.maxPushConstantsSize; }
+        bool upload(const void* data, uint32_t bytes, native::Buffer& out) override {
+            if (!bytes || bytes > (1u << 16)) return false;
+            const VkDeviceSize at = r_.ringAlloc(bytes, r_.storageAlign_);
+            std::memcpy(static_cast<uint8_t*>(r_.R().ringPtr_) + at, data, bytes);
+            out.buffer = r_.R().ring_, out.offset = at, out.range = bytes, out.byteOffset = 0;
+            return true;
+        }
         VkShaderModule shader(const std::string& glsl, Stage stage) override {
             const gcn::GlslStage s = stage == Stage::Vertex     ? gcn::GlslStage::Vertex
                                      : stage == Stage::Compute ? gcn::GlslStage::Compute
@@ -5935,7 +5942,7 @@ void main() {
             Image* img = compareImage(index, t, depth);
             if (!img) return false;
             barrier(); // after a new copy's clear
-            const VkImageAspectFlags aspect = depth ? img->aspect : VK_IMAGE_ASPECT_COLOR_BIT;
+            const VkImageAspectFlags aspect = depth ? img->aspect : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
             VkImageCopy rg{};
             rg.srcSubresource = rg.dstSubresource = {aspect, 0, 0, 1};
             rg.extent = {t.width, t.height, 1};
