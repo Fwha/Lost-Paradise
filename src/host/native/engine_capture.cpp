@@ -4,6 +4,7 @@
 #include "host/hooks.h"
 #include "host/module.h"
 #include "host/native/draw_origin.h"
+#include "host/crash.h"
 #include "host/display_settings.h"
 
 #include <cstdio>
@@ -97,7 +98,16 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
             std::memcpy(d.state->data(), reinterpret_cast<const void*>(s), 0x4000);
             if (const uint64_t t = at<uint64_t>(ctx + 0x68); t > 0x100000000ull && t < (1ull << 40)) {
                 d.table = std::make_shared<std::vector<uint8_t>>(0x3000);
-                std::memcpy(d.table->data(), reinterpret_cast<const void*>(t), 0x3000);
+                struct Copy {
+                    void* dst;
+                    uint64_t src;
+                } cp{d.table->data(), t};
+                // Guarded: a table shorter than this at the end of a mapping must not crash the game.
+                if (!guarded([](void* c) {
+                        auto* k = static_cast<Copy*>(c);
+                        std::memcpy(k->dst, reinterpret_cast<const void*>(k->src), 0x3000);
+                    }, &cp))
+                    d.table.reset();
             }
         }
         const bool opaqueClass = site == 0xa5177a || site == 0xa518fe;
