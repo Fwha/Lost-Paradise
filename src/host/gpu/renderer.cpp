@@ -1131,6 +1131,8 @@ public:
             return;
         } else {
             recordDraw(d, DrawRegs::of(r), held);
+            // LPN_NATIVE_COMPARE: the translated draw is recorded now; compared before what comes next.
+            if (compareAwaiting_) compareAwaiting_ = false, comparePending_ = true;
         }
         if (frame_ == timingFrame_ && timing_ && R().recording_ && timingMeta_.size() + 1 < kTimingQueries) {
             rec([c = R().cmd_, q = timing_, i = uint32_t(timingMeta_.size() + 1)] {
@@ -5932,6 +5934,7 @@ void main() {
         auto copy = [&](uint32_t index, native::Target& t, bool depth) {
             Image* img = compareImage(index, t, depth);
             if (!img) return false;
+            barrier(); // after a new copy's clear
             const VkImageAspectFlags aspect = depth ? img->aspect : VK_IMAGE_ASPECT_COLOR_BIT;
             VkImageCopy rg{};
             rg.srcSubresource = rg.dstSubresource = {aspect, 0, 0, 1};
@@ -5972,7 +5975,7 @@ void main() {
         pc.rect[0] = nd.scissor[0], pc.rect[1] = nd.scissor[1], pc.rect[2] = nd.scissor[2], pc.rect[3] = nd.scissor[3];
         pc.role = uint32_t(std::min(role, 6));
         pendingCompare_ = pc;
-        comparePending_ = true;
+        compareAwaiting_ = true; // armed once the translated draw is recorded (see recordDraw's caller)
     }
     // After the translated draw: the differences.
     void runCompare() {
@@ -6012,8 +6015,9 @@ void main() {
         R().bound_ = Bound{};
         compareRunning_ = false;
     }
-    // Every 10 seconds: what the copies' comparisons found since the last report (the counters
-    // the GPU adds to are read as they are; a frame's late additions go to the next report).
+    // Every 10 seconds: what the copies' comparisons found since the last report. The counters the
+    // GPU adds to are read without waiting for it: a report can miss the last frames' additions
+    // (they go to the next one), and its mean can be a little off. Enough for a check.
     void compareReport() {
         if (!compareMap_) return;
         const auto now = std::chrono::steady_clock::now();
@@ -6050,7 +6054,7 @@ void main() {
     VkBuffer compareBuf_ = VK_NULL_HANDLE;
     VkDeviceMemory compareMem_ = VK_NULL_HANDLE;
     void* compareMap_ = nullptr;
-    bool compareFailed_ = false, comparePending_ = false, compareRunning_ = false;
+    bool compareFailed_ = false, compareAwaiting_ = false, comparePending_ = false, compareRunning_ = false;
     Image compareImages_[9];
     PendingCompare pendingCompare_;
     uint64_t compareFrame_ = ~0ull, compareSeq_ = 0;
