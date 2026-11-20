@@ -5498,6 +5498,9 @@ void main() {
             const uint32_t vte = r.ctx[reg::kPaClVteCntl];
             const float zs = (vte & 16) ? v[4] : 1, zo = (vte & 32) ? v[5] : 0;
             const bool dx = (r.ctx[reg::kPaClClipCntl] >> 19) & 1;
+            nd.clipZHalf = !dx;
+            nd.pixelPositions = !(vte & 0xF);
+            nd.upscaler = upOn_;
             nd.vkViewport = gameViewport(r, tw, th);
             nd.vkViewport.minDepth = std::clamp(dx ? zo : zo - zs, 0.0f, 1.0f);
             nd.vkViewport.maxDepth = std::clamp(zo + zs, 0.0f, 1.0f);

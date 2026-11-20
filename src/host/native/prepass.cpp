@@ -41,7 +41,7 @@ struct Push {
     float off[4];     // the offset; w: the alpha threshold
     float cam[4];     // the camera; w: 1 to subtract it
     uint32_t pos[4];  // first word, stride in words, dfmt | nfmt << 4; w: the target's swizzle
-    uint32_t nrm[4];
+    uint32_t nrm[4]; // w: 1 to map clip z from [-w, w]
     uint32_t uv[4];
 };
 static_assert(sizeof(Push) == 240);
@@ -119,6 +119,8 @@ void main() {
     vec3 e = vec3(dot3(p.rot[0], w), dot3(p.rot[1], w), dot3(p.rot[2], w));
     vec4 c;
     for (int r = 0; r < 4; ++r) c[r] = mac(p.proj[r].z, e.z, mac(p.proj[r].y, e.y, mac(p.proj[r].x, e.x, p.proj[r].w)));
+    // As the translated export: clip z from [-w, w] to [0, w] (PA_CL_CLIP_CNTL bit 19 clear).
+    if (p.nrm.w != 0u) c.z = (c.z + c.w) * 0.5;
     gl_Position = c;
     vec3 m = fetch(1u, p.nrm).xyz;
     m = vec3(mac(2.0078431, m.x, -1.0), mac(2.0078431, m.y, -1.0), mac(2.0078431, m.z, -1.0));
@@ -143,7 +145,9 @@ void main() {
     if (0.0 > texture(mask1, t).w * texture(mask0, t).z - p.off.w) discard;
 #endif
     const float k = 0.49803922;
-    vec4 v = vec4(n * k + k, 0.0);
+    vec3 e = n * k + k;
+    // v_cvt_pkrtz_f16_f32 before the compressed export, as the translator rounds it.
+    vec4 v = vec4(unpackHalf2x16(packHalf2x16(e.xy)), unpackHalf2x16(packHalf2x16(vec2(e.z, 0.0))));
     uint s = p.pos.w;
     color = vec4(v[s & 3u], v[(s >> 2) & 3u], v[(s >> 4) & 3u], v[(s >> 6) & 3u]);
 }
@@ -178,6 +182,10 @@ public:
         const bool alpha = role == kAlphaTest;
         const char* vs = alpha ? "vs_normal_rigid_pt.vso" : "vs_normal_rigid.vso";
         if (!d.vsName || *d.vsName != vs) return decline(role, "another vertex shader");
+        // The depths must be the translated ones: with an upscaler the scene's draws are jittered
+        // and the camera read from the first of them, which stays with the translated renderer.
+        if (d.upscaler) return decline(role, "an upscaler is on");
+        if (d.pixelPositions) return decline(role, "positions in pixels");
         if (gpu.maxPushConstants() < sizeof(Push)) return decline(role, "a device with fewer than 240 bytes of push constants");
         if (d.colorCount != 1 || !d.color[0].view || !d.depth.view) return decline(role, "not one colour target with depth");
         if (d.blend || d.stencil) return decline(role, "blending or stencil");
@@ -223,6 +231,7 @@ public:
         int32_t sw[4];
         swizzle(d.color[0], sw);
         push.pos[3] = uint32_t(sw[0] | sw[1] << 2 | sw[2] << 4 | sw[3] << 6);
+        push.nrm[3] = d.clipZHalf ? 1 : 0;
         VkDescriptorBufferInfo bufs[3]{};
         for (int i = 0; i < slots; ++i) bufs[i] = {slot[i]->data.buffer, slot[i]->data.offset, slot[i]->data.range};
         VkDescriptorImageInfo images[2]{};
