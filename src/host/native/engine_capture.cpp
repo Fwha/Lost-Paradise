@@ -49,6 +49,37 @@ bool readGuestFloats(uint64_t addr, float* out, size_t n) {
 
 bool displaySettingsNative() { return displaySettings().nativeRenderer; }
 
+bool readable(uint64_t a) { return a > 0x100000000ull && a < (1ull << 40); }
+
+// What the alpha-tested casters need besides the opaque ones' (Codex's reading of eabdb0 and
+// e61ae0): fetch slot 1 through the metadata at S+0x698 (table at +0x10 of 8-byte entries:
+// offset/4 in bits 0-7, stream in 8-15, then V# word 3), and the texture through the pixel
+// shader's slot table and S+0x8e8.
+void readAlphaInputs(uint64_t ctx, uint64_t s, EngineDraw& d) {
+    const uint64_t f = *reinterpret_cast<const uint64_t*>(s + 0x698);
+    if (readable(f)) {
+        const uint64_t t = *reinterpret_cast<const uint64_t*>(f + 0x10);
+        const uint32_t n = *reinterpret_cast<const uint32_t*>(f + 0x18);
+        if (readable(t) && n >= 2) {
+            const uint32_t a = *reinterpret_cast<const uint32_t*>(t + 8);
+            d.uvOffset = (a & 0xFF) * 4, d.uvStream = (a >> 8) & 0xFF;
+            d.uvWord3 = *reinterpret_cast<const uint32_t*>(t + 12);
+            d.uvKnown = !(a & 0xFF0000);
+        }
+    }
+    const uint64_t h = *reinterpret_cast<const uint64_t*>(ctx + 0xb8);
+    if (!readable(h)) return;
+    for (int j = 0; j < 16; ++j) {
+        const uint16_t m = *reinterpret_cast<const uint16_t*>(h + 0x1c + 2 * j);
+        if (m == 0xFFFF || !(m & 0x8000) || (m & 0x3FFF) != 0) continue;
+        const uint64_t p = *reinterpret_cast<const uint64_t*>(s + 0x8e8 + 8 * j);
+        if (!readable(p)) return;
+        std::memcpy(d.texture, reinterpret_cast<const void*>(p), 32);
+        d.textureSlot = j;
+        return;
+    }
+}
+
 template <typename T> T at(uint64_t a) {
     T v;
     std::memcpy(&v, reinterpret_cast<const void*>(a), sizeof v);
@@ -88,6 +119,7 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
         for (int i = 0; i < 4; ++i) d.constants[i] = at<uint64_t>(s + 0x6c8 + 8 * i);
         d.view = at<uint64_t>(s + 0x20c8);
         d.vertexFormat = at<uint32_t>(s + 0x298);
+        readAlphaInputs(ctx, s, d);
         // Three of each class (the alpha-tested class's textures are looked for too).
         static std::atomic<int> copies[2]{};
         const bool alphaClass = site == 0xa51b79 || site == 0xa51d37;

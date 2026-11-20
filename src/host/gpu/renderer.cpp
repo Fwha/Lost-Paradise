@@ -5684,8 +5684,8 @@ void main() {
             const uint64_t fetch = (uint64_t(a.vs.launch.userData[1]) << 32) | a.vs.launch.userData[0];
             for (const gcn::ImageResource& im : a.ps.images) {
                 if (im.pc - a.ps.launch.entry != 0x24) continue;
-                std::fprintf(stderr, "[native] engine check:   alpha texture T# %08x %08x %08x %08x S# %08x %08x, fetch shader 0x%" PRIx64 "\n",
-                             im.t[0], im.t[1], im.t[2], im.t[3], im.s[0], im.s[1], fetch);
+                std::fprintf(stderr, "[native] engine check:   alpha texture T# %08x %08x %08x %08x S# %08x %08x %08x %08x, fetch shader 0x%" PRIx64 "\n",
+                             im.t[0], im.t[1], im.t[2], im.t[3], im.s[0], im.s[1], im.s[2], im.s[3], fetch);
                 auto find = [&](const std::shared_ptr<std::vector<uint8_t>>& block, const char* what) {
                     if (!block) return;
                     const auto& b = *block;
@@ -5738,6 +5738,19 @@ void main() {
                               return "?";
                           }());
             if (engineKinds_.insert(key).second && engineKinds_.size() <= 32) std::fprintf(stderr, "[native] engine check: kind %s\n", key);
+            if (uvAt >= 0) { // an alpha-tested caster: the engine's coordinates and texture against the game's
+                bool tex = false;
+                for (const gcn::ImageResource& im : a.ps.images)
+                    if (im.pc - a.ps.launch.entry == 0x24) tex = std::memcmp(im.t, e.texture, 32) == 0;
+                const bool uv = e.uvKnown && e.uvStream == 0 && int64_t(e.uvOffset) == uvAt && (e.uvWord3 & 0x7FFFF) == (((uvFmt >> 8) & 0xFFF) | (((uvFmt >> 4) & 7) << 12) | ((uvFmt & 0xF) << 15));
+                ++engineAlpha_[(uv ? 0 : 1) + (tex ? 0 : 2)];
+                if ((!uv || !tex) && engineAlpha_[1] + engineAlpha_[2] + engineAlpha_[3] <= 10)
+                    std::fprintf(stderr, "[native] engine check:   alpha inputs differ: coordinates %s (engine offset %u stream %u word3 0x%x known %d, game at %lld fmt 0x%x), texture %s (slot %d)\n",
+                                 uv ? "same" : "differ", e.uvOffset, e.uvStream, e.uvWord3, e.uvKnown, (long long)uvAt, uvFmt, tex ? "same" : "differs", e.textureSlot);
+                if ((engineAlpha_[0] + engineAlpha_[1] + engineAlpha_[2] + engineAlpha_[3]) % 1000 == 0)
+                    std::fprintf(stderr, "[native] engine check: alpha casters: %" PRIu64 " both match, %" PRIu64 " coordinates differ, %" PRIu64 " texture differs, %" PRIu64 " both\n",
+                                 engineAlpha_[0], engineAlpha_[1], engineAlpha_[2], engineAlpha_[3]);
+            }
         }
         if (engineStats_[0] + engineStats_[1] == 3000)
             std::fprintf(stderr, "[native] engine check: %" PRIu64 " of 3000 stage shadow draws match the engine's (%" PRIu64 " without one)\n",
@@ -5745,6 +5758,7 @@ void main() {
     }
     uint64_t engineStats_[3] = {}; // matched, differing, uncaptured
     std::set<std::string> engineKinds_;
+    uint64_t engineAlpha_[4] = {}; // alpha casters: both inputs match, coordinates differ, texture differs, both differ
 
     native::PassMap passMap_;
     bool nativeOn_ = false;

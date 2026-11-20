@@ -32,6 +32,14 @@ struct EngineDraw {
     uint64_t constants[4] = {}; // the vertex stage's first constant buffer slots (state block)
     uint64_t view = 0;        // the view constants' V# (state block +0x20c8: base in the low 40 bits)
     uint32_t vertexFormat = 0; // state block +0x298 (stride in bits 4-19, low 4 bits from the buffer)
+    // The second fetch slot (the alpha-tested casters' coordinates), from the fetch metadata at
+    // state +0x698: its byte offset in the vertex, stream, and V# word 3 (formats, DST_SEL).
+    uint32_t uvOffset = 0, uvStream = 0, uvWord3 = 0;
+    bool uvKnown = false;
+    // The pixel shader's texture read from user SGPR 0 (state +0x8e8 by the slot whose entry in
+    // the shader's table at *(context+0xb8)+0x1c maps to it): its T#.
+    uint32_t texture[8] = {};
+    int32_t textureSlot = -1;
     // For finding the view constants: the first draws keep copies of the Gnm context (0x400
     // bytes) and its state block (0x4000) as they were at the call.
     std::shared_ptr<std::vector<uint8_t>> context, state, table; // table: *(context+0x68), 0x3000 bytes
