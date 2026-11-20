@@ -5530,6 +5530,101 @@ void main() {
         return true;
     }
 
+    // LPN_ENGINE_SHADOWS (native/engine_capture.h): a stage shadow caster the engine described,
+    // drawn natively where the game's draw would have been. Its depth target and state come from
+    // the registers, its buffers and constants from the capture.
+    void onEngineDraw(uint32_t id, const GpuRegs& gr) override {
+        if (recordThreads_) drainSegments(0); // in order with the draws before it
+        std::lock_guard lock(m_);
+        native::EngineCaster c;
+        if (!native::engineCaster(id, c)) {
+            if (engineLost_++ < 5) std::fprintf(stderr, "[native] engine draw %u: its capture is gone\n", id);
+            return;
+        }
+        const DrawRegs r = DrawRegs::of(gr);
+        native::Draw nd;
+        nd.primitive = r.prim;
+        nd.count = c.draw.count;
+        const uint32_t depthControl = r.ctx[reg::kDbDepthControl];
+        const uint32_t zInfo = r.ctx[reg::kDbZInfo];
+        if (!(zInfo & 3)) return;
+        const bool stencil = r.ctx[reg::kDbStencilInfo] & 1;
+        const VkFormat f = stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : (zInfo & 3) == 1 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
+        const uint32_t size = r.ctx[reg::kDbDepthSize];
+        const uint32_t dw = ((size & 0x7FF) + 1) * 8, dh = (((size >> 11) & 0x7FF) + 1) * 8;
+        Surface* s = depthSurface(uint64_t(r.ctx[reg::kDbZReadBase]) << 8, dw, dh, f);
+        if (!s) return;
+        nd.depth = {view(s->img, f, VK_IMAGE_VIEW_TYPE_2D, kIdentity, s->img.aspect), s->img.image, f, s->img.width, s->img.height,
+                    uint64_t(r.ctx[reg::kDbZReadBase]) << 8};
+        nd.hasStencil = stencil;
+        nd.stencil = stencil && (depthControl & 1);
+        nd.depthTest = (depthControl >> 1) & 1;
+        nd.depthWrite = (depthControl >> 2) & 1;
+        GraphicsState gs{};
+        gs.depthFormat = f, gs.stencil = stencil, gs.depthControl = depthControl;
+        gs.stencilControl = r.ctx[reg::kDbStencilControl];
+        gs.topology = r.prim;
+        gs.modeCntl = r.ctx[reg::kPaSuScModeCntl];
+        depthState(gs, nd.depthStencil);
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rasterState(gs, rs);
+        nd.cull = rs.cullMode, nd.frontFace = rs.frontFace;
+        {
+            const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
+            const uint32_t vte = r.ctx[reg::kPaClVteCntl];
+            const float zs = (vte & 16) ? v[4] : 1, zo = (vte & 32) ? v[5] : 0;
+            const bool dx = (r.ctx[reg::kPaClClipCntl] >> 19) & 1;
+            nd.vkViewport = gameViewport(r, s->img.width, s->img.height);
+            nd.vkViewport.minDepth = std::clamp(dx ? zo : zo - zs, 0.0f, 1.0f);
+            nd.vkViewport.maxDepth = std::clamp(zo + zs, 0.0f, 1.0f);
+            if (nd.vkViewport.width < 0) nd.vkViewport.x += nd.vkViewport.width, nd.vkViewport.width = -nd.vkViewport.width;
+            int32_t x0 = 0, y0 = 0, x1 = int32_t(s->img.width), y1 = int32_t(s->img.height);
+            auto clip = [&](uint32_t tl, uint32_t br) {
+                if (!br) return;
+                x0 = std::max<int32_t>(x0, tl & 0x7FFF), y0 = std::max<int32_t>(y0, (tl >> 16) & 0x7FFF);
+                x1 = std::min<int32_t>(x1, br & 0x7FFF), y1 = std::min<int32_t>(y1, (br >> 16) & 0x7FFF);
+            };
+            clip(r.ctx[reg::kScreenScissorTl], r.ctx[reg::kScreenScissorBr]);
+            clip(r.ctx[reg::kGenericScissorTl], r.ctx[reg::kGenericScissorBr]);
+            clip(r.ctx[reg::kWindowScissorTl], r.ctx[reg::kWindowScissorBr]);
+            if ((r.ctx[0x292] >> 1) & 1) clip(r.ctx[reg::kVportScissorTl], r.ctx[reg::kVportScissorBr]);
+            nd.scissor[0] = x0, nd.scissor[1] = y0, nd.scissor[2] = std::max(0, x1 - x0), nd.scissor[3] = std::max(0, y1 - y0);
+        }
+        auto buffer = [&](uint64_t base, uint64_t bytes, native::Buffer& out) {
+            VkDeviceSize off = 0;
+            if (!vramBuffer(base, bytes, out.buffer, off) && !guestBuffer(base, bytes, out.buffer, off)) return false;
+            out.offset = off & ~(storageAlign_ - 1);
+            out.byteOffset = uint32_t(off - out.offset);
+            out.range = std::min<VkDeviceSize>(bytes + out.byteOffset, vk_.props.limits.maxStorageBufferRange);
+            return true;
+        };
+        native::VertexBuffer vb;
+        vb.slot = 0, vb.components = 3, vb.stride = c.draw.stride, vb.records = c.vertices, vb.dfmt = 13, vb.nfmt = 7, vb.dstSel = 0xFAC;
+        const uint64_t vbytes = std::max<uint64_t>(uint64_t(c.vertices) * c.draw.stride, 16);
+        if (!buffer(c.draw.vertexBase, vbytes, vb.data)) return;
+        nd.vertex.push_back(vb);
+        nd.indexed = true;
+        nd.indexType = c.index32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+        if (!buffer(c.draw.indexAddr, uint64_t(c.draw.count) * (c.index32 ? 4 : 2), nd.index)) return;
+        if (!ringFits(1 << 12)) flush();
+        begin();
+        NativeGpu gpu(*this);
+        if (!native::drawStageCaster(c, nd, gpu)) {
+            if (engineLost_++ < 5) std::fprintf(stderr, "[native] engine draw %u: the shadow pass could not draw it\n", id);
+            return;
+        }
+        R().needBarrier_ = true;
+        for (VkImage im : R().pass_.images) addOnce(R().drawWritten_, im);
+        R().bound_ = Bound{};
+        ++R().passSerial_;
+        R().fast_.valid = false;
+        for (FastSlot& fs : R().fastSlots_) fs.f.valid = false;
+        R().lastMergeable_ = false;
+        ++fastEpoch_;
+        if (nd.depthWrite) gpuWrote(*s);
+    }
+    uint32_t engineLost_ = 0;
+
     // LPN_ENGINE_CHECK (native/engine_capture.h): a draw of the stage shadow casters against the
     // engine's own description of it, kept at its drawIndex call.
     void engineCheck(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {

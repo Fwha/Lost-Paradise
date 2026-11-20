@@ -14,6 +14,7 @@
 // times a scale (no scale for _pt), capped (constants at 0x300 of the pixel shader's buffer;
 // 0.01 for _pt), clamped to [0, 1]. _pt first drops pixels whose texture alpha is below 0.5.
 #include "host/native/native.h"
+#include "host/native/engine_capture.h"
 
 #include <cinttypes>
 #include <cstdio>
@@ -37,8 +38,9 @@ struct Push {
     uint32_t uv[4];
     float bias[2];    // scale, cap
     float uvScale[2]; // the texture's coordinate scale (native::Texture::scale)
+    float origin[4];  // subtracted from the position first (the camera, for world-space casters)
 };
-static_assert(sizeof(Push) == 112);
+static_assert(sizeof(Push) == 128);
 
 constexpr const char* kHeader = R"(#version 450
 layout(push_constant) uniform P {
@@ -46,6 +48,7 @@ layout(push_constant) uniform P {
     uvec4 pos;
     uvec4 uv;
     vec4 k; // bias scale, bias cap, texture scale
+    vec4 origin;
 } p;
 #define K p.k
 )";
@@ -146,7 +149,8 @@ vec3 position(uint s) {
     return vec3(uintBitsToFloat(v0.w[s]), uintBitsToFloat(v0.w[s + 1u]), uintBitsToFloat(v0.w[s + 2u]));
 }
 void main() {
-    vec4 c = p.m * vec4(position(p.pos.x + uint(gl_VertexIndex) * p.pos.y), 1.0);
+    precise vec3 x = position(p.pos.x + uint(gl_VertexIndex) * p.pos.y) - p.origin.xyz;
+    vec4 c = p.m * vec4(x, 1.0);
     gl_Position = vec4(c.x, c.y, max(0.0, c.z), c.w);
     vec2 uv = vec2(0.0);
 #ifdef ALPHA_TEST
@@ -262,6 +266,7 @@ public:
             uint32_t w[2];
             if (!d.load(0xc, w, 2)) return decline(role, "no bias constants");
             std::memcpy(push.bias, w, 8);
+            std::memcpy(lastBias_, w, 8); // for the casters drawn from the engine's captures
         }
         VkPipeline pipe = pipeline(gpu, role, d);
         if (!pipe) return decline(role, "no pipeline");
@@ -302,7 +307,57 @@ public:
         return true;
     }
 
+    // A stage caster from the engine's capture: world-space positions (the stage's casters have
+    // an identity world matrix, no offset, and subtract the camera: checked with LPN_ENGINE_CHECK).
+    bool drawEngine(const EngineCaster& c, const Draw& d, Gpu& gpu) {
+        const int role = kOpaque;
+        if (d.colorCount || !d.depth.view || d.blend || d.stencil || d.vertex.empty() || !d.indexed) return false;
+        const VertexBuffer& pos = d.vertex[0];
+        if (pos.stride % 4 || pos.data.byteOffset % 4) return false;
+        Push push{};
+        for (int r = 0; r < 4; ++r) // projection * rotation
+            for (int col = 0; col < 4; ++col) {
+                double s = col == 3 ? c.projection[r * 4 + 3] : 0;
+                if (col < 3)
+                    for (int k = 0; k < 3; ++k) s += double(c.projection[r * 4 + k]) * c.rotation[k * 4 + col];
+                push.m[col * 4 + r] = float(s);
+            }
+        for (int a = 0; a < 3; ++a) push.origin[a] = c.camera[a];
+        push.pos[0] = pos.data.byteOffset / 4, push.pos[1] = pos.stride / 4, push.pos[2] = 13;
+        push.bias[0] = lastBias_[0], push.bias[1] = lastBias_[1];
+        VkPipeline pipe = pipeline(gpu, role, d);
+        if (!pipe) return false;
+        if (!engineLogged_) {
+            engineLogged_ = true;
+            std::fprintf(stderr, "[native] shadow: drawing stage casters from the engine's captures (depth 0x%" PRIx64 ")\n", d.depth.address);
+        }
+        gpu.beginRendering(nullptr, 0, d.depth, d.hasStencil);
+        const VkViewport vp = d.vkViewport;
+        const VkRect2D sc{{d.scissor[0], d.scissor[1]}, {uint32_t(d.scissor[2]), uint32_t(d.scissor[3])}};
+        const VkDescriptorBufferInfo buf{pos.data.buffer, pos.data.offset, pos.data.range};
+        const Buffer index = d.index;
+        gpu.record([pipe, layout = layouts_[role], push, buf, vp, sc, index, indexType = d.indexType, count = d.count,
+                    pushSet = gpu.pushDescriptorSet()](VkCommandBuffer cb) {
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            vkCmdSetViewport(cb, 0, 1, &vp);
+            vkCmdSetScissor(cb, 0, 1, &sc);
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstBinding = 0;
+            w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w.pBufferInfo = &buf;
+            pushSet(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &w);
+            vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, &push);
+            vkCmdBindIndexBuffer(cb, index.buffer, index.offset + index.byteOffset, indexType);
+            vkCmdDrawIndexed(cb, count, 1, 0, 0, 0);
+        });
+        return true;
+    }
+
 private:
+    float lastBias_[2] = {1.0f, 0.01f}; // the opaque casters' bias constants, as last seen
+    bool engineLogged_ = false;
+
     // A fetch slot in a format the skinned shader decodes (32-, 16- or 8-bit channels).
     static bool decodable(const VertexBuffer& v) {
         static constexpr uint32_t kDfmts[] = {1, 2, 3, 4, 5, 10, 11, 12, 13, 14};
@@ -537,11 +592,15 @@ private:
     std::set<std::string> declined_[4];
 };
 
+Shadow& shadowInstance() {
+    static Shadow pass;
+    return pass;
+}
+
 } // namespace
 
-Pass* shadowPass() {
-    static Shadow pass;
-    return &pass;
-}
+Pass* shadowPass() { return &shadowInstance(); }
+
+bool drawStageCaster(const EngineCaster& c, const Draw& d, Gpu& gpu) { return shadowInstance().drawEngine(c, d, gpu); }
 
 } // namespace host::native

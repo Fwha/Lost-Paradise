@@ -47,6 +47,9 @@ class DrawListener {
 public:
     virtual ~DrawListener() = default;
     virtual void onDraw(const DrawCall& draw, const GpuRegs& regs) = 0;
+    // A draw the engine described itself (native/engine_capture.h): the capture's id, with the
+    // registers as the game's draw would have had them.
+    virtual void onEngineDraw(uint32_t /*id*/, const GpuRegs&) {}
     // A draw through the geometry shader pipeline (export, geometry and copy shaders), which is
     // not rendered yet: it gets this instead of onDraw (and no analysis).
     virtual void onGeometryShaderDraw(const DrawCall&, const GpuRegs&) {}

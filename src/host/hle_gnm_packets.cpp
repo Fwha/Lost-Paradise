@@ -6,6 +6,7 @@
 #include "host/kernel.h"
 #include "host/pm4.h"
 #include "host/native/draw_origin.h"
+#include "host/native/engine_capture.h"
 
 #include <cstdio>
 #include <initializer_list>
@@ -64,6 +65,12 @@ constexpr uint32_t kSourceDma = 0, kSourceAuto = 2, kUseOpaque = 0x8;
 
 int32_t sceGnmDrawIndex(uint32_t* cmd, uint32_t size, uint32_t count, uint64_t indexAddr, uint32_t, uint32_t) {
     Writer w(cmd, size);
+    if (const uint32_t id = native::tEngineDrawId) { // the renderer draws the engine's capture here
+        native::tEngineDrawId = 0;
+        native::tPendingOrigin = {};
+        w.packet(kOpNop, {native::kEngineTag, id - 1});
+        return w.finish(__func__);
+    }
     w.origin(6);
     w.packet(kOpDrawIndex2, {0x7FFFFFFF, uint32_t(indexAddr), uint32_t(indexAddr >> 32), count, kSourceDma});
     return w.finish(__func__);

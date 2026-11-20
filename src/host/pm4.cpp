@@ -1,5 +1,6 @@
 #include "host/pm4.h"
 #include "host/native/draw_origin.h"
+#include "host/native/engine_capture.h"
 
 #include "host/equeue.h"
 #include "host/profile.h"
@@ -263,9 +264,13 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
                 if (op == kOpSetContextReg) ++tRegs->ctxSerial;
                 break;
             }
-            case kOpNop: // a draw's origin, ahead of it (native/draw_origin.h)
+            case kOpNop: // a draw's origin, ahead of it (native/draw_origin.h), or an engine draw
                 if (native::isOriginNop(b, count + 1))
                     for (int i = 0; i < 3; ++i) tOrigin[i] = b[i] & ~native::kOriginMask;
+                else if (count + 1 >= 2 && b[0] == native::kEngineTag && !tDry) {
+                    ++st->draws;
+                    for (DrawListener* l : gListeners) l->onEngineDraw(b[1], *tRegs);
+                }
                 break;
             case kOpIndexBase: tRegs->indexBase = address(b[0], b[1]); break;
             case kOpIndexBufferSize: tRegs->indexBufferSize = b[0]; break;

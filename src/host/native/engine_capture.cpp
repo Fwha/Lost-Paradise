@@ -4,6 +4,7 @@
 #include "host/hooks.h"
 #include "host/module.h"
 #include "host/native/draw_origin.h"
+#include "host/display_settings.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -30,6 +31,20 @@ bool gOn = false;
 
 std::mutex gMutex;
 std::deque<EngineDraw> gQueue;
+bool gShadows = false; // LPN_ENGINE_SHADOWS
+constexpr uint32_t kCasters = 1 << 14; // captures kept (a frame has a few hundred)
+std::mutex gCasterMutex;
+std::vector<EngineCaster> gCasters(kCasters);
+std::vector<uint32_t> gCasterIds(kCasters, ~0u);
+uint32_t gNextCaster = 0;
+
+bool readGuestFloats(uint64_t addr, float* out, size_t n) {
+    if (!addr || addr >= (1ull << 40)) return false;
+    std::memcpy(out, reinterpret_cast<const void*>(addr), n * 4);
+    return true;
+}
+
+bool displaySettingsNative() { return displaySettings().nativeRenderer; }
 
 template <typename T> T at(uint64_t a) {
     T v;
@@ -77,11 +92,29 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
             std::memcpy(d.context->data(), reinterpret_cast<const void*>(ctx), 0x400);
             std::memcpy(d.state->data(), reinterpret_cast<const void*>(s), 0x4000);
         }
-        std::lock_guard lock(gMutex);
-        if (gQueue.size() < kMaxQueued) gQueue.push_back(d);
+        const bool opaqueClass = site == 0xa5177a || site == 0xa518fe;
+        if (gShadows && opaqueClass && displaySettingsNative()) {
+            EngineCaster c;
+            c.draw = d;
+            c.vertices = at<uint32_t>(s + 0x294);
+            c.index32 = (ib >> 31) != 0;
+            const uint64_t view = d.view & 0xFFFFFFFFFFull;
+            if (readGuestFloats(view, c.projection, 16) && readGuestFloats(view + 0x40, c.rotation, 12) &&
+                readGuestFloats(view + 0x220, c.camera, 4)) {
+                std::lock_guard lock(gCasterMutex);
+                const uint32_t id = gNextCaster++;
+                gCasters[id % kCasters] = c;
+                gCasterIds[id % kCasters] = id;
+                tEngineDrawId = id + 1;
+            }
+        } else if (gOn) {
+            std::lock_guard lock(gMutex);
+            if (gQueue.size() < kMaxQueued) gQueue.push_back(d);
+        }
     }
     const uint64_t r = gDrawIndex(ctx, count, first, baseVertex, r8, r9);
     tForcedOrigin = {}; // not left for another draw when this one wrote none
+    tEngineDrawId = 0;
     return r;
 }
 
@@ -101,11 +134,23 @@ bool takeEngineDraw(EngineDraw& out) {
     return true;
 }
 
-bool engineCheckOn() { return gOn; }
+bool engineCheckOn() { return gOn && !gShadows; }
+bool engineShadowsOn() { return gShadows; }
+
+bool engineCaster(uint32_t id, EngineCaster& out) {
+    std::lock_guard lock(gCasterMutex);
+    if (gCasterIds[id % kCasters] != id) return false;
+    out = gCasters[id % kCasters];
+    return true;
+}
 
 bool installEngineCapture(Module& eboot) {
-    const char* e = std::getenv("LPN_ENGINE_CHECK");
-    if (!e || !*e || *e == '0') return false;
+    auto on = [](const char* name) {
+        const char* e = std::getenv(name);
+        return e && *e && *e != '0';
+    };
+    gShadows = on("LPN_ENGINE_SHADOWS");
+    if (!on("LPN_ENGINE_CHECK") && !gShadows) return false;
     // push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov eax, ecx
     const Hook hooks[] = {
         {kDrawIndex, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x89, 0xc8}, guestHook<&drawIndex>(),
@@ -114,7 +159,8 @@ bool installEngineCapture(Module& eboot) {
     gBase = eboot.base();
     if (!installHooks(gBase, hooks, std::size(hooks), "engine")) return false;
     gOn = true;
-    std::fprintf(stderr, "[native] engine capture: checking the stage shadow casters against their draws (LPN_ENGINE_CHECK)\n");
+    if (gShadows) std::fprintf(stderr, "[native] engine capture: the stage's opaque shadow casters are drawn from the engine (LPN_ENGINE_SHADOWS)\n");
+    else std::fprintf(stderr, "[native] engine capture: checking the stage shadow casters against their draws (LPN_ENGINE_CHECK)\n");
     return true;
 }
 
