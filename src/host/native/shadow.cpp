@@ -28,6 +28,8 @@ namespace host::native {
 namespace {
 
 enum Role { kOpaque = 1, kAlphaTest = 2 };
+// Its own pipelines for skinned casters (vs_shadowmap_skin with the opaque pixel shader).
+constexpr int kSkin = 3;
 
 struct Push {
     float m[16];      // clip = m * (position, 1), column major
@@ -45,6 +47,91 @@ layout(push_constant) uniform P {
     uvec4 uv;
     vec4 k; // bias scale, bias cap, texture scale
 } p;
+#define K p.k
+)";
+
+// Skinned casters: 128 bytes of constants (the least a device offers).
+struct SkinPush {
+    float m[16];     // clip = m * (world, 1): projection * rotation * (minus the camera)
+    float off[4];    // the offset added to the blended translation (0x170 of s[4:7]); w: bias scale
+    uint32_t pos[4];  // first word, stride in words, format (dfmt | nfmt << 4); w: the palette's first word
+    uint32_t wgt[4];  // the weights' slot; w: the palette's stride in words
+    uint32_t idx[4];  // the bone indices' slot; w: the bias cap (float bits)
+};
+static_assert(sizeof(SkinPush) == 128);
+
+constexpr const char* kSkinHeader = R"(#version 450
+layout(push_constant) uniform P {
+    mat4 m;
+    vec4 off;
+    uvec4 pos;
+    uvec4 wgt;
+    uvec4 idx;
+} p;
+#define K vec4(p.off.w, uintBitsToFloat(p.idx.w), 0.0, 0.0)
+)";
+
+// vs_shadowmap_skin.vso: four bones from a palette of 3x4 rows (three 16-byte elements a bone in
+// the buffer s[8:11]), weights from the second fetch slot's y, z, w (the first bone's is 1 minus
+// their sum), indices from the third. The translation is blended relative to the floor of the
+// first bone's, as the game keeps large world positions precise.
+constexpr const char* kSkinVs = R"(
+layout(set = 0, binding = 0, std430) readonly buffer V0 { uint w[]; } v0;
+layout(set = 0, binding = 1, std430) readonly buffer V1 { uint w[]; } v1;
+layout(set = 0, binding = 2, std430) readonly buffer V2 { uint w[]; } v2;
+layout(set = 0, binding = 3, std430) readonly buffer Pal { uint w[]; } pal;
+layout(location = 0) out vec4 o;
+uint word(uint b, uint i) { return b == 0u ? v0.w[i] : b == 1u ? v1.w[i] : v2.w[i]; }
+// An element as the GCN fetch decodes it, as raw bits (floats as their bits), by data format
+// (bits 0-3) and number format (bits 4-6): 32-bit, 16-bit and 8-bit channels.
+uint conv(uint raw, uint bits, uint nfmt) {
+    float maxv = float((1u << bits) - 1u), half_ = float((1u << (bits - 1u)) - 1u);
+    int sx = bitfieldExtract(int(raw), 0, int(bits));
+    if (nfmt == 0u) return floatBitsToUint(float(raw) / maxv);
+    if (nfmt == 1u) return floatBitsToUint(max(float(sx) / half_, -1.0));
+    if (nfmt == 7u && bits == 16u) return floatBitsToUint(unpackHalf2x16(raw).x);
+    if (nfmt == 5u) return uint(sx);
+    return raw;
+}
+uvec4 fetch(uint b, uvec4 s) {
+    uint i = s.x + uint(gl_VertexIndex) * s.y, dfmt = s.z & 15u, nfmt = (s.z >> 4) & 7u;
+    uvec4 e = uvec4(0u, 0u, 0u, floatBitsToUint(1.0));
+    if (dfmt == 4u || dfmt == 11u || dfmt == 13u || dfmt == 14u) {
+        uint n = dfmt == 4u ? 1u : dfmt == 11u ? 2u : dfmt == 13u ? 3u : 4u;
+        for (uint c = 0u; c < n; ++c) e[c] = conv(word(b, i + c), 32u, nfmt);
+    } else if (dfmt == 2u || dfmt == 5u || dfmt == 12u) {
+        uint n = dfmt == 2u ? 1u : dfmt == 5u ? 2u : 4u;
+        for (uint c = 0u; c < n; ++c) e[c] = conv((word(b, i + c / 2u) >> (16u * (c & 1u))) & 0xffffu, 16u, nfmt);
+    } else {
+        uint n = dfmt == 1u ? 1u : dfmt == 3u ? 2u : 4u, x = word(b, i);
+        for (uint c = 0u; c < n; ++c) e[c] = conv((x >> (8u * c)) & 0xffu, 8u, nfmt);
+    }
+    return e;
+}
+vec4 row(int e) { uint i = p.pos.w + uint(e) * p.wgt.w; return uintBitsToFloat(uvec4(pal.w[i], pal.w[i + 1u], pal.w[i + 2u], pal.w[i + 3u])); }
+void main() {
+    vec3 x = uintBitsToFloat(fetch(0u, p.pos).xyz);
+    vec4 wv = uintBitsToFloat(fetch(1u, p.wgt));
+    uvec4 bi = fetch(2u, p.idx);
+    float w[4] = float[4](1.0 - ((wv.y + wv.z) + wv.w), wv.y, wv.z, wv.w);
+    vec4 r[4][3];
+    for (int k = 0; k < 4; ++k) {
+        int b = (int(bi[k]) * 48) >> 4;
+        r[k][0] = row(b), r[k][1] = row(b + 1), r[k][2] = row(b + 2);
+    }
+    vec3 world;
+    for (int a = 0; a < 3; ++a) {
+        float f = floor(r[0][a].w);
+        float t = p.off[a] + f;
+        for (int k = 0; k < 4; ++k) t += w[k] * (r[k][a].w - f);
+        vec3 m = r[0][a].xyz * w[0];
+        for (int k = 1; k < 4; ++k) m += w[k] * r[k][a].xyz;
+        world[a] = t + m.x * x.x + m.y * x.y + m.z * x.z;
+    }
+    vec4 c = p.m * vec4(world, 1.0);
+    gl_Position = vec4(c.x, c.y, max(0.0, c.z), c.w);
+    o = vec4(c.z, c.w, 0.0, 0.0);
+}
 )";
 
 constexpr const char* kVs = R"(
@@ -83,11 +170,11 @@ float slope(float z) {
 }
 void main() {
 #ifdef ALPHA_TEST
-    if (0.5 > texture(alpha, i.zw * p.k.zw).w) demote; // kept for the quad's differences
+    if (0.5 > texture(alpha, i.zw * K.zw).w) demote; // kept for the quad's differences
     float rw = 1.0 / i.y;
-    gl_FragDepth = clamp(min(p.k.y, slope(i.x * rw)) + rw * i.x, 0.0, 1.0);
+    gl_FragDepth = clamp(min(K.y, slope(i.x * rw)) + rw * i.x, 0.0, 1.0);
 #else
-    gl_FragDepth = clamp(i.x + min(p.k.y, p.k.x * slope(i.x)), 0.0, 1.0);
+    gl_FragDepth = clamp(i.x + min(K.y, K.x * slope(i.x)), 0.0, 1.0);
 #endif
 }
 )";
@@ -119,6 +206,7 @@ public:
     }
 
     bool draw(int role, const Draw& d, Gpu& gpu) override {
+        if (role == kOpaque && d.vsName && *d.vsName == "vs_shadowmap_skin.vso") return drawSkin(d, gpu);
         const bool alpha = role == kAlphaTest;
         const char* vs = alpha ? "vs_shadowmap_normal_pt.vso" : "vs_shadowmap_normal.vso";
         if (!d.vsName || *d.vsName != vs) return decline(role, "another vertex shader");
@@ -214,11 +302,120 @@ public:
     }
 
 private:
+    // A fetch slot in a format the skinned shader decodes (32-, 16- or 8-bit channels).
+    static bool decodable(const VertexBuffer& v) {
+        static constexpr uint32_t kDfmts[] = {1, 2, 3, 4, 5, 10, 11, 12, 13, 14};
+        bool dfmt = false;
+        for (uint32_t f : kDfmts) dfmt = dfmt || v.dfmt == f;
+        const bool nfmt = v.nfmt == 0 || v.nfmt == 1 || v.nfmt == 4 || v.nfmt == 5 || v.nfmt == 7;
+        return dfmt && nfmt && v.stride % 4 == 0 && (v.data.byteOffset + v.offset) % 4 == 0 && v.indexVgpr == 0;
+    }
+
+    bool drawSkin(const Draw& d, Gpu& gpu) {
+        const int role = kSkin;
+        if (d.colorCount || !d.depth.view) return decline(role, "colour targets or no depth buffer");
+        if (d.blend || d.stencil) return decline(role, "blending or stencil");
+        if (d.instances != 1) return decline(role, "instanced");
+        if (d.primitive != 4) return decline(role, "not a triangle list");
+        // Fetch slots: position (v4), weights (v8: y, z, w used), bone indices (v12); the palette
+        // is the buffer of the first bone row load (pc 0x38).
+        const VertexBuffer* slot[3] = {};
+        const VertexBuffer* palette = nullptr;
+        for (const VertexBuffer& v : d.vertex) {
+            if (v.slot >= 0 && v.slot < 3 && v.components) slot[v.slot] = &v;
+            if (v.slot < 0 && v.pc == 0x38) palette = &v;
+        }
+        if (!slot[0] || !slot[1] || !slot[2] || !palette) return decline(role, "no position, weights, bone indices or palette");
+        if (slot[0]->components < 3 || slot[1]->components < 4 || slot[2]->components < 4)
+            return decline(role, "fewer components than the shader reads");
+        for (const VertexBuffer* v : slot) {
+            // As stored, for every component used.
+            const uint32_t used = v == slot[0] ? 3 : 4;
+            bool plain = true;
+            for (uint32_t c = 0; c < used; ++c) plain = plain && ((v->dstSel >> (3 * c)) & 7) == 4 + c;
+            if (!decodable(*v) || !plain) {
+                char why[96];
+                std::snprintf(why, sizeof why, "vertex format dfmt %u nfmt %u stride %u offset %u sel 0x%x index v%u", v->dfmt,
+                              v->nfmt, v->stride, v->data.byteOffset + v->offset, v->dstSel, v->indexVgpr);
+                return decline(role, why);
+            }
+        }
+        if (palette->stride % 4 || palette->data.byteOffset % 4 || palette->stride < 16) return decline(role, "a palette layout it does not read");
+        SkinPush push{};
+        float off[4], rot[12], proj[16], cam[4] = {};
+        uint32_t flags;
+        auto get = [&](uint32_t pc, float* v, uint32_t n) { return d.vsLoad(pc, reinterpret_cast<uint32_t*>(v), n); };
+        if (!get(0x104, off, 4) || !d.vsLoad(0x118, &flags, 1) || !get(0x2c8, rot, 8) || !get(0x2d0, rot + 8, 4) ||
+            !get(0x2cc, proj, 16))
+            return decline(role, "the vertex shader's constants are missing");
+        if (!((flags & 0x80000) && !(flags & 0x100000)) && !get(0x2a8, cam, 4)) return decline(role, "no camera constants");
+        // projection * rotation * (x - camera)
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c) {
+                double s = c == 3 ? proj[r * 4 + 3] : 0;
+                for (int k = 0; k < 3; ++k) {
+                    double a = 0; // row k of rotation * [I | -cam], column c
+                    if (c < 3) a = rot[k * 4 + c];
+                    else
+                        for (int j = 0; j < 3; ++j) a -= double(rot[k * 4 + j]) * cam[j];
+                    s += double(proj[r * 4 + k]) * a;
+                }
+                push.m[c * 4 + r] = float(s);
+            }
+        uint32_t w[2];
+        if (!d.load(0xc, w, 2)) return decline(role, "no bias constants");
+        push.off[0] = off[0], push.off[1] = off[1], push.off[2] = off[2];
+        std::memcpy(&push.off[3], &w[0], 4);
+        push.idx[3] = w[1];
+        auto put = [](const VertexBuffer& v, uint32_t* s) {
+            s[0] = (v.data.byteOffset + v.offset) / 4, s[1] = v.stride / 4, s[2] = v.dfmt | v.nfmt << 4;
+        };
+        put(*slot[0], push.pos), put(*slot[1], push.wgt), put(*slot[2], push.idx);
+        push.pos[3] = palette->data.byteOffset / 4, push.wgt[3] = palette->stride / 4;
+        VkDescriptorBufferInfo bufs[4];
+        for (int i = 0; i < 3; ++i) bufs[i] = {slot[i]->data.buffer, slot[i]->data.offset, slot[i]->data.range};
+        bufs[3] = {palette->data.buffer, palette->data.offset, palette->data.range};
+        VkPipeline pipe = pipeline(gpu, role, d);
+        if (!pipe) return decline(role, "no pipeline");
+        if (!logged_[role]) {
+            logged_[role] = true;
+            std::fprintf(stderr, "[native] shadow: drawing vs_shadowmap_skin.vso natively (depth 0x%" PRIx64 " %ux%u)\n",
+                         d.depth.address, d.depth.width, d.depth.height);
+        }
+        gpu.beginRendering(nullptr, 0, d.depth, d.hasStencil);
+        const VkViewport vp = d.vkViewport;
+        const VkRect2D sc{{d.scissor[0], d.scissor[1]}, {uint32_t(d.scissor[2]), uint32_t(d.scissor[3])}};
+        const Buffer index = d.index;
+        gpu.record([pipe, layout = layouts_[role], push, bufs, vp, sc, index, indexed = d.indexed, indexType = d.indexType,
+                    count = d.count, pushSet = gpu.pushDescriptorSet()](VkCommandBuffer c) {
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            vkCmdSetViewport(c, 0, 1, &vp);
+            vkCmdSetScissor(c, 0, 1, &sc);
+            VkWriteDescriptorSet wr[4]{};
+            for (uint32_t i = 0; i < 4; ++i) {
+                wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                wr[i].dstBinding = i;
+                wr[i].descriptorCount = 1;
+                wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                wr[i].pBufferInfo = &bufs[i];
+            }
+            pushSet(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 4, wr);
+            vkCmdPushConstants(c, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, &push);
+            if (indexed) {
+                vkCmdBindIndexBuffer(c, index.buffer, index.offset + index.byteOffset, indexType);
+                vkCmdDrawIndexed(c, count, 1, 0, 0, 0);
+            } else {
+                vkCmdDraw(c, count, 1, 0, 0);
+            }
+        });
+        return true;
+    }
+
     // Logs each reason once.
     bool decline(int role, const char* why) {
         if (declined_[role].insert(why).second && declined_[role].size() <= 16)
             std::fprintf(stderr, "[native] shadow: a %s draw left to the translated renderer (%s)\n",
-                         role == kAlphaTest ? "ps_shadowmap_pt" : "ps_shadowmap", why);
+                         role == kAlphaTest ? "ps_shadowmap_pt" : role == kSkin ? "vs_shadowmap_skin" : "ps_shadowmap", why);
         return false;
     }
 
@@ -263,19 +460,22 @@ private:
         if (auto it = pipes_.find(key); it != pipes_.end()) return it->second;
         VkPipeline& out = pipes_[key];
         const VkDevice dev = gpu.device();
-        const bool alpha = role == kAlphaTest;
+        const bool alpha = role == kAlphaTest, skin = role == kSkin;
         if (!layouts_[role]) {
-            VkDescriptorSetLayoutBinding b[3] = {
+            VkDescriptorSetLayoutBinding b[4] = {
                 {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
                 {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
                 {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+                {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
             };
+            if (skin) b[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
             VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
             dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-            dl.bindingCount = alpha ? 3 : 1;
+            dl.bindingCount = skin ? 4 : alpha ? 3 : 1;
             dl.pBindings = b;
             if (vkCreateDescriptorSetLayout(dev, &dl, nullptr, &setLayouts_[role]) != VK_SUCCESS) return out = VK_NULL_HANDLE;
-            const VkPushConstantRange pr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Push)};
+            const VkPushConstantRange pr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                         uint32_t(skin ? sizeof(SkinPush) : sizeof(Push))};
             VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
             pl.setLayoutCount = 1;
             pl.pSetLayouts = &setLayouts_[role];
@@ -284,8 +484,9 @@ private:
             if (vkCreatePipelineLayout(dev, &pl, nullptr, &layouts_[role]) != VK_SUCCESS) return out = VK_NULL_HANDLE;
         }
         const std::string defs = alpha ? "#define ALPHA_TEST\n" : "";
-        const VkShaderModule vsm = gpu.shader(std::string(kHeader) + defs + kVs, Gpu::Stage::Vertex);
-        const VkShaderModule fsm = gpu.shader(std::string(kHeader) + defs + kFs, Gpu::Stage::Fragment);
+        const char* header = skin ? kSkinHeader : kHeader;
+        const VkShaderModule vsm = gpu.shader(std::string(header) + defs + (skin ? kSkinVs : kVs), Gpu::Stage::Vertex);
+        const VkShaderModule fsm = gpu.shader(std::string(header) + defs + kFs, Gpu::Stage::Fragment);
         if (!vsm || !fsm) return out = VK_NULL_HANDLE;
         VkPipelineShaderStageCreateInfo st[2]{};
         st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vsm, "main", nullptr};
@@ -332,10 +533,10 @@ private:
     }
 
     std::map<std::tuple<int, int, bool, VkBool32, VkBool32, int, int, int>, VkPipeline> pipes_;
-    VkDescriptorSetLayout setLayouts_[3] = {};
-    VkPipelineLayout layouts_[3] = {};
-    bool logged_[3] = {};
-    std::set<std::string> declined_[3];
+    VkDescriptorSetLayout setLayouts_[4] = {};
+    VkPipelineLayout layouts_[4] = {};
+    bool logged_[4] = {};
+    std::set<std::string> declined_[4];
 };
 
 } // namespace

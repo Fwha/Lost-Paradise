@@ -5479,6 +5479,7 @@ void main() {
             if (!buffer(b.base(), bindSize(b), vb.data)) return false;
             vb.stride = b.stride(), vb.records = b.numRecords(), vb.dfmt = b.dfmt, vb.nfmt = b.nfmt;
             vb.dstSel = b.sharp[3] & 0xFFF;
+            vb.pc = uint32_t(b.pc - a.vs.launch.entry);
             nd.vertex.push_back(vb);
         }
         if (d.kind == DrawCall::kIndexed) {
