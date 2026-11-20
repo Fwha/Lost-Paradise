@@ -63,6 +63,7 @@ struct VertexBuffer {
     // slot < 0: a buffer the shader reads otherwise.
     int32_t slot = -1;
     uint32_t components = 0, indexVgpr = 0, offset = 0;
+    uint32_t pc = 0; // the load that reads it (slot < 0), as an offset from the shader's start
 };
 
 // One of the game's draws that a native pass claimed.
