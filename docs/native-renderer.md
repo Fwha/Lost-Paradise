@@ -155,3 +155,19 @@ every step leaves a game that plays:
   pixel shader's half rounding before the export is kept too. Declined with an upscaler on (the
   scene is jittered and the camera read from these draws), positions in pixels or a polygon
   offset. 240 bytes of push constants.
+- `LPN_NATIVE_COMPARE=prepass` (Fwha's runs): depth exact for both variants; the opaque variant's
+  normals exact after the decode factor was corrected to the shader's 0x40008102 (255/127). The
+  _pt variant's normals stay one 8-bit step off on a share of pixels, with the varyings, the
+  encoding's rounding and the decode all as the game's: a known, invisible difference, not chased
+  further.
+
+### Stage 2 (the material pass, first pair)
+
+- The forward material pass (~3,350 draws): two vertex shaders (`r_b1dst_a(vr)2d`, `r_b1dst`) cover
+  ~2,500 draws across about ten pixel shader families, each full forward lighting (~850
+  instructions, 13 textures).
+- `native/material.cpp`: `r_b1dst_a(vr)2d` with `r_o1dst_m(vr)2ds` (~570 draws). Constants come from
+  the shaders' own loads by their offsets, uploaded per draw (`Gpu::upload`). The position uses the
+  prepass's operations. Codex's reading is in `docs/shaders/`.
+- `LPN_NATIVE_COMPARE=material` (Fwha's run): ~57,000 draws compared, no pixel more than one 8-bit
+  step off in either target, depth exact, none declined. Looked right in play.

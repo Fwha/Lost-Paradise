@@ -1094,6 +1094,10 @@ public:
         if (native::engineCheckOn() && d.kind == DrawCall::kIndexed && native::engineSite(d.origin[0])) engineCheck(d, r, *held);
         // A draw a native pass takes is recorded here, in order (see nativeDraw).
         const bool native = nativeOn_ && d.kind != DrawCall::kDispatch && nativeClaimed(*held);
+        if (comparePending_) { // LPN_NATIVE_COMPARE: before a recorder thread takes the next draw
+            std::lock_guard lock(m_);
+            runCompare();
+        }
         if (recordThreads_) {
             if (!native && segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
                 addToSegment(d, r, held);
@@ -1127,6 +1131,8 @@ public:
             return;
         } else {
             recordDraw(d, DrawRegs::of(r), held);
+            // LPN_NATIVE_COMPARE: the translated draw is recorded now; compared before what comes next.
+            if (compareAwaiting_) compareAwaiting_ = false, comparePending_ = true;
         }
         if (frame_ == timingFrame_ && timing_ && R().recording_ && timingMeta_.size() + 1 < kTimingQueries) {
             rec([c = R().cmd_, q = timing_, i = uint32_t(timingMeta_.size() + 1)] {
@@ -1307,6 +1313,7 @@ public:
         evictImages();
         sweepVram();
         trace_ = false; // recorder threads read it (a traced frame is recorded here, in order)
+        compareReport();
         for (native::Pass* np : native::passes()) np->frameEnd();
         passMap_.onFrameEnd(frame_, pendingCapture_); // F12: the next frame's pass map beside its trace
         nativeOn_ = displaySettings().nativeRenderer;
@@ -2118,6 +2125,7 @@ private:
     // Before a copy, clear, dispatch or upload: everything before it is done and visible. What it
     // writes is then made visible by the barrier the next draw's pass starts with (R().needBarrier_).
     void fullBarrier() {
+        if (comparePending_ && !R().worker_) runCompare(); // before a copy or clear changes what it compares
         endPass();
         barrier();
         R().needBarrier_ = true;
@@ -5278,6 +5286,13 @@ void main() {
         VkDevice device() const override { return r_.vk_.device; }
         PFN_vkCmdPushDescriptorSetKHR pushDescriptorSet() const override { return r_.vk_.cmdPushDescriptorSet; }
         uint32_t maxPushConstants() const override { return r_.vk_.props.limits.maxPushConstantsSize; }
+        bool upload(const void* data, uint32_t bytes, native::Buffer& out) override {
+            if (!bytes || bytes > (1u << 16)) return false;
+            const VkDeviceSize at = r_.ringAlloc(bytes, r_.storageAlign_);
+            std::memcpy(static_cast<uint8_t*>(r_.R().ringPtr_) + at, data, bytes);
+            out.buffer = r_.R().ring_, out.offset = at, out.range = bytes, out.byteOffset = 0;
+            return true;
+        }
         VkShaderModule shader(const std::string& glsl, Stage stage) override {
             const gcn::GlslStage s = stage == Stage::Vertex     ? gcn::GlslStage::Vertex
                                      : stage == Stage::Compute ? gcn::GlslStage::Compute
@@ -5357,14 +5372,44 @@ void main() {
     // The draw as a native pass sees it (native::Draw), then the pass's own recording in its place.
     // False when the pass declines it: the translated path draws it.
     bool nativeDraw(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
+        native::Draw nd;
+        Surface* written[8]{};
+        Surface* depthWritten = nullptr;
+        if (!nativeBuild(d, r, a, nd, written, depthWritten)) return false;
+        if (!ringFits(1 << 12)) flush();
+        begin();
+        NativeGpu gpu(*this);
+        if (!a.psm->nativePass->draw(a.psm->nativeRole, nd, gpu)) return false;
+        nativeDrawn(written, depthWritten);
+        return true;
+    }
+    // After a native pass recorded a draw: its writes and reads, for the barriers of the draws
+    // after it (see draw()): every attachment counts as written. The pass bound pipelines and
+    // descriptors of its own: everything is set again.
+    void nativeDrawn(Surface* const* written, Surface* depthWritten) {
+        R().needBarrier_ = true;
+        for (VkImage im : R().pass_.images) addOnce(R().drawWritten_, im);
+        for (VkImage im : R().sampledSurfaces_) addOnce(R().drawSampled_, im);
+        R().bound_ = Bound{};
+        ++R().passSerial_;
+        R().fast_.valid = false;
+        for (FastSlot& f : R().fastSlots_) f.f.valid = false;
+        R().lastMergeable_ = false;
+        ++fastEpoch_;
+        if (written)
+            for (int i = 0; i < 8; ++i)
+                if (written[i]) gpuWrote(*written[i]);
+        if (depthWritten) gpuWrote(*depthWritten);
+    }
+    // The draw as a native pass sees it. False when the renderer cannot describe it.
+    bool nativeBuild(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a, native::Draw& nd, Surface** written,
+                     Surface*& depthWritten) {
         // Analysed before the claim: without its scalar loads (the next draws have them).
         if (!a.nativeLoads) return false;
         const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
-        native::Draw nd;
         nd.psName = a.psm->gameName;
         nd.primitive = r.prim;
         nd.count = d.count;
-        Surface* written[8]{};
         const uint32_t targetMask = r.ctx[reg::kCbTargetMask] & r.ctx[reg::kCbShaderMask];
         for (uint32_t i = 0; i < 8 && cbMode == 1; ++i) {
             const uint32_t* cb = &r.ctx[reg::kCbColorBase + i * reg::kCbColorStride];
@@ -5386,7 +5431,6 @@ void main() {
             if ((r.ctx[reg::kCbBlendControl + i] >> 30) & 1) nd.blend = true;
         }
         const uint32_t depthControl = r.ctx[reg::kDbDepthControl];
-        Surface* depthWritten = nullptr;
         if (const uint32_t zInfo = r.ctx[reg::kDbZInfo]; zInfo & 3) {
             const bool stencil = r.ctx[reg::kDbStencilInfo] & 1;
             const VkFormat f = stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : (zInfo & 3) == 1 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
@@ -5513,25 +5557,6 @@ void main() {
             nd.cull = rs.cullMode, nd.frontFace = rs.frontFace;
             nd.depthBias = rs.depthBiasEnable;
         }
-        if (!ringFits(1 << 12)) flush();
-        begin();
-        NativeGpu gpu(*this);
-        if (!a.psm->nativePass->draw(a.psm->nativeRole, nd, gpu)) return false;
-        // Its writes and reads, for the barriers of the draws after it (see draw()): every
-        // attachment counts as written.
-        R().needBarrier_ = true;
-        for (VkImage im : R().pass_.images) addOnce(R().drawWritten_, im);
-        for (VkImage im : R().sampledSurfaces_) addOnce(R().drawSampled_, im);
-        // The pass bound pipelines and descriptors of its own: everything is set again.
-        R().bound_ = Bound{};
-        ++R().passSerial_;
-        R().fast_.valid = false;
-        for (FastSlot& f : R().fastSlots_) f.f.valid = false;
-        R().lastMergeable_ = false;
-        ++fastEpoch_;
-        for (Surface* s : written)
-            if (s) gpuWrote(*s);
-        if (depthWritten) gpuWrote(*depthWritten);
         return true;
     }
 
@@ -5793,6 +5818,257 @@ void main() {
     uint64_t engineStats_[3] = {}; // matched, differing, uncaptured
     std::set<std::string> engineKinds_;
     uint64_t engineAlpha_[4] = {}; // alpha casters: both inputs match, coordinates differ, texture differs, both differ
+
+    // ---- LPN_NATIVE_COMPARE=<pass> -------------------------------------------------------------
+    // Checks a native pass against the game's shaders: for some of the draws it claims (a few a
+    // frame), the targets and depth buffer are copied, the native pass draws into the copies, the
+    // translated draw goes on as usual, and before anything else is recorded the two results are
+    // compared on the GPU. Every 10 seconds: per role and target, the draws compared and the pixels
+    // that differ (by more than half an 8-bit step; depth: any bit), with the largest difference.
+    static constexpr uint32_t kComparePerFrame = 24;
+    static constexpr uint32_t kCompareSlots = 64; // role * 9 + target (8: depth)
+    struct CompareSlot {
+        uint32_t px, maxBits, sum, pad; // sum: of differences in 1/255 steps (colour) or ulps (depth), saturating
+    };
+    struct ComparePush {
+        int32_t rect[4];
+        uint32_t slot, depth, pad[2];
+    };
+    struct PendingCompare {
+        VkImageView a[9] = {}, b[9] = {};
+        int32_t rect[4] = {};
+        uint32_t role = 0;
+    };
+    static constexpr const char* kCompareGlsl = R"(#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D a;
+layout(set = 0, binding = 1) uniform sampler2D b;
+struct Slot { uint px, maxBits, sum, pad; };
+layout(set = 0, binding = 2, std430) buffer S { Slot s[]; } st;
+layout(push_constant) uniform P { ivec4 rect; uint slot, depth, pad0, pad1; } p;
+void main() {
+    ivec2 q = p.rect.xy + ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(gl_GlobalInvocationID.xy, uvec2(p.rect.zw)))) return;
+    vec4 x = texelFetch(a, q, 0), y = texelFetch(b, q, 0);
+    if (p.depth != 0u) {
+        uint u = floatBitsToUint(x.r), v = floatBitsToUint(y.r);
+        if (u == v) return;
+        uint d = u > v ? u - v : v - u;
+        atomicAdd(st.s[p.slot].px, 1u);
+        atomicMax(st.s[p.slot].maxBits, floatBitsToUint(abs(x.r - y.r)));
+        atomicAdd(st.s[p.slot].sum, min(d, 65535u));
+        return;
+    }
+    vec4 d = abs(x - y);
+    float m = max(max(d.x, d.y), max(d.z, d.w));
+    if (!(m > 0.5 / 255.0)) return;
+    atomicAdd(st.s[p.slot].px, 1u);
+    atomicMax(st.s[p.slot].maxBits, floatBitsToUint(m));
+    atomicAdd(st.s[p.slot].sum, uint(min(m * 255.0 + 0.5, 255.0)));
+}
+)";
+    bool comparePipeline() {
+        if (comparePipe_) return true;
+        if (compareFailed_) return false;
+        compareFailed_ = true;
+        const VkShaderModule sm = module(kCompareGlsl, gcn::GlslStage::Compute);
+        if (!sm) return false;
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (vkCreateSampler(vk_.device, &sci, nullptr, &compareSampler_) != VK_SUCCESS) return false;
+        const VkDescriptorSetLayoutBinding b[3] = {
+            {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        };
+        VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        dl.bindingCount = 3;
+        dl.pBindings = b;
+        if (vkCreateDescriptorSetLayout(vk_.device, &dl, nullptr, &compareSetLayout_) != VK_SUCCESS) return false;
+        const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ComparePush)};
+        VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pl.setLayoutCount = 1;
+        pl.pSetLayouts = &compareSetLayout_;
+        pl.pushConstantRangeCount = 1;
+        pl.pPushConstantRanges = &pr;
+        if (vkCreatePipelineLayout(vk_.device, &pl, nullptr, &compareLayout_) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = sm;
+        ci.stage.pName = "main";
+        ci.layout = compareLayout_;
+        if (vkCreateComputePipelines(vk_.device, VK_NULL_HANDLE, 1, &ci, nullptr, &comparePipe_) != VK_SUCCESS) return false;
+        compareBuf_ = createHostBuffer(sizeof(CompareSlot) * kCompareSlots, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &compareMem_,
+                                       &compareMap_, true);
+        if (!compareBuf_ || !compareMap_) return false;
+        std::memset(compareMap_, 0, sizeof(CompareSlot) * kCompareSlots);
+        compareFailed_ = false;
+        return true;
+    }
+    // A copy of a target's size and format (one for each target index: a draw writes up to 8).
+    Image* compareImage(uint32_t index, const native::Target& t, bool depth) {
+        Image& img = compareImages_[index];
+        if (img.image && img.format == t.format && img.width == t.width && img.height == t.height) return &img;
+        if (img.image) {
+            fullBarrier();
+            destroyImage(img);
+        }
+        const VkImageUsageFlags usage = (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
+                                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (!createImage(img, t.format, t.width, t.height, usage, depth)) {
+            img = Image{};
+            return nullptr;
+        }
+        return &img;
+    }
+    // Before the translated draw: the copies, and the native pass's draw into them.
+    void nativeCompare(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
+        if (compareFrame_ != frame_) compareFrame_ = frame_, compareCount_ = 0;
+        // Spread over the frame's draws: every fourth, starting at a different one each frame.
+        if (compareCount_ >= kComparePerFrame || (compareSeq_++ + frame_) % 4) return;
+        native::Draw nd;
+        Surface* written[8]{};
+        Surface* depthWritten = nullptr;
+        if (!nativeBuild(d, r, a, nd, written, depthWritten) || !comparePipeline()) return;
+        if (!ringFits(1 << 12)) flush();
+        begin();
+        fullBarrier();
+        native::Draw cd = nd;
+        PendingCompare pc;
+        auto copy = [&](uint32_t index, native::Target& t, bool depth) {
+            Image* img = compareImage(index, t, depth);
+            if (!img) return false;
+            barrier(); // after a new copy's clear
+            const VkImageAspectFlags aspect = depth ? img->aspect : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
+            VkImageCopy rg{};
+            rg.srcSubresource = rg.dstSubresource = {aspect, 0, 0, 1};
+            rg.extent = {t.width, t.height, 1};
+            rec([c = R().cmd_, src = t.image, dst = img->image, rg] {
+                vkCmdCopyImage(c, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+            });
+            const VkImageAspectFlags sampled = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+            pc.a[index] = t.view ? (depth ? view(*img, t.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, sampled) : t.view) : VK_NULL_HANDLE;
+            pc.b[index] = view(*img, t.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, sampled);
+            t.image = img->image;
+            t.view = view(*img, t.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, depth ? img->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+            return true;
+        };
+        for (uint32_t i = 0; i < cd.colorCount; ++i)
+            if (cd.color[i].view && !copy(i, cd.color[i], false)) return;
+        if (cd.depth.view) {
+            // The real depth buffer, sampled: its depth aspect.
+            Surface* ds = depthSurface(nd.depth.address, nd.depth.width, nd.depth.height, nd.depth.format);
+            if (!ds) return;
+            if (!copy(8, cd.depth, true)) return;
+            pc.a[8] = view(ds->img, nd.depth.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, VK_IMAGE_ASPECT_DEPTH_BIT);
+        }
+        barrier();
+        NativeGpu gpu(*this);
+        const int role = a.psm->nativeRole;
+        const bool drawn = a.psm->nativePass->draw(role, cd, gpu);
+        endPass();
+        barrier();
+        nativeDrawn(nullptr, nullptr);
+        ++compareCount_;
+        if (!drawn) {
+            ++compareDeclined_[std::min(role, 6)];
+            return;
+        }
+        ++compareDrawn_[std::min(role, 6)];
+        // Where it could have drawn: the scissor.
+        pc.rect[0] = nd.scissor[0], pc.rect[1] = nd.scissor[1], pc.rect[2] = nd.scissor[2], pc.rect[3] = nd.scissor[3];
+        pc.role = uint32_t(std::min(role, 6));
+        pendingCompare_ = pc;
+        compareAwaiting_ = true; // armed once the translated draw is recorded (see recordDraw's caller)
+    }
+    // After the translated draw: the differences.
+    void runCompare() {
+        if (!comparePending_ || compareRunning_) return;
+        compareRunning_ = true;
+        comparePending_ = false;
+        const PendingCompare pc = pendingCompare_;
+        if (!ringFits(1 << 12)) flush();
+        begin();
+        fullBarrier();
+        for (uint32_t i = 0; i < 9; ++i) {
+            if (!pc.a[i] || !pc.b[i] || pc.rect[2] <= 0 || pc.rect[3] <= 0) continue;
+            ComparePush push{};
+            std::memcpy(push.rect, pc.rect, sizeof push.rect);
+            push.slot = pc.role * 9 + i;
+            push.depth = i == 8;
+            rec([this, c = R().cmd_, push, va = pc.a[i], vb = pc.b[i]] {
+                const VkDescriptorImageInfo di[2] = {{compareSampler_, va, VK_IMAGE_LAYOUT_GENERAL},
+                                                     {compareSampler_, vb, VK_IMAGE_LAYOUT_GENERAL}};
+                const VkDescriptorBufferInfo bi{compareBuf_, 0, VK_WHOLE_SIZE};
+                VkWriteDescriptorSet wr[3]{};
+                for (uint32_t k = 0; k < 3; ++k) {
+                    wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    wr[k].dstBinding = k;
+                    wr[k].descriptorCount = 1;
+                    wr[k].descriptorType = k < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    if (k < 2) wr[k].pImageInfo = &di[k];
+                    else wr[k].pBufferInfo = &bi;
+                }
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, comparePipe_);
+                vk_.cmdPushDescriptorSet(c, VK_PIPELINE_BIND_POINT_COMPUTE, compareLayout_, 0, 3, wr);
+                vkCmdPushConstants(c, compareLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
+                vkCmdDispatch(c, (uint32_t(push.rect[2]) + 7) / 8, (uint32_t(push.rect[3]) + 7) / 8, 1);
+            });
+        }
+        barrier();
+        R().bound_ = Bound{};
+        compareRunning_ = false;
+    }
+    // Every 10 seconds: what the copies' comparisons found since the last report. The counters the
+    // GPU adds to are read without waiting for it: a report can miss the last frames' additions
+    // (they go to the next one), and its mean can be a little off. Enough for a check.
+    void compareReport() {
+        if (!compareMap_) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - compareLast_ < std::chrono::seconds(10)) return;
+        compareLast_ = now;
+        const auto* slot = static_cast<const CompareSlot*>(compareMap_);
+        for (uint32_t role = 0; role < 7; ++role) {
+            if (!compareDrawn_[role] && !compareDeclined_[role]) continue;
+            std::string line;
+            char buf[160];
+            for (uint32_t i = 0; i < 9; ++i) {
+                const CompareSlot& c = slot[role * 9 + i];
+                CompareSlot& was = compareSeen_[role * 9 + i];
+                const uint32_t px = c.px - was.px, sum = c.sum - was.sum;
+                float mx;
+                std::memcpy(&mx, &c.maxBits, 4);
+                if (px || c.maxBits != was.maxBits || i == 0 || i == 8) {
+                    if (i == 8) std::snprintf(buf, sizeof buf, "; depth %u px (largest %g, mean %.1f ulps)", px, mx, px ? double(sum) / px : 0.0);
+                    else std::snprintf(buf, sizeof buf, "; target %u: %u px (largest %.1f/255, mean %.2f)", i, px, mx * 255, px ? double(sum) / px : 0.0);
+                    line += buf;
+                }
+                was = c;
+            }
+            std::fprintf(stderr, "[native] compare %s role %u: %" PRIu64 " draws compared, %" PRIu64 " declined%s\n", compareWith_.c_str(), role,
+                         compareDrawn_[role], compareDeclined_[role], line.c_str());
+            compareDrawn_[role] = compareDeclined_[role] = 0;
+        }
+    }
+    std::string compareWith_ = std::getenv("LPN_NATIVE_COMPARE") ? std::getenv("LPN_NATIVE_COMPARE") : "";
+    VkPipeline comparePipe_ = VK_NULL_HANDLE;
+    VkPipelineLayout compareLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout compareSetLayout_ = VK_NULL_HANDLE;
+    VkSampler compareSampler_ = VK_NULL_HANDLE;
+    VkBuffer compareBuf_ = VK_NULL_HANDLE;
+    VkDeviceMemory compareMem_ = VK_NULL_HANDLE;
+    void* compareMap_ = nullptr;
+    bool compareFailed_ = false, compareAwaiting_ = false, comparePending_ = false, compareRunning_ = false;
+    Image compareImages_[9];
+    PendingCompare pendingCompare_;
+    uint64_t compareFrame_ = ~0ull, compareSeq_ = 0;
+    uint32_t compareCount_ = 0;
+    uint64_t compareDrawn_[7] = {}, compareDeclined_[7] = {};
+    CompareSlot compareSeen_[kCompareSlots] = {};
+    std::chrono::steady_clock::time_point compareLast_ = std::chrono::steady_clock::now();
 
     native::PassMap passMap_;
     bool nativeOn_ = false;
@@ -7741,7 +8017,13 @@ void main() {
 
         if (!a.ok) return;
         if (upOn_ && a.psm && a.psm->smaa && upscaleSmaa(r, a.psm->smaa, a)) return;
-        if (nativeOn_ && !R().worker_ && a.psm && a.psm->nativePass && nativeDraw(d, r, a)) return;
+        if (nativeOn_ && !R().worker_) {
+            runCompare(); // the last compared draw's: its translated draw is recorded by now
+            if (a.psm && a.psm->nativePass) {
+                if (!compareWith_.empty() && compareWith_ == a.psm->nativePass->name()) nativeCompare(d, r, a); // and drawn as usual
+                else if (nativeDraw(d, r, a)) return;
+            }
+        }
         const bool wasMergeable = R().lastMergeable_;
         R().lastMergeable_ = false;
         if (fastDraw(d, r, a, wasMergeable) || switchDraw(d, r, a)) return;

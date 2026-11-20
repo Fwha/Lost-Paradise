@@ -118,6 +118,9 @@ public:
     virtual PFN_vkCmdPushDescriptorSetKHR pushDescriptorSet() const = 0;
     // The device's maxPushConstantsSize (at least 128).
     virtual uint32_t maxPushConstants() const = 0;
+    // `bytes` of data copied into this frame's upload ring, for a draw recorded now (a storage
+    // buffer; `byteOffset` 0). False when there is no room.
+    virtual bool upload(const void* data, uint32_t bytes, Buffer& out) = 0;
     // A shader module from GLSL (compiled once, kept in the SPIR-V cache); null on an error.
     enum class Stage { Vertex, Fragment, Compute };
     virtual VkShaderModule shader(const std::string& glsl, Stage stage) = 0;
