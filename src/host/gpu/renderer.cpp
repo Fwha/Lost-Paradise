@@ -5584,11 +5584,43 @@ void main() {
             search(e.context, "context");
             search(e.state, "state");
         }
+        // What a draw from the engine alone needs to know: does the view V# agree, and which
+        // offsets, flags and position formats do the casters' shaders read (each kind once).
+        if (same) {
+            uint32_t off[4] = {}, flags = 0;
+            auto load = [&](uint32_t pc, uint32_t* out, uint32_t n) {
+                auto it = a.vs.smrd.find(a.vs.launch.entry + pc);
+                if (it == a.vs.smrd.end() || it->second + n > a.vs.data.size()) return false;
+                std::memcpy(out, &a.vs.data[it->second], n * 4);
+                return true;
+            };
+            const bool got = load(0x10, off, 4) && load(0x20, &flags, 1);
+            uint32_t dfmt = 0, nfmt = 0, foff = 0;
+            for (const gcn::BufferResource& b : a.vs.buffers)
+                if (a.vs.fetchSite && b.pc == a.vs.fetchSite && b.data + 5 < a.vs.data.size()) {
+                    dfmt = b.dfmt, nfmt = b.nfmt, foff = a.vs.data[b.data + 5] >> 8;
+                    break;
+                }
+            char key[160];
+            std::snprintf(key, sizeof key, "site 0x%x vs %s off %g %g %g flags 0x%x pos dfmt %u nfmt %u offset %u fmt 0x%x view %s", e.site,
+                          native::shaderNameAt(a.vs.launch.entry, &readGuest).c_str(), got ? std::bit_cast<float>(off[0]) : -1.0f,
+                          std::bit_cast<float>(off[1]), std::bit_cast<float>(off[2]), flags, dfmt, nfmt, foff, e.vertexFormat & 0xF,
+                          [&] {
+                              for (const auto& [pc, at] : a.vs.smrd) {
+                                  const uint32_t o = uint32_t(pc - a.vs.launch.entry);
+                                  if ((o == 0xbc || o == 0xb0) && at + 2 <= a.vs.data.size())
+                                      return (a.vs.data[at] | (uint64_t(a.vs.data[at + 1] & 0xFFF) << 32)) == (e.view & 0xFFFFFFFFFFull) ? "same" : "differs";
+                              }
+                              return "?";
+                          }());
+            if (engineKinds_.insert(key).second && engineKinds_.size() <= 32) std::fprintf(stderr, "[native] engine check: kind %s\n", key);
+        }
         if (engineStats_[0] + engineStats_[1] == 3000)
             std::fprintf(stderr, "[native] engine check: %" PRIu64 " of 3000 stage shadow draws match the engine's (%" PRIu64 " without one)\n",
                          engineStats_[0], engineStats_[2]);
     }
     uint64_t engineStats_[3] = {}; // matched, differing, uncaptured
+    std::set<std::string> engineKinds_;
 
     native::PassMap passMap_;
     bool nativeOn_ = false;

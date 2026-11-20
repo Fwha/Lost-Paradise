@@ -68,6 +68,8 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
         d.indexAddr = at<uint64_t>(s + 0x688) + uint32_t((uint32_t(first) << ((ib >> 31) + 1)) + (ib & 0x7FFFFFFF));
         d.count = uint32_t(count);
         for (int i = 0; i < 4; ++i) d.constants[i] = at<uint64_t>(s + 0x6c8 + 8 * i);
+        d.view = at<uint64_t>(s + 0x20c8);
+        d.vertexFormat = at<uint32_t>(s + 0x298);
         static std::atomic<int> copies{0};
         if (copies.fetch_add(1) < 3) {
             d.context = std::make_shared<std::vector<uint8_t>>(0x400);

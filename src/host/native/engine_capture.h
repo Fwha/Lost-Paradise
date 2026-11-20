@@ -30,6 +30,8 @@ struct EngineDraw {
     uint64_t indexAddr = 0;   // the first index drawn
     uint32_t count = 0;       // indices
     uint64_t constants[4] = {}; // the vertex stage's first constant buffer slots (state block)
+    uint64_t view = 0;        // the view constants' V# (state block +0x20c8: base in the low 40 bits)
+    uint32_t vertexFormat = 0; // state block +0x298 (stride in bits 4-19, low 4 bits from the buffer)
     // For finding the view constants: the first draws keep copies of the Gnm context (0x400
     // bytes) and its state block (0x4000) as they were at the call.
     std::shared_ptr<std::vector<uint8_t>> context, state;
