@@ -91,6 +91,13 @@ struct Draw {
     Buffer index;
     VkIndexType indexType = VK_INDEX_TYPE_UINT16;
     VkViewport vkViewport{};     // as the translated draw sets it (depth range included)
+    // The translated vertex shader's position adjustments: clip z from [-w, w] to [0, w]
+    // (PA_CL_CLIP_CNTL bit 19 clear), and positions in pixels (PA_CL_VTE_CNTL scaling off) mapped
+    // to clip space. A pass that writes depth other passes test must do the same, or decline.
+    bool clipZHalf = false, pixelPositions = false;
+    // An upscaler is on: scene draws are jittered and the camera is read from them.
+    bool upscaler = false;
+    bool depthBias = false; // polygon offset on (PA_SU_SC_MODE_CNTL)
     VkCullModeFlags cull = VK_CULL_MODE_NONE;
     VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     std::vector<VertexBuffer> vertex;
@@ -109,6 +116,8 @@ public:
     virtual ~Gpu() = default;
     virtual VkDevice device() const = 0;
     virtual PFN_vkCmdPushDescriptorSetKHR pushDescriptorSet() const = 0;
+    // The device's maxPushConstantsSize (at least 128).
+    virtual uint32_t maxPushConstants() const = 0;
     // A shader module from GLSL (compiled once, kept in the SPIR-V cache); null on an error.
     enum class Stage { Vertex, Fragment, Compute };
     virtual VkShaderModule shader(const std::string& glsl, Stage stage) = 0;

@@ -32,11 +32,18 @@ void writeIndirectJump(uint8_t* p, const void* to) {
 
 bool installHooks(uint8_t* base, const Hook* hooks, size_t n, const char* tag) {
     constexpr size_t kSlot = 32;
-    for (size_t i = 0; i < n; ++i)
+    for (size_t i = 0; i < n; ++i) {
         if (std::memcmp(base + hooks[i].at, hooks[i].was.data(), hooks[i].was.size()) != 0) {
             std::fprintf(stderr, "[%s] unexpected eboot code at 0x%x: not patched\n", tag, hooks[i].at);
             return false;
         }
+        // Checked before any is installed: a hook whose moved code and jump back overflow its slot
+        // must not leave the others half done.
+        if (hooks[i].was.size() < 12 || (hooks[i].original && hooks[i].was.size() + 14 > kSlot)) {
+            std::fprintf(stderr, "[%s] hook at 0x%x moves %zu bytes: not patched\n", tag, hooks[i].at, hooks[i].was.size());
+            return false;
+        }
+    }
     void* mem = mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED || n * kSlot > 4096) return false;
     uint8_t* tramp = static_cast<uint8_t*>(mem);

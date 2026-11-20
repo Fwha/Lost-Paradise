@@ -5277,6 +5277,7 @@ void main() {
         explicit NativeGpu(Renderer& r) : r_(r) {}
         VkDevice device() const override { return r_.vk_.device; }
         PFN_vkCmdPushDescriptorSetKHR pushDescriptorSet() const override { return r_.vk_.cmdPushDescriptorSet; }
+        uint32_t maxPushConstants() const override { return r_.vk_.props.limits.maxPushConstantsSize; }
         VkShaderModule shader(const std::string& glsl, Stage stage) override {
             const gcn::GlslStage s = stage == Stage::Vertex     ? gcn::GlslStage::Vertex
                                      : stage == Stage::Compute ? gcn::GlslStage::Compute
@@ -5497,6 +5498,9 @@ void main() {
             const uint32_t vte = r.ctx[reg::kPaClVteCntl];
             const float zs = (vte & 16) ? v[4] : 1, zo = (vte & 32) ? v[5] : 0;
             const bool dx = (r.ctx[reg::kPaClClipCntl] >> 19) & 1;
+            nd.clipZHalf = !dx;
+            nd.pixelPositions = !(vte & 0xF);
+            nd.upscaler = upOn_;
             nd.vkViewport = gameViewport(r, tw, th);
             nd.vkViewport.minDepth = std::clamp(dx ? zo : zo - zs, 0.0f, 1.0f);
             nd.vkViewport.maxDepth = std::clamp(zo + zs, 0.0f, 1.0f);
@@ -5507,6 +5511,7 @@ void main() {
             VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
             rasterState(gs, rs);
             nd.cull = rs.cullMode, nd.frontFace = rs.frontFace;
+            nd.depthBias = rs.depthBiasEnable;
         }
         if (!ringFits(1 << 12)) flush();
         begin();

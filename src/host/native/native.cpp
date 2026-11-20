@@ -4,14 +4,15 @@ namespace host::native {
 
 Pass* aaPass();     // aa.cpp
 Pass* shadowPass(); // shadow.cpp
+Pass* prepassPass(); // prepass.cpp
 
 namespace {
 
 Pass* const* all() {
-    static Pass* const list[] = {aaPass(), shadowPass()};
+    static Pass* const list[] = {aaPass(), shadowPass(), prepassPass()};
     return list;
 }
-constexpr size_t kPasses = 2;
+constexpr size_t kPasses = 3;
 
 } // namespace
 

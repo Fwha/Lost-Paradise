@@ -133,3 +133,25 @@ every step leaves a game that plays:
   draws it there (`onEngineDraw`). The first draws with no PS4 draw packet. On with Native
   Renderer; `LPN_ENGINE_SHADOWS=0` turns it off. The game's state commit still runs; the
   alpha-tested class (sites 0xa51b79, 0xa51d37) needs the materials' textures and is next.
+
+### Stage 2 (skipping the engine's per-caster state work: measured, dropped)
+
+- Codex's reading of 0xe61ae0, 0xeabdb0 and 0xe574c0: not pure deferred emission. 0xeabdb0 issues
+  synchronization when ctx+0x32c bit 2 is set and prepares shaders (0xeba8c0); 0xe61ae0 emits the
+  cull state itself. The native draws also still read depth, cull and viewport from the PM4 state.
+- `LPN_ENGINE_TIMING=1` times the caster loop (0xa51d90), its commits (0xe61ae0 from 0xa51100) and
+  its drawIndex calls. Fwha's run, busiest 10 s: loop 24.3 ms/s, commits 1.9 ms/s, drawIndex
+  3.0 ms/s (327k casters). Skipping both would save under 0.1 ms a frame, so the commits stay.
+
+### Stage 2 (the depth and normal prepass)
+
+- There is no G-buffer: pass 9 is a depth and normal prepass (~2,700 draws) that SSAO and the
+  material passes read. Its draws come from the engine's draw-command lists: list entries
+  (0x36d0's command) call 0xea3f40, which sets the vertex and index buffers in the state block,
+  commits (0xe61ae0) and tail-calls drawIndex (0xeac430), so their origin is 0x3700.
+- `native/prepass.cpp`: vs_normal_rigid[_pt] with ps_normal[_pt] natively. The position is
+  computed with the game's operations in its order, each rounded, as the translated shader does
+  (the material passes depth-test against it), including the translator's clip z mapping. The
+  pixel shader's half rounding before the export is kept too. Declined with an upscaler on (the
+  scene is jittered and the camera read from these draws), positions in pixels or a polygon
+  offset. 240 bytes of push constants.
