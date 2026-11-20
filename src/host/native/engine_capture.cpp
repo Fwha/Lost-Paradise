@@ -87,8 +87,10 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
         for (int i = 0; i < 4; ++i) d.constants[i] = at<uint64_t>(s + 0x6c8 + 8 * i);
         d.view = at<uint64_t>(s + 0x20c8);
         d.vertexFormat = at<uint32_t>(s + 0x298);
-        static std::atomic<int> copies{0};
-        if (copies.fetch_add(1) < 3) {
+        // Three of each class (the alpha-tested class's textures are looked for too).
+        static std::atomic<int> copies[2]{};
+        const bool alphaClass = site == 0xa51b79 || site == 0xa51d37;
+        if (copies[alphaClass].fetch_add(1) < 3) {
             d.context = std::make_shared<std::vector<uint8_t>>(0x400);
             d.state = std::make_shared<std::vector<uint8_t>>(0x4000);
             std::memcpy(d.context->data(), reinterpret_cast<const void*>(ctx), 0x400);

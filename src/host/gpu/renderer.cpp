@@ -5647,7 +5647,7 @@ void main() {
                          "[native] engine check: differs at 0x%x/0x%x: indices 0x%" PRIx64 " x%u, engine 0x%" PRIx64 " x%u; vertices 0x%" PRIx64
                          ", engine 0x%" PRIx64 " (stride %u)\n",
                          d.origin[0], e.site, index, d.count, e.indexAddr, e.count, vertex, e.vertexBase, e.stride);
-        if (same && engineStats_[0] <= 3) {
+        if (same && e.state) { // the draws that kept copies of the state (three of each class)
             // Where the view constants are: the vertex stage's slots against the V# the shader read.
             uint64_t view = 0;
             for (const auto& [pc, at] : a.vs.smrd) {
@@ -5678,6 +5678,17 @@ void main() {
             };
             search(e.context, "context");
             search(e.state, "state");
+            // The alpha-tested casters' texture (pc 0x24 of ps_shadowmap_pt): its T# and S# words.
+            for (const gcn::ImageResource& im : a.ps.images) {
+                if (im.pc - a.ps.launch.entry != 0x24 || !e.state) continue;
+                std::fprintf(stderr, "[native] engine check:   alpha texture T# %08x %08x %08x %08x S# %08x %08x\n", im.t[0], im.t[1], im.t[2],
+                             im.t[3], im.s[0], im.s[1]);
+                const auto& b = *e.state;
+                for (size_t o = 0; o + 16 <= b.size(); o += 4) {
+                    if (std::memcmp(b.data() + o, im.t, 16) == 0) std::fprintf(stderr, "[native] engine check:   state+0x%zx = the T#\n", o);
+                    if (std::memcmp(b.data() + o, im.s, 8) == 0) std::fprintf(stderr, "[native] engine check:   state+0x%zx = the S#\n", o);
+                }
+            }
         }
         // What a draw from the engine alone needs to know: does the view V# agree, and which
         // offsets, flags and position formats do the casters' shaders read (each kind once).
@@ -5691,15 +5702,19 @@ void main() {
             };
             const bool got = load(0x10, off, 4) && load(0x20, &flags, 1);
             uint32_t dfmt = 0, nfmt = 0, foff = 0;
+            int64_t uvAt = -1; // the coordinates' slot: where in the vertex, and its format
+            uint32_t uvFmt = 0, slotIndex = 0;
             for (const gcn::BufferResource& b : a.vs.buffers)
                 if (a.vs.fetchSite && b.pc == a.vs.fetchSite && b.data + 5 < a.vs.data.size()) {
-                    dfmt = b.dfmt, nfmt = b.nfmt, foff = a.vs.data[b.data + 5] >> 8;
-                    break;
+                    if (slotIndex == 0) dfmt = b.dfmt, nfmt = b.nfmt, foff = a.vs.data[b.data + 5] >> 8;
+                    if (slotIndex == 1 && b.known) uvAt = int64_t(b.base() + (a.vs.data[b.data + 5] >> 8)) - int64_t(e.vertexBase), uvFmt = b.dfmt | b.nfmt << 4 | (b.sharp[3] & 0xFFF) << 8;
+                    ++slotIndex;
                 }
-            char key[160];
-            std::snprintf(key, sizeof key, "site 0x%x vs %s off %g %g %g flags 0x%x pos dfmt %u nfmt %u offset %u fmt 0x%x view %s", e.site,
+            char key[200];
+            std::snprintf(key, sizeof key, "site 0x%x vs %s off %g %g %g flags 0x%x pos dfmt %u nfmt %u offset %u fmt 0x%x uv at %lld fmt 0x%x stride %u view %s", e.site,
                           native::shaderNameAt(a.vs.launch.entry, &readGuest).c_str(), got ? std::bit_cast<float>(off[0]) : -1.0f,
                           std::bit_cast<float>(off[1]), std::bit_cast<float>(off[2]), flags, dfmt, nfmt, foff, e.vertexFormat & 0xF,
+                          (long long)uvAt, uvFmt, e.stride,
                           [&] {
                               for (const auto& [pc, at] : a.vs.smrd) {
                                   const uint32_t o = uint32_t(pc - a.vs.launch.entry);
