@@ -5563,6 +5563,26 @@ void main() {
             std::fprintf(stderr, "[native] engine check: draw at 0x%x matches; view constants V# 0x%" PRIx64
                                  ", state slots 0x%" PRIx64 " 0x%" PRIx64 " 0x%" PRIx64 " 0x%" PRIx64 "\n",
                          e.site, view, e.constants[0], e.constants[1], e.constants[2], e.constants[3]);
+            // Where the context or its state block holds that address (or a pointer to a V# of it).
+            auto search = [&](const std::shared_ptr<std::vector<uint8_t>>& block, const char* what) {
+                if (!block || !view) return;
+                for (size_t o = 0; o + 8 <= block->size(); o += 4) {
+                    uint64_t v;
+                    std::memcpy(&v, block->data() + o, 8);
+                    const uint64_t lo40 = v & 0xFFFFFFFFFFull;
+                    bool hit = lo40 == view || (v >> 8) == (view >> 8);
+                    if (!hit && v >= 0x100000000ull && v < (1ull << 40)) { // a pointer to a V# of it
+                        uint32_t w[2];
+                        if (readGuest(v, w, 8) && (w[0] | (uint64_t(w[1] & 0xFFF) << 32)) == view) {
+                            std::fprintf(stderr, "[native] engine check:   %s+0x%zx -> V# of the view constants\n", what, o);
+                            continue;
+                        }
+                    }
+                    if (hit) std::fprintf(stderr, "[native] engine check:   %s+0x%zx = 0x%" PRIx64 "\n", what, o, v);
+                }
+            };
+            search(e.context, "context");
+            search(e.state, "state");
         }
         if (engineStats_[0] + engineStats_[1] == 3000)
             std::fprintf(stderr, "[native] engine check: %" PRIu64 " of 3000 stage shadow draws match the engine's (%" PRIu64 " without one)\n",

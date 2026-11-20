@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <deque>
 #include <mutex>
 
@@ -67,6 +68,13 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
         d.indexAddr = at<uint64_t>(s + 0x688) + uint32_t((uint32_t(first) << ((ib >> 31) + 1)) + (ib & 0x7FFFFFFF));
         d.count = uint32_t(count);
         for (int i = 0; i < 4; ++i) d.constants[i] = at<uint64_t>(s + 0x6c8 + 8 * i);
+        static std::atomic<int> copies{0};
+        if (copies.fetch_add(1) < 3) {
+            d.context = std::make_shared<std::vector<uint8_t>>(0x400);
+            d.state = std::make_shared<std::vector<uint8_t>>(0x4000);
+            std::memcpy(d.context->data(), reinterpret_cast<const void*>(ctx), 0x400);
+            std::memcpy(d.state->data(), reinterpret_cast<const void*>(s), 0x4000);
+        }
         std::lock_guard lock(gMutex);
         if (gQueue.size() < kMaxQueued) gQueue.push_back(d);
     }

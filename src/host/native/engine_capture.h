@@ -10,6 +10,8 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <vector>
 
 namespace host {
 class Module;
@@ -28,6 +30,9 @@ struct EngineDraw {
     uint64_t indexAddr = 0;   // the first index drawn
     uint32_t count = 0;       // indices
     uint64_t constants[4] = {}; // the vertex stage's first constant buffer slots (state block)
+    // For finding the view constants: the first draws keep copies of the Gnm context (0x400
+    // bytes) and its state block (0x4000) as they were at the call.
+    std::shared_ptr<std::vector<uint8_t>> context, state;
 };
 
 // Whether a draw's origin (DrawCall::origin[0]) is a site the capture covers.
