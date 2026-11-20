@@ -147,6 +147,11 @@ struct Claim {
 };
 Claim claim(const std::string& psName);
 
+// A stage shadow caster drawn from the engine's capture (engine_capture.h), with `d` holding
+// the depth target and state from the registers and the capture's buffers (shadow.cpp).
+struct EngineCaster;
+bool drawStageCaster(const EngineCaster& c, const Draw& d, Gpu& gpu);
+
 // A fullscreen-triangle vertex shader (no inputs) that native passes share.
 extern const char* const kFullscreenVs;
 

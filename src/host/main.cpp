@@ -18,6 +18,7 @@
 #include "host/kernel.h"
 #include "host/linker.h"
 #include "host/module.h"
+#include "host/native/engine_capture.h"
 #include "host/native/shader_names.h"
 #include "host/profile.h"
 #include "host/tls.h"
@@ -207,6 +208,7 @@ int main(int argc, char** argv) {
         host::patchRenderResolution(*modules[0], w, h, upscale);
     }
     host::patchDrawSites(*modules[0]);
+    host::native::installEngineCapture(*modules[0]);
 
     const host::ThreadPointerSlot tpSlot = host::guestThreadPointerSlot();
     for (auto* m : modules) {

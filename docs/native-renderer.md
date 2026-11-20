@@ -117,3 +117,19 @@ every step leaves a game that plays:
 - Native draws now share render passes (`Gpu::beginRendering`) and take part in the translated
   path's barrier tracking. Still drawn from the game's draws; switching the game's shadow code
   off and drawing from captured scene data comes next.
+
+### Stage 2 (shadow maps from the engine)
+
+- Skinned casters (`vs_shadowmap_skin`) natively: four bones from the palette, the floor-relative
+  translation blend.
+- `native/engine_capture`: a hook on the engine's drawIndex (0xeac430) reads each stage shadow
+  caster draw of 0xa51100 from the Gnm context's state block (vertex buffer +0x288, stride in
+  +0x298, capacity +0x294, index buffer +0x688/+0x690, view constants' V# +0x20c8). The casters'
+  list, mesh ranges and batching are in `docs/frame-map.md`'s engine notes and the commit history.
+  `LPN_ENGINE_CHECK=1` compares every capture with the draw the game sends (3000 of 3000 matched in
+  Fwha's runs; offsets 0, the camera always subtracted, 3-float positions).
+- The stage's opaque casters (sites 0xa5177a, 0xa518fe) are now drawn from the captures alone:
+  the packet helper writes a NOP with the capture's id where the draw packet was, and the renderer
+  draws it there (`onEngineDraw`). The first draws with no PS4 draw packet. On with Native
+  Renderer; `LPN_ENGINE_SHADOWS=0` turns it off. The game's state commit still runs; the
+  alpha-tested class (sites 0xa51b79, 0xa51d37) needs the materials' textures and is next.

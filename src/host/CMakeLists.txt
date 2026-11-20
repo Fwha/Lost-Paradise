@@ -35,6 +35,7 @@ add_executable(lpn-host
     gpu/tiling.cpp
     gpu/vk.cpp
     native/aa.cpp
+    native/engine_capture.cpp
     native/native.cpp
     native/pass_map.cpp
     native/shader_names.cpp

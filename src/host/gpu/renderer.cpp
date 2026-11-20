@@ -22,6 +22,7 @@
 #include "host/kernel.h"
 #include "host/memory.h"
 #include "host/module.h"
+#include "host/native/engine_capture.h"
 #include "host/native/native.h"
 #include "host/native/pass_map.h"
 #include "host/native/shader_names.h"
@@ -1090,6 +1091,7 @@ public:
         if (upPrevScene_ && !smaaSeen_) upscalePrevWritten(d, r, *held);
         if (upIn_.on && smaaSeen_ && !upEffect_ && upLastScene_) upscaleEffect(d, r, *held);
         if (passMap_.active()) passMap_.onDraw(d, r, &readGuest);
+        if (native::engineCheckOn() && d.kind == DrawCall::kIndexed && native::engineSite(d.origin[0])) engineCheck(d, r, *held);
         // A draw a native pass takes is recorded here, in order (see nativeDraw).
         const bool native = nativeOn_ && d.kind != DrawCall::kDispatch && nativeClaimed(*held);
         if (recordThreads_) {
@@ -5527,6 +5529,193 @@ void main() {
         if (depthWritten) gpuWrote(*depthWritten);
         return true;
     }
+
+    // LPN_ENGINE_SHADOWS (native/engine_capture.h): a stage shadow caster the engine described,
+    // drawn natively where the game's draw would have been. Its depth target and state come from
+    // the registers, its buffers and constants from the capture.
+    void onEngineDraw(uint32_t id, const GpuRegs& gr) override {
+        if (recordThreads_) drainSegments(0); // in order with the draws before it
+        std::lock_guard lock(m_);
+        native::EngineCaster c;
+        if (!native::engineCaster(id, c)) {
+            if (engineLost_++ < 5) std::fprintf(stderr, "[native] engine draw %u: its capture is gone\n", id);
+            return;
+        }
+        const DrawRegs r = DrawRegs::of(gr);
+        native::Draw nd;
+        nd.primitive = r.prim;
+        nd.count = c.draw.count;
+        const uint32_t depthControl = r.ctx[reg::kDbDepthControl];
+        const uint32_t zInfo = r.ctx[reg::kDbZInfo];
+        if (!(zInfo & 3)) return;
+        const bool stencil = r.ctx[reg::kDbStencilInfo] & 1;
+        const VkFormat f = stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : (zInfo & 3) == 1 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
+        const uint32_t size = r.ctx[reg::kDbDepthSize];
+        const uint32_t dw = ((size & 0x7FF) + 1) * 8, dh = (((size >> 11) & 0x7FF) + 1) * 8;
+        Surface* s = depthSurface(uint64_t(r.ctx[reg::kDbZReadBase]) << 8, dw, dh, f);
+        if (!s) return;
+        nd.depth = {view(s->img, f, VK_IMAGE_VIEW_TYPE_2D, kIdentity, s->img.aspect), s->img.image, f, s->img.width, s->img.height,
+                    uint64_t(r.ctx[reg::kDbZReadBase]) << 8};
+        nd.hasStencil = stencil;
+        nd.stencil = stencil && (depthControl & 1);
+        nd.depthTest = (depthControl >> 1) & 1;
+        nd.depthWrite = (depthControl >> 2) & 1;
+        GraphicsState gs{};
+        gs.depthFormat = f, gs.stencil = stencil, gs.depthControl = depthControl;
+        gs.stencilControl = r.ctx[reg::kDbStencilControl];
+        gs.topology = r.prim;
+        gs.modeCntl = r.ctx[reg::kPaSuScModeCntl];
+        depthState(gs, nd.depthStencil);
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rasterState(gs, rs);
+        nd.cull = rs.cullMode, nd.frontFace = rs.frontFace;
+        {
+            const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
+            const uint32_t vte = r.ctx[reg::kPaClVteCntl];
+            const float zs = (vte & 16) ? v[4] : 1, zo = (vte & 32) ? v[5] : 0;
+            const bool dx = (r.ctx[reg::kPaClClipCntl] >> 19) & 1;
+            nd.vkViewport = gameViewport(r, s->img.width, s->img.height);
+            nd.vkViewport.minDepth = std::clamp(dx ? zo : zo - zs, 0.0f, 1.0f);
+            nd.vkViewport.maxDepth = std::clamp(zo + zs, 0.0f, 1.0f);
+            if (nd.vkViewport.width < 0) nd.vkViewport.x += nd.vkViewport.width, nd.vkViewport.width = -nd.vkViewport.width;
+            int32_t x0 = 0, y0 = 0, x1 = int32_t(s->img.width), y1 = int32_t(s->img.height);
+            auto clip = [&](uint32_t tl, uint32_t br) {
+                if (!br) return;
+                x0 = std::max<int32_t>(x0, tl & 0x7FFF), y0 = std::max<int32_t>(y0, (tl >> 16) & 0x7FFF);
+                x1 = std::min<int32_t>(x1, br & 0x7FFF), y1 = std::min<int32_t>(y1, (br >> 16) & 0x7FFF);
+            };
+            clip(r.ctx[reg::kScreenScissorTl], r.ctx[reg::kScreenScissorBr]);
+            clip(r.ctx[reg::kGenericScissorTl], r.ctx[reg::kGenericScissorBr]);
+            clip(r.ctx[reg::kWindowScissorTl], r.ctx[reg::kWindowScissorBr]);
+            if ((r.ctx[0x292] >> 1) & 1) clip(r.ctx[reg::kVportScissorTl], r.ctx[reg::kVportScissorBr]);
+            nd.scissor[0] = x0, nd.scissor[1] = y0, nd.scissor[2] = std::max(0, x1 - x0), nd.scissor[3] = std::max(0, y1 - y0);
+        }
+        auto buffer = [&](uint64_t base, uint64_t bytes, native::Buffer& out) {
+            VkDeviceSize off = 0;
+            if (!vramBuffer(base, bytes, out.buffer, off) && !guestBuffer(base, bytes, out.buffer, off)) return false;
+            out.offset = off & ~(storageAlign_ - 1);
+            out.byteOffset = uint32_t(off - out.offset);
+            out.range = std::min<VkDeviceSize>(bytes + out.byteOffset, vk_.props.limits.maxStorageBufferRange);
+            return true;
+        };
+        native::VertexBuffer vb;
+        vb.slot = 0, vb.components = 3, vb.stride = c.draw.stride, vb.records = c.vertices, vb.dfmt = 13, vb.nfmt = 7, vb.dstSel = 0xFAC;
+        const uint64_t vbytes = std::max<uint64_t>(uint64_t(c.vertices) * c.draw.stride, 16);
+        if (!buffer(c.draw.vertexBase, vbytes, vb.data)) return;
+        nd.vertex.push_back(vb);
+        nd.indexed = true;
+        nd.indexType = c.index32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+        if (!buffer(c.draw.indexAddr, uint64_t(c.draw.count) * (c.index32 ? 4 : 2), nd.index)) return;
+        if (!ringFits(1 << 12)) flush();
+        begin();
+        NativeGpu gpu(*this);
+        if (!native::drawStageCaster(c, nd, gpu)) {
+            if (engineLost_++ < 5) std::fprintf(stderr, "[native] engine draw %u: the shadow pass could not draw it\n", id);
+            return;
+        }
+        R().needBarrier_ = true;
+        for (VkImage im : R().pass_.images) addOnce(R().drawWritten_, im);
+        R().bound_ = Bound{};
+        ++R().passSerial_;
+        R().fast_.valid = false;
+        for (FastSlot& fs : R().fastSlots_) fs.f.valid = false;
+        R().lastMergeable_ = false;
+        ++fastEpoch_;
+        if (nd.depthWrite) gpuWrote(*s);
+    }
+    uint32_t engineLost_ = 0;
+
+    // LPN_ENGINE_CHECK (native/engine_capture.h): a draw of the stage shadow casters against the
+    // engine's own description of it, kept at its drawIndex call.
+    void engineCheck(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
+        native::EngineDraw e;
+        if (!native::takeEngineDraw(e)) {
+            if (engineStats_[2]++ < 5) std::fprintf(stderr, "[native] engine check: draw from 0x%x without a captured one\n", d.origin[0]);
+            return;
+        }
+        const uint64_t index = d.indexAddr + uint64_t(d.indexOffset) * (r.indexType ? 4 : 2);
+        uint64_t vertex = 0;
+        for (const gcn::BufferResource& b : a.vs.buffers)
+            if (a.vs.fetchSite && b.pc == a.vs.fetchSite && b.known) {
+                vertex = b.base();
+                break;
+            }
+        const bool same = e.site == d.origin[0] && e.indexAddr == index && e.count == d.count && (!vertex || e.vertexBase == vertex);
+        ++engineStats_[same ? 0 : 1];
+        if (!same && engineStats_[1] <= 20)
+            std::fprintf(stderr,
+                         "[native] engine check: differs at 0x%x/0x%x: indices 0x%" PRIx64 " x%u, engine 0x%" PRIx64 " x%u; vertices 0x%" PRIx64
+                         ", engine 0x%" PRIx64 " (stride %u)\n",
+                         d.origin[0], e.site, index, d.count, e.indexAddr, e.count, vertex, e.vertexBase, e.stride);
+        if (same && engineStats_[0] <= 3) {
+            // Where the view constants are: the vertex stage's slots against the V# the shader read.
+            uint64_t view = 0;
+            for (const auto& [pc, at] : a.vs.smrd) {
+                const uint32_t off = uint32_t(pc - a.vs.launch.entry);
+                if ((off == 0xbc || off == 0xb0 || off == 0x2c0) && at + 2 <= a.vs.data.size())
+                    view = (a.vs.data[at] | (uint64_t(a.vs.data[at + 1] & 0xFFF) << 32));
+            }
+            std::fprintf(stderr, "[native] engine check: draw at 0x%x matches; view constants V# 0x%" PRIx64
+                                 ", state slots 0x%" PRIx64 " 0x%" PRIx64 " 0x%" PRIx64 " 0x%" PRIx64 "\n",
+                         e.site, view, e.constants[0], e.constants[1], e.constants[2], e.constants[3]);
+            // Where the context or its state block holds that address (or a pointer to a V# of it).
+            auto search = [&](const std::shared_ptr<std::vector<uint8_t>>& block, const char* what) {
+                if (!block || !view) return;
+                for (size_t o = 0; o + 8 <= block->size(); o += 4) {
+                    uint64_t v;
+                    std::memcpy(&v, block->data() + o, 8);
+                    const uint64_t lo40 = v & 0xFFFFFFFFFFull;
+                    bool hit = lo40 == view || (v >> 8) == (view >> 8);
+                    if (!hit && v >= 0x100000000ull && v < (1ull << 40)) { // a pointer to a V# of it
+                        uint32_t w[2];
+                        if (readGuest(v, w, 8) && (w[0] | (uint64_t(w[1] & 0xFFF) << 32)) == view) {
+                            std::fprintf(stderr, "[native] engine check:   %s+0x%zx -> V# of the view constants\n", what, o);
+                            continue;
+                        }
+                    }
+                    if (hit) std::fprintf(stderr, "[native] engine check:   %s+0x%zx = 0x%" PRIx64 "\n", what, o, v);
+                }
+            };
+            search(e.context, "context");
+            search(e.state, "state");
+        }
+        // What a draw from the engine alone needs to know: does the view V# agree, and which
+        // offsets, flags and position formats do the casters' shaders read (each kind once).
+        if (same) {
+            uint32_t off[4] = {}, flags = 0;
+            auto load = [&](uint32_t pc, uint32_t* out, uint32_t n) {
+                auto it = a.vs.smrd.find(a.vs.launch.entry + pc);
+                if (it == a.vs.smrd.end() || it->second + n > a.vs.data.size()) return false;
+                std::memcpy(out, &a.vs.data[it->second], n * 4);
+                return true;
+            };
+            const bool got = load(0x10, off, 4) && load(0x20, &flags, 1);
+            uint32_t dfmt = 0, nfmt = 0, foff = 0;
+            for (const gcn::BufferResource& b : a.vs.buffers)
+                if (a.vs.fetchSite && b.pc == a.vs.fetchSite && b.data + 5 < a.vs.data.size()) {
+                    dfmt = b.dfmt, nfmt = b.nfmt, foff = a.vs.data[b.data + 5] >> 8;
+                    break;
+                }
+            char key[160];
+            std::snprintf(key, sizeof key, "site 0x%x vs %s off %g %g %g flags 0x%x pos dfmt %u nfmt %u offset %u fmt 0x%x view %s", e.site,
+                          native::shaderNameAt(a.vs.launch.entry, &readGuest).c_str(), got ? std::bit_cast<float>(off[0]) : -1.0f,
+                          std::bit_cast<float>(off[1]), std::bit_cast<float>(off[2]), flags, dfmt, nfmt, foff, e.vertexFormat & 0xF,
+                          [&] {
+                              for (const auto& [pc, at] : a.vs.smrd) {
+                                  const uint32_t o = uint32_t(pc - a.vs.launch.entry);
+                                  if ((o == 0xbc || o == 0xb0) && at + 2 <= a.vs.data.size())
+                                      return (a.vs.data[at] | (uint64_t(a.vs.data[at + 1] & 0xFFF) << 32)) == (e.view & 0xFFFFFFFFFFull) ? "same" : "differs";
+                              }
+                              return "?";
+                          }());
+            if (engineKinds_.insert(key).second && engineKinds_.size() <= 32) std::fprintf(stderr, "[native] engine check: kind %s\n", key);
+        }
+        if (engineStats_[0] + engineStats_[1] == 3000)
+            std::fprintf(stderr, "[native] engine check: %" PRIu64 " of 3000 stage shadow draws match the engine's (%" PRIu64 " without one)\n",
+                         engineStats_[0], engineStats_[2]);
+    }
+    uint64_t engineStats_[3] = {}; // matched, differing, uncaptured
+    std::set<std::string> engineKinds_;
 
     native::PassMap passMap_;
     bool nativeOn_ = false;

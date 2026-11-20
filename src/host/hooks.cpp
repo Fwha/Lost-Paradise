@@ -19,6 +19,15 @@ void writeJump(uint8_t* p, const void* fn) {
     p[10] = 0xff, p[11] = 0xe0;
 }
 
+// jmp qword ptr [rip]; .quad to: back to the game from a trampoline without touching a register
+// (the instructions it moved may have set %rax, as eac430's `mov eax, ecx`). 14 bytes.
+void writeIndirectJump(uint8_t* p, const void* to) {
+    p[0] = 0xff, p[1] = 0x25;
+    std::memset(p + 2, 0, 4);
+    const uint64_t target = reinterpret_cast<uint64_t>(to);
+    std::memcpy(p + 6, &target, 8);
+}
+
 } // namespace
 
 bool installHooks(uint8_t* base, const Hook* hooks, size_t n, const char* tag) {
@@ -35,8 +44,9 @@ bool installHooks(uint8_t* base, const Hook* hooks, size_t n, const char* tag) {
     for (size_t i = 0; i < n; ++i) {
         const Hook& h = hooks[i];
         if (h.original) {
+            if (h.was.size() + 14 > kSlot) return false;
             std::memcpy(tramp, h.was.data(), h.was.size());
-            writeJump(tramp + h.was.size(), base + h.at + h.was.size());
+            writeIndirectJump(tramp + h.was.size(), base + h.at + h.was.size());
             *h.original = tramp;
             tramp += kSlot;
         }

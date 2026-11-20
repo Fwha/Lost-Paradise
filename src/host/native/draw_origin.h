@@ -18,6 +18,9 @@ struct Origin {
 // The origin of the draw this thread is about to write (set by the wrapper hook, taken by the
 // packet helper).
 inline thread_local Origin tPendingOrigin{};
+// Set by a hook that calls the engine function above the draw wrapper itself (so the wrapper's
+// own return address is the hook's): the origin to use for the next draw instead.
+inline thread_local Origin tForcedOrigin{};
 
 // The NOP's three payload dwords: each offset (below 2^26) with this tag in its top 6 bits.
 constexpr uint32_t kOriginTag = 0x2Du << 26;

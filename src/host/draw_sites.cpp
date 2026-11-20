@@ -100,7 +100,11 @@ void count(Kind kind, const uint64_t* frame) {
         fp = reinterpret_cast<const uint64_t*>(fp[0]);
     }
     // The draw's origin, for the packet the wrapper writes next (native/draw_origin.h).
-    if (kind != kDispatch) native::tPendingOrigin = {{k.at[0], k.at[1], k.at[2]}};
+    if (kind != kDispatch) {
+        native::Origin& forced = native::tForcedOrigin;
+        native::tPendingOrigin = forced.at[0] ? forced : native::Origin{{k.at[0], k.at[1], k.at[2]}};
+        forced = {};
+    }
     if (!gCounting) return;
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard lock(gMutex);
