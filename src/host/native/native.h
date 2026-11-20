@@ -97,6 +97,7 @@ struct Draw {
     bool clipZHalf = false, pixelPositions = false;
     // An upscaler is on: scene draws are jittered and the camera is read from them.
     bool upscaler = false;
+    bool depthBias = false; // polygon offset on (PA_SU_SC_MODE_CNTL)
     VkCullModeFlags cull = VK_CULL_MODE_NONE;
     VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     std::vector<VertexBuffer> vertex;

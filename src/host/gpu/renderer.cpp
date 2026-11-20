@@ -5511,6 +5511,7 @@ void main() {
             VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
             rasterState(gs, rs);
             nd.cull = rs.cullMode, nd.frontFace = rs.frontFace;
+            nd.depthBias = rs.depthBiasEnable;
         }
         if (!ringFits(1 << 12)) flush();
         begin();

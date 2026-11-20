@@ -186,6 +186,7 @@ public:
         // and the camera read from the first of them, which stays with the translated renderer.
         if (d.upscaler) return decline(role, "an upscaler is on");
         if (d.pixelPositions) return decline(role, "positions in pixels");
+        if (d.depthBias) return decline(role, "a polygon offset");
         if (gpu.maxPushConstants() < sizeof(Push)) return decline(role, "a device with fewer than 240 bytes of push constants");
         if (d.colorCount != 1 || !d.color[0].view || !d.depth.view) return decline(role, "not one colour target with depth");
         if (d.blend || d.stencil) return decline(role, "blending or stencil");
