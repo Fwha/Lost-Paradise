@@ -665,9 +665,11 @@ vec3 directionalDiffuse =
     lightColor0 * directionalShadowTint * ndotl0 +
     lightColor1 * shadowG * ndotl1;
 
+// Corrected in review: the ambient texture term is weighted by adjustedBase here
+// (0x800) and again with the rest (0x90c).
 vec3 diffuseLighting =
     vertexTint *
-        (ambientTextureColor +
+        (ambientTextureColor * adjustedBase +
          F3(PSV[0x10],0x100) +
          diffuseColor * directionalDiffuse);
 
