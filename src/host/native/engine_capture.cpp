@@ -32,7 +32,9 @@ bool gOn = false;
 std::mutex gMutex;
 std::deque<EngineDraw> gQueue;
 bool gShadows = false; // LPN_ENGINE_SHADOWS
-constexpr uint32_t kCasters = 1 << 14; // captures kept (a frame has a few hundred)
+// Captures kept: a frame has a few hundred and the renderer is at most a few frames behind the
+// game, so an id is drawn long before its slot comes round again (a lost one is logged).
+constexpr uint32_t kCasters = 1 << 16;
 std::mutex gCasterMutex;
 std::vector<EngineCaster> gCasters(kCasters);
 std::vector<uint32_t> gCasterIds(kCasters, ~0u);

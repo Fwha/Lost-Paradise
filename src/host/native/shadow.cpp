@@ -16,6 +16,7 @@
 #include "host/native/native.h"
 #include "host/native/engine_capture.h"
 
+#include <bit>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -266,7 +267,11 @@ public:
             uint32_t w[2];
             if (!d.load(0xc, w, 2)) return decline(role, "no bias constants");
             std::memcpy(push.bias, w, 8);
-            std::memcpy(lastBias_, w, 8); // for the casters drawn from the engine's captures
+            // For the casters drawn from the engine's captures, which do not read their pixel
+            // constants: every opaque caster has had the same (1, 0.01) so far; a change is logged.
+            if (std::memcmp(lastBias_, w, 8) != 0 && biasChanges_++ < 8)
+                std::fprintf(stderr, "[native] shadow: caster bias constants %g %g\n", std::bit_cast<float>(w[0]), std::bit_cast<float>(w[1]));
+            std::memcpy(lastBias_, w, 8);
         }
         VkPipeline pipe = pipeline(gpu, role, d);
         if (!pipe) return decline(role, "no pipeline");
@@ -356,6 +361,7 @@ public:
 
 private:
     float lastBias_[2] = {1.0f, 0.01f}; // the opaque casters' bias constants, as last seen
+    uint32_t biasChanges_ = 0;
     bool engineLogged_ = false;
 
     // A fetch slot in a format the skinned shader decodes (32-, 16- or 8-bit channels).
