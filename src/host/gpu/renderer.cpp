@@ -5277,6 +5277,7 @@ void main() {
         explicit NativeGpu(Renderer& r) : r_(r) {}
         VkDevice device() const override { return r_.vk_.device; }
         PFN_vkCmdPushDescriptorSetKHR pushDescriptorSet() const override { return r_.vk_.cmdPushDescriptorSet; }
+        uint32_t maxPushConstants() const override { return r_.vk_.props.limits.maxPushConstantsSize; }
         VkShaderModule shader(const std::string& glsl, Stage stage) override {
             const gcn::GlslStage s = stage == Stage::Vertex     ? gcn::GlslStage::Vertex
                                      : stage == Stage::Compute ? gcn::GlslStage::Compute

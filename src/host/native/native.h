@@ -109,6 +109,8 @@ public:
     virtual ~Gpu() = default;
     virtual VkDevice device() const = 0;
     virtual PFN_vkCmdPushDescriptorSetKHR pushDescriptorSet() const = 0;
+    // The device's maxPushConstantsSize (at least 128).
+    virtual uint32_t maxPushConstants() const = 0;
     // A shader module from GLSL (compiled once, kept in the SPIR-V cache); null on an error.
     enum class Stage { Vertex, Fragment, Compute };
     virtual VkShaderModule shader(const std::string& glsl, Stage stage) = 0;
