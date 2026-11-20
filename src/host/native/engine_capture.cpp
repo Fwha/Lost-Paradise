@@ -12,6 +12,7 @@
 #include <cstring>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <mutex>
 
@@ -41,6 +42,57 @@ std::mutex gCasterMutex;
 std::vector<EngineCaster> gCasters(kCasters);
 std::vector<uint32_t> gCasterIds(kCasters, ~0u);
 uint32_t gNextCaster = 0;
+
+// LPN_ENGINE_TIMING: how long the game spends in the stage caster loop (0xa51d90), in its
+// per-batch state commit (0xe61ae0 called from 0xa51100) and in drawIndex for those casters,
+// logged every 10 s of wall time: what skipping the engine's own state work could save.
+bool gTiming = false;
+Fn gCasterLoop = nullptr, gCommit = nullptr;
+std::atomic<uint64_t> gLoopNs{0}, gCommitNs{0}, gDrawNs{0}, gDrawsCaptured{0}, gDrawsGame{0}, gLoops{0}, gCommits{0};
+std::atomic<int64_t> gTimingStart{0};
+
+int64_t nowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void timingReport(int64_t now) {
+    int64_t start = gTimingStart.load();
+    if (!start) {
+        gTimingStart.compare_exchange_strong(start, now);
+        return;
+    }
+    if (now - start < 10'000'000'000ll || !gTimingStart.compare_exchange_strong(start, now)) return;
+    const double s = double(now - start) / 1e9;
+    const uint64_t loops = gLoops.exchange(0), commits = gCommits.exchange(0);
+    const uint64_t captured = gDrawsCaptured.exchange(0), game = gDrawsGame.exchange(0);
+    std::fprintf(stderr,
+                 "[native] engine timing over %.1f s: caster loop %.2f ms/s (%llu calls), its state commits %.2f ms/s (%llu), "
+                 "its drawIndex %.2f ms/s (%llu drawn from captures, %llu by the game)\n",
+                 s, double(gLoopNs.exchange(0)) / 1e6 / s, (unsigned long long)loops, double(gCommitNs.exchange(0)) / 1e6 / s,
+                 (unsigned long long)commits, double(gDrawNs.exchange(0)) / 1e6 / s, (unsigned long long)captured,
+                 (unsigned long long)game);
+}
+
+uint64_t casterLoop(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+    const int64_t t = nowNs();
+    const uint64_t r = gCasterLoop(a, b, c, d, e, f);
+    const int64_t n = nowNs();
+    gLoopNs += uint64_t(n - t);
+    ++gLoops;
+    timingReport(n);
+    return r;
+}
+
+uint64_t commit(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
+    const auto* frame = static_cast<const uint64_t*>(LPN_GUEST_FRAME());
+    const uint64_t ret = frame[1] - reinterpret_cast<uint64_t>(gBase);
+    if (ret < 0xa51100 || ret >= 0xa51d90) return gCommit(a, b, c, d, e, f);
+    const int64_t t = nowNs();
+    const uint64_t r = gCommit(a, b, c, d, e, f);
+    gCommitNs += uint64_t(nowNs() - t);
+    ++gCommits;
+    return r;
+}
 
 bool readGuestFloats(uint64_t addr, float* out, size_t n) {
     if (!addr || addr >= (1ull << 40)) return false;
@@ -201,7 +253,14 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
             if (gQueue.size() < kMaxQueued) gQueue.push_back(d);
         }
     }
+    const bool timed = gTiming && engineSite(site);
+    const bool captured = tEngineDrawId != 0;
+    const int64_t t = timed ? nowNs() : 0;
     const uint64_t r = gDrawIndex(ctx, count, first, baseVertex, r8, r9);
+    if (timed) {
+        gDrawNs += uint64_t(nowNs() - t);
+        ++(captured ? gDrawsCaptured : gDrawsGame);
+    }
     tForcedOrigin = {}; // not left for another draw when this one wrote none
     tEngineDrawId = 0;
     return r;
@@ -252,6 +311,18 @@ bool installEngineCapture(Module& eboot) {
     gBase = eboot.base();
     if (!installHooks(gBase, hooks, std::size(hooks), "engine")) return false;
     gOn = true;
+    if (on("LPN_ENGINE_TIMING")) {
+        // push rbp; mov rbp, rsp; push r15..rbx; sub rsp, imm
+        const Hook timing[] = {
+            {0xa51d90, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x48},
+             guestHook<&casterLoop>(), reinterpret_cast<void**>(&gCasterLoop)},
+            {0xe61ae0,
+             {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0xb8, 0x00, 0x00, 0x00},
+             guestHook<&commit>(), reinterpret_cast<void**>(&gCommit)},
+        };
+        gTiming = installHooks(gBase, timing, std::size(timing), "engine timing");
+        if (gTiming) std::fprintf(stderr, "[native] engine timing: the stage caster loop is timed (LPN_ENGINE_TIMING)\n");
+    }
     if (gShadows) std::fprintf(stderr, "[native] engine capture: the stage's opaque shadow casters are drawn from the engine (LPN_ENGINE_SHADOWS)\n");
     else std::fprintf(stderr, "[native] engine capture: checking the stage shadow casters against their draws (LPN_ENGINE_CHECK)\n");
     return true;
