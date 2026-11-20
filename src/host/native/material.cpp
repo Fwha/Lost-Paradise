@@ -203,9 +203,10 @@ void main() {
     if ((flags & 0x40000u) != 0u) scatter = vec3(0.0);
     const float k = uintBitsToFloat(0x40008102u);
     vec4 n = fetch(1u), t = fetch(2u), col = fetch(3u), b = fetch(6u);
-    vec3 on = n.xyz * k - 1.0, ot = t.xyz * k - 1.0;
-    float handed = t.w * k - 1.0;
-    mat3 L = mat3(W[0].x, W[1].x, W[2].x, W[0].y, W[1].y, W[2].y, W[0].z, W[1].z, W[2].z);
+    // Rounded as the game's shader (each product, then each sum), as the prepass does.
+    vec3 on = vec3(mac(k, n.x, -1.0), mac(k, n.y, -1.0), mac(k, n.z, -1.0));
+    vec3 ot = vec3(mac(k, t.x, -1.0), mac(k, t.y, -1.0), mac(k, t.z, -1.0));
+    float handed = mac(k, t.w, -1.0);
     float flatten = cf(14).x * (1.0 - clamp(n.w * uintBitsToFloat(0x3f808102u), 0.0, 1.0));
     vec3 baked = 0.25 * b.xyz / (1.0 - b.w);
     baked *= baked;
@@ -213,10 +214,10 @@ void main() {
     p0 = vec4(fetch(4u).xy + uvo.xy, fetch(5u).xy + uvo.zw);
     p1 = vec4(col.rgb * T, col.a * cf(14).y);
     p2 = vec4(scatter, flatten);
-    p3 = vec4(L * on, 0.0);
+    p3 = vec4(dot3(W[0], on), dot3(W[1], on), dot3(W[2], on), 0.0);
     p4 = vec4(baked, 0.0);
     p5 = vec4(T, 0.0);
-    p6 = vec4(L * ot, handed);
+    p6 = vec4(dot3(W[0], ot), dot3(W[1], ot), dot3(W[2], ot), handed);
     p7 = vec4(lp, 0.0);
 }
 )";
@@ -308,7 +309,9 @@ void main() {
     vec3 vtint = a1.rgb * cover, itint = indTint * cover;
     vec3 bp = a4.xyz + point, T = a5.xyz;
     vec3 dirDiffuse = lc0 * dirTint * nl0 + lc1 * shG * nl1;
-    vec3 diffuse = vtint * (ambientTex + cf(40).xyz + diffuseColor * dirDiffuse);
+    // The ambient texture's term is weighted by the base colour here and again with the rest
+    // (m1.s 0x800, then 0x90c): adjBase squared in all (Codex's review).
+    vec3 diffuse = vtint * (ambientTex * adjBase + cf(40).xyz + diffuseColor * dirDiffuse);
     vec3 indDiffuse = T * diffuseColor * bp + screenLight.rgb * shG;
     float blendBase = misc.x;
     diffuse += (blendBase + (1.0 - blendBase) * shG) * itint * indDiffuse;
