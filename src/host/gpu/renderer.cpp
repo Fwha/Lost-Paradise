@@ -1174,6 +1174,10 @@ public:
     // A draw (not a dispatch), on whichever thread records it: the main recorder under m_, or a
     // recorder thread (which takes m_ itself where the caches are touched, see WLock).
     void recordDraw(const DrawCall& d, const DrawRegs& r, std::unique_ptr<DrawAnalysis>& held) {
+        if (d.kind == DrawCall::kEngine) { // onEngineDraw's, in a segment: no analysis
+            engineDraw(d.count, r);
+            return;
+        }
         DrawAnalysis& a = *held;
         ++R().prof_.calls;
         const uint64_t drawsBefore = R().stats_.draws;
@@ -5613,14 +5617,41 @@ void main() {
     // drawn natively where the game's draw would have been. Its depth target and state come from
     // the registers, its buffers and constants from the capture.
     void onEngineDraw(uint32_t id, const GpuRegs& gr) override {
+        // With recorder threads, in a segment like the draws around it (in order with them): hundreds
+        // a frame each waiting for the recorder threads cost the main recorder ~10 ms a frame.
+        if (recordThreads_ && !computeOnly_ && frame_ != traceFrame_ && frame_ != timingFrame_) {
+            DrawCall d{};
+            d.kind = DrawCall::kEngine;
+            d.count = id;
+            std::unique_ptr<DrawAnalysis> none;
+            addToSegment(d, gr, none);
+            return;
+        }
         if (recordThreads_) drainSegments(0); // in order with the draws before it
         std::lock_guard lock(m_);
+        engineDraw(id, DrawRegs::of(gr));
+    }
+    // The capture's draw (on the main recorder holding m_, or a recorder thread in its segment).
+    void engineDraw(uint32_t id, const DrawRegs& r) {
         native::EngineCaster c;
         if (!native::engineCaster(id, c)) {
             if (engineLost_++ < 5) std::fprintf(stderr, "[native] engine draw %u: its capture is gone\n", id);
             return;
         }
-        const DrawRegs r = DrawRegs::of(gr);
+        // The caches looked up holding m_ shared, started over exclusively when one would change
+        // (as draw() does); the depth buffer marked written before anything is recorded.
+        bool sharedTry = R().worker_;
+    retry:
+        R().abort_ = false;
+        WLock wl(*this, sharedTry);
+        auto again = [&] {
+            if (!R().abort_) return false;
+            wl.unlock();
+            sharedTry = false;
+            ++R().prof_.sharedRetries;
+            return true;
+        };
+        R().sampledSurfaces_.clear(); // filled by resolveImage
         native::Draw nd;
         nd.primitive = r.prim;
         nd.count = c.draw.count;
@@ -5632,7 +5663,10 @@ void main() {
         const uint32_t size = r.ctx[reg::kDbDepthSize];
         const uint32_t dw = ((size & 0x7FF) + 1) * 8, dh = (((size >> 11) & 0x7FF) + 1) * 8;
         Surface* s = depthSurface(uint64_t(r.ctx[reg::kDbZReadBase]) << 8, dw, dh, f);
-        if (!s) return;
+        if (!s) {
+            if (again()) goto retry;
+            return;
+        }
         nd.depth = {view(s->img, f, VK_IMAGE_VIEW_TYPE_2D, kIdentity, s->img.aspect), s->img.image, f, s->img.width, s->img.height,
                     uint64_t(r.ctx[reg::kDbZReadBase]) << 8};
         nd.hasStencil = stencil;
@@ -5680,7 +5714,10 @@ void main() {
         native::VertexBuffer vb;
         vb.slot = 0, vb.components = 3, vb.stride = c.draw.stride, vb.records = c.vertices, vb.dfmt = 13, vb.nfmt = 7, vb.dstSel = 0xFAC;
         const uint64_t vbytes = std::max<uint64_t>(uint64_t(c.vertices) * c.draw.stride, 16);
-        if (!buffer(c.draw.vertexBase, vbytes, vb.data)) return;
+        if (!buffer(c.draw.vertexBase, vbytes, vb.data)) {
+            if (again()) goto retry;
+            return;
+        }
         nd.vertex.push_back(vb);
         if (c.alpha) { // the coordinates (slot 1) in the same buffer, and the texture
             native::VertexBuffer uv = vb;
@@ -5696,7 +5733,10 @@ void main() {
             im.pc = 0x24;
             R().sampledSurfaces_.clear();
             const ImageBinding b = resolveImage(im);
-            if (!b.view || !b.sampler) return;
+            if (!b.view || !b.sampler) {
+                if (again()) goto retry;
+                return;
+            }
             native::Texture t;
             t.view = b.view, t.sampler = b.sampler, t.scale[0] = b.scale[0], t.scale[1] = b.scale[1];
             t.address = im.base(), t.width = im.width(), t.height = im.height(), t.pc = 0x24;
@@ -5704,27 +5744,28 @@ void main() {
         }
         nd.indexed = true;
         nd.indexType = c.index32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
-        if (!buffer(c.draw.indexAddr, uint64_t(c.draw.count) * (c.index32 ? 4 : 2), nd.index)) return;
-        if (!ringFits(1 << 12)) flush();
-        begin();
-        NativeGpu gpu(*this);
-        std::unique_lock nlock(nativeMutex_);
-        if (!native::drawStageCaster(c, nd, gpu)) {
-            if (engineLost_++ < 5) std::fprintf(stderr, "[native] engine draw %u: the shadow pass could not draw it\n", id);
+        if (!buffer(c.draw.indexAddr, uint64_t(c.draw.count) * (c.index32 ? 4 : 2), nd.index)) {
+            if (again()) goto retry;
             return;
         }
-        R().needBarrier_ = true;
-        for (VkImage im : R().pass_.images) addOnce(R().drawWritten_, im);
-        for (VkImage im : R().sampledSurfaces_) addOnce(R().drawSampled_, im);
-        R().bound_ = Bound{};
-        ++R().passSerial_;
-        R().fast_.valid = false;
-        for (FastSlot& fs : R().fastSlots_) fs.f.valid = false;
-        R().lastMergeable_ = false;
-        ++fastEpoch_;
         if (nd.depthWrite) gpuWrote(*s);
+        if (again()) goto retry;
+        if (!R().worker_ && !ringFits(1 << 12)) flush();
+        begin();
+        NativeGpu gpu(*this);
+        {
+            std::lock_guard nlock(nativeMutex_);
+            if (!native::drawStageCaster(c, nd, gpu)) {
+                if (engineLost_++ < 5) std::fprintf(stderr, "[native] engine draw %u: the shadow pass could not draw it\n", id);
+                return;
+            }
+        }
+        std::vector<VkImage>& wrote = R().nativeWrote_;
+        wrote.clear();
+        if (nd.depthWrite) wrote.push_back(s->img.image);
+        nativeDrawn(nullptr, nullptr, &wrote);
     }
-    uint32_t engineLost_ = 0;
+    std::atomic<uint32_t> engineLost_{0}; // recorder threads draw these too
 
     // LPN_ENGINE_CHECK (native/engine_capture.h): a draw of the stage shadow casters against the
     // engine's own description of it, kept at its drawIndex call.
