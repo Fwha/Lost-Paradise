@@ -157,6 +157,8 @@ public:
     virtual bool draw(int role, const Draw& d, Gpu& gpu) = 0;
     // Each frame's end (temporal state, statistics).
     virtual void frameEnd() {}
+    // Compare mode (LPN_NATIVE_COMPARE): what the last draw on this thread used, for its log.
+    virtual std::string lastDrawInfo() const { return {}; }
 };
 
 // Every native pass, in no particular order.

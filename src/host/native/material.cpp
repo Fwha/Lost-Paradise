@@ -1437,6 +1437,7 @@ public:
         if (!gpu.upload(c, sizeof c, consts)) return decline(role, "no room for the constants");
         VkPipeline pipe = pipeline(gpu, role, d);
         if (!pipe) return decline(role, "no pipeline");
+        if (kCompareOn) describe(c, slot, inputs, d);
         if (!logged_[role].exchange(true)) {
             std::fprintf(stderr, "[native] material: drawing %s natively (targets 0x%" PRIx64 ", 0x%" PRIx64 ")\n", var.ps,
                          d.color[0].address, d.color[1].address);
@@ -1531,6 +1532,37 @@ private:
     std::shared_mutex offsetsMutex_;
     std::unordered_map<PairKey, std::vector<int64_t>, PairHash> offsets_;
 
+    std::string lastDrawInfo() const override { return info_; }
+    // Compare mode's log: the constants a wrong pixel can come from, and the vertex inputs.
+    static void describe(const uint32_t (&c)[kConstants][4], const VertexBuffer* const* slot, int inputs, const Draw& d) {
+        std::string s;
+        char b[200];
+        std::snprintf(b, sizeof b, "vs %s; ps flags 0x%x, 0x22c 0x%x, vs flags 0x%x, mask flags 0x%x, out swizzles 0x%x 0x%x",
+                      d.vsName ? d.vsName->c_str() : "?", c[cPsFlags][0], c[cPsFlags][3], c[cVsMisc][2], c[cMisc2][3], c[cOut][0], c[cOut][1]);
+        s += b;
+        std::snprintf(b, sizeof b, "; target formats %d %d", int(d.color[0].format), int(d.color[1].format));
+        s += b;
+        const int show[] = {13, 14, 21, 22, 23, 24, 25, 29, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 51, 56, 57, 58, 59};
+        for (int i : show) {
+            float f[4];
+            std::memcpy(f, c[i], sizeof f);
+            std::snprintf(b, sizeof b, "\n    c%d: %g %g %g %g", i, f[0], f[1], f[2], f[3]);
+            s += b;
+        }
+        for (int i = 0; i < inputs; ++i)
+            if (slot[i]) {
+                std::snprintf(b, sizeof b, "\n    input %d: dfmt %u nfmt %u stride %u sel 0x%x components %u", i, slot[i]->dfmt, slot[i]->nfmt,
+                              slot[i]->stride, slot[i]->dstSel, slot[i]->components);
+                s += b;
+            }
+        for (const Texture& t : d.textures) {
+            std::snprintf(b, sizeof b, "\n    texture pc 0x%x: %ux%u at 0x%llx scale %g %g", t.pc, t.width, t.height, (unsigned long long)t.address, t.scale[0], t.scale[1]);
+            s += b;
+        }
+        info_ = std::move(s);
+    }
+    static inline const bool kCompareOn = std::getenv("LPN_NATIVE_COMPARE") != nullptr;
+    static inline thread_local std::string info_;
     bool decline(int role, const char* why) {
         std::lock_guard lock(m_);
         if (declined_[role].insert(why).second && declined_[role].size() <= 16)

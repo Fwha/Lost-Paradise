@@ -5956,26 +5956,34 @@ void main() {
     // compared on the GPU. Every 10 seconds: per role and target, the draws compared and the pixels
     // that differ (by more than half an 8-bit step; depth: any bit), with the largest difference.
     static constexpr uint32_t kComparePerFrame = 24;
-    static constexpr uint32_t kCompareSlots = 64; // role * 9 + target (8: depth)
+    static constexpr uint32_t kCompareRoles = 16;
+    static constexpr uint32_t kCompareSlots = kCompareRoles * 9; // role * 9 + target (8: depth)
     struct CompareSlot {
-        uint32_t px, maxBits, sum, pad; // sum: of differences in 1/255 steps (colour) or ulps (depth), saturating
+        uint32_t px, maxBits, sum, claim; // sum: of differences in 1/255 steps (colour) or ulps (depth), saturating
+        // The first pixel that differs by 8/255 or more since the last report (claim 1): the draw, where, both values.
+        uint32_t seq, x, y, pad;
+        float translated[4], native[4];
     };
     struct ComparePush {
         int32_t rect[4];
-        uint32_t slot, depth, pad[2];
+        uint32_t slot, depth, seq, pad;
+    };
+    struct CompareInfo {
+        uint32_t seq = ~0u;
+        std::string info;
     };
     struct PendingCompare {
         VkImageView a[9] = {}, b[9] = {};
         int32_t rect[4] = {};
-        uint32_t role = 0;
+        uint32_t role = 0, seq = 0;
     };
     static constexpr const char* kCompareGlsl = R"(#version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D a;
 layout(set = 0, binding = 1) uniform sampler2D b;
-struct Slot { uint px, maxBits, sum, pad; };
+struct Slot { uint px, maxBits, sum, claim, seq, x, y, pad; vec4 translated, native; };
 layout(set = 0, binding = 2, std430) buffer S { Slot s[]; } st;
-layout(push_constant) uniform P { ivec4 rect; uint slot, depth, pad0, pad1; } p;
+layout(push_constant) uniform P { ivec4 rect; uint slot, depth, seq, pad1; } p;
 void main() {
     ivec2 q = p.rect.xy + ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(gl_GlobalInvocationID.xy, uvec2(p.rect.zw)))) return;
@@ -5995,6 +6003,11 @@ void main() {
     atomicAdd(st.s[p.slot].px, 1u);
     atomicMax(st.s[p.slot].maxBits, floatBitsToUint(m));
     atomicAdd(st.s[p.slot].sum, uint(min(m * 255.0 + 0.5, 255.0)));
+    if (m >= 8.0 / 255.0 && atomicCompSwap(st.s[p.slot].claim, 0u, 1u) == 0u) {
+        st.s[p.slot].seq = p.seq;
+        st.s[p.slot].x = uint(q.x), st.s[p.slot].y = uint(q.y);
+        st.s[p.slot].translated = x, st.s[p.slot].native = y;
+    }
 }
 )";
     bool comparePipeline() {
@@ -6104,13 +6117,16 @@ void main() {
         nativeDrawn(nullptr, nullptr);
         ++compareCount_;
         if (!drawn) {
-            ++compareDeclined_[std::min(role, 6)];
+            ++compareDeclined_[std::min<uint32_t>(role, kCompareRoles - 1)];
             return;
         }
-        ++compareDrawn_[std::min(role, 6)];
+        ++compareDrawn_[std::min<uint32_t>(role, kCompareRoles - 1)];
+        const uint32_t seq = uint32_t(compareSeq_);
+        compareInfo_[seq % kCompareInfos] = {seq, a.psm->nativePass->lastDrawInfo()};
+        pc.seq = seq;
         // Where it could have drawn: the scissor.
         pc.rect[0] = nd.scissor[0], pc.rect[1] = nd.scissor[1], pc.rect[2] = nd.scissor[2], pc.rect[3] = nd.scissor[3];
-        pc.role = uint32_t(std::min(role, 6));
+        pc.role = std::min<uint32_t>(role, kCompareRoles - 1);
         pendingCompare_ = pc;
         compareAwaiting_ = true; // armed once the translated draw is recorded (see recordDraw's caller)
     }
@@ -6129,6 +6145,7 @@ void main() {
             std::memcpy(push.rect, pc.rect, sizeof push.rect);
             push.slot = pc.role * 9 + i;
             push.depth = i == 8;
+            push.seq = pc.seq;
             rec([this, c = R().cmd_, push, va = pc.a[i], vb = pc.b[i]] {
                 const VkDescriptorImageInfo di[2] = {{compareSampler_, va, VK_IMAGE_LAYOUT_GENERAL},
                                                      {compareSampler_, vb, VK_IMAGE_LAYOUT_GENERAL}};
@@ -6161,7 +6178,8 @@ void main() {
         if (now - compareLast_ < std::chrono::seconds(10)) return;
         compareLast_ = now;
         const auto* slot = static_cast<const CompareSlot*>(compareMap_);
-        for (uint32_t role = 0; role < 7; ++role) {
+        auto* slots = static_cast<CompareSlot*>(compareMap_);
+        for (uint32_t role = 0; role < kCompareRoles; ++role) {
             if (!compareDrawn_[role] && !compareDeclined_[role]) continue;
             std::string line;
             char buf[160];
@@ -6180,6 +6198,16 @@ void main() {
             }
             std::fprintf(stderr, "[native] compare %s role %u: %" PRIu64 " draws compared, %" PRIu64 " declined%s\n", compareWith_.c_str(), role,
                          compareDrawn_[role], compareDeclined_[role], line.c_str());
+            for (uint32_t i = 0; i < 9; ++i) {
+                CompareSlot& c = slots[role * 9 + i];
+                if (c.claim != 1) continue;
+                const CompareInfo& ci = compareInfo_[c.seq % kCompareInfos];
+                std::fprintf(stderr,
+                             "[native]   target %u differs at %u,%u: translated %g %g %g %g, native %g %g %g %g; draw %u: %s\n", i, c.x, c.y,
+                             c.translated[0], c.translated[1], c.translated[2], c.translated[3], c.native[0], c.native[1], c.native[2],
+                             c.native[3], c.seq, ci.seq == c.seq ? ci.info.c_str() : "(no longer kept)");
+                c.claim = 0; // the next report's first
+            }
             compareDrawn_[role] = compareDeclined_[role] = 0;
         }
     }
@@ -6196,7 +6224,9 @@ void main() {
     PendingCompare pendingCompare_;
     uint64_t compareFrame_ = ~0ull, compareSeq_ = 0;
     uint32_t compareCount_ = 0;
-    uint64_t compareDrawn_[7] = {}, compareDeclined_[7] = {};
+    uint64_t compareDrawn_[kCompareRoles] = {}, compareDeclined_[kCompareRoles] = {};
+    static constexpr uint32_t kCompareInfos = 256;
+    CompareInfo compareInfo_[kCompareInfos];
     CompareSlot compareSeen_[kCompareSlots] = {};
     std::chrono::steady_clock::time_point compareLast_ = std::chrono::steady_clock::now();
 
