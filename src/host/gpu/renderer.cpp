@@ -560,6 +560,10 @@ struct BufferRange {
 // the launch. The renderer fills resource fields into prog.data per draw.
 struct CachedProgram {
     gcn::Program prog;
+    // Its scalar loads' places in the data (smrd and the trace's), built once for native passes
+    // and shared by the draws of it (see loadsOf); reset when prog is analysed again.
+    std::shared_ptr<const std::map<uint64_t, uint32_t>> loads;
+    size_t loadsTrace = 0;
     std::vector<std::pair<uint64_t, uint64_t>> code; // [start, end) of the code analysed
     uint64_t codeHash = 0;
     uint64_t checkedSubmit = ~0ull; // the submission codeHash was last verified in
@@ -5563,19 +5567,20 @@ void main() {
             t.pc = uint32_t(im.pc - a.ps.launch.entry);
             nd.textures.push_back(t);
         }
-        auto loads = [](const gcn::Program& p) {
-            return [&p](uint32_t pc, uint32_t* out, uint32_t n) {
-                auto it = p.smrd.find(p.launch.entry + pc);
-                if (it == p.smrd.end() || it->second + n > p.data.size()) return false;
+        if (!a.psLoads || !a.vsLoads) return false;
+        auto loads = [](const gcn::Program& p, const std::map<uint64_t, uint32_t>& m) {
+            return [&p, &m](uint32_t pc, uint32_t* out, uint32_t n) {
+                auto it = m.find(p.launch.entry + pc);
+                if (it == m.end() || it->second + n > p.data.size()) return false;
                 std::memcpy(out, &p.data[it->second], n * 4);
                 return true;
             };
         };
-        nd.load = loads(a.ps);
-        auto offsets = [](const gcn::Program& p) {
-            return [&p](uint32_t pc) -> int64_t {
-                auto it = p.smrd.find(p.launch.entry + pc);
-                return it == p.smrd.end() ? -1 : int64_t(it->second);
+        nd.load = loads(a.ps, *a.psLoads);
+        auto offsets = [](const gcn::Program& p, const std::map<uint64_t, uint32_t>& m) {
+            return [&p, &m](uint32_t pc) -> int64_t {
+                auto it = m.find(p.launch.entry + pc);
+                return it == m.end() ? -1 : int64_t(it->second);
             };
         };
         // A module's load offsets are the same for every draw only with generic translation (its
@@ -5583,8 +5588,8 @@ void main() {
         if (gcn::genericTranslation()) nd.vsId = a.vsm, nd.psId = a.psm;
         nd.vsData = a.vs.data.data(), nd.vsSize = a.vs.data.size();
         nd.psData = a.ps.data.data(), nd.psSize = a.ps.data.size();
-        nd.vsOffset = offsets(a.vs), nd.psOffset = offsets(a.ps);
-        nd.vsLoad = loads(a.vs);
+        nd.vsOffset = offsets(a.vs, *a.vsLoads), nd.psOffset = offsets(a.ps, *a.psLoads);
+        nd.vsLoad = loads(a.vs, *a.vsLoads);
         if (a.vsm && a.vsm->gameName) nd.vsName = a.vsm->gameName;
         else nd.vsName = &native::shaderNameAt(a.vs.launch.entry, &readGuest);
         nd.instances = std::max(r.numInstances, 1u);
@@ -5802,6 +5807,8 @@ void main() {
     // LPN_ENGINE_CHECK (native/engine_capture.h): a draw of the stage shadow casters against the
     // engine's own description of it, kept at its drawIndex call.
     void engineCheck(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
+        static const std::map<uint64_t, uint32_t> kNone;
+        const std::map<uint64_t, uint32_t>& vsLoads = a.vsLoads ? *a.vsLoads : kNone;
         native::EngineDraw e;
         if (!native::takeEngineDraw(e)) {
             if (engineStats_[2]++ < 5) std::fprintf(stderr, "[native] engine check: draw from 0x%x without a captured one\n", d.origin[0]);
@@ -5824,7 +5831,7 @@ void main() {
         if (same && e.state) { // the draws that kept copies of the state (three of each class)
             // Where the view constants are: the vertex stage's slots against the V# the shader read.
             uint64_t view = 0;
-            for (const auto& [pc, at] : a.vs.smrd) {
+            for (const auto& [pc, at] : vsLoads) {
                 const uint32_t off = uint32_t(pc - a.vs.launch.entry);
                 if ((off == 0xbc || off == 0xb0 || off == 0x2c0) && at + 2 <= a.vs.data.size())
                     view = (a.vs.data[at] | (uint64_t(a.vs.data[at + 1] & 0xFFF) << 32));
@@ -5883,8 +5890,8 @@ void main() {
         if (same) {
             uint32_t off[4] = {}, flags = 0;
             auto load = [&](uint32_t pc, uint32_t* out, uint32_t n) {
-                auto it = a.vs.smrd.find(a.vs.launch.entry + pc);
-                if (it == a.vs.smrd.end() || it->second + n > a.vs.data.size()) return false;
+                auto it = vsLoads.find(a.vs.launch.entry + pc);
+                if (it == vsLoads.end() || it->second + n > a.vs.data.size()) return false;
                 std::memcpy(out, &a.vs.data[it->second], n * 4);
                 return true;
             };
@@ -5904,7 +5911,7 @@ void main() {
                           std::bit_cast<float>(off[1]), std::bit_cast<float>(off[2]), flags, dfmt, nfmt, foff, e.vertexFormat & 0xF,
                           (long long)uvAt, uvFmt, e.stride,
                           [&] {
-                              for (const auto& [pc, at] : a.vs.smrd) {
+                              for (const auto& [pc, at] : vsLoads) {
                                   const uint32_t o = uint32_t(pc - a.vs.launch.entry);
                                   if ((o == 0xbc || o == 0xb0) && at + 2 <= a.vs.data.size())
                                       return (a.vs.data[at] | (uint64_t(a.vs.data[at + 1] & 0xFFF) << 32)) == (e.view & 0xFFFFFFFFFFull) ? "same" : "differs";
@@ -7463,7 +7470,8 @@ void main() {
         // Its buffers' bindings, resolved on the worker (resolveAhead) at bufferEpoch_ resEpoch.
         std::vector<BufRes> vsRes, psRes;
         uint64_t resEpoch = 0;
-        bool nativeLoads = false; // vs and ps hold their scalar load maps (a native pass claims the draw)
+        bool nativeLoads = false; // psLoads and vsLoads are set (a native pass claims the draw)
+        std::shared_ptr<const std::map<uint64_t, uint32_t>> psLoads, vsLoads; // pc -> data offset
     };
     // A draw's launches as the registers give them, for a worker to analyse.
     struct DrawJob {
@@ -7692,6 +7700,7 @@ void main() {
     CachedProgram* analyze(AnalysisCtx& c, CachedProgram& p, const gcn::LaunchState& l, uint32_t bindingBase) {
         ++c.prof.analyses;
         p.prog = gcn::analyze(l, c.read);
+        p.loads.reset();
         p.code.clear();
         for (const auto& [pc, in] : p.prog.code) {
             if (!p.code.empty() && p.code.back().second == pc) p.code.back().second = pc + in.size;
@@ -7716,6 +7725,17 @@ void main() {
         out = p.smrd;
         for (const auto& t : p.trace)
             if (!t.start && t.in.format == gcn::Format::SMRD && t.slot != ~0u) out.emplace(t.pc, t.slot);
+    }
+    // The same, kept with the cached program: copying the map for every claimed draw was a
+    // large part of the analysis workers' time with native passes on.
+    static std::shared_ptr<const std::map<uint64_t, uint32_t>> loadsOf(CachedProgram& c) {
+        if (!c.loads || c.loadsTrace != c.prog.trace.size()) {
+            auto m = std::make_shared<std::map<uint64_t, uint32_t>>();
+            loadMap(c.prog, *m);
+            c.loads = std::move(m);
+            c.loadsTrace = c.prog.trace.size();
+        }
+        return c.loads;
     }
     static void takeDrawPart(gcn::Program& to, const gcn::Program& from) {
         to.launch = from.launch;
@@ -7807,6 +7827,7 @@ void main() {
     void runJob(AnalysisCtx& c, DrawJob& j) {
         DrawAnalysis& a = *j.out;
         a.nativeLoads = false;
+        a.psLoads.reset(), a.vsLoads.reset();
         if (j.kind == DrawJob::kDispatch) {
             CachedProgram* csc = analyzed(c, j.vs, 0);
             if (!csc) return;
@@ -7830,8 +7851,8 @@ void main() {
                 takeDrawPart(a.ps, psc->prog);
                 a.nativeLoads = psc->module && psc->module->nativeLoads.load(std::memory_order_relaxed);
                 if (a.nativeLoads) {
-                    loadMap(psc->prog, a.ps.smrd);
-                    loadMap(vsc->prog, a.vs.smrd); // native passes read the vertex shader's constants too
+                    a.psLoads = loadsOf(*psc);
+                    a.vsLoads = loadsOf(*vsc); // native passes read the vertex shader's constants too
                 }
                 a.repeat = a.repeat && c.memoHit;
                 a.psc = psc;
