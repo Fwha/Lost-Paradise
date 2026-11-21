@@ -175,3 +175,7 @@ every step leaves a game that plays:
   `r_o1dst_b(vr)2dst`, `r_o1dst_b(vr)2ds`: a detail normal map, and detail textures blended by
   their alpha), ~1,380 of the material pass's draws in all. Their names carry shader_names' " +1".
   Compare run: all four within one 8-bit step, depth exact.
+- The `r_b1dst` family as `SIMPLE_MATERIAL` variants: `r_o1dst`, `r_o1dut` (specular map's green
+  alone), `r_p1dut` (alpha-tested). The material pass now covers ~2,100 of its ~3,350 draws.
+  Compare run: within one step, depth exact; once, a few thousand pixels of the edge mask (target 1)
+  differed by up to 65/255, since that mask is a threshold that rounding can flip.
