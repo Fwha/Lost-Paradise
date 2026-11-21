@@ -5341,7 +5341,7 @@ void main() {
                 ds.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
                 ds.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             }
-            p.written = p.images;
+            p.written.clear(); // filled by what the draws in it write (nativeDrawn, and translated draws joining)
             Rec& R = r_.R();
             // Joined unless the draw samples what a draw in the pass wrote (as draw() decides).
             bool feedback = false;
@@ -5435,7 +5435,10 @@ void main() {
     // `wrote`: the attachments it wrote (null: all of the pass's), as the translated path counts
     // them: a depth buffer only tested is not written, so later draws may sample it in the same pass.
     void nativeDrawn(Surface* const* written, Surface* depthWritten, const std::vector<VkImage>* wrote = nullptr) {
-        for (VkImage im : wrote ? *wrote : R().pass_.images) addOnce(R().drawWritten_, im);
+        for (VkImage im : wrote ? *wrote : R().pass_.images) {
+            addOnce(R().drawWritten_, im);
+            addOnce(R().pass_.written, im);
+        }
         for (VkImage im : R().sampledSurfaces_) addOnce(R().drawSampled_, im);
         R().bound_ = Bound{};
         ++R().passSerial_;
@@ -5500,7 +5503,7 @@ void main() {
                 const uint32_t m = i ? back : front;
                 nd.stencilRef[i] = m & 0xFF, nd.stencilCompare[i] = (m >> 8) & 0xFF, nd.stencilWrite[i] = (m >> 16) & 0xFF;
             }
-            if (nd.depthWrite || (nd.stencil && nd.stencilWrite[0])) depthWritten = s;
+            if (nd.depthWrite || (nd.stencil && (nd.stencilWrite[0] || nd.stencilWrite[1]))) depthWritten = s;
         }
         // The viewport and scissor as setViewportScissor makes them (without the HUD's layout).
         const native::Target& first = nd.colorCount ? nd.color[0] : nd.depth;
