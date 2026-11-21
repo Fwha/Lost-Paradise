@@ -5347,7 +5347,9 @@ void main() {
             bool feedback = false;
             for (VkImage im : R.sampledSurfaces_)
                 if (std::find(R.drawWritten_.begin(), R.drawWritten_.end(), im) != R.drawWritten_.end()) feedback = true;
-            if (R.pass_.open && R.nativePassOpen_ && !feedback && R.pass_.sameTargets(p)) return;
+            // Joined whichever path opened it: a pass on the same targets whose draws wrote nothing
+            // this one samples (drawWritten_ holds every attachment written since the last barrier).
+            if (R.pass_.open && !feedback && R.pass_.sameTargets(p)) return;
             r_.endPass();
             r_.barrier(); // what the draws before wrote or sampled
             VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
@@ -5378,11 +5380,29 @@ void main() {
         // possible there; the translated path takes it then), and the caches the draw looks up and
         // the surfaces it marks written are held exclusively (m_; on the main recorder m_ is held).
         if (R().worker_ && !ringFits(1 << 12)) return false;
-        WLock wl(*this);
+        // As the translated path: the caches looked up holding m_ shared, started over holding it
+        // exclusively when one would change (sharedMiss sets abort_). The surfaces are marked
+        // written before anything is recorded, so a start over records nothing twice.
+        bool sharedTry = R().worker_;
+    retry:
+        R().abort_ = false;
+        WLock wl(*this, sharedTry);
         native::Draw nd;
         Surface* written[8]{};
         Surface* depthWritten = nullptr;
-        if (!nativeBuild(d, r, a, nd, written, depthWritten)) return false;
+        const bool built = nativeBuild(d, r, a, nd, written, depthWritten);
+        if (built) {
+            for (Surface* x : written)
+                if (x) gpuWrote(*x);
+            if (depthWritten) gpuWrote(*depthWritten);
+        }
+        if (R().abort_) {
+            wl.unlock();
+            sharedTry = false;
+            ++R().prof_.sharedRetries;
+            goto retry;
+        }
+        if (!built) return false;
         if (!R().worker_ && !ringFits(1 << 12)) flush();
         begin();
         NativeGpu gpu(*this);
@@ -5390,7 +5410,7 @@ void main() {
             std::lock_guard lock(nativeMutex_);
             if (!a.psm->nativePass->draw(a.psm->nativeRole, nd, gpu)) return false;
         }
-        nativeDrawn(written, depthWritten);
+        nativeDrawn(nullptr, nullptr); // the surfaces are marked above
         return true;
     }
     // After a native pass recorded a draw: its writes and reads, for the barriers of the draws
