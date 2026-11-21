@@ -474,7 +474,10 @@ void main() {
     precise vec2 enc = de * dw + s;
     vec2 nxy = 2.0 * enc - 1.0;
 #else
-    vec2 nxy = 2.0 * mix(s, vec2(0.5), dw) - 1.0;
+    // Toward (0.5, 0.5) in the shader's two steps: q = 0.5 w + s, then q - w s.
+    precise vec2 q = 0.5 * dw + s;
+    precise vec2 q2 = dw * -s + q;
+    precise vec2 nxy = 2.0 * q2 - 1.0;
 #endif
     float nz = sqrt(clamp(1.0 - dot(nxy, nxy), 0.0, 1.0));
     vec3 N = normalize(tg * nxy.x + bt * nxy.y + gn * nz);
