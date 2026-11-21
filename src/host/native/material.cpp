@@ -17,7 +17,9 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <tuple>
@@ -1104,8 +1106,7 @@ public:
         if (!gpu.upload(c, sizeof c, consts)) return decline(role, "no room for the constants");
         VkPipeline pipe = pipeline(gpu, role, d);
         if (!pipe) return decline(role, "no pipeline");
-        if (!logged_[role]) {
-            logged_[role] = true;
+        if (!logged_[role].exchange(true)) {
             std::fprintf(stderr, "[native] material: drawing %s natively (targets 0x%" PRIx64 ", 0x%" PRIx64 ")\n", var.ps,
                          d.color[0].address, d.color[1].address);
         }
@@ -1154,12 +1155,14 @@ public:
 
 private:
     bool decline(int role, const char* why) {
+        std::lock_guard lock(m_);
         if (declined_[role].insert(why).second && declined_[role].size() <= 16)
             std::fprintf(stderr, "[native] material: a %s draw left to the translated renderer (%s)\n", kVariants[role - 1].ps, why);
         return false;
     }
 
     VkPipeline pipeline(Gpu& gpu, int role, const Draw& d) {
+        std::lock_guard lock(m_);
         const VkPipelineDepthStencilStateCreateInfo& z = d.depthStencil;
         const auto key = std::make_tuple(role, int(d.color[0].format), int(d.color[1].format), int(d.writeMask & 0xFF), int(d.depth.format),
                                          bool(d.hasStencil), z.depthTestEnable, z.depthWriteEnable, int(z.depthCompareOp),
@@ -1250,7 +1253,9 @@ private:
     std::map<std::tuple<int, int, int, int, int, bool, VkBool32, VkBool32, int, int, int>, VkPipeline> pipes_;
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
-    bool logged_[kVariantCount + 1] = {};
+    std::atomic<bool> logged_[kVariantCount + 1] = {};
+    // Recorder threads draw concurrently: the pipelines and logs are guarded.
+    std::mutex m_;
     std::set<std::string> declined_[kVariantCount + 1];
 };
 

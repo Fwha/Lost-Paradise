@@ -20,7 +20,9 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <tuple>
@@ -271,14 +273,14 @@ public:
             // constants: every opaque caster has had the same (1, 0.01) so far; a change is logged.
             // (Recorded on several recorder threads, the order between these and the engine's
             // casters is not kept: a change would reach some casters a little early or late.)
+            std::lock_guard lock(m_);
             if (std::memcmp(lastBias_, w, 8) != 0 && biasChanges_++ < 8)
                 std::fprintf(stderr, "[native] shadow: caster bias constants %g %g\n", std::bit_cast<float>(w[0]), std::bit_cast<float>(w[1]));
             std::memcpy(lastBias_, w, 8);
         }
         VkPipeline pipe = pipeline(gpu, role, d);
         if (!pipe) return decline(role, "no pipeline");
-        if (!logged_[role]) {
-            logged_[role] = true;
+        if (!logged_[role].exchange(true)) {
             std::fprintf(stderr, "[native] shadow: drawing %s natively (depth 0x%" PRIx64 " %ux%u)\n",
                          alpha ? "ps_shadowmap_pt[fp32][bias].pso" : "ps_shadowmap[fp32][bias].pso", d.depth.address,
                          d.depth.width, d.depth.height);
@@ -332,7 +334,10 @@ public:
             }
         for (int a = 0; a < 3; ++a) push.origin[a] = c.camera[a];
         push.pos[0] = pos.data.byteOffset / 4, push.pos[1] = pos.stride / 4, push.pos[2] = 13;
-        push.bias[0] = lastBias_[0], push.bias[1] = lastBias_[1];
+        {
+            std::lock_guard lock(m_);
+            push.bias[0] = lastBias_[0], push.bias[1] = lastBias_[1];
+        }
         VkDescriptorImageInfo image{};
         VkDescriptorBufferInfo uvBuf{};
         if (c.alpha) { // as the alpha-tested casters: bias without scale, capped at 0.01
@@ -454,8 +459,7 @@ private:
         bufs[3] = {palette->data.buffer, palette->data.offset, palette->data.range};
         VkPipeline pipe = pipeline(gpu, role, d);
         if (!pipe) return decline(role, "no pipeline");
-        if (!logged_[role]) {
-            logged_[role] = true;
+        if (!logged_[role].exchange(true)) {
             std::fprintf(stderr, "[native] shadow: drawing vs_shadowmap_skin.vso natively (depth 0x%" PRIx64 " %ux%u)\n",
                          d.depth.address, d.depth.width, d.depth.height);
         }
@@ -490,6 +494,7 @@ private:
 
     // Logs each reason once.
     bool decline(int role, const char* why) {
+        std::lock_guard lock(m_);
         if (declined_[role].insert(why).second && declined_[role].size() <= 16)
             std::fprintf(stderr, "[native] shadow: a %s draw left to the translated renderer (%s)\n",
                          role == kAlphaTest ? "ps_shadowmap_pt" : role == kSkin ? "vs_shadowmap_skin" : "ps_shadowmap", why);
@@ -531,6 +536,7 @@ private:
     }
 
     VkPipeline pipeline(Gpu& gpu, int role, const Draw& d) {
+        std::lock_guard lock(m_);
         const VkPipelineDepthStencilStateCreateInfo& z = d.depthStencil;
         const auto key = std::make_tuple(role, int(d.depth.format), bool(d.hasStencil), z.depthTestEnable, z.depthWriteEnable,
                                          int(z.depthCompareOp), int(d.cull), int(d.frontFace));
@@ -612,7 +618,9 @@ private:
     std::map<std::tuple<int, int, bool, VkBool32, VkBool32, int, int, int>, VkPipeline> pipes_;
     VkDescriptorSetLayout setLayouts_[4] = {};
     VkPipelineLayout layouts_[4] = {};
-    bool logged_[4] = {};
+    std::atomic<bool> logged_[4] = {};
+    // Recorder threads draw concurrently: the pipelines and logs are guarded.
+    std::mutex m_;
     std::set<std::string> declined_[4];
 };
 

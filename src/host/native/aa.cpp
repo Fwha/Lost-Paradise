@@ -21,7 +21,9 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
+#include <atomic>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <tuple>
@@ -189,6 +191,11 @@ public:
     }
 
     bool draw(int role, const Draw& d, Gpu& gpu) override {
+        std::lock_guard whole(drawMutex_); // a few full-screen draws a frame, with state across them
+        return drawLocked(role, d, gpu);
+    }
+    std::mutex drawMutex_;
+    bool drawLocked(int role, const Draw& d, Gpu& gpu) {
         const RoleInfo& info = kRoles[role];
         if (d.colorCount != 1 || !d.color[0].view) return decline(role, "not one render target");
         if (d.blend) return decline(role, "blending");
@@ -226,8 +233,7 @@ public:
         const uint32_t mask = d.writeMask & 0xF;
         VkPipeline pipe = pipeline(gpu, role, d.color[0].format, mask, d);
         if (!pipe) return decline(role, "no pipeline");
-        if (!logged_[role]) {
-            logged_[role] = true;
+        if (!logged_[role].exchange(true)) {
             std::fprintf(stderr, "[native] aa: drawing %s natively (target 0x%" PRIx64 " %ux%u)\n", info.shader,
                          d.color[0].address, d.color[0].width, d.color[0].height);
         }
@@ -269,6 +275,7 @@ public:
 
 private:
     bool decline(int role, const char* why) {
+        std::lock_guard lock(m_);
         if (declined_[role].insert(why).second) {
             std::fprintf(stderr, "[native] aa: %s left to the translated renderer (%s)\n", kRoles[role].shader, why);
         }
@@ -276,6 +283,7 @@ private:
     }
 
     VkPipeline pipeline(Gpu& gpu, int role, VkFormat format, uint32_t mask, const Draw& d) {
+        std::lock_guard lock(m_);
         // With the stencil: its state as the game set it, depth untouched.
         VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         const VkFormat depthFormat = d.stencil ? d.depth.format : VK_FORMAT_UNDEFINED;
@@ -360,7 +368,9 @@ private:
     std::map<std::tuple<int, int, uint32_t, int, uint64_t, uint64_t>, VkPipeline> pipes_;
     VkDescriptorSetLayout setLayouts_[4] = {};
     VkPipelineLayout layouts_[4] = {};
-    bool logged_[4] = {};
+    std::atomic<bool> logged_[4] = {};
+    // Recorder threads draw concurrently: the pipelines and logs are guarded.
+    std::mutex m_;
     std::set<std::string> declined_[4];
     uint32_t drawn_ = 0;
 };

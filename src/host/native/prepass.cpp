@@ -22,7 +22,9 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <tuple>
@@ -256,8 +258,7 @@ public:
         }
         VkPipeline pipe = pipeline(gpu, role, d);
         if (!pipe) return decline(role, "no pipeline");
-        if (!logged_[role]) {
-            logged_[role] = true;
+        if (!logged_[role].exchange(true)) {
             std::fprintf(stderr, "[native] prepass: drawing %s natively (target 0x%" PRIx64 " %ux%u, depth 0x%" PRIx64 ")\n",
                          alpha ? "ps_normal_pt.pso" : "ps_normal.pso", d.color[0].address, d.color[0].width, d.color[0].height,
                          d.depth.address);
@@ -304,6 +305,7 @@ public:
 private:
     // Logs each reason once.
     bool decline(int role, const char* why) {
+        std::lock_guard lock(m_);
         if (declined_[role].insert(why).second && declined_[role].size() <= 16)
             std::fprintf(stderr, "[native] prepass: a %s draw left to the translated renderer (%s)\n",
                          role == kAlphaTest ? "ps_normal_pt" : "ps_normal", why);
@@ -311,6 +313,7 @@ private:
     }
 
     VkPipeline pipeline(Gpu& gpu, int role, const Draw& d) {
+        std::lock_guard lock(m_);
         const VkPipelineDepthStencilStateCreateInfo& z = d.depthStencil;
         const auto key = std::make_tuple(role, int(d.color[0].format), int(d.writeMask & 0xF), int(d.depth.format),
                                          bool(d.hasStencil), z.depthTestEnable, z.depthWriteEnable, int(z.depthCompareOp),
@@ -401,7 +404,9 @@ private:
     std::map<std::tuple<int, int, int, int, bool, VkBool32, VkBool32, int, int, int>, VkPipeline> pipes_;
     VkDescriptorSetLayout setLayouts_[3] = {};
     VkPipelineLayout layouts_[3] = {};
-    bool logged_[3] = {};
+    std::atomic<bool> logged_[3] = {};
+    // Recorder threads draw concurrently: the pipelines and logs are guarded.
+    std::mutex m_;
     std::set<std::string> declined_[3];
 };
 

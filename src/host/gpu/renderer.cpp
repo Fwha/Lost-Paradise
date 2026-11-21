@@ -5443,10 +5443,7 @@ void main() {
         if (!R().worker_ && !ringFits(1 << 12)) flush();
         begin();
         NativeGpu gpu(*this);
-        {
-            std::lock_guard lock(nativeMutex_);
-            if (!a.psm->nativePass->draw(a.psm->nativeRole, nd, gpu)) return false;
-        }
+        if (!a.psm->nativePass->draw(a.psm->nativeRole, nd, gpu)) return false; // the passes guard their own state
         std::vector<VkImage>& wrote = R().nativeWrote_;
         wrote.clear();
         for (uint32_t i = 0; i < nd.colorCount; ++i)
@@ -5779,12 +5776,9 @@ void main() {
         if (!R().worker_ && !ringFits(1 << 12)) flush();
         begin();
         NativeGpu gpu(*this);
-        {
-            std::lock_guard nlock(nativeMutex_);
-            if (!native::drawStageCaster(c, nd, gpu)) {
-                if (engineLost_++ < 5) std::fprintf(stderr, "[native] engine draw %u: the shadow pass could not draw it\n", id);
-                return;
-            }
+        if (!native::drawStageCaster(c, nd, gpu)) {
+            if (engineLost_++ < 5) std::fprintf(stderr, "[native] engine draw %u: the shadow pass could not draw it\n", id);
+            return;
         }
         std::vector<VkImage>& wrote = R().nativeWrote_;
         wrote.clear();
@@ -6085,11 +6079,7 @@ void main() {
         barrier();
         NativeGpu gpu(*this);
         const int role = a.psm->nativeRole;
-        bool drawn;
-        {
-            std::lock_guard lock(nativeMutex_);
-            drawn = a.psm->nativePass->draw(role, cd, gpu);
-        }
+        const bool drawn = a.psm->nativePass->draw(role, cd, gpu);
         endPass();
         barrier();
         nativeDrawn(nullptr, nullptr);
@@ -6195,8 +6185,7 @@ void main() {
     bool nativeOn_ = false;
     std::mutex nativeModulesMutex_;
     std::unordered_map<std::string, VkShaderModule> nativeModules_;
-    // The native passes keep their pipelines and logs unguarded: one recorder thread in them at a time.
-    std::mutex nativeMutex_;
+
 
     bool upscaleSmaa(const DrawRegs& r, uint8_t role, const DrawAnalysis& a) {
         if (upKind_ == Upscaler::Off || !upscale::usable(upKind_)) return false;
