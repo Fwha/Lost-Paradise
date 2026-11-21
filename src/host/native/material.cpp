@@ -75,7 +75,9 @@ enum : uint32_t {
     cFetch = 62,     // 7: the vertex inputs (first word, stride in words, dfmt | nfmt << 4)
     cOut = 69,       // the targets' swizzles, 1 to map clip z from [-w, w]
     cUvBlock = 70,   // (SIMPLE_MATERIAL: 70.x is the alpha test's reference, PSV[0x70] 0x80)   // 2 (dst variants): PSV[0x70] 0x40..0x5f; 71: specular detail xy, normal detail zw
-    kConstants = 72,
+    cReflectVs = 72, // x: the reflection coefficient (VSV[0x10] 0x0, [ref] vertex shaders)
+    cReflectPs = 73, // PSV[0x30] 0xf0 (the secondary specular gain) and 0xf4 (the reflection light's floor)
+    kConstants = 74,
 };
 
 // A scalar load of the game's shaders and where its dwords go: vec4 `index`, from component `at`.
@@ -624,13 +626,263 @@ constexpr Load kPsLoadsOdutBdu[] = {
     {false, 0xfdc, 1, cPsFlags,        3},
 };
 
+// The reflective [ref] family (Codex's reading): r_b1dst[ref] / r_b1dut[ref] vertex shaders (a
+// Fresnel-like weight in p3.w), an environment cube map added to the lit colour.
+constexpr Load kVsLoadsRefSt[] = {
+    {true, 0x01c,  4, cOffset,    0},
+    {true, 0x020,  8, cWorld,     0},
+    {true, 0x024,  4, cWorld + 2, 0},
+    {true, 0x028,  1, cVsMisc,    2},
+    {true, 0x0b8,  4, cCamera,    0},
+    {true, 0x0dc,  4, cOffset2,   0},
+    {true, 0x118, 16, cProj + 3,  0},
+    {true, 0x168, 16, cFog,       0},
+    {true, 0x16c,  4, cFogDir,    0},
+    {true, 0x174,  4, cCamera,    0},
+    {true, 0x2f0,  8, cProj,      0},
+    {true, 0x2f4,  4, cProj + 2,  0},
+    {true, 0x2f8,  4, cCamera,    0},
+    {true, 0x2fc,  1, cVsMisc,    1},
+    {true, 0x300,  2, cUvOffset,  0},
+    {true, 0x304,  1, cReflectVs, 0},
+};
+constexpr Load kVsLoadsRefUt[] = {
+    {true, 0x01c,  4, cOffset,    0},
+    {true, 0x020,  8, cWorld,     0},
+    {true, 0x024,  4, cWorld + 2, 0},
+    {true, 0x028,  1, cVsMisc,    2},
+    {true, 0x0b8,  4, cCamera,    0},
+    {true, 0x0dc,  4, cOffset2,   0},
+    {true, 0x118, 16, cProj + 3,  0},
+    {true, 0x168, 16, cFog,       0},
+    {true, 0x16c,  4, cFogDir,    0},
+    {true, 0x174,  4, cCamera,    0},
+    {true, 0x2ec,  8, cProj,      0},
+    {true, 0x2f0,  4, cProj + 2,  0},
+    {true, 0x2f4,  4, cCamera,    0},
+    {true, 0x2f8,  2, cVsMisc,    0},
+    {true, 0x2fc,  2, cUvOffset,  0},
+    {true, 0x300,  1, cReflectVs, 0},
+};
+constexpr Load kPsLoadsRefOdst[] = {
+    {false, 0x034, 4, cUvScale,        0},
+    {false, 0x088, 1, cPsFlags,        0},
+    {false, 0x0c0, 2, cPsFlags,        1},
+    {false, 0x184, 4, cShadowMap,      0},
+    {false, 0x1c4, 4, cShadowMap,      0},
+    {false, 0x1ec, 4, cTintBase,       0},
+    {false, 0x244, 4, cTint,           0},
+    {false, 0x2b0, 4, cPointPos,       0},
+    {false, 0x318, 4, cPointColor,     0},
+    {false, 0x368, 4, cPointPos + 1,   0},
+    {false, 0x3d0, 4, cPointColor + 1, 0},
+    {false, 0x420, 4, cPointPos + 2,   0},
+    {false, 0x488, 4, cPointColor + 2, 0},
+    {false, 0x4d8, 4, cPointPos + 3,   0},
+    {false, 0x540, 4, cPointColor + 3, 0},
+    {false, 0x5cc, 4, cPsCamera,       0},
+    {false, 0x5d0, 8, cMaterial,       0},
+    {false, 0x5d4, 4, cAmbientTint,    0},
+    {false, 0x5d8, 1, cMisc,           0},
+    {false, 0x6b4, 8, cDir,            0},
+    {false, 0x6b8, 2, cReflectPs,      0},
+    {false, 0x6bc, 8, cLight,          0},
+    {false, 0x700, 8, cMul,            0},
+    {false, 0x7bc, 4, cExposure,       0},
+    {false, 0x7c8, 4, cAmbient,        0},
+    {false, 0xb54, 8, cDistFog,        0},
+    {false, 0xbc4, 1, cMisc,           2},
+    {false, 0xbc8, 1, cMisc,           3},
+    {false, 0xbcc, 1, cMisc2,          2},
+    {false, 0xbd0, 1, cPsFlags,        0},
+    {false, 0xbd4, 4, cOutScale,       0},
+    {false, 0xc3c, 2, cPsFlags,        1},
+    {false, 0xc40, 1, cMask0,          0},
+    {false, 0xc44, 4, cMask1,          0},
+    {false, 0xc48, 1, cMask0,          1},
+    {false, 0xc4c, 1, cMask0,          2},
+    {false, 0xc50, 1, cMisc2,          3},
+    {false, 0xd94, 2, cMask2,          0},
+    {false, 0xdf0, 2, cMask2,          2},
+    {false, 0xdf4, 1, cMask0,          3},
+    {false, 0xec8, 4, cMask3,          0},
+    {false, 0xecc, 2, cMask4,          0},
+    {false, 0xed0, 1, cMask4,          2},
+    {false, 0xf88, 2, cMask5,          0},
+    {false, 0xf8c, 1, cMask4,          3},
+    {false, 0xfd8, 1, cPsFlags,        0},
+    {false, 0xff4, 4, cBlend,          0},
+    {false, 0x106c,1, cPsFlags,        3},
+};
+constexpr Load kPsLoadsRefOdut[] = {
+    {false, 0x034, 4, cUvScale,        0},
+    {false, 0x094, 1, cPsFlags,        0},
+    {false, 0x0c0, 2, cPsFlags,        1},
+    {false, 0x184, 4, cShadowMap,      0},
+    {false, 0x1c4, 4, cShadowMap,      0},
+    {false, 0x1ec, 4, cTintBase,       0},
+    {false, 0x244, 4, cTint,           0},
+    {false, 0x2b0, 4, cPointPos,       0},
+    {false, 0x310, 4, cPointColor,     0},
+    {false, 0x360, 4, cPointPos + 1,   0},
+    {false, 0x3c0, 4, cPointColor + 1, 0},
+    {false, 0x410, 4, cPointPos + 2,   0},
+    {false, 0x470, 4, cPointColor + 2, 0},
+    {false, 0x4c0, 4, cPointPos + 3,   0},
+    {false, 0x520, 4, cPointColor + 3, 0},
+    {false, 0x5bc, 4, cPsCamera,       0},
+    {false, 0x5c0, 8, cMaterial,       0},
+    {false, 0x5c4, 2, cReflectPs,      0},
+    {false, 0x5c8, 4, cAmbientTint,    0},
+    {false, 0x5cc, 1, cMisc,           0},
+    {false, 0x684, 8, cDir,            0},
+    {false, 0x688, 8, cMul,            0},
+    {false, 0x768, 8, cLight,          0},
+    {false, 0x7bc, 4, cExposure,       0},
+    {false, 0x7c0, 4, cAmbient,        0},
+    {false, 0xb38, 8, cDistFog,        0},
+    {false, 0xba4, 1, cMisc,           2},
+    {false, 0xba8, 1, cMisc,           3},
+    {false, 0xbac, 1, cMisc2,          2},
+    {false, 0xbb0, 4, cOutScale,       0},
+    {false, 0xbb4, 1, cPsFlags,        0},
+    {false, 0xc20, 2, cPsFlags,        1},
+    {false, 0xc24, 4, cMask1,          0},
+    {false, 0xc28, 1, cMask0,          0},
+    {false, 0xc2c, 1, cMask0,          1},
+    {false, 0xc30, 1, cMask0,          2},
+    {false, 0xc34, 1, cMisc2,          3},
+    {false, 0xd78, 2, cMask2,          0},
+    {false, 0xdd0, 2, cMask2,          2},
+    {false, 0xdd4, 1, cMask0,          3},
+    {false, 0xeb0, 4, cMask3,          0},
+    {false, 0xeb4, 2, cMask4,          0},
+    {false, 0xeb8, 1, cMask4,          2},
+    {false, 0xf70, 2, cMask5,          0},
+    {false, 0xf74, 1, cMask4,          3},
+    {false, 0xfc0, 1, cPsFlags,        0},
+    {false, 0xfdc, 4, cBlend,          0},
+    {false, 0x1050,1, cPsFlags,        3},
+};
+constexpr Load kPsLoadsRefOdu[] = {
+    {false, 0x024, 1, cPsFlags,        0},
+    {false, 0x030, 2, cPsFlags,        1},
+    {false, 0x0ac, 4, cShadowMap,      0},
+    {false, 0x0ec, 4, cShadowMap,      0},
+    {false, 0x114, 4, cTintBase,       0},
+    {false, 0x16c, 4, cTint,           0},
+    {false, 0x1d8, 4, cPointPos,       0},
+    {false, 0x240, 4, cPointColor,     0},
+    {false, 0x290, 4, cPointPos + 1,   0},
+    {false, 0x2f8, 4, cPointColor + 1, 0},
+    {false, 0x348, 4, cPointPos + 2,   0},
+    {false, 0x3b0, 4, cPointColor + 2, 0},
+    {false, 0x400, 4, cPointPos + 3,   0},
+    {false, 0x468, 4, cPointColor + 3, 0},
+    {false, 0x508, 4, cPsCamera,       0},
+    {false, 0x50c, 8, cDir,            0},
+    {false, 0x510, 2, cReflectPs,      0},
+    {false, 0x514, 1, cMisc,           0},
+    {false, 0x630, 2, cUvScale,        0},
+    {false, 0x654, 8, cMaterial,       0},
+    {false, 0x6b8, 8, cMul,            0},
+    {false, 0x6dc, 4, cAmbientTint,    0},
+    {false, 0x6ec, 8, cLight,          0},
+    {false, 0x6f0, 4, cExposure,       0},
+    {false, 0x6f4, 4, cAmbient,        0},
+    {false, 0xa94, 8, cDistFog,        0},
+    {false, 0xb04, 1, cMisc,           2},
+    {false, 0xb08, 1, cMisc,           3},
+    {false, 0xb0c, 1, cMisc2,          2},
+    {false, 0xb10, 1, cPsFlags,        0},
+    {false, 0xb14, 4, cOutScale,       0},
+    {false, 0xb7c, 2, cPsFlags,        1},
+    {false, 0xb80, 1, cMask0,          0},
+    {false, 0xb84, 4, cMask1,          0},
+    {false, 0xb88, 1, cMask0,          1},
+    {false, 0xb8c, 1, cMask0,          2},
+    {false, 0xb90, 1, cMisc2,          3},
+    {false, 0xcd4, 2, cMask2,          0},
+    {false, 0xd30, 2, cMask2,          2},
+    {false, 0xd34, 1, cMask0,          3},
+    {false, 0xe08, 4, cMask3,          0},
+    {false, 0xe0c, 2, cMask4,          0},
+    {false, 0xe10, 1, cMask4,          2},
+    {false, 0xec8, 2, cMask5,          0},
+    {false, 0xecc, 1, cMask4,          3},
+    {false, 0xf18, 1, cPsFlags,        0},
+    {false, 0xf34, 4, cBlend,          0},
+    {false, 0xfac, 1, cPsFlags,        3},
+};
+constexpr Load kPsLoadsRefPdut[] = {
+    {false, 0x034, 4, cUvScale,        0},
+    {false, 0x094, 1, cPsFlags,        0},
+    {false, 0x0c0, 2, cPsFlags,        1},
+    {false, 0x184, 4, cShadowMap,      0},
+    {false, 0x1c4, 4, cShadowMap,      0},
+    {false, 0x1ec, 4, cTintBase,       0},
+    {false, 0x244, 4, cTint,           0},
+    {false, 0x2b0, 4, cPointPos,       0},
+    {false, 0x310, 4, cPointColor,     0},
+    {false, 0x360, 4, cPointPos + 1,   0},
+    {false, 0x3c0, 4, cPointColor + 1, 0},
+    {false, 0x410, 4, cPointPos + 2,   0},
+    {false, 0x470, 4, cPointColor + 2, 0},
+    {false, 0x4c0, 4, cPointPos + 3,   0},
+    {false, 0x520, 4, cPointColor + 3, 0},
+    {false, 0x5bc, 4, cPsCamera,       0},
+    {false, 0x5c0, 8, cMaterial,       0},
+    {false, 0x5c4, 2, cReflectPs,      0},
+    {false, 0x5c8, 4, cAmbientTint,    0},
+    {false, 0x5cc, 1, cMisc,           0},
+    {false, 0x684, 8, cDir,            0},
+    {false, 0x688, 8, cMul,            0},
+    {false, 0x768, 8, cLight,          0},
+    {false, 0x7bc, 4, cExposure,       0},
+    {false, 0x7c0, 4, cAmbient,        0},
+    {false, 0xb38, 8, cDistFog,        0},
+    {false, 0xb8c, 1, cUvBlock,        0},
+    {false, 0xbac, 1, cMisc,           3},
+    {false, 0xbc4, 1, cMisc,           2},
+    {false, 0xbc8, 1, cMisc2,          2},
+    {false, 0xbcc, 4, cOutScale,       0},
+    {false, 0xbd0, 1, cPsFlags,        0},
+    {false, 0xc3c, 2, cPsFlags,        1},
+    {false, 0xc40, 4, cMask1,          0},
+    {false, 0xc44, 1, cMask0,          0},
+    {false, 0xc48, 1, cMask0,          1},
+    {false, 0xc4c, 1, cMask0,          2},
+    {false, 0xc50, 1, cMisc2,          3},
+    {false, 0xd94, 2, cMask2,          0},
+    {false, 0xdec, 2, cMask2,          2},
+    {false, 0xdf0, 1, cMask0,          3},
+    {false, 0xecc, 4, cMask3,          0},
+    {false, 0xed0, 2, cMask4,          0},
+    {false, 0xed4, 1, cMask4,          2},
+    {false, 0xf8c, 2, cMask5,          0},
+    {false, 0xf90, 1, cMask4,          3},
+    {false, 0xfdc, 1, cPsFlags,        0},
+    {false, 0xff8, 4, cBlend,          0},
+    {false, 0x106c,1, cPsFlags,        3},
+};
+
+struct VertexShaderInfo {
+    const char* name;
+    const char* defines;
+    const Load* loads;
+    size_t loadCount;
+    uint32_t used[7]; // components read from each fetch slot (0: not read)
+    int inputs;
+};
+
 struct Variant {
     const char* ps;
     const char* defines;
     const Load* loads;
     size_t loadCount;
     uint32_t texturePc[kTextures]; // 0: not read (bound to another of the draw's textures)
-    bool simple = false;           // the r_b1dst vertex shader and SIMPLE_MATERIAL
+    uint8_t vs = 0;                // its vertex shader (kVertexShaders); 1 and up: SIMPLE_MATERIAL
+    uint32_t cubePc = 0;           // the environment cube map's sample ([ref])
 };
 template <size_t N> constexpr size_t count(const Load (&)[N]) { return N; }
 const Variant kVariants[] = {
@@ -644,8 +896,19 @@ const Variant kVariants[] = {
     {"r_p1dut_b(vr)2dut.fxo", "#define DETAIL_NORMAL\n#define DETAIL_BLEND\n#define SPECULAR_GREEN\n#define MATERIAL_ALPHA_TEST\n", kPsLoadsPdutBdut, count(kPsLoadsPdutBdut), {0x07c, 0x1b4, 0x084, 0x7f0, 0x770, 0x790, 0x750, 0xc20, 0xc28, 0x074}},
     {"r_o1dut_b(vr)2du.fxo", "#define DETAIL_BLEND\n#define SPECULAR_GREEN\n#define KEEP_PRIMARY_NORMAL\n", kPsLoadsOdutBdu, count(kPsLoadsOdutBdu), {0x054, 0x160, 0x5e0, 0x5f0, 0x6c8, 0x778, 0x7a8, 0xbe8, 0xbf0, 0}},
     {"r_p1dut.fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define MATERIAL_ALPHA_TEST\n", kPsLoadsPdut, count(kPsLoadsPdut), {0x04c, 0x17c, 0, 0x78c, 0x7d4, 0x7e8, 0, 0xbac, 0xbb4, 0}, true},
+    {"r_o1dst[ref].fxo", "#define SIMPLE_MATERIAL\n#define REFLECT_MATERIAL\n", kPsLoadsRefOdst, count(kPsLoadsRefOdst), {0x54, 0x16c, 0, 0x860, 0x868, 0x870, 0, 0xc60, 0xc68, 0}, 2, 0x698},
+    {"r_o1dut[ref].fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n", kPsLoadsRefOdut, count(kPsLoadsRefOdut), {0x54, 0x16c, 0, 0x838, 0x830, 0x6f4, 0, 0xc44, 0xc68, 0}, 3, 0x67c},
+    {"r_o1du[ref].fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define GEOMETRIC_NORMAL\n", kPsLoadsRefOdu, count(kPsLoadsRefOdu), {0, 0x94, 0, 0x7dc, 0x7ec, 0x640, 0, 0xba0, 0xba8, 0}, 3, 0x608},
+    {"r_p1dut[ref].fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define MATERIAL_ALPHA_TEST\n#define REFLECT_MATERIAL\n", kPsLoadsRefPdut, count(kPsLoadsRefPdut), {0x54, 0x16c, 0, 0x838, 0x830, 0x6f4, 0, 0xc60, 0xc84, 0}, 3, 0x67c},
 };
-constexpr int kVariantCount = 10;
+constexpr int kVariantCount = 14;
+
+constexpr VertexShaderInfo kVertexShaders[4] = {
+    {"r_b1dst_a(vr)2d.fxo", "", kVsLoads, count(kVsLoads), {3, 4, 4, 4, 2, 2, 4}, 7},
+    {"r_b1dst.fxo", "#define SIMPLE_MATERIAL\n", kVsLoadsSimple, count(kVsLoadsSimple), {3, 3, 4, 4, 2, 4, 0}, 6},
+    {"r_b1dst[ref].fxo", "#define SIMPLE_MATERIAL\n#define REFLECT_MATERIAL\n", kVsLoadsRefSt, count(kVsLoadsRefSt), {3, 3, 4, 4, 2, 4, 0}, 6},
+    {"r_b1dut[ref].fxo", "#define SIMPLE_MATERIAL\n#define REFLECT_MATERIAL\n#define REFLECT_VERTEX_U\n", kVsLoadsRefUt, count(kVsLoadsRefUt), {3, 4, 4, 4, 2, 4, 0}, 6},
+};
 
 constexpr const char* kHeader = R"(#version 450
 layout(set = 0, binding = 7, std430) readonly buffer C { uvec4 c[]; } cb;
@@ -772,8 +1035,28 @@ void main() {
     p0 = vec4(fetch(4u).xy + uvo.xy, fetch(5u).xy + uvo.zw);
 #endif
     p1 = vec4(col.rgb * T, col.a * cf(14).y);
+#ifdef REFLECT_VERTEX_U
+    p2 = vec4(scatter, mac(-cf(14).x, clamp(n.w * uintBitsToFloat(0x3f808102u), 0.0, 1.0), cf(14).x));
+#else
     p2 = vec4(scatter, flatten);
-    p3 = vec4(dot3(W[0], on), dot3(W[1], on), dot3(W[2], on), 0.0);
+#endif
+    vec3 wn = vec3(dot3(W[0], on), dot3(W[1], on), dot3(W[2], on));
+#ifdef REFLECT_MATERIAL
+    // The reflection's weight: 1 + (normal . view) / |view| (the normal as it is, unnormalised),
+    // saturated, to the fourth, scaled (VSV[0x10] 0x0).
+    float rw;
+    {
+        vec3 dv = vec3(lp.x - cam.x, lp.y - cam.y, lp.z - cam.z);
+        float d2 = mac(dv.z, dv.z, mac(dv.y, dv.y, mul(dv.x, dv.x)));
+        float nd = mac(wn.z, dv.z, mac(wn.y, dv.y, mul(wn.x, dv.x)));
+        float f = clamp(mac(inversesqrt(d2), nd, 1.0), 0.0, 1.0);
+        float f2 = f * f, f4 = f2 * f2;
+        rw = 0.5 * mac(cf(72).x, f4, cf(72).x);
+    }
+    p3 = vec4(wn, rw);
+#else
+    p3 = vec4(wn, 0.0);
+#endif
     p4 = vec4(baked, 0.0);
     p5 = vec4(T, 0.0);
     p6 = vec4(dot3(W[0], ot), dot3(W[1], ot), dot3(W[2], ot), handed);
@@ -783,6 +1066,11 @@ void main() {
 
 constexpr const char* kFs = R"(
 layout(set = 0, binding = 8) uniform sampler2D tex[10];
+#ifdef REFLECT_MATERIAL
+layout(set = 0, binding = 9) uniform samplerCube env;
+#endif
+float mac(float a, float b, float c) { precise float r = a * b + c; return r; }
+float mul(float a, float b) { precise float r = a * b; return r; }
 layout(location = 0) in vec4 a0;
 layout(location = 1) in vec4 a1;
 layout(location = 2) in vec4 a2;
@@ -846,14 +1134,21 @@ void main() {
     precise vec2 nxy = 2.0 * q2 - 1.0;
 #endif
     float nz = sqrt(clamp(1.0 - dot(nxy, nxy), 0.0, 1.0));
+#ifdef GEOMETRIC_NORMAL
+    vec3 N = normalize(gn); // r_o1du[ref]: no normal map
+#else
     vec3 N = normalize(tg * nxy.x + bt * nxy.y + gn * nz);
+#endif
 
-    float shR = 1.0, shG = 1.0, cover = 1.0;
+    float shR = 1.0, shG = 1.0, cover = 1.0, shR1 = 1.0, shG1 = 1.0;
     vec4 rm = cf(22);
     if (has(flags, 8u)) {
         vec4 g = at(1, ruv);
         shR = g.r, shG = g.g, cover = g.a;
-        for (int i = 0; i < 2; ++i) { shR = rm.x * shR + rm.y; shG = shG * rm.z + rm.w; }
+        for (int i = 0; i < 2; ++i) {
+            shR = rm.x * shR + rm.y; shG = shG * rm.z + rm.w;
+            if (i == 0) shR1 = shR, shG1 = shG; // [ref]'s reflection light takes the first remap
+        }
     }
     vec3 tb = cf(23).xyz;
     vec3 dirTint = tb + (1.0 - tb) * (shR * shG);
@@ -894,7 +1189,8 @@ void main() {
 #endif
     vec3 detail = detail4.rgb;
 #ifdef SPECULAR_GREEN
-    vec3 specMat = vec3(at(5, uv0 * cf(21).xy).g);
+    vec4 specSample = at(5, uv0 * cf(21).xy);
+    vec3 specMat = vec3(specSample.g);
 #else
     vec3 specMat = at(5, uv0 * cf(21).xy).rgb;
 #endif
@@ -928,11 +1224,36 @@ void main() {
     vec3 indDiffuse = T * diffuseColor * bp + screenLight.rgb * shG;
     float blendBase = misc.x;
     diffuse += (blendBase + (1.0 - blendBase) * shG) * itint * indDiffuse;
-    vec3 dirSpec = lc0 * dirTint * lobe0 + lc1 * (2.0 * misc.y) * lobe1 * nl1;
+#ifdef REFLECT_MATERIAL
+    float secondaryGain = cf(73).x; // its load lands with the floor at 0xf4
+#else
+    float secondaryGain = misc.y;
+#endif
+    vec3 dirSpec = lc0 * dirTint * lobe0 + lc1 * (2.0 * secondaryGain) * lobe1 * nl1;
     vec3 spec = vtint * specularColor * dirSpec;
     vec3 indSpec = T * specularColor * bp + vec3(screenLight.a * shG);
     spec += itint * lobe1 * indSpec;
     vec3 lin = adjBase * diffuse + adjSpec * spec;
+#ifdef REFLECT_MATERIAL
+    // The environment: reflected about N (its x mirrored, as the shader's cube lookup takes it),
+    // decoded (rgb / (4 a), squared), lit by the first shadow remap and the light's angle.
+    {
+        float dd2 = mac(away.z, N.z, mac(away.y, N.y, mul(away.x, N.x)));
+        float twice = 2.0 * dd2;
+        vec3 cd = vec3(mac(N.x, twice, -away.x), mac(-N.y, twice, away.y), mac(-N.z, twice, away.z));
+        vec4 cube = texture(env, cd);
+        float inva = 1.0 / max(cube.a, uintBitsToFloat(0x3b808081u));
+        vec3 dec = cube.rgb * (0.25 * inva);
+        vec3 envLin = dec * dec;
+        float angular = clamp(0.75 - dot(d0, N), 0.0, 1.0);
+        float rlight = max(shR1 * shG1 * angular, cf(73).y);
+#ifdef SPECULAR_GREEN
+        lin += envLin * (specSample.r * a3.w * rlight);
+#else
+        lin += envLin * rlight * (a3.w * point.x);
+#endif
+    }
+#endif
 
     float exposure = cf(39).x;
     vec3 tc = vec3(tone(lin.r, exposure), tone(lin.g, exposure), tone(lin.b, exposure));
@@ -1033,7 +1354,8 @@ public:
     bool draw(int role, const Draw& d, Gpu& gpu) override {
         if (role < 1 || role > kVariantCount) return false;
         const Variant& var = kVariants[role - 1];
-        const char* vsWanted = var.simple ? "r_b1dst.fxo" : "r_b1dst_a(vr)2d.fxo";
+        const VertexShaderInfo& vsi = kVertexShaders[var.vs];
+        const char* vsWanted = vsi.name;
         if (!d.vsName || (*d.vsName != vsWanted && d.vsName->rfind(std::string(vsWanted) + " +", 0) != 0))
             return decline(role, "another vertex shader");
         if (d.upscaler) return decline(role, "an upscaler is on");
@@ -1046,8 +1368,8 @@ public:
         if (d.primitive != 4) return decline(role, "not a triangle list");
         uint32_t c[kConstants][4] = {};
         // The loads' offsets in the shaders' data, resolved once per shader pair.
-        const Load* vsList = var.simple ? kVsLoadsSimple : kVsLoads;
-        const size_t vsCount = var.simple ? count(kVsLoadsSimple) : count(kVsLoads);
+        const Load* vsList = vsi.loads;
+        const size_t vsCount = vsi.loadCount;
         const std::vector<int64_t>& offs = offsets(role, d, vsList, vsCount, var.loads, var.loadCount);
         for (size_t k = 0; k < vsCount + var.loadCount; ++k) {
             const Load& l = k < vsCount ? vsList[k] : var.loads[k - vsCount];
@@ -1062,9 +1384,8 @@ public:
         }
         // The vertex inputs: v4 position, v8 normal, v12 tangent, v16 colour, v20 uv0, v24 uv1, v28 baked light.
         // r_b1dst: v4 position, v8 normal (xyz), v12 tangent, v16 colour, v20 uv, v24 baked light.
-        static constexpr uint32_t kUsedFull[7] = {3, 4, 4, 4, 2, 2, 4}, kUsedSimple[7] = {3, 3, 4, 4, 2, 4, 0};
-        const uint32_t* kUsed = var.simple ? kUsedSimple : kUsedFull;
-        const int inputs = var.simple ? 6 : 7;
+        const uint32_t* kUsed = vsi.used;
+        const int inputs = vsi.inputs;
         const VertexBuffer* slot[7] = {};
         for (const VertexBuffer& v : d.vertex)
             if (v.slot >= 0 && v.slot < 7 && v.components) slot[v.slot] = &v;
@@ -1098,6 +1419,14 @@ public:
             images[t] = {x->sampler, x->view, VK_IMAGE_LAYOUT_GENERAL};
             std::memcpy(&c[cTexScale + t / 2][(t & 1) * 2], x->scale, 8);
         }
+        VkDescriptorImageInfo cube{}; // [ref]: the environment cube map, at its own binding
+        if (var.cubePc) {
+            const Texture* x = nullptr;
+            for (const Texture& y : d.textures)
+                if (y.pc == var.cubePc) x = &y;
+            if (!x || !x->view || !x->sampler) return decline(role, "no environment cube map");
+            cube = {x->sampler, x->view, VK_IMAGE_LAYOUT_GENERAL};
+        }
         for (int i = 0; i < 2; ++i) {
             int32_t sw[4];
             swizzle(d.color[i], sw);
@@ -1126,12 +1455,12 @@ public:
         std::memcpy(imgs.data(), images, sizeof images);
         std::array<VkDescriptorBufferInfo, 8> bs;
         std::memcpy(bs.data(), bufs, sizeof bufs);
-        gpu.record([pipe, layout = layout_, bs, imgs, vp, sc, index, indexed = d.indexed, indexType = d.indexType, count = d.count,
+        gpu.record([pipe, layout = layout_, bs, imgs, cube, vp, sc, index, indexed = d.indexed, indexType = d.indexType, count = d.count,
                     pushSet = gpu.pushDescriptorSet()](VkCommandBuffer cmd) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             vkCmdSetViewport(cmd, 0, 1, &vp);
             vkCmdSetScissor(cmd, 0, 1, &sc);
-            VkWriteDescriptorSet w[9]{};
+            VkWriteDescriptorSet w[10]{};
             for (uint32_t i = 0; i < 8; ++i) {
                 w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 w[i].dstBinding = i;
@@ -1144,7 +1473,16 @@ public:
             w[8].descriptorCount = kTextures;
             w[8].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             w[8].pImageInfo = imgs.data();
-            pushSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 9, w);
+            uint32_t n = 9;
+            if (cube.imageView) {
+                w[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w[9].dstBinding = 9;
+                w[9].descriptorCount = 1;
+                w[9].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                w[9].pImageInfo = &cube;
+                n = 10;
+            }
+            pushSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, n, w);
             if (indexed) {
                 vkCmdBindIndexBuffer(cmd, index.buffer, index.offset + index.byteOffset, indexType);
                 vkCmdDrawIndexed(cmd, count, 1, 0, 0, 0);
@@ -1218,15 +1556,16 @@ private:
         VkPipeline& out = pipes_[key];
         const VkDevice dev = gpu.device();
         if (!layout_) {
-            VkDescriptorSetLayoutBinding b[9];
+            VkDescriptorSetLayoutBinding b[10];
             for (uint32_t i = 0; i < 8; ++i)
                 b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VkShaderStageFlags(i < 7 ? VK_SHADER_STAGE_VERTEX_BIT
                                                                                            : VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT),
                         nullptr};
             b[8] = {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kTextures, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+            b[9] = {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}; // [ref]'s cube map
             VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
             dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-            dl.bindingCount = 9;
+            dl.bindingCount = 10;
             dl.pBindings = b;
             if (vkCreateDescriptorSetLayout(dev, &dl, nullptr, &setLayout_) != VK_SUCCESS) return out = VK_NULL_HANDLE;
             VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -1239,7 +1578,7 @@ private:
         }
         const Variant& var = kVariants[role - 1];
         const std::string header = kHeader;
-        const std::string vsDefs = var.simple ? "#define SIMPLE_MATERIAL\n" : "";
+        const std::string vsDefs = kVertexShaders[var.vs].defines;
         const VkShaderModule vsm = gpu.shader(header + vsDefs + kVs, Gpu::Stage::Vertex);
         // The fragment stage's extension, ahead of everything else.
         const std::string fsHeader = "#version 450\n#extension GL_EXT_demote_to_helper_invocation : require\n" + header.substr(header.find('\n') + 1);
