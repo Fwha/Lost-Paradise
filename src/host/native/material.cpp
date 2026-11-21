@@ -643,8 +643,11 @@ public:
     const char* name() const override { return "material"; }
 
     int claims(const std::string& psName) const override {
-        for (int i = 0; i < kVariantCount; ++i)
-            if (psName == kVariants[i].ps) return i + 1;
+        // An archive name, with " +N" when N other entries have the same code (shader_names.cpp).
+        for (int i = 0; i < kVariantCount; ++i) {
+            const std::string name = kVariants[i].ps;
+            if (psName == name || psName.rfind(name + " +", 0) == 0) return i + 1;
+        }
         return 0;
     }
 
