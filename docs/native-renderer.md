@@ -179,3 +179,20 @@ every step leaves a game that plays:
   alone), `r_p1dut` (alpha-tested). The material pass now covers ~2,100 of its ~3,350 draws.
   Compare run: within one step, depth exact; once, a few thousand pixels of the edge mask (target 1)
   differed by up to 65/255, since that mask is a threshold that rounding can flip.
+
+### Native draws at the old path's speed
+
+Fwha measured ~45 fps with Native Renderer on against ~88 off at a busy town spot. With
+`LPN_PROFILE` (now with a "native draws" line and native pass counts) and a perf profile:
+
+- Native draws were recorded on the main recorder only, each draining the recorder threads: they
+  now record in the threads' segments, engine-captured shadow casters too (`DrawCall::kEngine`).
+- Native and translated draws on the same targets restarted the pass with a full barrier (~1,100
+  passes a frame against ~115): they now share the open pass, a native draw counts only what it
+  writes (a depth buffer it only tests is not written), and barriers follow the translated path's
+  rules.
+- One lock around every native draw: each pass now guards only its own state.
+- Per draw, ~60 map lookups for the material's constants (now resolved once per shader pair) and
+  two copied load maps in the analysis (now built once per cached program and shared).
+
+Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
