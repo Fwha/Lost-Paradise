@@ -5968,10 +5968,7 @@ void main() {
         int32_t rect[4];
         uint32_t slot, depth, seq, pad;
     };
-    struct CompareInfo {
-        uint32_t seq = ~0u;
-        std::string info;
-    };
+
     struct PendingCompare {
         VkImageView a[9] = {}, b[9] = {};
         int32_t rect[4] = {};
@@ -6122,7 +6119,7 @@ void main() {
         }
         ++compareDrawn_[std::min<uint32_t>(role, kCompareRoles - 1)];
         const uint32_t seq = uint32_t(compareSeq_);
-        compareInfo_[seq % kCompareInfos] = {seq, a.psm->nativePass->lastDrawInfo()};
+        if (compareInfo_.size() < 20000) compareInfo_[seq] = a.psm->nativePass->lastDrawInfo();
         pc.seq = seq;
         // Where it could have drawn: the scissor.
         pc.rect[0] = nd.scissor[0], pc.rect[1] = nd.scissor[1], pc.rect[2] = nd.scissor[2], pc.rect[3] = nd.scissor[3];
@@ -6201,15 +6198,16 @@ void main() {
             for (uint32_t i = 0; i < 9; ++i) {
                 CompareSlot& c = slots[role * 9 + i];
                 if (c.claim != 1) continue;
-                const CompareInfo& ci = compareInfo_[c.seq % kCompareInfos];
+                const auto ci = compareInfo_.find(c.seq);
                 std::fprintf(stderr,
                              "[native]   target %u differs at %u,%u: translated %g %g %g %g, native %g %g %g %g; draw %u: %s\n", i, c.x, c.y,
                              c.translated[0], c.translated[1], c.translated[2], c.translated[3], c.native[0], c.native[1], c.native[2],
-                             c.native[3], c.seq, ci.seq == c.seq ? ci.info.c_str() : "(no longer kept)");
+                             c.native[3], c.seq, ci != compareInfo_.end() ? ci->second.c_str() : "(not kept)");
                 c.claim = 0; // the next report's first
             }
             compareDrawn_[role] = compareDeclined_[role] = 0;
         }
+        compareInfo_.clear();
     }
     std::string compareWith_ = std::getenv("LPN_NATIVE_COMPARE") ? std::getenv("LPN_NATIVE_COMPARE") : "";
     VkPipeline comparePipe_ = VK_NULL_HANDLE;
@@ -6225,8 +6223,7 @@ void main() {
     uint64_t compareFrame_ = ~0ull, compareSeq_ = 0;
     uint32_t compareCount_ = 0;
     uint64_t compareDrawn_[kCompareRoles] = {}, compareDeclined_[kCompareRoles] = {};
-    static constexpr uint32_t kCompareInfos = 256;
-    CompareInfo compareInfo_[kCompareInfos];
+    std::unordered_map<uint32_t, std::string> compareInfo_; // since the last report
     CompareSlot compareSeen_[kCompareSlots] = {};
     std::chrono::steady_clock::time_point compareLast_ = std::chrono::steady_clock::now();
 

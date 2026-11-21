@@ -1542,7 +1542,13 @@ private:
         s += b;
         std::snprintf(b, sizeof b, "; target formats %d %d", int(d.color[0].format), int(d.color[1].format));
         s += b;
-        const int show[] = {13, 14, 21, 22, 23, 24, 25, 29, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 51, 56, 57, 58, 59};
+        std::snprintf(b, sizeof b, "; %s %u (index offset %u, type %d), cull %d front %d, depth test %d write %d op %d", d.indexed ? "indices" : "vertices",
+                      d.count, d.index.byteOffset, int(d.indexType), int(d.cull), int(d.frontFace), int(d.depthStencil.depthTestEnable),
+                      int(d.depthStencil.depthWriteEnable), int(d.depthStencil.depthCompareOp));
+        s += b;
+        std::snprintf(b, sizeof b, "; %zu buffers, viewport %g %g %g %g", d.vertex.size(), d.viewport[0], d.viewport[1], d.viewport[2], d.viewport[3]);
+        s += b;
+        const int show[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 21, 22, 23, 24, 25, 29, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 51, 56, 57, 58, 59};
         for (int i : show) {
             float f[4];
             std::memcpy(f, c[i], sizeof f);
@@ -1551,8 +1557,9 @@ private:
         }
         for (int i = 0; i < inputs; ++i)
             if (slot[i]) {
-                std::snprintf(b, sizeof b, "\n    input %d: dfmt %u nfmt %u stride %u sel 0x%x components %u", i, slot[i]->dfmt, slot[i]->nfmt,
-                              slot[i]->stride, slot[i]->dstSel, slot[i]->components);
+                std::snprintf(b, sizeof b, "\n    input %d: dfmt %u nfmt %u stride %u sel 0x%x components %u index v%u offset %u+%u records %u", i,
+                              slot[i]->dfmt, slot[i]->nfmt, slot[i]->stride, slot[i]->dstSel, slot[i]->components, slot[i]->indexVgpr,
+                              slot[i]->data.byteOffset, slot[i]->offset, slot[i]->records);
                 s += b;
             }
         for (const Texture& t : d.textures) {
