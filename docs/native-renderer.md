@@ -171,3 +171,7 @@ every step leaves a game that plays:
   prepass's operations. Codex's reading is in `docs/shaders/`.
 - `LPN_NATIVE_COMPARE=material` (Fwha's run): ~57,000 draws compared, no pixel more than one 8-bit
   step off in either target, depth exact, none declined. Looked right in play.
+- Three more pixel shaders of the family as variants of the same port (`r_o1dst_m(vr)2dst`,
+  `r_o1dst_b(vr)2dst`, `r_o1dst_b(vr)2ds`: a detail normal map, and detail textures blended by
+  their alpha), ~1,380 of the material pass's draws in all. Their names carry shader_names' " +1".
+  Compare run: all four within one 8-bit step, depth exact.
