@@ -589,6 +589,7 @@ struct Profiler {
     uint64_t passWhy[4] = {}; // why a new render pass started, by PassWhy
     uint64_t feedbackOn[2] = {}; // a draw sampled the open pass's depth / color attachment
     uint64_t nativePasses = 0;   // of the passes, those a native draw opened
+    uint64_t native[6] = {};     // native draws: drawn, declined, started over; ns building, recording, the whole
     uint64_t missWhy[4] = {}; // a launch not repeating the stage's last: shader, submission, user data, other
     uint64_t missUser[16] = {}; // the user data words that differed
     uint64_t fastMiss[8] = {}; // a draw not taking fastDraw, by FastMiss
@@ -1506,6 +1507,10 @@ public:
                          R().prof_.drainWhy[0] / n, R().prof_.drainWhy[1] / n, R().prof_.drainWhy[2] / n, R().prof_.drainWhy[3] / n,
                          R().prof_.drainNs / 1e6 / n, R().prof_.aheadNs / 1e6 / n, R().prof_.locks / n, R().prof_.lockWaits / n,
                          R().prof_.lockNs / 1e6 / n, R().prof_.sharedDraws / n, R().prof_.sharedRetries / n);
+        if (R().prof_.native[0] || R().prof_.native[1])
+            std::fprintf(stderr, "[prof] t=%.1f native draws %.0f (%.0f declined, %.0f started over): building %.2f ms, recording %.2f ms, in all %.2f ms (summed) per frame\n",
+                         profile::seconds(), R().prof_.native[0] / n, R().prof_.native[1] / n, R().prof_.native[2] / n,
+                         R().prof_.native[3] / 1e6 / n, R().prof_.native[4] / 1e6 / n, R().prof_.native[5] / 1e6 / n);
         std::fprintf(stderr, "[prof] t=%.1f VRAM copies %zu: %.1f allocations, %.2f evictions (%.1f freed, %.2f found none) per frame\n",
                      profile::seconds(), vram_.size(), R().prof_.vramAllocs / n, R().prof_.vramEvicts / n, R().prof_.vramFreed / n,
                      R().prof_.vramEvictsEmpty / n);
@@ -5392,6 +5397,24 @@ void main() {
         // On a recorder thread its segment's ring must hold the draw's data (flushing is not
         // possible there; the translated path takes it then).
         if (R().worker_ && !ringFits(1 << 12)) return false;
+        using Clock = std::chrono::steady_clock;
+        const bool prof = R().prof_.on;
+        const Clock::time_point t0 = prof ? Clock::now() : Clock::time_point{};
+        Clock::time_point t1{};
+        struct Note { // LPN_PROFILE: the draw's times, however it ends
+            Renderer& r; bool prof; Clock::time_point t0; Clock::time_point& t1; bool drawn = false;
+            ~Note() {
+                if (!prof) return;
+                const auto t2 = Clock::now();
+                auto& p = r.R().prof_;
+                ++p.native[drawn ? 0 : 1];
+                if (t1 != Clock::time_point{}) {
+                    p.native[3] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+                    p.native[4] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
+                }
+                p.native[5] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t0).count());
+            }
+        } note{*this, prof, t0, t1};
         // As the translated path: the caches looked up holding m_ shared, started over holding it
         // exclusively when one would change (sharedMiss sets abort_). The surfaces are marked
         // written before anything is recorded, so a start over records nothing twice.
@@ -5412,9 +5435,11 @@ void main() {
             wl.unlock();
             sharedTry = false;
             ++R().prof_.sharedRetries;
+            ++R().prof_.native[2];
             goto retry;
         }
         if (!built) return false;
+        if (prof) t1 = Clock::now();
         if (!R().worker_ && !ringFits(1 << 12)) flush();
         begin();
         NativeGpu gpu(*this);
@@ -5428,6 +5453,7 @@ void main() {
             if (nd.color[i].image && ((nd.writeMask >> (4 * i)) & 0xF)) wrote.push_back(nd.color[i].image);
         if (depthWritten) wrote.push_back(depthWritten->img.image);
         nativeDrawn(nullptr, nullptr, &wrote); // the surfaces are marked above
+        note.drawn = true;
         return true;
     }
     // After a native pass recorded a draw: its writes and reads, for the barriers of the draws
@@ -9795,7 +9821,7 @@ private:
         auto add = [](auto& x, auto& y) {
             for (size_t i = 0; i < std::size(x); ++i) x[i] += std::exchange(y[i], 0);
         };
-        add(a.ns, b.ns), add(a.passWhy, b.passWhy), a.nativePasses += b.nativePasses, add(a.feedbackOn, b.feedbackOn), add(a.missWhy, b.missWhy);
+        add(a.ns, b.ns), add(a.passWhy, b.passWhy), a.nativePasses += std::exchange(b.nativePasses, 0), add(a.native, b.native), add(a.feedbackOn, b.feedbackOn), add(a.missWhy, b.missWhy);
         add(a.missUser, b.missUser), add(a.fastMiss, b.fastMiss), add(a.fastKind, b.fastKind), add(a.fastRes, b.fastRes);
         add(a.switchMiss, b.switchMiss), add(a.drainWhy, b.drainWhy), add(a.passBySize, b.passBySize), add(a.drawsBySize, b.drawsBySize);
         for (uint64_t Profiler::*f : {&Profiler::fastMoved, &Profiler::fastImages, &Profiler::diffsTaken, &Profiler::fastSwitches,
