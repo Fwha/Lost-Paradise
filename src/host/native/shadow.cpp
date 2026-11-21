@@ -269,6 +269,8 @@ public:
             std::memcpy(push.bias, w, 8);
             // For the casters drawn from the engine's captures, which do not read their pixel
             // constants: every opaque caster has had the same (1, 0.01) so far; a change is logged.
+            // (Recorded on several recorder threads, the order between these and the engine's
+            // casters is not kept: a change would reach some casters a little early or late.)
             if (std::memcmp(lastBias_, w, 8) != 0 && biasChanges_++ < 8)
                 std::fprintf(stderr, "[native] shadow: caster bias constants %g %g\n", std::bit_cast<float>(w[0]), std::bit_cast<float>(w[1]));
             std::memcpy(lastBias_, w, 8);
