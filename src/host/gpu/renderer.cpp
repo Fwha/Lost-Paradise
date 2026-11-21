@@ -1099,7 +1099,8 @@ public:
             runCompare();
         }
         if (recordThreads_) {
-            if (!native && segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
+            // Native draws go to the recorder threads too (but for LPN_NATIVE_COMPARE's, recorded here).
+            if ((!native || compareWith_.empty()) && segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
                 addToSegment(d, r, held);
                 return;
             }
@@ -5297,6 +5298,7 @@ void main() {
             const gcn::GlslStage s = stage == Stage::Vertex     ? gcn::GlslStage::Vertex
                                      : stage == Stage::Compute ? gcn::GlslStage::Compute
                                                                : gcn::GlslStage::Fragment;
+            std::lock_guard lock(r_.nativeModulesMutex_); // recorder threads draw natively too
             auto it = r_.nativeModules_.find(glsl);
             if (it != r_.nativeModules_.end()) return it->second;
             return r_.nativeModules_[glsl] = r_.module(glsl, s);
@@ -5308,7 +5310,7 @@ void main() {
         // targets carry on in it and any others end it. A native draw only joins a pass a native
         // draw opened: one the translated path opened may hold what the native draw samples.
         void beginRendering(const native::Target* color, uint32_t colorCount, const native::Target& depth, bool stencil) override {
-            Pass& p = r_.nativeNext_;
+            Pass& p = r_.R().nativeNext_;
             p.open = true;
             p.colorCount = colorCount;
             p.width = p.height = 16384;
@@ -5345,7 +5347,7 @@ void main() {
             bool feedback = false;
             for (VkImage im : R.sampledSurfaces_)
                 if (std::find(R.drawWritten_.begin(), R.drawWritten_.end(), im) != R.drawWritten_.end()) feedback = true;
-            if (R.pass_.open && r_.nativePassOpen_ && !feedback && R.pass_.sameTargets(p)) return;
+            if (R.pass_.open && R.nativePassOpen_ && !feedback && R.pass_.sameTargets(p)) return;
             r_.endPass();
             r_.barrier(); // what the draws before wrote or sampled
             VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
@@ -5362,7 +5364,7 @@ void main() {
             R.pass_.open = true;
             ++R.passSerial_;
             ++R.prof_.passes;
-            r_.nativePassOpen_ = true;
+            R.nativePassOpen_ = true;
         }
 
     private:
@@ -5376,18 +5378,23 @@ void main() {
         Surface* written[8]{};
         Surface* depthWritten = nullptr;
         if (!nativeBuild(d, r, a, nd, written, depthWritten)) return false;
-        if (!ringFits(1 << 12)) flush();
+        if (!R().worker_ && !ringFits(1 << 12)) flush(); // a recorder thread's segment has its own ring
         begin();
         NativeGpu gpu(*this);
-        if (!a.psm->nativePass->draw(a.psm->nativeRole, nd, gpu)) return false;
+        {
+            std::lock_guard lock(nativeMutex_);
+            if (!a.psm->nativePass->draw(a.psm->nativeRole, nd, gpu)) return false;
+        }
         nativeDrawn(written, depthWritten);
         return true;
     }
     // After a native pass recorded a draw: its writes and reads, for the barriers of the draws
     // after it (see draw()): every attachment counts as written. The pass bound pipelines and
     // descriptors of its own: everything is set again.
+    // Only this thread's state: a draw like any other, the barriers decided by what it wrote and
+    // sampled (drawWritten_, drawSampled_), not one before whatever comes next; the fast paths of
+    // the other recorder threads stay valid (no fastEpoch_ bump: passSerial_ moves on here).
     void nativeDrawn(Surface* const* written, Surface* depthWritten) {
-        R().needBarrier_ = true;
         for (VkImage im : R().pass_.images) addOnce(R().drawWritten_, im);
         for (VkImage im : R().sampledSurfaces_) addOnce(R().drawSampled_, im);
         R().bound_ = Bound{};
@@ -5395,7 +5402,6 @@ void main() {
         R().fast_.valid = false;
         for (FastSlot& f : R().fastSlots_) f.f.valid = false;
         R().lastMergeable_ = false;
-        ++fastEpoch_;
         if (written)
             for (int i = 0; i < 8; ++i)
                 if (written[i]) gpuWrote(*written[i]);
@@ -5659,6 +5665,7 @@ void main() {
         if (!ringFits(1 << 12)) flush();
         begin();
         NativeGpu gpu(*this);
+        std::unique_lock nlock(nativeMutex_);
         if (!native::drawStageCaster(c, nd, gpu)) {
             if (engineLost_++ < 5) std::fprintf(stderr, "[native] engine draw %u: the shadow pass could not draw it\n", id);
             return;
@@ -5968,7 +5975,11 @@ void main() {
         barrier();
         NativeGpu gpu(*this);
         const int role = a.psm->nativeRole;
-        const bool drawn = a.psm->nativePass->draw(role, cd, gpu);
+        bool drawn;
+        {
+            std::lock_guard lock(nativeMutex_);
+            drawn = a.psm->nativePass->draw(role, cd, gpu);
+        }
         endPass();
         barrier();
         nativeDrawn(nullptr, nullptr);
@@ -6072,8 +6083,10 @@ void main() {
 
     native::PassMap passMap_;
     bool nativeOn_ = false;
-    bool nativePassOpen_ = false; // R().pass_ was opened by a native draw (NativeGpu::beginRendering)
+    std::mutex nativeModulesMutex_;
     std::unordered_map<std::string, VkShaderModule> nativeModules_;
+    // The native passes keep their pipelines and logs unguarded: one recorder thread in them at a time.
+    std::mutex nativeMutex_;
 
     bool upscaleSmaa(const DrawRegs& r, uint8_t role, const DrawAnalysis& a) {
         if (upKind_ == Upscaler::Off || !upscale::usable(upKind_)) return false;
@@ -8023,6 +8036,8 @@ void main() {
                 if (!compareWith_.empty() && compareWith_ == a.psm->nativePass->name()) nativeCompare(d, r, a); // and drawn as usual
                 else if (nativeDraw(d, r, a)) return;
             }
+        } else if (nativeOn_ && compareWith_.empty() && a.psm && a.psm->nativePass && nativeDraw(d, r, a)) {
+            return; // on a recorder thread, in its segment
         }
         const bool wasMergeable = R().lastMergeable_;
         R().lastMergeable_ = false;
@@ -8305,7 +8320,7 @@ void main() {
             rec([c = R().cmd_, ri] { vkCmdBeginRendering(c, &ri); });
             std::swap(R().pass_, pass); // the old pass's storage is reused by the next draw
             R().pass_.open = true;
-            if (!R().worker_) nativePassOpen_ = false;
+            R().nativePassOpen_ = false;
             ++R().passSerial_;
             ++R().prof_.passes;
         }
@@ -8847,7 +8862,7 @@ void main() {
 
     void endPass() {
         R().needBarrier_ = true; // something other than a draw comes next
-        if (!R().worker_) nativePassOpen_ = false;
+        R().nativePassOpen_ = false;
         if (!R().pass_.open) return;
         rec([c = R().cmd_] { vkCmdEndRendering(c); });
         R().pass_.open = false;
@@ -9310,7 +9325,6 @@ private:
                    height == o.height && std::equal(views, views + colorCount, o.views);
         }
     };
-    Pass nativeNext_; // a native pass's storage, swapped with R().pass_ (NativeGpu::beginRendering)
     std::array<ImageMemo, kImageMemos> imageMemos_{};
     uint64_t imageGen_ = 1;
     int anisoSeen_ = 0; // the Anisotropic Filtering setting the bindings were made with
@@ -9349,6 +9363,8 @@ private:
         std::vector<std::function<void()>> pendingDone_; // due after the batch being recorded
         std::vector<std::function<void()>> afterFlush_;
         Pass pass_, drawPass_; // the open pass; the draw being recorded's
+        Pass nativeNext_;      // a native pass's storage, swapped with pass_ (NativeGpu::beginRendering)
+        bool nativePassOpen_ = false; // pass_ was opened by a native draw
         PassWhy passClosedBy_ = kPassOther;
         uint64_t passSerial_ = 0;
         // Since the last barrier: images draws wrote and sampled, and whether anything else (a copy,
