@@ -7741,7 +7741,7 @@ void main() {
         to.launch = from.launch;
         to.fetchSite = from.fetchSite, to.fetchSlots = from.fetchSlots;
         // Analyses are recycled: a scalar load map left from another program would give a native
-        // pass another shader's constants (runJob copies it for claimed draws only).
+        // pass another shader's constants (native passes read psLoads/vsLoads instead).
         if (!to.smrd.empty()) to.smrd.clear();
         to.data = from.data;
         to.buffers = from.buffers;
