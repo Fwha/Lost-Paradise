@@ -588,6 +588,7 @@ struct Profiler {
     uint64_t ns[kProfCount] = {};
     uint64_t passWhy[4] = {}; // why a new render pass started, by PassWhy
     uint64_t feedbackOn[2] = {}; // a draw sampled the open pass's depth / color attachment
+    uint64_t nativePasses = 0;   // of the passes, those a native draw opened
     uint64_t missWhy[4] = {}; // a launch not repeating the stage's last: shader, submission, user data, other
     uint64_t missUser[16] = {}; // the user data words that differed
     uint64_t fastMiss[8] = {}; // a draw not taking fastDraw, by FastMiss
@@ -1457,10 +1458,10 @@ public:
         std::fprintf(stderr, "[prof] t=%.1f frames %" PRIu64 "-%" PRIu64 ": %.1f fps, %.1f ms/frame, worst %.1f ms, %" PRIu64 " over 17 ms;",
                      profile::seconds(), frame_ - windowFrames_, frame_, n / wall, wall * 1000 / n, worstFrameMs_, slowFrames_);
         for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.2f", kProfNames[i], R().prof_.ns[i] / 1e6 / n);
-        std::fprintf(stderr, " passes for targets %.0f feedback %.0f (depth %.0f color %.0f) store %.0f other %.0f; depth-only draws %.0f (%.0f joined a pass);",
+        std::fprintf(stderr, " passes for targets %.0f feedback %.0f (depth %.0f color %.0f) store %.0f other %.0f (native %.0f); depth-only draws %.0f (%.0f joined a pass);",
                      R().prof_.passWhy[0] / n, R().prof_.passWhy[1] / n, R().prof_.feedbackOn[0] / n,
-                     R().prof_.feedbackOn[1] / n, R().prof_.passWhy[2] / n, R().prof_.passWhy[3] / n, R().prof_.depthOnly / n,
-                     R().prof_.depthJoins / n);
+                     R().prof_.feedbackOn[1] / n, R().prof_.passWhy[2] / n, R().prof_.passWhy[3] / n, R().prof_.nativePasses / n,
+                     R().prof_.depthOnly / n, R().prof_.depthJoins / n);
         std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / n, R().prof_.dmas / n,
                      R().prof_.dmaBytes / n / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
@@ -5349,8 +5350,17 @@ void main() {
             // Joined whichever path opened it: a pass on the same targets whose draws wrote nothing
             // this one samples (drawWritten_ holds every attachment written since the last barrier).
             if (R.pass_.open && !feedback && R.pass_.sameTargets(p)) return;
-            r_.endPass();
-            r_.barrier(); // what the draws before wrote or sampled
+            if (R.prof_.on) { // LPN_PROFILE: why a native draw opened a pass (with the translated ones)
+                ++R.prof_.passWhy[!R.pass_.open ? R.passClosedBy_ : feedback ? kPassFeedback : kPassTargets];
+                ++R.prof_.nativePasses;
+            }
+            if (R.pass_.open) { // as the translated path ends it: endPass() would demand a barrier
+                r_.rec([c = R.cmd_] { vkCmdEndRendering(c); });
+                R.pass_.open = false;
+                R.passClosedBy_ = kPassTargets;
+            }
+            // As the translated path decides it: what the draws since the last barrier wrote or sampled.
+            if (R.needBarrier_ || feedback || overlaps(p.images, R.drawWritten_) || overlaps(p.images, R.drawSampled_)) r_.barrier();
             VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
             ri.renderArea = {{0, 0}, {p.width, p.height}};
             ri.layerCount = 1;
@@ -5408,7 +5418,12 @@ void main() {
             std::lock_guard lock(nativeMutex_);
             if (!a.psm->nativePass->draw(a.psm->nativeRole, nd, gpu)) return false;
         }
-        nativeDrawn(nullptr, nullptr); // the surfaces are marked above
+        std::vector<VkImage>& wrote = R().nativeWrote_;
+        wrote.clear();
+        for (uint32_t i = 0; i < nd.colorCount; ++i)
+            if (nd.color[i].image && ((nd.writeMask >> (4 * i)) & 0xF)) wrote.push_back(nd.color[i].image);
+        if (depthWritten) wrote.push_back(depthWritten->img.image);
+        nativeDrawn(nullptr, nullptr, &wrote); // the surfaces are marked above
         return true;
     }
     // After a native pass recorded a draw: its writes and reads, for the barriers of the draws
@@ -5417,8 +5432,10 @@ void main() {
     // Only this thread's state: a draw like any other, the barriers decided by what it wrote and
     // sampled (drawWritten_, drawSampled_), not one before whatever comes next; the fast paths of
     // the other recorder threads stay valid (no fastEpoch_ bump: passSerial_ moves on here).
-    void nativeDrawn(Surface* const* written, Surface* depthWritten) {
-        for (VkImage im : R().pass_.images) addOnce(R().drawWritten_, im);
+    // `wrote`: the attachments it wrote (null: all of the pass's), as the translated path counts
+    // them: a depth buffer only tested is not written, so later draws may sample it in the same pass.
+    void nativeDrawn(Surface* const* written, Surface* depthWritten, const std::vector<VkImage>* wrote = nullptr) {
+        for (VkImage im : wrote ? *wrote : R().pass_.images) addOnce(R().drawWritten_, im);
         for (VkImage im : R().sampledSurfaces_) addOnce(R().drawSampled_, im);
         R().bound_ = Bound{};
         ++R().passSerial_;
@@ -9388,6 +9405,7 @@ private:
         Pass pass_, drawPass_; // the open pass; the draw being recorded's
         Pass nativeNext_;      // a native pass's storage, swapped with pass_ (NativeGpu::beginRendering)
         bool nativePassOpen_ = false; // pass_ was opened by a native draw
+        std::vector<VkImage> nativeWrote_; // scratch: the attachments a native draw wrote
         PassWhy passClosedBy_ = kPassOther;
         uint64_t passSerial_ = 0;
         // Since the last barrier: images draws wrote and sampled, and whether anything else (a copy,
@@ -9733,7 +9751,7 @@ private:
         auto add = [](auto& x, auto& y) {
             for (size_t i = 0; i < std::size(x); ++i) x[i] += std::exchange(y[i], 0);
         };
-        add(a.ns, b.ns), add(a.passWhy, b.passWhy), add(a.feedbackOn, b.feedbackOn), add(a.missWhy, b.missWhy);
+        add(a.ns, b.ns), add(a.passWhy, b.passWhy), a.nativePasses += b.nativePasses, add(a.feedbackOn, b.feedbackOn), add(a.missWhy, b.missWhy);
         add(a.missUser, b.missUser), add(a.fastMiss, b.fastMiss), add(a.fastKind, b.fastKind), add(a.fastRes, b.fastRes);
         add(a.switchMiss, b.switchMiss), add(a.drainWhy, b.drainWhy), add(a.passBySize, b.passBySize), add(a.drawsBySize, b.drawsBySize);
         for (uint64_t Profiler::*f : {&Profiler::fastMoved, &Profiler::fastImages, &Profiler::diffsTaken, &Profiler::fastSwitches,
