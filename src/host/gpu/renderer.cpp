@@ -5306,9 +5306,8 @@ void main() {
         void record(std::function<void(VkCommandBuffer)> fn) override {
             r_.rec([c = r_.R().cmd_, fn = std::move(fn)] { fn(c); });
         }
-        // As the translated draw opens a pass (R().pass_), so that translated draws on the same
-        // targets carry on in it and any others end it. A native draw only joins a pass a native
-        // draw opened: one the translated path opened may hold what the native draw samples.
+        // As the translated draw opens a pass (R().pass_), so that draws of either path on the same
+        // targets carry on in it and any others end it.
         void beginRendering(const native::Target* color, uint32_t colorCount, const native::Target& depth, bool stencil) override {
             Pass& p = r_.R().nativeNext_;
             p.open = true;
@@ -5376,9 +5375,8 @@ void main() {
     // The draw as a native pass sees it (native::Draw), then the pass's own recording in its place.
     // False when the pass declines it: the translated path draws it.
     bool nativeDraw(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
-        // On a recorder thread: its segment's ring must hold the draw's data (flushing is not
-        // possible there; the translated path takes it then), and the caches the draw looks up and
-        // the surfaces it marks written are held exclusively (m_; on the main recorder m_ is held).
+        // On a recorder thread its segment's ring must hold the draw's data (flushing is not
+        // possible there; the translated path takes it then).
         if (R().worker_ && !ringFits(1 << 12)) return false;
         // As the translated path: the caches looked up holding m_ shared, started over holding it
         // exclusively when one would change (sharedMiss sets abort_). The surfaces are marked
