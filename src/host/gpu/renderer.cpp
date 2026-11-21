@@ -5572,6 +5572,16 @@ void main() {
             };
         };
         nd.load = loads(a.ps);
+        auto offsets = [](const gcn::Program& p) {
+            return [&p](uint32_t pc) -> int64_t {
+                auto it = p.smrd.find(p.launch.entry + pc);
+                return it == p.smrd.end() ? -1 : int64_t(it->second);
+            };
+        };
+        nd.vsId = a.vsm, nd.psId = a.psm;
+        nd.vsData = a.vs.data.data(), nd.vsSize = a.vs.data.size();
+        nd.psData = a.ps.data.data(), nd.psSize = a.ps.data.size();
+        nd.vsOffset = offsets(a.vs), nd.psOffset = offsets(a.ps);
         nd.vsLoad = loads(a.vs);
         if (a.vsm && a.vsm->gameName) nd.vsName = a.vsm->gameName;
         else nd.vsName = &native::shaderNameAt(a.vs.launch.entry, &readGuest);

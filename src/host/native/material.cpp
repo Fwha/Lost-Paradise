@@ -20,6 +20,9 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
+#include <vector>
 #include <set>
 #include <string>
 #include <tuple>
@@ -1042,22 +1045,21 @@ public:
         if (d.instances != 1) return decline(role, "instanced");
         if (d.primitive != 4) return decline(role, "not a triangle list");
         uint32_t c[kConstants][4] = {};
-        auto loadAll = [&](const Load* list, size_t n) -> const char* {
-            for (size_t k = 0; k < n; ++k) {
-                const Load& l = list[k];
-                uint32_t w[16];
-                if (!(l.vs ? d.vsLoad : d.load)(l.pc, w, l.n)) {
-                    static thread_local char why[64];
-                    std::snprintf(why, sizeof why, "no %s load at 0x%x", l.vs ? "vertex" : "pixel", l.pc);
-                    return why;
-                }
-                for (uint32_t i = 0; i < l.n; ++i) c[l.index + (l.at + i) / 4][(l.at + i) % 4] = w[i];
+        // The loads' offsets in the shaders' data, resolved once per shader pair.
+        const Load* vsList = var.simple ? kVsLoadsSimple : kVsLoads;
+        const size_t vsCount = var.simple ? count(kVsLoadsSimple) : count(kVsLoads);
+        const std::vector<int64_t>& offs = offsets(role, d, vsList, vsCount, var.loads, var.loadCount);
+        for (size_t k = 0; k < vsCount + var.loadCount; ++k) {
+            const Load& l = k < vsCount ? vsList[k] : var.loads[k - vsCount];
+            const uint32_t* data = l.vs ? d.vsData : d.psData;
+            const size_t size = l.vs ? d.vsSize : d.psSize;
+            if (offs[k] < 0 || size_t(offs[k]) + l.n > size) {
+                static thread_local char why[64];
+                std::snprintf(why, sizeof why, "no %s load at 0x%x", l.vs ? "vertex" : "pixel", l.pc);
+                return decline(role, why);
             }
-            return nullptr;
-        };
-        if (const char* why = var.simple ? loadAll(kVsLoadsSimple, count(kVsLoadsSimple)) : loadAll(kVsLoads, count(kVsLoads)))
-            return decline(role, why);
-        if (const char* why = loadAll(var.loads, var.loadCount)) return decline(role, why);
+            for (uint32_t i = 0; i < l.n; ++i) c[l.index + (l.at + i) / 4][(l.at + i) % 4] = data[offs[k] + i];
+        }
         // The vertex inputs: v4 position, v8 normal, v12 tangent, v16 colour, v20 uv0, v24 uv1, v28 baked light.
         // r_b1dst: v4 position, v8 normal (xyz), v12 tangent, v16 colour, v20 uv, v24 baked light.
         static constexpr uint32_t kUsedFull[7] = {3, 4, 4, 4, 2, 2, 4}, kUsedSimple[7] = {3, 3, 4, 4, 2, 4, 0};
@@ -1154,6 +1156,34 @@ public:
     }
 
 private:
+    // Per shader pair (and role): each load's offset in the shader's data, or -1.
+    struct PairKey {
+        int role;
+        const void *vs, *ps;
+        bool operator==(const PairKey&) const = default;
+    };
+    struct PairHash {
+        size_t operator()(const PairKey& k) const {
+            return std::hash<const void*>()(k.vs) * 31 ^ std::hash<const void*>()(k.ps) ^ size_t(k.role);
+        }
+    };
+    const std::vector<int64_t>& offsets(int role, const Draw& d, const Load* vs, size_t vsCount, const Load* ps, size_t psCount) {
+        const PairKey key{role, d.vsId, d.psId};
+        {
+            std::shared_lock lock(offsetsMutex_);
+            if (auto it = offsets_.find(key); it != offsets_.end()) return it->second;
+        }
+        std::vector<int64_t> v(vsCount + psCount);
+        for (size_t k = 0; k < v.size(); ++k) {
+            const Load& l = k < vsCount ? vs[k] : ps[k - vsCount];
+            v[k] = l.vs ? d.vsOffset(l.pc) : d.psOffset(l.pc);
+        }
+        std::unique_lock lock(offsetsMutex_);
+        return offsets_.try_emplace(key, std::move(v)).first->second; // unordered_map: references stay valid
+    }
+    std::shared_mutex offsetsMutex_;
+    std::unordered_map<PairKey, std::vector<int64_t>, PairHash> offsets_;
+
     bool decline(int role, const char* why) {
         std::lock_guard lock(m_);
         if (declined_[role].insert(why).second && declined_[role].size() <= 16)
@@ -1162,12 +1192,20 @@ private:
     }
 
     VkPipeline pipeline(Gpu& gpu, int role, const Draw& d) {
-        std::lock_guard lock(m_);
         const VkPipelineDepthStencilStateCreateInfo& z = d.depthStencil;
         const auto key = std::make_tuple(role, int(d.color[0].format), int(d.color[1].format), int(d.writeMask & 0xFF), int(d.depth.format),
                                          bool(d.hasStencil), z.depthTestEnable, z.depthWriteEnable, int(z.depthCompareOp),
                                          int(d.cull), int(d.frontFace));
-        if (auto it = pipes_.find(key); it != pipes_.end()) return it->second;
+        // Most draws repeat the last pipeline on their recorder thread: no lock, no lookup.
+        thread_local std::remove_const_t<decltype(key)> lastKey{};
+        thread_local VkPipeline lastPipe = VK_NULL_HANDLE;
+        thread_local const Material* lastPass = nullptr;
+        if (lastPipe && lastPass == this && lastKey == key) return lastPipe;
+        std::lock_guard lock(m_);
+        if (auto it = pipes_.find(key); it != pipes_.end()) {
+            if (it->second) lastKey = key, lastPipe = it->second, lastPass = this;
+            return it->second;
+        }
         VkPipeline& out = pipes_[key];
         const VkDevice dev = gpu.device();
         if (!layout_) {

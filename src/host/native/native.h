@@ -108,6 +108,15 @@ struct Draw {
     // `n` dwords of the scalar load at `pc` (an offset from the pixel shader's start), as the
     // shader read them for this draw. False when the shader has no such load.
     std::function<bool(uint32_t pc, uint32_t* out, uint32_t n)> load;
+    // The same, for a pass reading many loads a draw: the shaders' data and where a load's result
+    // is in it (-1: no such load), the same for every draw of one shader pair (vsId, psId), so a
+    // pass can resolve the offsets once and read the data directly after that.
+    const void* vsId = nullptr;
+    const void* psId = nullptr;
+    const uint32_t* vsData = nullptr;
+    const uint32_t* psData = nullptr;
+    size_t vsSize = 0, psSize = 0;
+    std::function<int64_t(uint32_t pc)> vsOffset, psOffset;
 };
 
 // What the renderer gives a native pass to draw with.
