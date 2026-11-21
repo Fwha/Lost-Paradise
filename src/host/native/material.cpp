@@ -1169,6 +1169,15 @@ private:
     };
     const std::vector<int64_t>& offsets(int role, const Draw& d, const Load* vs, size_t vsCount, const Load* ps, size_t psCount) {
         const PairKey key{role, d.vsId, d.psId};
+        if (!d.vsId || !d.psId) { // not cacheable: this draw's own
+            thread_local std::vector<int64_t> v;
+            v.resize(vsCount + psCount);
+            for (size_t k = 0; k < v.size(); ++k) {
+                const Load& l = k < vsCount ? vs[k] : ps[k - vsCount];
+                v[k] = l.vs ? d.vsOffset(l.pc) : d.psOffset(l.pc);
+            }
+            return v;
+        }
         {
             std::shared_lock lock(offsetsMutex_);
             if (auto it = offsets_.find(key); it != offsets_.end()) return it->second;

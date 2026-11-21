@@ -110,7 +110,8 @@ struct Draw {
     std::function<bool(uint32_t pc, uint32_t* out, uint32_t n)> load;
     // The same, for a pass reading many loads a draw: the shaders' data and where a load's result
     // is in it (-1: no such load), the same for every draw of one shader pair (vsId, psId), so a
-    // pass can resolve the offsets once and read the data directly after that.
+    // pass can resolve the offsets once and read the data directly after that. Null ids: the
+    // offsets may differ from draw to draw (resolve them each time).
     const void* vsId = nullptr;
     const void* psId = nullptr;
     const uint32_t* vsData = nullptr;

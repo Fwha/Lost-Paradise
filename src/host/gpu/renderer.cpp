@@ -5578,7 +5578,9 @@ void main() {
                 return it == p.smrd.end() ? -1 : int64_t(it->second);
             };
         };
-        nd.vsId = a.vsm, nd.psId = a.psm;
+        // A module's load offsets are the same for every draw only with generic translation (its
+        // scalar loads laid out first, by pc); specialised translations can lay them out otherwise.
+        if (gcn::genericTranslation()) nd.vsId = a.vsm, nd.psId = a.psm;
         nd.vsData = a.vs.data.data(), nd.vsSize = a.vs.data.size();
         nd.psData = a.ps.data.data(), nd.psSize = a.ps.data.size();
         nd.vsOffset = offsets(a.vs), nd.psOffset = offsets(a.ps);
