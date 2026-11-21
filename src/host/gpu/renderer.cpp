@@ -5374,11 +5374,16 @@ void main() {
     // The draw as a native pass sees it (native::Draw), then the pass's own recording in its place.
     // False when the pass declines it: the translated path draws it.
     bool nativeDraw(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
+        // On a recorder thread: its segment's ring must hold the draw's data (flushing is not
+        // possible there; the translated path takes it then), and the caches the draw looks up and
+        // the surfaces it marks written are held exclusively (m_; on the main recorder m_ is held).
+        if (R().worker_ && !ringFits(1 << 12)) return false;
+        WLock wl(*this);
         native::Draw nd;
         Surface* written[8]{};
         Surface* depthWritten = nullptr;
         if (!nativeBuild(d, r, a, nd, written, depthWritten)) return false;
-        if (!R().worker_ && !ringFits(1 << 12)) flush(); // a recorder thread's segment has its own ring
+        if (!R().worker_ && !ringFits(1 << 12)) flush();
         begin();
         NativeGpu gpu(*this);
         {
