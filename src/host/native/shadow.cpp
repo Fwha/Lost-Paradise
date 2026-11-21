@@ -351,8 +351,7 @@ public:
         }
         VkPipeline pipe = pipeline(gpu, role, d);
         if (!pipe) return false;
-        if (!engineLogged_[c.alpha]) {
-            engineLogged_[c.alpha] = true;
+        if (!engineLogged_[c.alpha].exchange(true)) {
             std::fprintf(stderr, "[native] shadow: drawing %s stage casters from the engine's captures (depth 0x%" PRIx64 ")\n",
                          c.alpha ? "alpha-tested" : "opaque", d.depth.address);
         }
@@ -385,7 +384,7 @@ public:
 private:
     float lastBias_[2] = {1.0f, 0.01f}; // the opaque casters' bias constants, as last seen
     uint32_t biasChanges_ = 0;
-    bool engineLogged_[2] = {};
+    std::atomic<bool> engineLogged_[2] = {};
 
     // A fetch slot in a format the skinned shader decodes (32-, 16- or 8-bit channels).
     static bool decodable(const VertexBuffer& v) {
