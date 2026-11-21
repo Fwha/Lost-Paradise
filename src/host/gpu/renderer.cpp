@@ -560,6 +560,10 @@ struct BufferRange {
 // the launch. The renderer fills resource fields into prog.data per draw.
 struct CachedProgram {
     gcn::Program prog;
+    // Its scalar loads' places in the data (smrd and the trace's), built once for native passes
+    // and shared by the draws of it (see loadsOf); reset when prog is analysed again.
+    std::shared_ptr<const std::map<uint64_t, uint32_t>> loads;
+    size_t loadsTrace = 0;
     std::vector<std::pair<uint64_t, uint64_t>> code; // [start, end) of the code analysed
     uint64_t codeHash = 0;
     uint64_t checkedSubmit = ~0ull; // the submission codeHash was last verified in
@@ -588,6 +592,8 @@ struct Profiler {
     uint64_t ns[kProfCount] = {};
     uint64_t passWhy[4] = {}; // why a new render pass started, by PassWhy
     uint64_t feedbackOn[2] = {}; // a draw sampled the open pass's depth / color attachment
+    uint64_t nativePasses = 0;   // of the passes, those a native draw opened
+    uint64_t native[6] = {};     // native draws: drawn, declined, started over; ns building, recording, the whole
     uint64_t missWhy[4] = {}; // a launch not repeating the stage's last: shader, submission, user data, other
     uint64_t missUser[16] = {}; // the user data words that differed
     uint64_t fastMiss[8] = {}; // a draw not taking fastDraw, by FastMiss
@@ -1099,7 +1105,8 @@ public:
             runCompare();
         }
         if (recordThreads_) {
-            if (!native && segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
+            // Native draws go to the recorder threads too (but for LPN_NATIVE_COMPARE's, recorded here).
+            if ((!native || compareWith_.empty()) && segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
                 addToSegment(d, r, held);
                 return;
             }
@@ -1172,6 +1179,10 @@ public:
     // A draw (not a dispatch), on whichever thread records it: the main recorder under m_, or a
     // recorder thread (which takes m_ itself where the caches are touched, see WLock).
     void recordDraw(const DrawCall& d, const DrawRegs& r, std::unique_ptr<DrawAnalysis>& held) {
+        if (d.kind == DrawCall::kEngine) { // onEngineDraw's, in a segment: no analysis
+            engineDraw(d.count, r);
+            return;
+        }
         DrawAnalysis& a = *held;
         ++R().prof_.calls;
         const uint64_t drawsBefore = R().stats_.draws;
@@ -1456,10 +1467,10 @@ public:
         std::fprintf(stderr, "[prof] t=%.1f frames %" PRIu64 "-%" PRIu64 ": %.1f fps, %.1f ms/frame, worst %.1f ms, %" PRIu64 " over 17 ms;",
                      profile::seconds(), frame_ - windowFrames_, frame_, n / wall, wall * 1000 / n, worstFrameMs_, slowFrames_);
         for (int i = 0; i < kProfCount; ++i) std::fprintf(stderr, " %s %.2f", kProfNames[i], R().prof_.ns[i] / 1e6 / n);
-        std::fprintf(stderr, " passes for targets %.0f feedback %.0f (depth %.0f color %.0f) store %.0f other %.0f; depth-only draws %.0f (%.0f joined a pass);",
+        std::fprintf(stderr, " passes for targets %.0f feedback %.0f (depth %.0f color %.0f) store %.0f other %.0f (native %.0f); depth-only draws %.0f (%.0f joined a pass);",
                      R().prof_.passWhy[0] / n, R().prof_.passWhy[1] / n, R().prof_.feedbackOn[0] / n,
-                     R().prof_.feedbackOn[1] / n, R().prof_.passWhy[2] / n, R().prof_.passWhy[3] / n, R().prof_.depthOnly / n,
-                     R().prof_.depthJoins / n);
+                     R().prof_.feedbackOn[1] / n, R().prof_.passWhy[2] / n, R().prof_.passWhy[3] / n, R().prof_.nativePasses / n,
+                     R().prof_.depthOnly / n, R().prof_.depthJoins / n);
         std::fprintf(stderr, " gpu-busy %.2f dma %.0f (%.2f MB)", gpuBusyNs_.exchange(0) / 1e6 / n, R().prof_.dmas / n,
                      R().prof_.dmaBytes / n / 1e6);
         if (raceCheck_) std::fprintf(stderr, " races %" PRIu64 "/%" PRIu64, raceChanged_.load(), raceChecked_.exchange(0));
@@ -1500,6 +1511,10 @@ public:
                          R().prof_.drainWhy[0] / n, R().prof_.drainWhy[1] / n, R().prof_.drainWhy[2] / n, R().prof_.drainWhy[3] / n,
                          R().prof_.drainNs / 1e6 / n, R().prof_.aheadNs / 1e6 / n, R().prof_.locks / n, R().prof_.lockWaits / n,
                          R().prof_.lockNs / 1e6 / n, R().prof_.sharedDraws / n, R().prof_.sharedRetries / n);
+        if (R().prof_.native[0] || R().prof_.native[1])
+            std::fprintf(stderr, "[prof] t=%.1f native draws %.0f (%.0f declined, %.0f started over): building %.2f ms, recording %.2f ms, in all %.2f ms (summed) per frame\n",
+                         profile::seconds(), R().prof_.native[0] / n, R().prof_.native[1] / n, R().prof_.native[2] / n,
+                         R().prof_.native[3] / 1e6 / n, R().prof_.native[4] / 1e6 / n, R().prof_.native[5] / 1e6 / n);
         std::fprintf(stderr, "[prof] t=%.1f VRAM copies %zu: %.1f allocations, %.2f evictions (%.1f freed, %.2f found none) per frame\n",
                      profile::seconds(), vram_.size(), R().prof_.vramAllocs / n, R().prof_.vramEvicts / n, R().prof_.vramFreed / n,
                      R().prof_.vramEvictsEmpty / n);
@@ -5297,6 +5312,7 @@ void main() {
             const gcn::GlslStage s = stage == Stage::Vertex     ? gcn::GlslStage::Vertex
                                      : stage == Stage::Compute ? gcn::GlslStage::Compute
                                                                : gcn::GlslStage::Fragment;
+            std::lock_guard lock(r_.nativeModulesMutex_); // recorder threads draw natively too
             auto it = r_.nativeModules_.find(glsl);
             if (it != r_.nativeModules_.end()) return it->second;
             return r_.nativeModules_[glsl] = r_.module(glsl, s);
@@ -5304,11 +5320,10 @@ void main() {
         void record(std::function<void(VkCommandBuffer)> fn) override {
             r_.rec([c = r_.R().cmd_, fn = std::move(fn)] { fn(c); });
         }
-        // As the translated draw opens a pass (R().pass_), so that translated draws on the same
-        // targets carry on in it and any others end it. A native draw only joins a pass a native
-        // draw opened: one the translated path opened may hold what the native draw samples.
+        // As the translated draw opens a pass (R().pass_), so that draws of either path on the same
+        // targets carry on in it and any others end it.
         void beginRendering(const native::Target* color, uint32_t colorCount, const native::Target& depth, bool stencil) override {
-            Pass& p = r_.nativeNext_;
+            Pass& p = r_.R().nativeNext_;
             p.open = true;
             p.colorCount = colorCount;
             p.width = p.height = 16384;
@@ -5339,15 +5354,26 @@ void main() {
                 ds.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
                 ds.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             }
-            p.written = p.images;
+            p.written.clear(); // filled by what the draws in it write (nativeDrawn, and translated draws joining)
             Rec& R = r_.R();
             // Joined unless the draw samples what a draw in the pass wrote (as draw() decides).
             bool feedback = false;
             for (VkImage im : R.sampledSurfaces_)
                 if (std::find(R.drawWritten_.begin(), R.drawWritten_.end(), im) != R.drawWritten_.end()) feedback = true;
-            if (R.pass_.open && r_.nativePassOpen_ && !feedback && R.pass_.sameTargets(p)) return;
-            r_.endPass();
-            r_.barrier(); // what the draws before wrote or sampled
+            // Joined whichever path opened it: a pass on the same targets whose draws wrote nothing
+            // this one samples (drawWritten_ holds every attachment written since the last barrier).
+            if (R.pass_.open && !feedback && R.pass_.sameTargets(p)) return;
+            if (R.prof_.on) { // LPN_PROFILE: why a native draw opened a pass (with the translated ones)
+                ++R.prof_.passWhy[!R.pass_.open ? R.passClosedBy_ : feedback ? kPassFeedback : kPassTargets];
+                ++R.prof_.nativePasses;
+            }
+            if (R.pass_.open) { // as the translated path ends it: endPass() would demand a barrier
+                r_.rec([c = R.cmd_] { vkCmdEndRendering(c); });
+                R.pass_.open = false;
+                R.passClosedBy_ = kPassTargets;
+            }
+            // As the translated path decides it: what the draws since the last barrier wrote or sampled.
+            if (R.needBarrier_ || feedback || overlaps(p.images, R.drawWritten_) || overlaps(p.images, R.drawSampled_)) r_.barrier();
             VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
             ri.renderArea = {{0, 0}, {p.width, p.height}};
             ri.layerCount = 1;
@@ -5362,7 +5388,7 @@ void main() {
             R.pass_.open = true;
             ++R.passSerial_;
             ++R.prof_.passes;
-            r_.nativePassOpen_ = true;
+            R.nativePassOpen_ = true;
         }
 
     private:
@@ -5372,30 +5398,84 @@ void main() {
     // The draw as a native pass sees it (native::Draw), then the pass's own recording in its place.
     // False when the pass declines it: the translated path draws it.
     bool nativeDraw(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
+        // On a recorder thread its segment's ring must hold the draw's data (flushing is not
+        // possible there; the translated path takes it then).
+        if (R().worker_ && !ringFits(1 << 12)) return false;
+        using Clock = std::chrono::steady_clock;
+        const bool prof = R().prof_.on;
+        const Clock::time_point t0 = prof ? Clock::now() : Clock::time_point{};
+        Clock::time_point t1{};
+        struct Note { // LPN_PROFILE: the draw's times, however it ends
+            Renderer& r; bool prof; Clock::time_point t0; Clock::time_point& t1; bool drawn = false;
+            ~Note() {
+                if (!prof) return;
+                const auto t2 = Clock::now();
+                auto& p = r.R().prof_;
+                ++p.native[drawn ? 0 : 1];
+                if (t1 != Clock::time_point{}) {
+                    p.native[3] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+                    p.native[4] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
+                }
+                p.native[5] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t0).count());
+            }
+        } note{*this, prof, t0, t1};
+        // As the translated path: the caches looked up holding m_ shared, started over holding it
+        // exclusively when one would change (sharedMiss sets abort_). The surfaces are marked
+        // written before anything is recorded, so a start over records nothing twice.
+        bool sharedTry = R().worker_;
+    retry:
+        R().abort_ = false;
+        WLock wl(*this, sharedTry);
         native::Draw nd;
         Surface* written[8]{};
         Surface* depthWritten = nullptr;
-        if (!nativeBuild(d, r, a, nd, written, depthWritten)) return false;
-        if (!ringFits(1 << 12)) flush();
+        const bool built = nativeBuild(d, r, a, nd, written, depthWritten);
+        if (built) {
+            for (Surface* x : written)
+                if (x) gpuWrote(*x);
+            if (depthWritten) gpuWrote(*depthWritten);
+        }
+        if (R().abort_) {
+            wl.unlock();
+            sharedTry = false;
+            ++R().prof_.sharedRetries;
+            ++R().prof_.native[2];
+            goto retry;
+        }
+        if (!built) return false;
+        if (prof) t1 = Clock::now();
+        if (!R().worker_ && !ringFits(1 << 12)) flush();
         begin();
         NativeGpu gpu(*this);
-        if (!a.psm->nativePass->draw(a.psm->nativeRole, nd, gpu)) return false;
-        nativeDrawn(written, depthWritten);
+        if (!a.psm->nativePass->draw(a.psm->nativeRole, nd, gpu)) return false; // the passes guard their own state
+        std::vector<VkImage>& wrote = R().nativeWrote_;
+        wrote.clear();
+        for (uint32_t i = 0; i < nd.colorCount; ++i)
+            if (nd.color[i].image && ((nd.writeMask >> (4 * i)) & 0xF)) wrote.push_back(nd.color[i].image);
+        if (depthWritten) wrote.push_back(depthWritten->img.image);
+        nativeDrawn(nullptr, nullptr, &wrote); // the surfaces are marked above
+        note.drawn = true;
         return true;
     }
     // After a native pass recorded a draw: its writes and reads, for the barriers of the draws
     // after it (see draw()): every attachment counts as written. The pass bound pipelines and
     // descriptors of its own: everything is set again.
-    void nativeDrawn(Surface* const* written, Surface* depthWritten) {
-        R().needBarrier_ = true;
-        for (VkImage im : R().pass_.images) addOnce(R().drawWritten_, im);
+    // Only this thread's state: a draw like any other, the barriers decided by what it wrote and
+    // sampled (drawWritten_, drawSampled_), not one before whatever comes next; the fast paths of
+    // the other recorder threads stay valid (no fastEpoch_ bump: passSerial_ moves on here).
+    // `wrote`: the attachments it wrote (null: all of the pass's), as the translated path counts
+    // them: a depth buffer only tested is not written, so later draws may sample it in the same pass.
+    void nativeDrawn(Surface* const* written, Surface* depthWritten, const std::vector<VkImage>* wrote = nullptr) {
+        for (VkImage im : wrote ? *wrote : R().pass_.images) {
+            addOnce(R().drawWritten_, im);
+            addOnce(R().pass_.written, im);
+        }
         for (VkImage im : R().sampledSurfaces_) addOnce(R().drawSampled_, im);
         R().bound_ = Bound{};
         ++R().passSerial_;
         R().fast_.valid = false;
         for (FastSlot& f : R().fastSlots_) f.f.valid = false;
         R().lastMergeable_ = false;
-        ++fastEpoch_;
         if (written)
             for (int i = 0; i < 8; ++i)
                 if (written[i]) gpuWrote(*written[i]);
@@ -5454,7 +5534,7 @@ void main() {
                 const uint32_t m = i ? back : front;
                 nd.stencilRef[i] = m & 0xFF, nd.stencilCompare[i] = (m >> 8) & 0xFF, nd.stencilWrite[i] = (m >> 16) & 0xFF;
             }
-            if (nd.depthWrite || (nd.stencil && nd.stencilWrite[0])) depthWritten = s;
+            if (nd.depthWrite || (nd.stencil && (nd.stencilWrite[0] || nd.stencilWrite[1]))) depthWritten = s;
         }
         // The viewport and scissor as setViewportScissor makes them (without the HUD's layout).
         const native::Target& first = nd.colorCount ? nd.color[0] : nd.depth;
@@ -5487,16 +5567,29 @@ void main() {
             t.pc = uint32_t(im.pc - a.ps.launch.entry);
             nd.textures.push_back(t);
         }
-        auto loads = [](const gcn::Program& p) {
-            return [&p](uint32_t pc, uint32_t* out, uint32_t n) {
-                auto it = p.smrd.find(p.launch.entry + pc);
-                if (it == p.smrd.end() || it->second + n > p.data.size()) return false;
+        if (!a.psLoads || !a.vsLoads) return false;
+        auto loads = [](const gcn::Program& p, const std::map<uint64_t, uint32_t>& m) {
+            return [&p, &m](uint32_t pc, uint32_t* out, uint32_t n) {
+                auto it = m.find(p.launch.entry + pc);
+                if (it == m.end() || it->second + n > p.data.size()) return false;
                 std::memcpy(out, &p.data[it->second], n * 4);
                 return true;
             };
         };
-        nd.load = loads(a.ps);
-        nd.vsLoad = loads(a.vs);
+        nd.load = loads(a.ps, *a.psLoads);
+        auto offsets = [](const gcn::Program& p, const std::map<uint64_t, uint32_t>& m) {
+            return [&p, &m](uint32_t pc) -> int64_t {
+                auto it = m.find(p.launch.entry + pc);
+                return it == m.end() ? -1 : int64_t(it->second);
+            };
+        };
+        // A module's load offsets are the same for every draw only with generic translation (its
+        // scalar loads laid out first, by pc); specialised translations can lay them out otherwise.
+        if (gcn::genericTranslation()) nd.vsId = a.vsm, nd.psId = a.psm;
+        nd.vsData = a.vs.data.data(), nd.vsSize = a.vs.data.size();
+        nd.psData = a.ps.data.data(), nd.psSize = a.ps.data.size();
+        nd.vsOffset = offsets(a.vs, *a.vsLoads), nd.psOffset = offsets(a.ps, *a.psLoads);
+        nd.vsLoad = loads(a.vs, *a.vsLoads);
         if (a.vsm && a.vsm->gameName) nd.vsName = a.vsm->gameName;
         else nd.vsName = &native::shaderNameAt(a.vs.launch.entry, &readGuest);
         nd.instances = std::max(r.numInstances, 1u);
@@ -5564,14 +5657,41 @@ void main() {
     // drawn natively where the game's draw would have been. Its depth target and state come from
     // the registers, its buffers and constants from the capture.
     void onEngineDraw(uint32_t id, const GpuRegs& gr) override {
+        // With recorder threads, in a segment like the draws around it (in order with them): hundreds
+        // a frame each waiting for the recorder threads cost the main recorder ~10 ms a frame.
+        if (recordThreads_ && !computeOnly_ && frame_ != traceFrame_ && frame_ != timingFrame_) {
+            DrawCall d{};
+            d.kind = DrawCall::kEngine;
+            d.count = id;
+            std::unique_ptr<DrawAnalysis> none;
+            addToSegment(d, gr, none);
+            return;
+        }
         if (recordThreads_) drainSegments(0); // in order with the draws before it
         std::lock_guard lock(m_);
+        engineDraw(id, DrawRegs::of(gr));
+    }
+    // The capture's draw (on the main recorder holding m_, or a recorder thread in its segment).
+    void engineDraw(uint32_t id, const DrawRegs& r) {
         native::EngineCaster c;
         if (!native::engineCaster(id, c)) {
             if (engineLost_++ < 5) std::fprintf(stderr, "[native] engine draw %u: its capture is gone\n", id);
             return;
         }
-        const DrawRegs r = DrawRegs::of(gr);
+        // The caches looked up holding m_ shared, started over exclusively when one would change
+        // (as draw() does); the depth buffer marked written before anything is recorded.
+        bool sharedTry = R().worker_;
+    retry:
+        R().abort_ = false;
+        WLock wl(*this, sharedTry);
+        auto again = [&] {
+            if (!R().abort_) return false;
+            wl.unlock();
+            sharedTry = false;
+            ++R().prof_.sharedRetries;
+            return true;
+        };
+        R().sampledSurfaces_.clear(); // filled by resolveImage
         native::Draw nd;
         nd.primitive = r.prim;
         nd.count = c.draw.count;
@@ -5583,7 +5703,10 @@ void main() {
         const uint32_t size = r.ctx[reg::kDbDepthSize];
         const uint32_t dw = ((size & 0x7FF) + 1) * 8, dh = (((size >> 11) & 0x7FF) + 1) * 8;
         Surface* s = depthSurface(uint64_t(r.ctx[reg::kDbZReadBase]) << 8, dw, dh, f);
-        if (!s) return;
+        if (!s) {
+            if (again()) goto retry;
+            return;
+        }
         nd.depth = {view(s->img, f, VK_IMAGE_VIEW_TYPE_2D, kIdentity, s->img.aspect), s->img.image, f, s->img.width, s->img.height,
                     uint64_t(r.ctx[reg::kDbZReadBase]) << 8};
         nd.hasStencil = stencil;
@@ -5631,7 +5754,10 @@ void main() {
         native::VertexBuffer vb;
         vb.slot = 0, vb.components = 3, vb.stride = c.draw.stride, vb.records = c.vertices, vb.dfmt = 13, vb.nfmt = 7, vb.dstSel = 0xFAC;
         const uint64_t vbytes = std::max<uint64_t>(uint64_t(c.vertices) * c.draw.stride, 16);
-        if (!buffer(c.draw.vertexBase, vbytes, vb.data)) return;
+        if (!buffer(c.draw.vertexBase, vbytes, vb.data)) {
+            if (again()) goto retry;
+            return;
+        }
         nd.vertex.push_back(vb);
         if (c.alpha) { // the coordinates (slot 1) in the same buffer, and the texture
             native::VertexBuffer uv = vb;
@@ -5647,7 +5773,10 @@ void main() {
             im.pc = 0x24;
             R().sampledSurfaces_.clear();
             const ImageBinding b = resolveImage(im);
-            if (!b.view || !b.sampler) return;
+            if (!b.view || !b.sampler) {
+                if (again()) goto retry;
+                return;
+            }
             native::Texture t;
             t.view = b.view, t.sampler = b.sampler, t.scale[0] = b.scale[0], t.scale[1] = b.scale[1];
             t.address = im.base(), t.width = im.width(), t.height = im.height(), t.pc = 0x24;
@@ -5655,30 +5784,31 @@ void main() {
         }
         nd.indexed = true;
         nd.indexType = c.index32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
-        if (!buffer(c.draw.indexAddr, uint64_t(c.draw.count) * (c.index32 ? 4 : 2), nd.index)) return;
-        if (!ringFits(1 << 12)) flush();
+        if (!buffer(c.draw.indexAddr, uint64_t(c.draw.count) * (c.index32 ? 4 : 2), nd.index)) {
+            if (again()) goto retry;
+            return;
+        }
+        if (nd.depthWrite) gpuWrote(*s);
+        if (again()) goto retry;
+        if (!R().worker_ && !ringFits(1 << 12)) flush();
         begin();
         NativeGpu gpu(*this);
         if (!native::drawStageCaster(c, nd, gpu)) {
             if (engineLost_++ < 5) std::fprintf(stderr, "[native] engine draw %u: the shadow pass could not draw it\n", id);
             return;
         }
-        R().needBarrier_ = true;
-        for (VkImage im : R().pass_.images) addOnce(R().drawWritten_, im);
-        for (VkImage im : R().sampledSurfaces_) addOnce(R().drawSampled_, im);
-        R().bound_ = Bound{};
-        ++R().passSerial_;
-        R().fast_.valid = false;
-        for (FastSlot& fs : R().fastSlots_) fs.f.valid = false;
-        R().lastMergeable_ = false;
-        ++fastEpoch_;
-        if (nd.depthWrite) gpuWrote(*s);
+        std::vector<VkImage>& wrote = R().nativeWrote_;
+        wrote.clear();
+        if (nd.depthWrite) wrote.push_back(s->img.image);
+        nativeDrawn(nullptr, nullptr, &wrote);
     }
-    uint32_t engineLost_ = 0;
+    std::atomic<uint32_t> engineLost_{0}; // recorder threads draw these too
 
     // LPN_ENGINE_CHECK (native/engine_capture.h): a draw of the stage shadow casters against the
     // engine's own description of it, kept at its drawIndex call.
     void engineCheck(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
+        static const std::map<uint64_t, uint32_t> kNone;
+        const std::map<uint64_t, uint32_t>& vsLoads = a.vsLoads ? *a.vsLoads : kNone;
         native::EngineDraw e;
         if (!native::takeEngineDraw(e)) {
             if (engineStats_[2]++ < 5) std::fprintf(stderr, "[native] engine check: draw from 0x%x without a captured one\n", d.origin[0]);
@@ -5701,7 +5831,7 @@ void main() {
         if (same && e.state) { // the draws that kept copies of the state (three of each class)
             // Where the view constants are: the vertex stage's slots against the V# the shader read.
             uint64_t view = 0;
-            for (const auto& [pc, at] : a.vs.smrd) {
+            for (const auto& [pc, at] : vsLoads) {
                 const uint32_t off = uint32_t(pc - a.vs.launch.entry);
                 if ((off == 0xbc || off == 0xb0 || off == 0x2c0) && at + 2 <= a.vs.data.size())
                     view = (a.vs.data[at] | (uint64_t(a.vs.data[at + 1] & 0xFFF) << 32));
@@ -5760,8 +5890,8 @@ void main() {
         if (same) {
             uint32_t off[4] = {}, flags = 0;
             auto load = [&](uint32_t pc, uint32_t* out, uint32_t n) {
-                auto it = a.vs.smrd.find(a.vs.launch.entry + pc);
-                if (it == a.vs.smrd.end() || it->second + n > a.vs.data.size()) return false;
+                auto it = vsLoads.find(a.vs.launch.entry + pc);
+                if (it == vsLoads.end() || it->second + n > a.vs.data.size()) return false;
                 std::memcpy(out, &a.vs.data[it->second], n * 4);
                 return true;
             };
@@ -5781,7 +5911,7 @@ void main() {
                           std::bit_cast<float>(off[1]), std::bit_cast<float>(off[2]), flags, dfmt, nfmt, foff, e.vertexFormat & 0xF,
                           (long long)uvAt, uvFmt, e.stride,
                           [&] {
-                              for (const auto& [pc, at] : a.vs.smrd) {
+                              for (const auto& [pc, at] : vsLoads) {
                                   const uint32_t o = uint32_t(pc - a.vs.launch.entry);
                                   if ((o == 0xbc || o == 0xb0) && at + 2 <= a.vs.data.size())
                                       return (a.vs.data[at] | (uint64_t(a.vs.data[at + 1] & 0xFFF) << 32)) == (e.view & 0xFFFFFFFFFFull) ? "same" : "differs";
@@ -6072,8 +6202,9 @@ void main() {
 
     native::PassMap passMap_;
     bool nativeOn_ = false;
-    bool nativePassOpen_ = false; // R().pass_ was opened by a native draw (NativeGpu::beginRendering)
+    std::mutex nativeModulesMutex_;
     std::unordered_map<std::string, VkShaderModule> nativeModules_;
+
 
     bool upscaleSmaa(const DrawRegs& r, uint8_t role, const DrawAnalysis& a) {
         if (upKind_ == Upscaler::Off || !upscale::usable(upKind_)) return false;
@@ -7339,7 +7470,8 @@ void main() {
         // Its buffers' bindings, resolved on the worker (resolveAhead) at bufferEpoch_ resEpoch.
         std::vector<BufRes> vsRes, psRes;
         uint64_t resEpoch = 0;
-        bool nativeLoads = false; // vs and ps hold their scalar load maps (a native pass claims the draw)
+        bool nativeLoads = false; // psLoads and vsLoads are set (a native pass claims the draw)
+        std::shared_ptr<const std::map<uint64_t, uint32_t>> psLoads, vsLoads; // pc -> data offset
     };
     // A draw's launches as the registers give them, for a worker to analyse.
     struct DrawJob {
@@ -7568,6 +7700,7 @@ void main() {
     CachedProgram* analyze(AnalysisCtx& c, CachedProgram& p, const gcn::LaunchState& l, uint32_t bindingBase) {
         ++c.prof.analyses;
         p.prog = gcn::analyze(l, c.read);
+        p.loads.reset();
         p.code.clear();
         for (const auto& [pc, in] : p.prog.code) {
             if (!p.code.empty() && p.code.back().second == pc) p.code.back().second = pc + in.size;
@@ -7593,11 +7726,22 @@ void main() {
         for (const auto& t : p.trace)
             if (!t.start && t.in.format == gcn::Format::SMRD && t.slot != ~0u) out.emplace(t.pc, t.slot);
     }
+    // The same, kept with the cached program: copying the map for every claimed draw was a
+    // large part of the analysis workers' time with native passes on.
+    static std::shared_ptr<const std::map<uint64_t, uint32_t>> loadsOf(CachedProgram& c) {
+        if (!c.loads || c.loadsTrace != c.prog.trace.size()) {
+            auto m = std::make_shared<std::map<uint64_t, uint32_t>>();
+            loadMap(c.prog, *m);
+            c.loads = std::move(m);
+            c.loadsTrace = c.prog.trace.size();
+        }
+        return c.loads;
+    }
     static void takeDrawPart(gcn::Program& to, const gcn::Program& from) {
         to.launch = from.launch;
         to.fetchSite = from.fetchSite, to.fetchSlots = from.fetchSlots;
         // Analyses are recycled: a scalar load map left from another program would give a native
-        // pass another shader's constants (runJob copies it for claimed draws only).
+        // pass another shader's constants (native passes read psLoads/vsLoads instead).
         if (!to.smrd.empty()) to.smrd.clear();
         to.data = from.data;
         to.buffers = from.buffers;
@@ -7683,6 +7827,7 @@ void main() {
     void runJob(AnalysisCtx& c, DrawJob& j) {
         DrawAnalysis& a = *j.out;
         a.nativeLoads = false;
+        a.psLoads.reset(), a.vsLoads.reset();
         if (j.kind == DrawJob::kDispatch) {
             CachedProgram* csc = analyzed(c, j.vs, 0);
             if (!csc) return;
@@ -7706,8 +7851,8 @@ void main() {
                 takeDrawPart(a.ps, psc->prog);
                 a.nativeLoads = psc->module && psc->module->nativeLoads.load(std::memory_order_relaxed);
                 if (a.nativeLoads) {
-                    loadMap(psc->prog, a.ps.smrd);
-                    loadMap(vsc->prog, a.vs.smrd); // native passes read the vertex shader's constants too
+                    a.psLoads = loadsOf(*psc);
+                    a.vsLoads = loadsOf(*vsc); // native passes read the vertex shader's constants too
                 }
                 a.repeat = a.repeat && c.memoHit;
                 a.psc = psc;
@@ -8023,6 +8168,8 @@ void main() {
                 if (!compareWith_.empty() && compareWith_ == a.psm->nativePass->name()) nativeCompare(d, r, a); // and drawn as usual
                 else if (nativeDraw(d, r, a)) return;
             }
+        } else if (nativeOn_ && compareWith_.empty() && a.psm && a.psm->nativePass && nativeDraw(d, r, a)) {
+            return; // on a recorder thread, in its segment
         }
         const bool wasMergeable = R().lastMergeable_;
         R().lastMergeable_ = false;
@@ -8305,7 +8452,7 @@ void main() {
             rec([c = R().cmd_, ri] { vkCmdBeginRendering(c, &ri); });
             std::swap(R().pass_, pass); // the old pass's storage is reused by the next draw
             R().pass_.open = true;
-            if (!R().worker_) nativePassOpen_ = false;
+            R().nativePassOpen_ = false;
             ++R().passSerial_;
             ++R().prof_.passes;
         }
@@ -8847,7 +8994,7 @@ void main() {
 
     void endPass() {
         R().needBarrier_ = true; // something other than a draw comes next
-        if (!R().worker_) nativePassOpen_ = false;
+        R().nativePassOpen_ = false;
         if (!R().pass_.open) return;
         rec([c = R().cmd_] { vkCmdEndRendering(c); });
         R().pass_.open = false;
@@ -9310,7 +9457,6 @@ private:
                    height == o.height && std::equal(views, views + colorCount, o.views);
         }
     };
-    Pass nativeNext_; // a native pass's storage, swapped with R().pass_ (NativeGpu::beginRendering)
     std::array<ImageMemo, kImageMemos> imageMemos_{};
     uint64_t imageGen_ = 1;
     int anisoSeen_ = 0; // the Anisotropic Filtering setting the bindings were made with
@@ -9349,6 +9495,9 @@ private:
         std::vector<std::function<void()>> pendingDone_; // due after the batch being recorded
         std::vector<std::function<void()>> afterFlush_;
         Pass pass_, drawPass_; // the open pass; the draw being recorded's
+        Pass nativeNext_;      // a native pass's storage, swapped with pass_ (NativeGpu::beginRendering)
+        bool nativePassOpen_ = false; // pass_ was opened by a native draw
+        std::vector<VkImage> nativeWrote_; // scratch: the attachments a native draw wrote
         PassWhy passClosedBy_ = kPassOther;
         uint64_t passSerial_ = 0;
         // Since the last barrier: images draws wrote and sampled, and whether anything else (a copy,
@@ -9694,7 +9843,7 @@ private:
         auto add = [](auto& x, auto& y) {
             for (size_t i = 0; i < std::size(x); ++i) x[i] += std::exchange(y[i], 0);
         };
-        add(a.ns, b.ns), add(a.passWhy, b.passWhy), add(a.feedbackOn, b.feedbackOn), add(a.missWhy, b.missWhy);
+        add(a.ns, b.ns), add(a.passWhy, b.passWhy), a.nativePasses += std::exchange(b.nativePasses, 0), add(a.native, b.native), add(a.feedbackOn, b.feedbackOn), add(a.missWhy, b.missWhy);
         add(a.missUser, b.missUser), add(a.fastMiss, b.fastMiss), add(a.fastKind, b.fastKind), add(a.fastRes, b.fastRes);
         add(a.switchMiss, b.switchMiss), add(a.drainWhy, b.drainWhy), add(a.passBySize, b.passBySize), add(a.drawsBySize, b.drawsBySize);
         for (uint64_t Profiler::*f : {&Profiler::fastMoved, &Profiler::fastImages, &Profiler::diffsTaken, &Profiler::fastSwitches,

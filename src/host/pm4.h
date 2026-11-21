@@ -34,7 +34,9 @@ struct GpuRegs {
 };
 
 struct DrawCall {
-    enum Kind { kIndexed, kAuto, kIndexedIndirect, kIndirect, kDispatch, kDispatchIndirect } kind;
+    // kEngine: a draw the engine described (DrawListener::onEngineDraw), queued with the others;
+    // `count` holds the capture's id.
+    enum Kind { kIndexed, kAuto, kIndexedIndirect, kIndirect, kDispatch, kDispatchIndirect, kEngine } kind;
     uint32_t count = 0;              // indices or vertices
     uint32_t indexOffset = 0;        // first index for DRAW_INDEX_OFFSET_2
     uint64_t indexAddr = 0;          // index buffer for kIndexed

@@ -17,7 +17,12 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <map>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
+#include <vector>
 #include <set>
 #include <string>
 #include <tuple>
@@ -462,6 +467,163 @@ constexpr Load kPsLoadsPdut[] = {
     {false, 0xfb4, 1, cPsFlags,       3},
 };
 
+// Green-specular siblings of the b variants (Codex's reading): green alone from both specular maps;
+// 2du keeps the normal map unflattened while its detail weight still blends the textures.
+constexpr Load kPsLoadsOdutBdut[] = {
+    {false, 0x028, 1, cPsFlags,        0},
+    {false, 0x02c, 2, cPsFlags,        1},
+    {false, 0x040, 4, cUvScale,        0},
+    {false, 0x040, 8, cUvBlock,        0},
+    {false, 0x1cc, 4, cShadowMap,      0},
+    {false, 0x200, 4, cShadowMap,      0},
+    {false, 0x238, 4, cTintBase,       0},
+    {false, 0x290, 4, cTint,           0},
+    {false, 0x2fc, 4, cPointPos,       0},
+    {false, 0x364, 4, cPointColor,     0},
+    {false, 0x3b4, 4, cPointPos + 1,   0},
+    {false, 0x41c, 4, cPointColor + 1, 0},
+    {false, 0x46c, 4, cPointPos + 2,   0},
+    {false, 0x4d4, 4, cPointColor + 2, 0},
+    {false, 0x524, 4, cPointPos + 3,   0},
+    {false, 0x58c, 4, cPointColor + 3, 0},
+    {false, 0x5cc, 4, cPsCamera,       0},
+    {false, 0x614, 8, cDir,            0},
+    {false, 0x6a8, 4, cAmbientTint,    0},
+    {false, 0x6ac, 1, cMisc,           1},
+    {false, 0x6e8, 8, cMaterial,       0},
+    {false, 0x738, 8, cMul,            0},
+    {false, 0x758, 8, cLight,          0},
+    {false, 0x768, 1, cMisc,           0},
+    {false, 0x7f8, 4, cExposure,       0},
+    {false, 0x7fc, 4, cAmbient,        0},
+    {false, 0xb10, 8, cDistFog,        0},
+    {false, 0xb74, 1, cPsFlags,        0},
+    {false, 0xb84, 1, cMisc,           2},
+    {false, 0xb88, 1, cMisc,           3},
+    {false, 0xb8c, 1, cMisc2,          2},
+    {false, 0xb90, 4, cOutScale,       0},
+    {false, 0xbe0, 2, cPsFlags,        1},
+    {false, 0xc14, 1, cMask0,          0},
+    {false, 0xc18, 4, cMask1,          0},
+    {false, 0xc1c, 1, cMask0,          1},
+    {false, 0xc20, 1, cMask0,          2},
+    {false, 0xc24, 1, cMisc2,          3},
+    {false, 0xd50, 2, cMask2,          0},
+    {false, 0xdac, 2, cMask2,          2},
+    {false, 0xdb0, 1, cMask0,          3},
+    {false, 0xe80, 4, cMask3,          0},
+    {false, 0xe84, 2, cMask4,          0},
+    {false, 0xe88, 1, cMask4,          2},
+    {false, 0xf44, 2, cMask5,          0},
+    {false, 0xf48, 1, cMask4,          3},
+    {false, 0xf8c, 1, cPsFlags,        0},
+    {false, 0xfa0, 4, cBlend,          0},
+    {false, 0xff8, 1, cPsFlags,        3},
+};
+constexpr Load kPsLoadsPdutBdut[] = {
+    {false, 0x028,  1, cPsFlags,        0},
+    {false, 0x02c,  2, cPsFlags,        1},
+    {false, 0x040,  4, cUvScale,        0},
+    {false, 0x040,  8, cUvBlock,        0},
+    {false, 0x1cc,  4, cShadowMap,      0},
+    {false, 0x200,  4, cShadowMap,      0},
+    {false, 0x238,  4, cTintBase,       0},
+    {false, 0x290,  4, cTint,           0},
+    {false, 0x2fc,  4, cPointPos,       0},
+    {false, 0x364,  4, cPointColor,     0},
+    {false, 0x3b4,  4, cPointPos + 1,   0},
+    {false, 0x41c,  4, cPointColor + 1, 0},
+    {false, 0x46c,  4, cPointPos + 2,   0},
+    {false, 0x4d4,  4, cPointColor + 2, 0},
+    {false, 0x524,  4, cPointPos + 3,   0},
+    {false, 0x58c,  4, cPointColor + 3, 0},
+    {false, 0x5cc,  4, cPsCamera,       0},
+    {false, 0x614,  8, cDir,            0},
+    {false, 0x6a8,  4, cAmbientTint,    0},
+    {false, 0x6ac,  1, cMisc,           1},
+    {false, 0x6e8,  8, cMaterial,       0},
+    {false, 0x738,  8, cMul,            0},
+    {false, 0x758,  8, cLight,          0},
+    {false, 0x768,  1, cMisc,           0},
+    {false, 0x7f8,  4, cExposure,       0},
+    {false, 0x7fc,  4, cAmbient,        0},
+    {false, 0xb10,  8, cDistFog,        0},
+    {false, 0xb68,  1, cUvBlock,        0},
+    {false, 0xb88,  1, cMisc,           3},
+    {false, 0xb90,  1, cPsFlags,        0},
+    {false, 0xba4,  1, cMisc,           2},
+    {false, 0xba8,  1, cMisc2,          2},
+    {false, 0xbac,  4, cOutScale,       0},
+    {false, 0xbfc,  2, cPsFlags,        1},
+    {false, 0xc30,  1, cMask0,          0},
+    {false, 0xc34,  4, cMask1,          0},
+    {false, 0xc38,  1, cMask0,          1},
+    {false, 0xc3c,  1, cMask0,          2},
+    {false, 0xc40,  1, cMisc2,          3},
+    {false, 0xd6c,  2, cMask2,          0},
+    {false, 0xdc8,  2, cMask2,          2},
+    {false, 0xdcc,  1, cMask0,          3},
+    {false, 0xe9c,  4, cMask3,          0},
+    {false, 0xea0,  2, cMask4,          0},
+    {false, 0xea4,  1, cMask4,          2},
+    {false, 0xf60,  2, cMask5,          0},
+    {false, 0xf64,  1, cMask4,          3},
+    {false, 0xfa8,  1, cPsFlags,        0},
+    {false, 0xfbc,  4, cBlend,          0},
+    {false, 0x1014, 1, cPsFlags,        3},
+};
+constexpr Load kPsLoadsOdutBdu[] = {
+    {false, 0x018, 1, cPsFlags,        0},
+    {false, 0x01c, 2, cPsFlags,        1},
+    {false, 0x034, 4, cUvScale,        0},
+    {false, 0x178, 4, cShadowMap,      0},
+    {false, 0x1ac, 4, cShadowMap,      0},
+    {false, 0x1e4, 4, cTintBase,       0},
+    {false, 0x23c, 4, cTint,           0},
+    {false, 0x2a8, 4, cPointPos,       0},
+    {false, 0x310, 4, cPointColor,     0},
+    {false, 0x360, 4, cPointPos + 1,   0},
+    {false, 0x3c8, 4, cPointColor + 1, 0},
+    {false, 0x418, 4, cPointPos + 2,   0},
+    {false, 0x480, 4, cPointColor + 2, 0},
+    {false, 0x4d0, 4, cPointPos + 3,   0},
+    {false, 0x538, 4, cPointColor + 3, 0},
+    {false, 0x580, 4, cPsCamera,       0},
+    {false, 0x5d4, 4, cAmbientTint,    0},
+    {false, 0x5e8, 2, cMisc2,          0},
+    {false, 0x5f8, 8, cDir,            0},
+    {false, 0x638, 8, cMaterial,       0},
+    {false, 0x654, 1, cMisc,           0},
+    {false, 0x69c, 8, cMul,            0},
+    {false, 0x6e8, 4, cExposure,       0},
+    {false, 0x710, 4, cAmbient,        0},
+    {false, 0x7b0, 8, cLight,          0},
+    {false, 0x7c0, 1, cMisc,           1},
+    {false, 0xaf8, 8, cDistFog,        0},
+    {false, 0xb58, 1, cPsFlags,        0},
+    {false, 0xb68, 1, cMisc,           2},
+    {false, 0xb6c, 1, cMisc,           3},
+    {false, 0xb70, 1, cMisc2,          2},
+    {false, 0xb74, 4, cOutScale,       0},
+    {false, 0xbc4, 2, cPsFlags,        1},
+    {false, 0xbf8, 1, cMask0,          0},
+    {false, 0xbfc, 4, cMask1,          0},
+    {false, 0xc00, 1, cMask0,          1},
+    {false, 0xc04, 1, cMask0,          2},
+    {false, 0xc08, 1, cMisc2,          3},
+    {false, 0xd34, 2, cMask2,          0},
+    {false, 0xd90, 2, cMask2,          2},
+    {false, 0xd94, 1, cMask0,          3},
+    {false, 0xe68, 4, cMask3,          0},
+    {false, 0xe6c, 2, cMask4,          0},
+    {false, 0xe70, 1, cMask4,          2},
+    {false, 0xf28, 2, cMask5,          0},
+    {false, 0xf2c, 1, cMask4,          3},
+    {false, 0xf70, 1, cPsFlags,        0},
+    {false, 0xf84, 4, cBlend,          0},
+    {false, 0xfdc, 1, cPsFlags,        3},
+};
+
 struct Variant {
     const char* ps;
     const char* defines;
@@ -478,9 +640,12 @@ const Variant kVariants[] = {
     {"r_o1dst_b(vr)2ds.fxo", "#define DETAIL_BLEND\n", kPsLoadsBds, count(kPsLoadsBds), {0x6c, 0x1ac, 0x58, 0x7d8, 0x74c, 0x6b8, 0x7cc, 0xc08, 0xc10, 0x6c}},
     {"r_o1dst.fxo", "#define SIMPLE_MATERIAL\n", kPsLoadsOdst, count(kPsLoadsOdst), {0x04c, 0x178, 0, 0x714, 0x758, 0x81c, 0, 0xb8c, 0xb94, 0}, true},
     {"r_o1dut.fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n", kPsLoadsOdut, count(kPsLoadsOdut), {0x04c, 0x17c, 0, 0x78c, 0x7d4, 0x7e8, 0, 0xb90, 0xb98, 0}, true},
+    {"r_o1dut_b(vr)2dut.fxo", "#define DETAIL_NORMAL\n#define DETAIL_BLEND\n#define SPECULAR_GREEN\n", kPsLoadsOdutBdut, count(kPsLoadsOdutBdut), {0x07c, 0x1b4, 0x084, 0x7f0, 0x770, 0x790, 0x750, 0xc04, 0xc0c, 0x074}},
+    {"r_p1dut_b(vr)2dut.fxo", "#define DETAIL_NORMAL\n#define DETAIL_BLEND\n#define SPECULAR_GREEN\n#define MATERIAL_ALPHA_TEST\n", kPsLoadsPdutBdut, count(kPsLoadsPdutBdut), {0x07c, 0x1b4, 0x084, 0x7f0, 0x770, 0x790, 0x750, 0xc20, 0xc28, 0x074}},
+    {"r_o1dut_b(vr)2du.fxo", "#define DETAIL_BLEND\n#define SPECULAR_GREEN\n#define KEEP_PRIMARY_NORMAL\n", kPsLoadsOdutBdu, count(kPsLoadsOdutBdu), {0x054, 0x160, 0x5e0, 0x5f0, 0x6c8, 0x778, 0x7a8, 0xbe8, 0xbf0, 0}},
     {"r_p1dut.fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define MATERIAL_ALPHA_TEST\n", kPsLoadsPdut, count(kPsLoadsPdut), {0x04c, 0x17c, 0, 0x78c, 0x7d4, 0x7e8, 0, 0xbac, 0xbb4, 0}, true},
 };
-constexpr int kVariantCount = 7;
+constexpr int kVariantCount = 10;
 
 constexpr const char* kHeader = R"(#version 450
 layout(set = 0, binding = 7, std430) readonly buffer C { uvec4 c[]; } cb;
@@ -672,6 +837,8 @@ void main() {
     precise vec2 de = sd - s;
     precise vec2 enc = de * dw + s;
     vec2 nxy = 2.0 * enc - 1.0;
+#elif defined(KEEP_PRIMARY_NORMAL)
+    precise vec2 nxy = 2.0 * s - 1.0;
 #else
     // Toward (0.5, 0.5) in the shader's two steps: q = 0.5 w + s, then q - w s.
     precise vec2 q = 0.5 * dw + s;
@@ -737,6 +904,9 @@ void main() {
     vec3 specDetail = at(6, uv1 * cf(71).xy).rgb;
 #else
     vec3 specDetail = at(6, uv1 * cf(44).xy).rgb;
+#endif
+#ifdef SPECULAR_GREEN
+    specDetail = vec3(specDetail.g);
 #endif
     vec4 screenLight = at(3, ruv) / cf(39).z;
 #ifdef DETAIL_BLEND
@@ -875,22 +1045,21 @@ public:
         if (d.instances != 1) return decline(role, "instanced");
         if (d.primitive != 4) return decline(role, "not a triangle list");
         uint32_t c[kConstants][4] = {};
-        auto loadAll = [&](const Load* list, size_t n) -> const char* {
-            for (size_t k = 0; k < n; ++k) {
-                const Load& l = list[k];
-                uint32_t w[16];
-                if (!(l.vs ? d.vsLoad : d.load)(l.pc, w, l.n)) {
-                    static thread_local char why[64];
-                    std::snprintf(why, sizeof why, "no %s load at 0x%x", l.vs ? "vertex" : "pixel", l.pc);
-                    return why;
-                }
-                for (uint32_t i = 0; i < l.n; ++i) c[l.index + (l.at + i) / 4][(l.at + i) % 4] = w[i];
+        // The loads' offsets in the shaders' data, resolved once per shader pair.
+        const Load* vsList = var.simple ? kVsLoadsSimple : kVsLoads;
+        const size_t vsCount = var.simple ? count(kVsLoadsSimple) : count(kVsLoads);
+        const std::vector<int64_t>& offs = offsets(role, d, vsList, vsCount, var.loads, var.loadCount);
+        for (size_t k = 0; k < vsCount + var.loadCount; ++k) {
+            const Load& l = k < vsCount ? vsList[k] : var.loads[k - vsCount];
+            const uint32_t* data = l.vs ? d.vsData : d.psData;
+            const size_t size = l.vs ? d.vsSize : d.psSize;
+            if (offs[k] < 0 || size_t(offs[k]) + l.n > size) {
+                static thread_local char why[64];
+                std::snprintf(why, sizeof why, "no %s load at 0x%x", l.vs ? "vertex" : "pixel", l.pc);
+                return decline(role, why);
             }
-            return nullptr;
-        };
-        if (const char* why = var.simple ? loadAll(kVsLoadsSimple, count(kVsLoadsSimple)) : loadAll(kVsLoads, count(kVsLoads)))
-            return decline(role, why);
-        if (const char* why = loadAll(var.loads, var.loadCount)) return decline(role, why);
+            for (uint32_t i = 0; i < l.n; ++i) c[l.index + (l.at + i) / 4][(l.at + i) % 4] = data[offs[k] + i];
+        }
         // The vertex inputs: v4 position, v8 normal, v12 tangent, v16 colour, v20 uv0, v24 uv1, v28 baked light.
         // r_b1dst: v4 position, v8 normal (xyz), v12 tangent, v16 colour, v20 uv, v24 baked light.
         static constexpr uint32_t kUsedFull[7] = {3, 4, 4, 4, 2, 2, 4}, kUsedSimple[7] = {3, 3, 4, 4, 2, 4, 0};
@@ -939,8 +1108,7 @@ public:
         if (!gpu.upload(c, sizeof c, consts)) return decline(role, "no room for the constants");
         VkPipeline pipe = pipeline(gpu, role, d);
         if (!pipe) return decline(role, "no pipeline");
-        if (!logged_[role]) {
-            logged_[role] = true;
+        if (!logged_[role].exchange(true)) {
             std::fprintf(stderr, "[native] material: drawing %s natively (targets 0x%" PRIx64 ", 0x%" PRIx64 ")\n", var.ps,
                          d.color[0].address, d.color[1].address);
         }
@@ -988,7 +1156,45 @@ public:
     }
 
 private:
+    // Per shader pair (and role): each load's offset in the shader's data, or -1.
+    struct PairKey {
+        int role;
+        const void *vs, *ps;
+        bool operator==(const PairKey&) const = default;
+    };
+    struct PairHash {
+        size_t operator()(const PairKey& k) const {
+            return std::hash<const void*>()(k.vs) * 31 ^ std::hash<const void*>()(k.ps) ^ size_t(k.role);
+        }
+    };
+    const std::vector<int64_t>& offsets(int role, const Draw& d, const Load* vs, size_t vsCount, const Load* ps, size_t psCount) {
+        const PairKey key{role, d.vsId, d.psId};
+        if (!d.vsId || !d.psId) { // not cacheable: this draw's own
+            thread_local std::vector<int64_t> v;
+            v.resize(vsCount + psCount);
+            for (size_t k = 0; k < v.size(); ++k) {
+                const Load& l = k < vsCount ? vs[k] : ps[k - vsCount];
+                v[k] = l.vs ? d.vsOffset(l.pc) : d.psOffset(l.pc);
+            }
+            return v;
+        }
+        {
+            std::shared_lock lock(offsetsMutex_);
+            if (auto it = offsets_.find(key); it != offsets_.end()) return it->second;
+        }
+        std::vector<int64_t> v(vsCount + psCount);
+        for (size_t k = 0; k < v.size(); ++k) {
+            const Load& l = k < vsCount ? vs[k] : ps[k - vsCount];
+            v[k] = l.vs ? d.vsOffset(l.pc) : d.psOffset(l.pc);
+        }
+        std::unique_lock lock(offsetsMutex_);
+        return offsets_.try_emplace(key, std::move(v)).first->second; // unordered_map: references stay valid
+    }
+    std::shared_mutex offsetsMutex_;
+    std::unordered_map<PairKey, std::vector<int64_t>, PairHash> offsets_;
+
     bool decline(int role, const char* why) {
+        std::lock_guard lock(m_);
         if (declined_[role].insert(why).second && declined_[role].size() <= 16)
             std::fprintf(stderr, "[native] material: a %s draw left to the translated renderer (%s)\n", kVariants[role - 1].ps, why);
         return false;
@@ -999,7 +1205,16 @@ private:
         const auto key = std::make_tuple(role, int(d.color[0].format), int(d.color[1].format), int(d.writeMask & 0xFF), int(d.depth.format),
                                          bool(d.hasStencil), z.depthTestEnable, z.depthWriteEnable, int(z.depthCompareOp),
                                          int(d.cull), int(d.frontFace));
-        if (auto it = pipes_.find(key); it != pipes_.end()) return it->second;
+        // Most draws repeat the last pipeline on their recorder thread: no lock, no lookup.
+        thread_local std::remove_const_t<decltype(key)> lastKey{};
+        thread_local VkPipeline lastPipe = VK_NULL_HANDLE;
+        thread_local const Material* lastPass = nullptr;
+        if (lastPipe && lastPass == this && lastKey == key) return lastPipe;
+        std::lock_guard lock(m_);
+        if (auto it = pipes_.find(key); it != pipes_.end()) {
+            if (it->second) lastKey = key, lastPipe = it->second, lastPass = this;
+            return it->second;
+        }
         VkPipeline& out = pipes_[key];
         const VkDevice dev = gpu.device();
         if (!layout_) {
@@ -1085,7 +1300,9 @@ private:
     std::map<std::tuple<int, int, int, int, int, bool, VkBool32, VkBool32, int, int, int>, VkPipeline> pipes_;
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
-    bool logged_[kVariantCount + 1] = {};
+    std::atomic<bool> logged_[kVariantCount + 1] = {};
+    // Recorder threads draw concurrently: the pipelines and logs are guarded.
+    std::mutex m_;
     std::set<std::string> declined_[kVariantCount + 1];
 };
 
