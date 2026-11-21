@@ -13,6 +13,7 @@
 #include "host/native/native.h"
 
 #include <array>
+#include <span>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -68,7 +69,8 @@ enum : uint32_t {
     cTexScale = 57,  // 5: the textures' coordinate scales (native::Texture::scale), two a vec4
     cFetch = 62,     // 7: the vertex inputs (first word, stride in words, dfmt | nfmt << 4)
     cOut = 69,       // the targets' swizzles, 1 to map clip z from [-w, w]
-    kConstants = 70,
+    cUvBlock = 70,   // (SIMPLE_MATERIAL: 70.x is the alpha test's reference, PSV[0x70] 0x80)   // 2 (dst variants): PSV[0x70] 0x40..0x5f; 71: specular detail xy, normal detail zw
+    kConstants = 72,
 };
 
 // A scalar load of the game's shaders and where its dwords go: vec4 `index`, from component `at`.
@@ -76,33 +78,409 @@ struct Load {
     bool vs;
     uint32_t pc, n, index, at;
 };
-constexpr Load kLoads[] = {
-    {true, 0x1c, 4, cOffset, 0},     {true, 0x20, 8, cWorld, 0},       {true, 0x24, 4, cWorld + 2, 0},
-    {true, 0x28, 1, cVsMisc, 2},     {true, 0xb8, 4, cCamera, 0},      {true, 0xdc, 4, cOffset2, 0},
-    {true, 0x118, 16, cProj + 3, 0}, // 0x30..0x6f: the projection's w row, then the rotation
-    {true, 0x168, 16, cFog, 0},      {true, 0x16c, 4, cFogDir, 0},     {true, 0x2fc, 8, cProj, 0},
-    {true, 0x300, 4, cProj + 2, 0},  {true, 0x304, 2, cVsMisc, 0},     {true, 0x308, 4, cUvOffset, 0},
-    {false, 0x18, 1, cPsFlags, 0},   {false, 0x1c, 2, cPsFlags, 1},    {false, 0x101c, 1, cPsFlags, 3},
-    {false, 0x34, 4, cUvScale, 0},   {false, 0x19c, 4, cShadowMap, 0}, {false, 0x208, 4, cTintBase, 0},
-    {false, 0x260, 4, cTint, 0},     {false, 0x2cc, 4, cPointPos, 0},  {false, 0x334, 4, cPointColor, 0},
-    {false, 0x384, 4, cPointPos + 1, 0}, {false, 0x3ec, 4, cPointColor + 1, 0},
-    {false, 0x43c, 4, cPointPos + 2, 0}, {false, 0x4a4, 4, cPointColor + 2, 0},
-    {false, 0x4f4, 4, cPointPos + 3, 0}, {false, 0x55c, 4, cPointColor + 3, 0},
-    {false, 0x59c, 4, cPsCamera, 0}, {false, 0x600, 8, cMul, 0},       {false, 0x604, 1, cMisc, 0},
-    {false, 0x670, 1, cMisc, 1},     {false, 0xba8, 1, cMisc, 2},      {false, 0xbac, 1, cMisc, 3},
-    {false, 0x650, 8, cMaterial, 0}, {false, 0x654, 4, cExposure, 0},  {false, 0x660, 4, cAmbient, 0},
-    {false, 0x68c, 8, cDir, 0},      {false, 0x690, 4, cAmbientTint, 0}, {false, 0x694, 2, cMisc2, 0},
-    {false, 0xbb0, 1, cMisc2, 2},    {false, 0xc48, 1, cMisc2, 3},     {false, 0x730, 8, cLight, 0},
-    {false, 0xb38, 8, cDistFog, 0},  {false, 0xbb4, 4, cOutScale, 0},  {false, 0xc38, 1, cMask0, 0},
-    {false, 0xc40, 1, cMask0, 1},    {false, 0xc44, 1, cMask0, 2},     {false, 0xdd4, 1, cMask0, 3},
-    {false, 0xc3c, 4, cMask1, 0},    {false, 0xd74, 2, cMask2, 0},     {false, 0xdd0, 2, cMask2, 2},
-    {false, 0xea8, 4, cMask3, 0},    {false, 0xeac, 2, cMask4, 0},     {false, 0xeb0, 1, cMask4, 2},
-    {false, 0xf6c, 1, cMask4, 3},    {false, 0xf68, 2, cMask5, 0},     {false, 0xfc4, 4, cBlend, 0},
+constexpr Load kVsLoads[] = {
+    {true, 0x1c, 4, cOffset, 0},
+    {true, 0x20, 8, cWorld, 0},
+    {true, 0x24, 4, cWorld + 2, 0},
+    {true, 0x28, 1, cVsMisc, 2},
+    {true, 0xb8, 4, cCamera, 0},
+    {true, 0xdc, 4, cOffset2, 0},
+    {true, 0x118, 16, cProj + 3, 0},
+    {true, 0x168, 16, cFog, 0},
+    {true, 0x16c, 4, cFogDir, 0},
+    {true, 0x2fc, 8, cProj, 0},
+    {true, 0x300, 4, cProj + 2, 0},
+    {true, 0x304, 2, cVsMisc, 0},
+    {true, 0x308, 4, cUvOffset, 0},
 };
 
+// Each pixel shader's loads (the variants' pcs from Codex's reading of their disassembly).
+constexpr Load kPsLoadsMds[] = {
+    {false, 0x18, 1, cPsFlags, 0},
+    {false, 0x1c, 2, cPsFlags, 1},
+    {false, 0x101c, 1, cPsFlags, 3},
+    {false, 0x34, 4, cUvScale, 0},
+    {false, 0x19c, 4, cShadowMap, 0},
+    {false, 0x208, 4, cTintBase, 0},
+    {false, 0x260, 4, cTint, 0},
+    {false, 0x2cc, 4, cPointPos, 0},
+    {false, 0x334, 4, cPointColor, 0},
+    {false, 0x384, 4, cPointPos + 1, 0},
+    {false, 0x3ec, 4, cPointColor + 1, 0},
+    {false, 0x43c, 4, cPointPos + 2, 0},
+    {false, 0x4a4, 4, cPointColor + 2, 0},
+    {false, 0x4f4, 4, cPointPos + 3, 0},
+    {false, 0x55c, 4, cPointColor + 3, 0},
+    {false, 0x59c, 4, cPsCamera, 0},
+    {false, 0x600, 8, cMul, 0},
+    {false, 0x604, 1, cMisc, 0},
+    {false, 0x670, 1, cMisc, 1},
+    {false, 0xba8, 1, cMisc, 2},
+    {false, 0xbac, 1, cMisc, 3},
+    {false, 0x650, 8, cMaterial, 0},
+    {false, 0x654, 4, cExposure, 0},
+    {false, 0x660, 4, cAmbient, 0},
+    {false, 0x68c, 8, cDir, 0},
+    {false, 0x690, 4, cAmbientTint, 0},
+    {false, 0x694, 2, cMisc2, 0},
+    {false, 0xbb0, 1, cMisc2, 2},
+    {false, 0xc48, 1, cMisc2, 3},
+    {false, 0x730, 8, cLight, 0},
+    {false, 0xb38, 8, cDistFog, 0},
+    {false, 0xbb4, 4, cOutScale, 0},
+    {false, 0xc38, 1, cMask0, 0},
+    {false, 0xc40, 1, cMask0, 1},
+    {false, 0xc44, 1, cMask0, 2},
+    {false, 0xdd4, 1, cMask0, 3},
+    {false, 0xc3c, 4, cMask1, 0},
+    {false, 0xd74, 2, cMask2, 0},
+    {false, 0xdd0, 2, cMask2, 2},
+    {false, 0xea8, 4, cMask3, 0},
+    {false, 0xeac, 2, cMask4, 0},
+    {false, 0xeb0, 1, cMask4, 2},
+    {false, 0xf6c, 1, cMask4, 3},
+    {false, 0xf68, 2, cMask5, 0},
+    {false, 0xfc4, 4, cBlend, 0},
+};
+constexpr Load kPsLoadsMdst[] = {
+    {false, 0x20,   1, cPsFlags,       0},
+    {false, 0x24,   2, cPsFlags,       1},
+    {false, 0x3c,   4, cUvScale,       0},
+    {false, 0x3c,   8, cUvBlock,       0},
+    {false, 0x1b4,  4, cShadowMap,     0},
+    {false, 0x220,  4, cTintBase,      0},
+    {false, 0x278,  4, cTint,          0},
+    {false, 0x2e4,  4, cPointPos,      0},
+    {false, 0x34c,  4, cPointColor,    0},
+    {false, 0x39c,  4, cPointPos + 1,  0},
+    {false, 0x404,  4, cPointColor + 1,0},
+    {false, 0x454,  4, cPointPos + 2,  0},
+    {false, 0x4bc,  4, cPointColor + 2,0},
+    {false, 0x50c,  4, cPointPos + 3,  0},
+    {false, 0x574,  4, cPointColor + 3,0},
+    {false, 0x5b4,  4, cPsCamera,      0},
+    {false, 0x5fc,  8, cDir,           0},
+    {false, 0x608,  1, cMisc,          1},
+    {false, 0x740,  8, cLight,         0},
+    {false, 0x758,  8, cMaterial,      0},
+    {false, 0x76c,  4, cAmbientTint,   0},
+    {false, 0x7b4,  4, cExposure,      0},
+    {false, 0x7b8,  4, cAmbient,       0},
+    {false, 0x7bc,  8, cMul,           0},
+    {false, 0x7dc,  1, cMisc,          0},
+    {false, 0xb40,  8, cDistFog,       0},
+    {false, 0xbb0,  1, cMisc,          2},
+    {false, 0xbb4,  1, cMisc,          3},
+    {false, 0xbb8,  1, cMisc2,         2},
+    {false, 0xbbc,  4, cOutScale,      0},
+    {false, 0xc40,  1, cMask0,         0},
+    {false, 0xc44,  4, cMask1,         0},
+    {false, 0xc48,  1, cMask0,         1},
+    {false, 0xc4c,  1, cMask0,         2},
+    {false, 0xc50,  1, cMisc2,         3},
+    {false, 0xd7c,  2, cMask2,         0},
+    {false, 0xdd8,  2, cMask2,         2},
+    {false, 0xddc,  1, cMask0,         3},
+    {false, 0xeb0,  4, cMask3,         0},
+    {false, 0xeb4,  2, cMask4,         0},
+    {false, 0xeb8,  1, cMask4,         2},
+    {false, 0xf70,  2, cMask5,         0},
+    {false, 0xf74,  1, cMask4,         3},
+    {false, 0xfcc,  4, cBlend,         0},
+    {false, 0x1024, 1, cPsFlags,       3},
+};
+constexpr Load kPsLoadsBdst[] = {
+    {false, 0x28,  1, cPsFlags,       0},
+    {false, 0x2c,  2, cPsFlags,       1},
+    {false, 0x44,  4, cUvScale,       0},
+    {false, 0x44,  8, cUvBlock,       0},
+    {false, 0x1cc, 4, cShadowMap,     0},
+    {false, 0x238, 4, cTintBase,      0},
+    {false, 0x290, 4, cTint,          0},
+    {false, 0x2fc, 4, cPointPos,      0},
+    {false, 0x364, 4, cPointColor,    0},
+    {false, 0x3b4, 4, cPointPos + 1,  0},
+    {false, 0x41c, 4, cPointColor + 1,0},
+    {false, 0x46c, 4, cPointPos + 2,  0},
+    {false, 0x4d4, 4, cPointColor + 2,0},
+    {false, 0x524, 4, cPointPos + 3,  0},
+    {false, 0x58c, 4, cPointColor + 3,0},
+    {false, 0x5dc, 4, cPsCamera,      0},
+    {false, 0x634, 8, cMul,           0},
+    {false, 0x644, 4, cExposure,      0},
+    {false, 0x65c, 8, cMaterial,      0},
+    {false, 0x660, 4, cAmbientTint,   0},
+    {false, 0x664, 4, cAmbient,       0},
+    {false, 0x66c, 8, cLight,         0},
+    {false, 0x684, 8, cDir,           0},
+    {false, 0x730, 1, cMisc,          1},
+    {false, 0x76c, 1, cMisc,          0},
+    {false, 0xb18, 8, cDistFog,       0},
+    {false, 0xb88, 1, cMisc,          2},
+    {false, 0xb8c, 1, cMisc,          3},
+    {false, 0xb90, 1, cMisc2,         2},
+    {false, 0xb94, 4, cOutScale,      0},
+    {false, 0xc18, 1, cMask0,         0},
+    {false, 0xc1c, 4, cMask1,         0},
+    {false, 0xc20, 1, cMask0,         1},
+    {false, 0xc24, 1, cMask0,         2},
+    {false, 0xc28, 1, cMisc2,         3},
+    {false, 0xd54, 2, cMask2,         0},
+    {false, 0xdb0, 2, cMask2,         2},
+    {false, 0xdb4, 1, cMask0,         3},
+    {false, 0xe88, 4, cMask3,         0},
+    {false, 0xe8c, 2, cMask4,         0},
+    {false, 0xe90, 1, cMask4,         2},
+    {false, 0xf48, 2, cMask5,         0},
+    {false, 0xf4c, 1, cMask4,         3},
+    {false, 0xfa4, 4, cBlend,         0},
+    {false, 0xffc, 1, cPsFlags,       3},
+};
+constexpr Load kPsLoadsBds[] = {
+    {false, 0x20,  1, cPsFlags,       0},
+    {false, 0x24,  2, cPsFlags,       1},
+    {false, 0x3c,  4, cUvScale,       0},
+    {false, 0x1c4, 4, cShadowMap,     0},
+    {false, 0x230, 4, cTintBase,      0},
+    {false, 0x288, 4, cTint,          0},
+    {false, 0x2f4, 4, cPointPos,      0},
+    {false, 0x35c, 4, cPointColor,    0},
+    {false, 0x3ac, 4, cPointPos + 1,  0},
+    {false, 0x414, 4, cPointColor + 1,0},
+    {false, 0x464, 4, cPointPos + 2,  0},
+    {false, 0x4cc, 4, cPointColor + 2,0},
+    {false, 0x51c, 4, cPointPos + 3,  0},
+    {false, 0x584, 4, cPointColor + 3,0},
+    {false, 0x5c8, 4, cPsCamera,      0},
+    {false, 0x610, 8, cDir,           0},
+    {false, 0x620, 4, cExposure,      0},
+    {false, 0x624, 4, cAmbient,       0},
+    {false, 0x628, 1, cMisc,          0},
+    {false, 0x62c, 4, cAmbientTint,   0},
+    {false, 0x630, 1, cMisc,          1},
+    {false, 0x6b4, 2, cMisc2,         0},
+    {false, 0x6c0, 8, cMaterial,      0},
+    {false, 0x754, 8, cMul,           0},
+    {false, 0x758, 8, cLight,         0},
+    {false, 0xb18, 8, cDistFog,       0},
+    {false, 0xb88, 1, cMisc,          2},
+    {false, 0xb8c, 1, cMisc,          3},
+    {false, 0xb90, 1, cMisc2,         2},
+    {false, 0xb94, 4, cOutScale,      0},
+    {false, 0xc18, 1, cMask0,         0},
+    {false, 0xc1c, 4, cMask1,         0},
+    {false, 0xc20, 1, cMask0,         1},
+    {false, 0xc24, 1, cMask0,         2},
+    {false, 0xc28, 1, cMisc2,         3},
+    {false, 0xd54, 2, cMask2,         0},
+    {false, 0xdb0, 2, cMask2,         2},
+    {false, 0xdb4, 1, cMask0,         3},
+    {false, 0xe88, 4, cMask3,         0},
+    {false, 0xe8c, 2, cMask4,         0},
+    {false, 0xe90, 1, cMask4,         2},
+    {false, 0xf48, 2, cMask5,         0},
+    {false, 0xf4c, 1, cMask4,         3},
+    {false, 0xfa4, 4, cBlend,         0},
+    {false, 0xffc, 1, cPsFlags,       3},
+};
+
+
 // The pixel shader's textures, by the sample that reads each (the offset samples read the same).
-enum Tex { tNormal, tShadow, tDetail, tScreenLight, tBase, tSpecular, tSpecDetail, tDepth, tScreenNormal, kTextures };
-constexpr uint32_t kTexturePc[kTextures] = {0x54, 0x184, 0x5f0, 0x640, 0x684, 0x8c0, 0x91c, 0xc28, 0xc30};
+enum Tex { tNormal, tShadow, tDetail, tScreenLight, tBase, tSpecular, tSpecDetail, tDepth, tScreenNormal, tNormalDetail, kTextures };
+
+// The family's pixel shaders handled: "m" multiplies the detail textures in by the vertex's
+// weight, "b" blends toward them by the detail texture's alpha too; "dst" adds a detail normal
+// map blended toward (without it, slot 9 repeats the normal map, unread).
+// The r_b1dst family (vertex shader r_b1dst: one set of coordinates, no vertex detail weight),
+// from Codex's reading of its disassembly: no detail textures; "u" takes the specular map's
+// green alone, "p1" drops pixels whose base alpha is under a reference.
+constexpr Load kVsLoadsSimple[] = {
+    {true, 0x01c,  4, cOffset,     0},
+    {true, 0x020,  8, cWorld,      0},
+    {true, 0x024,  4, cWorld + 2,  0},
+    {true, 0x028,  1, cVsMisc,     2},
+    {true, 0x0b8,  4, cCamera,     0},
+    {true, 0x0dc,  4, cOffset2,    0},
+    {true, 0x118, 16, cProj + 3,   0},
+    {true, 0x168, 16, cFog,    0},
+    {true, 0x16c,  4, cFogDir,     0},
+    {true, 0x174,  4, cCamera,     0},
+    {true, 0x2e8,  8, cProj,       0},
+    {true, 0x2ec,  4, cProj + 2,   0},
+    {true, 0x2f0,  1, cVsMisc,     1},
+    {true, 0x2f4,  2, cUvOffset,   0},
+};
+constexpr Load kPsLoadsOdst[] = {
+    {false, 0x030, 4, cUvScale,       0},
+    {false, 0x094, 1, cPsFlags,       0},
+    {false, 0x0c8, 2, cPsFlags,       1},
+    {false, 0x190, 4, cShadowMap,     0},
+    {false, 0x1c4, 4, cShadowMap,     0},
+    {false, 0x1fc, 4, cTintBase,      0},
+    {false, 0x254, 4, cTint,      0},
+    {false, 0x2c0, 4, cPointPos,      0},
+    {false, 0x328, 4, cPointColor,    0},
+    {false, 0x378, 4, cPointPos + 1,  0},
+    {false, 0x3e0, 4, cPointColor + 1,0},
+    {false, 0x430, 4, cPointPos + 2,  0},
+    {false, 0x498, 4, cPointColor + 2,0},
+    {false, 0x4e8, 4, cPointPos + 3,  0},
+    {false, 0x550, 4, cPointColor + 3,0},
+    {false, 0x5cc, 4, cPsCamera,      0},
+    {false, 0x5d0, 8, cDir,       0},
+    {false, 0x5d4, 8, cMaterial,      0},
+    {false, 0x5d8, 8, cMul,       0},
+    {false, 0x5dc, 4, cExposure,      0},
+    {false, 0x5e0, 4, cAmbientTint,   0},
+    {false, 0x5e4, 1, cMisc,      1},
+    {false, 0x5e8, 4, cAmbient,       0},
+    {false, 0x5ec, 8, cLight,     0},
+    {false, 0x748, 1, cMisc,      0},
+    {false, 0xa7c, 8, cDistFog,       0},
+    {false, 0xaf0, 1, cMisc,      2},
+    {false, 0xaf4, 1, cMisc,      3},
+    {false, 0xaf8, 1, cMisc2,     2},
+    {false, 0xafc, 1, cPsFlags,       0},
+    {false, 0xb00, 4, cOutScale,      0},
+    {false, 0xb68, 2, cPsFlags,       1},
+    {false, 0xb6c, 1, cMask0,     0},
+    {false, 0xb70, 4, cMask1,     0},
+    {false, 0xb74, 1, cMask0,     1},
+    {false, 0xb78, 1, cMask0,     2},
+    {false, 0xb7c, 1, cMisc2,     3},
+    {false, 0xcc0, 2, cMask2,     0},
+    {false, 0xd1c, 2, cMask2,     2},
+    {false, 0xd20, 1, cMask0,     3},
+    {false, 0xdf0, 4, cMask3,     0},
+    {false, 0xdf4, 2, cMask4,     0},
+    {false, 0xdf8, 1, cMask4,     2},
+    {false, 0xeb4, 2, cMask5,     0},
+    {false, 0xeb8, 1, cMask4,     3},
+    {false, 0xf04, 1, cPsFlags,       0},
+    {false, 0xf20, 4, cBlend,     0},
+    {false, 0xf94, 1, cPsFlags,       3},
+};
+constexpr Load kPsLoadsOdut[] = {
+    {false, 0x030, 4, cUvScale,       0},
+    {false, 0x094, 1, cPsFlags,       0},
+    {false, 0x0c8, 2, cPsFlags,       1},
+    {false, 0x194, 4, cShadowMap,     0},
+    {false, 0x1c8, 4, cShadowMap,     0},
+    {false, 0x200, 4, cTintBase,      0},
+    {false, 0x258, 4, cTint,      0},
+    {false, 0x2c4, 4, cPointPos,      0},
+    {false, 0x32c, 4, cPointColor,    0},
+    {false, 0x37c, 4, cPointPos + 1,  0},
+    {false, 0x3e4, 4, cPointColor + 1,0},
+    {false, 0x434, 4, cPointPos + 2,  0},
+    {false, 0x49c, 4, cPointColor + 2,0},
+    {false, 0x4ec, 4, cPointPos + 3,  0},
+    {false, 0x554, 4, cPointColor + 3,0},
+    {false, 0x5c4, 4, cPsCamera,      0},
+    {false, 0x5c8, 8, cDir,       0},
+    {false, 0x5cc, 8, cMul,       0},
+    {false, 0x5d0, 8, cMaterial,      0},
+    {false, 0x5d4, 1, cMisc,      1},
+    {false, 0x5d8, 4, cExposure,      0},
+    {false, 0x5e8, 4, cAmbientTint,   0},
+    {false, 0x5ec, 4, cAmbient,       0},
+    {false, 0x5f0, 8, cLight,     0},
+    {false, 0x62c, 1, cMisc,      0},
+    {false, 0xa80, 8, cDistFog,       0},
+    {false, 0xaf4, 1, cMisc,      2},
+    {false, 0xaf8, 1, cMisc,      3},
+    {false, 0xafc, 1, cMisc2,     2},
+    {false, 0xb00, 1, cPsFlags,       0},
+    {false, 0xb04, 4, cOutScale,      0},
+    {false, 0xb6c, 2, cPsFlags,       1},
+    {false, 0xb70, 1, cMask0,     0},
+    {false, 0xb74, 4, cMask1,     0},
+    {false, 0xb78, 1, cMask0,     1},
+    {false, 0xb7c, 1, cMask0,     2},
+    {false, 0xb80, 1, cMisc2,     3},
+    {false, 0xcc4, 2, cMask2,     0},
+    {false, 0xd20, 2, cMask2,     2},
+    {false, 0xd24, 1, cMask0,     3},
+    {false, 0xdf4, 4, cMask3,     0},
+    {false, 0xdf8, 2, cMask4,     0},
+    {false, 0xdfc, 1, cMask4,     2},
+    {false, 0xeb8, 2, cMask5,     0},
+    {false, 0xebc, 1, cMask4,     3},
+    {false, 0xf08, 1, cPsFlags,       0},
+    {false, 0xf24, 4, cBlend,     0},
+    {false, 0xf98, 1, cPsFlags,       3},
+};
+constexpr Load kPsLoadsPdut[] = {
+    {false, 0x030, 4, cUvScale,       0},
+    {false, 0x094, 1, cPsFlags,       0},
+    {false, 0x0c8, 2, cPsFlags,       1},
+    {false, 0x194, 4, cShadowMap,     0},
+    {false, 0x1c8, 4, cShadowMap,     0},
+    {false, 0x200, 4, cTintBase,      0},
+    {false, 0x258, 4, cTint,      0},
+    {false, 0x2c4, 4, cPointPos,      0},
+    {false, 0x32c, 4, cPointColor,    0},
+    {false, 0x37c, 4, cPointPos + 1,  0},
+    {false, 0x3e4, 4, cPointColor + 1,0},
+    {false, 0x434, 4, cPointPos + 2,  0},
+    {false, 0x49c, 4, cPointColor + 2,0},
+    {false, 0x4ec, 4, cPointPos + 3,  0},
+    {false, 0x554, 4, cPointColor + 3,0},
+    {false, 0x5c4, 4, cPsCamera,      0},
+    {false, 0x5c8, 8, cDir,       0},
+    {false, 0x5cc, 8, cMul,       0},
+    {false, 0x5d0, 8, cMaterial,      0},
+    {false, 0x5d4, 1, cMisc,      1},
+    {false, 0x5d8, 4, cExposure,      0},
+    {false, 0x5e8, 4, cAmbientTint,   0},
+    {false, 0x5ec, 4, cAmbient,       0},
+    {false, 0x5f0, 8, cLight,     0},
+    {false, 0x62c, 1, cMisc,      0},
+    {false, 0xa80, 8, cDistFog,       0},
+    {false, 0xad8, 1, cUvBlock,      0},
+    {false, 0xafc, 1, cMisc,      3},
+    {false, 0xb10, 1, cMisc,      2},
+    {false, 0xb14, 1, cMisc2,     2},
+    {false, 0xb18, 1, cPsFlags,       0},
+    {false, 0xb1c, 4, cOutScale,      0},
+    {false, 0xb88, 2, cPsFlags,       1},
+    {false, 0xb8c, 1, cMask0,     0},
+    {false, 0xb90, 4, cMask1,     0},
+    {false, 0xb94, 1, cMask0,     1},
+    {false, 0xb98, 1, cMask0,     2},
+    {false, 0xb9c, 1, cMisc2,     3},
+    {false, 0xce0, 2, cMask2,     0},
+    {false, 0xd3c, 2, cMask2,     2},
+    {false, 0xd40, 1, cMask0,     3},
+    {false, 0xe10, 4, cMask3,     0},
+    {false, 0xe14, 2, cMask4,     0},
+    {false, 0xe18, 1, cMask4,     2},
+    {false, 0xed4, 2, cMask5,     0},
+    {false, 0xed8, 1, cMask4,     3},
+    {false, 0xf24, 1, cPsFlags,       0},
+    {false, 0xf40, 4, cBlend,     0},
+    {false, 0xfb4, 1, cPsFlags,       3},
+};
+
+struct Variant {
+    const char* ps;
+    const char* defines;
+    const Load* loads;
+    size_t loadCount;
+    uint32_t texturePc[kTextures]; // 0: not read (bound to another of the draw's textures)
+    bool simple = false;           // the r_b1dst vertex shader and SIMPLE_MATERIAL
+};
+template <size_t N> constexpr size_t count(const Load (&)[N]) { return N; }
+const Variant kVariants[] = {
+    {"r_o1dst_m(vr)2ds.fxo", "", kPsLoadsMds, count(kPsLoadsMds), {0x54, 0x184, 0x5f0, 0x640, 0x684, 0x8c0, 0x91c, 0xc28, 0xc30, 0x54}},
+    {"r_o1dst_m(vr)2dst.fxo", "#define DETAIL_NORMAL\n", kPsLoadsMdst, count(kPsLoadsMdst), {0x74, 0x19c, 0x78c, 0x7a4, 0x7ac, 0x778, 0x75c, 0xc30, 0xc38, 0x6c}},
+    {"r_o1dst_b(vr)2dst.fxo", "#define DETAIL_NORMAL\n#define DETAIL_BLEND\n", kPsLoadsBdst, count(kPsLoadsBdst), {0x7c, 0x1b4, 0x84, 0x67c, 0x618, 0x89c, 0x654, 0xc08, 0xc10, 0x74}},
+    {"r_o1dst_b(vr)2ds.fxo", "#define DETAIL_BLEND\n", kPsLoadsBds, count(kPsLoadsBds), {0x6c, 0x1ac, 0x58, 0x7d8, 0x74c, 0x6b8, 0x7cc, 0xc08, 0xc10, 0x6c}},
+    {"r_o1dst.fxo", "#define SIMPLE_MATERIAL\n", kPsLoadsOdst, count(kPsLoadsOdst), {0x04c, 0x178, 0, 0x714, 0x758, 0x81c, 0, 0xb8c, 0xb94, 0}, true},
+    {"r_o1dut.fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n", kPsLoadsOdut, count(kPsLoadsOdut), {0x04c, 0x17c, 0, 0x78c, 0x7d4, 0x7e8, 0, 0xb90, 0xb98, 0}, true},
+    {"r_p1dut.fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define MATERIAL_ALPHA_TEST\n", kPsLoadsPdut, count(kPsLoadsPdut), {0x04c, 0x17c, 0, 0x78c, 0x7d4, 0x7e8, 0, 0xbac, 0xbb4, 0}, true},
+};
+constexpr int kVariantCount = 7;
 
 constexpr const char* kHeader = R"(#version 450
 layout(set = 0, binding = 7, std430) readonly buffer C { uvec4 c[]; } cb;
@@ -202,16 +580,32 @@ void main() {
     }
     if ((flags & 0x40000u) != 0u) scatter = vec3(0.0);
     const float k = uintBitsToFloat(0x40008102u);
+#ifdef SIMPLE_MATERIAL
+    vec4 n = fetch(1u), t = fetch(2u), col = fetch(3u), b = fetch(5u);
+#else
     vec4 n = fetch(1u), t = fetch(2u), col = fetch(3u), b = fetch(6u);
+#endif
     // Rounded as the game's shader (each product, then each sum), as the prepass does.
     vec3 on = vec3(mac(k, n.x, -1.0), mac(k, n.y, -1.0), mac(k, n.z, -1.0));
     vec3 ot = vec3(mac(k, t.x, -1.0), mac(k, t.y, -1.0), mac(k, t.z, -1.0));
     float handed = mac(k, t.w, -1.0);
+#ifdef SIMPLE_MATERIAL
+    float flatten = 0.0;
+#else
     float flatten = cf(14).x * (1.0 - clamp(n.w * uintBitsToFloat(0x3f808102u), 0.0, 1.0));
-    vec3 baked = 0.25 * b.xyz / (1.0 - b.w);
-    baked *= baked;
+#endif
+    // As the shaders round it: 1 - w, its reciprocal, the product, a quarter, squared.
+    precise float bd = 1.0 - b.w;
+    precise float bi = 1.0 / bd;
+    precise vec3 b0 = b.xyz * bi;
+    precise vec3 b1 = 0.25 * b0;
+    precise vec3 baked = b1 * b1;
     vec4 uvo = cf(13);
+#ifdef SIMPLE_MATERIAL
+    p0 = vec4(fetch(4u).xy + uvo.xy, 0.0, 0.0);
+#else
     p0 = vec4(fetch(4u).xy + uvo.xy, fetch(5u).xy + uvo.zw);
+#endif
     p1 = vec4(col.rgb * T, col.a * cf(14).y);
     p2 = vec4(scatter, flatten);
     p3 = vec4(dot3(W[0], on), dot3(W[1], on), dot3(W[2], on), 0.0);
@@ -223,7 +617,7 @@ void main() {
 )";
 
 constexpr const char* kFs = R"(
-layout(set = 0, binding = 8) uniform sampler2D tex[9];
+layout(set = 0, binding = 8) uniform sampler2D tex[10];
 layout(location = 0) in vec4 a0;
 layout(location = 1) in vec4 a1;
 layout(location = 2) in vec4 a2;
@@ -254,9 +648,36 @@ void main() {
     vec2 ruv = gl_FragCoord.xy * rasterToUV;
     vec3 P = a7.xyz, gn = a3.xyz, tg = a6.xyz;
     vec3 bt = cross(gn, tg) * a6.w;
+#ifdef SIMPLE_MATERIAL
+    // No detail textures: their weight 0 leaves every step below as the shaders without them.
+    float flatten = 0.0;
+#else
     float flatten = a2.w;
+#endif
+#ifdef SIMPLE_MATERIAL
+    vec4 detail4 = vec4(1.0);
+    float dw = 0.0;
+#elif defined(DETAIL_BLEND)
+    // Toward the detail textures by their alpha too.
+    vec4 detail4 = at(2, uv1);
+    precise float dw = detail4.a * flatten;
+#else
+    vec4 detail4 = vec4(at(2, uv1).rgb, 1.0);
+    float dw = flatten;
+#endif
     vec2 s = at(0, uv0 * cf(21).zw).rg;
-    vec2 nxy = 2.0 * mix(s, vec2(0.5), flatten) - 1.0;
+#ifdef DETAIL_NORMAL
+    // Toward the detail normal map (its encoded x, y).
+    vec2 sd = at(9, uv1 * cf(71).zw).rg;
+    precise vec2 de = sd - s;
+    precise vec2 enc = de * dw + s;
+    vec2 nxy = 2.0 * enc - 1.0;
+#else
+    // Toward (0.5, 0.5) in the shader's two steps: q = 0.5 w + s, then q - w s.
+    precise vec2 q = 0.5 * dw + s;
+    precise vec2 q2 = dw * -s + q;
+    precise vec2 nxy = 2.0 * q2 - 1.0;
+#endif
     float nz = sqrt(clamp(1.0 - dot(nxy, nxy), 0.0, 1.0));
     vec3 N = normalize(tg * nxy.x + bt * nxy.y + gn * nz);
 
@@ -300,12 +721,34 @@ void main() {
     vec3 diffuseColor = m0.xyz * mul0.xyz, specularColor = m1.xyz * mul1.xyz;
     vec3 ambientTex = cf(43).xyz * mul1.w;
     vec4 base = at(4, uv0);
-    vec3 detail = at(2, uv1).rgb;
+#ifdef MATERIAL_ALPHA_TEST
+    // Base alpha under the reference: dropped (kept for the quad's derivatives).
+    if (cf(70).x > base.a) demote;
+#endif
+    vec3 detail = detail4.rgb;
+#ifdef SPECULAR_GREEN
+    vec3 specMat = vec3(at(5, uv0 * cf(21).xy).g);
+#else
     vec3 specMat = at(5, uv0 * cf(21).xy).rgb;
+#endif
+#if defined(SIMPLE_MATERIAL)
+    vec3 specDetail = vec3(1.0);
+#elif defined(DETAIL_NORMAL)
+    vec3 specDetail = at(6, uv1 * cf(71).xy).rgb;
+#else
     vec3 specDetail = at(6, uv1 * cf(44).xy).rgb;
+#endif
     vec4 screenLight = at(3, ruv) / cf(39).z;
-    vec3 adjBase = base.rgb * base.rgb * (1.0 - flatten * (1.0 - detail * detail));
-    vec3 adjSpec = specMat * (1.0 - flatten * (1.0 - specDetail));
+#ifdef DETAIL_BLEND
+    precise vec3 baseSq = base.rgb * base.rgb;
+    precise vec3 dd = detail * detail - baseSq;
+    precise vec3 adjBase = dw * dd + baseSq;
+    precise vec3 sdd = specDetail - specMat;
+    precise vec3 adjSpec = dw * sdd + specMat;
+#else
+    vec3 adjBase = base.rgb * base.rgb * (1.0 - dw * (1.0 - detail * detail));
+    vec3 adjSpec = specMat * (1.0 - dw * (1.0 - specDetail));
+#endif
     vec3 vtint = a1.rgb * cover, itint = indTint * cover;
     vec3 bp = a4.xyz + point, T = a5.xyz;
     vec3 dirDiffuse = lc0 * dirTint * nl0 + lc1 * shG * nl1;
@@ -408,58 +851,80 @@ class Material final : public Pass {
 public:
     const char* name() const override { return "material"; }
 
-    int claims(const std::string& psName) const override { return psName == "r_o1dst_m(vr)2ds.fxo" ? 1 : 0; }
-
-    bool draw(int /*role*/, const Draw& d, Gpu& gpu) override {
-        if (!d.vsName || d.vsName->rfind("r_b1dst_a(vr)2d.fxo", 0) != 0) return decline("another vertex shader");
-        if (d.upscaler) return decline("an upscaler is on");
-        if (d.pixelPositions) return decline("positions in pixels");
-        if (d.depthBias) return decline("a polygon offset");
-        if (d.colorCount != 2 || !d.color[0].view || !d.color[1].view || !d.depth.view)
-            return decline("not two colour targets with depth");
-        if (d.blend || d.stencil) return decline("blending or stencil");
-        if (d.instances != 1) return decline("instanced");
-        if (d.primitive != 4) return decline("not a triangle list");
-        uint32_t c[kConstants][4] = {};
-        for (const Load& l : kLoads) {
-            uint32_t w[16];
-            if (!(l.vs ? d.vsLoad : d.load)(l.pc, w, l.n)) {
-                char why[64];
-                std::snprintf(why, sizeof why, "no %s load at 0x%x", l.vs ? "vertex" : "pixel", l.pc);
-                return decline(why);
-            }
-            for (uint32_t i = 0; i < l.n; ++i) c[l.index + (l.at + i) / 4][(l.at + i) % 4] = w[i];
+    int claims(const std::string& psName) const override {
+        // An archive name, with " +N" when N other entries have the same code (shader_names.cpp).
+        for (int i = 0; i < kVariantCount; ++i) {
+            const std::string name = kVariants[i].ps;
+            if (psName == name || psName.rfind(name + " +", 0) == 0) return i + 1;
         }
+        return 0;
+    }
+
+    bool draw(int role, const Draw& d, Gpu& gpu) override {
+        if (role < 1 || role > kVariantCount) return false;
+        const Variant& var = kVariants[role - 1];
+        const char* vsWanted = var.simple ? "r_b1dst.fxo" : "r_b1dst_a(vr)2d.fxo";
+        if (!d.vsName || (*d.vsName != vsWanted && d.vsName->rfind(std::string(vsWanted) + " +", 0) != 0))
+            return decline(role, "another vertex shader");
+        if (d.upscaler) return decline(role, "an upscaler is on");
+        if (d.pixelPositions) return decline(role, "positions in pixels");
+        if (d.depthBias) return decline(role, "a polygon offset");
+        if (d.colorCount != 2 || !d.color[0].view || !d.color[1].view || !d.depth.view)
+            return decline(role, "not two colour targets with depth");
+        if (d.blend || d.stencil) return decline(role, "blending or stencil");
+        if (d.instances != 1) return decline(role, "instanced");
+        if (d.primitive != 4) return decline(role, "not a triangle list");
+        uint32_t c[kConstants][4] = {};
+        auto loadAll = [&](const Load* list, size_t n) -> const char* {
+            for (size_t k = 0; k < n; ++k) {
+                const Load& l = list[k];
+                uint32_t w[16];
+                if (!(l.vs ? d.vsLoad : d.load)(l.pc, w, l.n)) {
+                    static thread_local char why[64];
+                    std::snprintf(why, sizeof why, "no %s load at 0x%x", l.vs ? "vertex" : "pixel", l.pc);
+                    return why;
+                }
+                for (uint32_t i = 0; i < l.n; ++i) c[l.index + (l.at + i) / 4][(l.at + i) % 4] = w[i];
+            }
+            return nullptr;
+        };
+        if (const char* why = var.simple ? loadAll(kVsLoadsSimple, count(kVsLoadsSimple)) : loadAll(kVsLoads, count(kVsLoads)))
+            return decline(role, why);
+        if (const char* why = loadAll(var.loads, var.loadCount)) return decline(role, why);
         // The vertex inputs: v4 position, v8 normal, v12 tangent, v16 colour, v20 uv0, v24 uv1, v28 baked light.
-        static constexpr uint32_t kUsed[7] = {3, 4, 4, 4, 2, 2, 4};
+        // r_b1dst: v4 position, v8 normal (xyz), v12 tangent, v16 colour, v20 uv, v24 baked light.
+        static constexpr uint32_t kUsedFull[7] = {3, 4, 4, 4, 2, 2, 4}, kUsedSimple[7] = {3, 3, 4, 4, 2, 4, 0};
+        const uint32_t* kUsed = var.simple ? kUsedSimple : kUsedFull;
+        const int inputs = var.simple ? 6 : 7;
         const VertexBuffer* slot[7] = {};
         for (const VertexBuffer& v : d.vertex)
             if (v.slot >= 0 && v.slot < 7 && v.components) slot[v.slot] = &v;
-        for (int i = 0; i < 7; ++i) {
+        for (int i = 0; i < inputs; ++i) {
             const VertexBuffer* v = slot[i];
-            if (!v) return decline("a vertex input missing");
+            if (!v) return decline(role, "a vertex input missing");
             bool plain = v->components >= kUsed[i];
             for (uint32_t k = 0; k < kUsed[i]; ++k) plain = plain && ((v->dstSel >> (3 * k)) & 7) == 4 + k;
             if (!decodable(*v) || !plain) {
                 char why[112];
                 std::snprintf(why, sizeof why, "vertex input %d format dfmt %u nfmt %u stride %u sel 0x%x components %u", i, v->dfmt,
                               v->nfmt, v->stride, v->dstSel, v->components);
-                return decline(why);
+                return decline(role, why);
             }
             c[cFetch + i][0] = (v->data.byteOffset + v->offset) / 4, c[cFetch + i][1] = v->stride / 4;
             c[cFetch + i][2] = v->dfmt | v->nfmt << 4;
         }
         if (slot[0]->nfmt != 7 || (slot[0]->dfmt != 13 && slot[0]->dfmt != 14 && slot[0]->dfmt != 12))
-            return decline("a position format it does not read exactly");
+            return decline(role, "a position format it does not read exactly");
         VkDescriptorImageInfo images[kTextures]{};
         for (int t = 0; t < kTextures; ++t) {
             const Texture* x = nullptr;
+            const uint32_t pc = var.texturePc[t] ? var.texturePc[t] : var.texturePc[tBase]; // unread: the base's
             for (const Texture& y : d.textures)
-                if (y.pc == kTexturePc[t]) x = &y;
+                if (y.pc == pc) x = &y;
             if (!x || !x->view || !x->sampler) {
                 char why[48];
-                std::snprintf(why, sizeof why, "no texture at 0x%x", kTexturePc[t]);
-                return decline(why);
+                std::snprintf(why, sizeof why, "no texture at 0x%x", var.texturePc[t]);
+                return decline(role, why);
             }
             images[t] = {x->sampler, x->view, VK_IMAGE_LAYOUT_GENERAL};
             std::memcpy(&c[cTexScale + t / 2][(t & 1) * 2], x->scale, 8);
@@ -471,17 +936,20 @@ public:
         }
         c[cOut][2] = d.clipZHalf ? 1 : 0;
         Buffer consts;
-        if (!gpu.upload(c, sizeof c, consts)) return decline("no room for the constants");
-        VkPipeline pipe = pipeline(gpu, d);
-        if (!pipe) return decline("no pipeline");
-        if (!logged_) {
-            logged_ = true;
-            std::fprintf(stderr, "[native] material: drawing r_o1dst_m(vr)2ds.fxo natively (targets 0x%" PRIx64 ", 0x%" PRIx64 ")\n",
+        if (!gpu.upload(c, sizeof c, consts)) return decline(role, "no room for the constants");
+        VkPipeline pipe = pipeline(gpu, role, d);
+        if (!pipe) return decline(role, "no pipeline");
+        if (!logged_[role]) {
+            logged_[role] = true;
+            std::fprintf(stderr, "[native] material: drawing %s natively (targets 0x%" PRIx64 ", 0x%" PRIx64 ")\n", var.ps,
                          d.color[0].address, d.color[1].address);
         }
         gpu.beginRendering(d.color, 2, d.depth, d.hasStencil);
         VkDescriptorBufferInfo bufs[8];
-        for (int i = 0; i < 7; ++i) bufs[i] = {slot[i]->data.buffer, slot[i]->data.offset, slot[i]->data.range};
+        for (int i = 0; i < 7; ++i) {
+            const VertexBuffer* v = slot[i] && i < inputs ? slot[i] : slot[0]; // an unread binding: the position's
+            bufs[i] = {v->data.buffer, v->data.offset, v->data.range};
+        }
         bufs[7] = {consts.buffer, consts.offset, consts.range};
         const VkViewport vp = d.vkViewport;
         const VkRect2D sc{{d.scissor[0], d.scissor[1]}, {uint32_t(d.scissor[2]), uint32_t(d.scissor[3])}};
@@ -520,15 +988,15 @@ public:
     }
 
 private:
-    bool decline(const char* why) {
-        if (declined_.insert(why).second && declined_.size() <= 16)
-            std::fprintf(stderr, "[native] material: a r_o1dst_m(vr)2ds draw left to the translated renderer (%s)\n", why);
+    bool decline(int role, const char* why) {
+        if (declined_[role].insert(why).second && declined_[role].size() <= 16)
+            std::fprintf(stderr, "[native] material: a %s draw left to the translated renderer (%s)\n", kVariants[role - 1].ps, why);
         return false;
     }
 
-    VkPipeline pipeline(Gpu& gpu, const Draw& d) {
+    VkPipeline pipeline(Gpu& gpu, int role, const Draw& d) {
         const VkPipelineDepthStencilStateCreateInfo& z = d.depthStencil;
-        const auto key = std::make_tuple(int(d.color[0].format), int(d.color[1].format), int(d.writeMask & 0xFF), int(d.depth.format),
+        const auto key = std::make_tuple(role, int(d.color[0].format), int(d.color[1].format), int(d.writeMask & 0xFF), int(d.depth.format),
                                          bool(d.hasStencil), z.depthTestEnable, z.depthWriteEnable, int(z.depthCompareOp),
                                          int(d.cull), int(d.frontFace));
         if (auto it = pipes_.find(key); it != pipes_.end()) return it->second;
@@ -554,8 +1022,13 @@ private:
                 return out = VK_NULL_HANDLE;
             }
         }
-        const VkShaderModule vsm = gpu.shader(std::string(kHeader) + kVs, Gpu::Stage::Vertex);
-        const VkShaderModule fsm = gpu.shader(std::string(kHeader) + kFs, Gpu::Stage::Fragment);
+        const Variant& var = kVariants[role - 1];
+        const std::string header = kHeader;
+        const std::string vsDefs = var.simple ? "#define SIMPLE_MATERIAL\n" : "";
+        const VkShaderModule vsm = gpu.shader(header + vsDefs + kVs, Gpu::Stage::Vertex);
+        // The fragment stage's extension, ahead of everything else.
+        const std::string fsHeader = "#version 450\n#extension GL_EXT_demote_to_helper_invocation : require\n" + header.substr(header.find('\n') + 1);
+        const VkShaderModule fsm = gpu.shader(fsHeader + var.defines + kFs, Gpu::Stage::Fragment);
         if (!vsm || !fsm) return out = VK_NULL_HANDLE;
         VkPipelineShaderStageCreateInfo st[2]{};
         st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vsm, "main", nullptr};
@@ -609,11 +1082,11 @@ private:
         return out;
     }
 
-    std::map<std::tuple<int, int, int, int, bool, VkBool32, VkBool32, int, int, int>, VkPipeline> pipes_;
+    std::map<std::tuple<int, int, int, int, int, bool, VkBool32, VkBool32, int, int, int>, VkPipeline> pipes_;
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
-    bool logged_ = false;
-    std::set<std::string> declined_;
+    bool logged_[kVariantCount + 1] = {};
+    std::set<std::string> declined_[kVariantCount + 1];
 };
 
 } // namespace
