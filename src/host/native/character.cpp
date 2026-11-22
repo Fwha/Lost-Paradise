@@ -364,6 +364,54 @@ constexpr Load kPsHairHt[] = {
     P(0x110c, 4, cP10, 0x030),
     P(0x115c, 4, cView, 0x230),
 };
+constexpr Load kPsHairPHt[] = {
+    P(0x020, 1, cP60, 0x0dc),
+    P(0x074, 4, cP60, 0x050),
+    P(0x078, 4, cP60, 0x0d0),
+    P(0x0bc, 4, cP60, 0x090),
+    P(0x174, 1, cFlags, 0x000),
+    P(0x1a4, 2, cView, 0x218),
+    P(0x2c0, 4, cP10, 0x0f0),
+    P(0x344, 4, cP30, 0x0a0),
+    P(0x348, 4, cP30, 0x020),
+    P(0x41c, 4, cP30, 0x0b0),
+    P(0x420, 4, cP30, 0x030),
+    P(0x500, 4, cP30, 0x0c0),
+    P(0x504, 4, cP30, 0x040),
+    P(0x5e0, 4, cP30, 0x0d0),
+    P(0x5e4, 4, cP30, 0x050),
+    P(0x6c0, 8, cP30, 0x080),
+    P(0x748, 4, cP30, 0x060),
+    P(0x74c, 4, cP30, 0x0e0),
+    P(0x7a4, 4, cP30, 0x120),
+    P(0x7dc, 8, cP30, 0x000),
+    P(0x82c, 8, cP70, 0x090),
+    P(0x830, 1, cView, 0x22c),
+    P(0x838, 4, cP10, 0x000),
+    P(0x840, 4, cP30, 0x100),
+    P(0x844, 2, cP70, 0x068),
+    P(0x848, 1, cP70, 0x088),
+    P(0x914, 1, cP0, 0x048),
+    P(0x930, 1, cP90, 0x134),
+    P(0x9b8, 16, cP20, 0x530),
+    P(0x9cc, 4, cP20, 0x5b0),
+    P(0xaa4, 2, cP0, 0x040),
+    P(0xb10, 16, cP20, 0x4f0),
+    P(0xb24, 1, cP0, 0x00c),
+    P(0xb28, 4, cP90, 0x030),
+    P(0xb30, 16, cP20, 0x570),
+    P(0xb38, 8, cP60, 0x000),
+    P(0xb3c, 4, cP60, 0x110),
+    P(0xf1c, 16, cP0, 0x000),
+    P(0x1050, 4, cView, 0x220),
+    P(0x1054, 8, cP10, 0x010),
+    P(0x10b0, 1, cP70, 0x080),
+    P(0x10d0, 1, cP70, 0x09c),
+    P(0x10ec, 1, cP50, 0x01c),
+    P(0x10f0, 1, cP60, 0x00c),
+    P(0x10f4, 4, cP10, 0x030),
+    P(0x1140, 4, cView, 0x230),
+};
 constexpr Load kPsHairCmask[] = {
     P(0x01c, 1, cP60, 0x0dc),
     P(0x074, 4, cP60, 0x0d0),
@@ -644,6 +692,10 @@ const Variant kVariants[] = {
     {"s_o1dzt[eye][aref].fxo", "s_o1dzt[eye][aref].fxo", "#define EYE\n",
      kVsEye, kPsEye,
      {0x12c,0xccc,0x24c,0,0xe9c,0xe48,0,0,0,0,0,0,0,0,0},0xcb8},
+    {"sm_p1ht[hair][offset][dedit].fxo", "s_b1dt[hair].fxo", "#define HAIR\n#define HAIR_HT\n#define HAIR_P\n#define HAIR_P_HT\n",
+     kVsHair, kPsHairPHt,
+     {0x138, 0, 0x2a8, 0xaec, 0x130, 0xb08,
+      0x974, 0x994, 0x97c, 0x99c, 0, 0, 0, 0, 0}},
 };
 
 constexpr const char* kHeader = R"(#version 450
@@ -1291,7 +1343,13 @@ void main() {
     }
     uvec4 so=cb.c[455];
 #ifdef HAIR_P
+#ifdef HAIR_P_HT
+    float depthAlpha=mul(B(0x3e4ccccdu),gl_FragCoord.z);
+    depthAlpha=sat(mul(B(0x3b808081u),depthAlpha));
+    float alpha0=has(viewFlags,1u)?depthAlpha:exportAlpha;
+#else
     float alpha0=has(viewFlags,1u)?sat(mul(B(0x3a4d9a68u),gl_FragCoord.z)):exportAlpha;
+#endif
     o0=swz(half4(vec4(color,alpha0)),so.x);
 #else
     o0=swz(half4(vec4(color,alpha)),so.x);
@@ -2215,13 +2273,13 @@ class Character final : public Pass {
 public:
     const char* name() const override { return "character"; }
     int claims(const std::string& psName) const override {
-        for (int i = 0; i < 8; ++i)
+        for (int i = 0; i < 9; ++i)
             if (named(psName, kVariants[i].ps)) return i + 1;
         return 0;
     }
 
     bool draw(int role, const Draw& d, Gpu& gpu) override {
-        if (role < 1 || role > 8) return false;
+        if (role < 1 || role > 9) return false;
         const Variant& var = kVariants[role - 1];
         if (!d.vsName || !named(*d.vsName, var.vs))
             return decline(role, "another vertex shader");
@@ -2649,8 +2707,8 @@ private:
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     std::mutex m_;
-    std::set<std::string> declined_[9];
-    std::atomic<bool> logged_[9]{};
+    std::set<std::string> declined_[10];
+    std::atomic<bool> logged_[10]{};
     std::shared_mutex offsetsMutex_;
     std::unordered_map<PairKey, std::vector<int64_t>, PairHash> offsets_;
     std::atomic<int> cacheWarned_{0};

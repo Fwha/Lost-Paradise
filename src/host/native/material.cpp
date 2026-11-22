@@ -1005,6 +1005,288 @@ constexpr Load kPsLoadsD[] = {
     {false, 0xcfc, 4, cBlend, 0},
     {false, 0xd60, 1, cPsFlags, 3},
 };
+constexpr Load kPsLoadsB1dst[] = {
+    {false, 0x30, 4, cUvScale, 0},
+    {false, 0x94, 1, cPsFlags, 0},
+    {false, 0xc8, 2, cPsFlags, 1},
+    {false, 0x190, 4, cShadowMap, 0},
+    {false, 0x1c4, 4, cShadowMap, 0},
+    {false, 0x1fc, 4, cTintBase, 0},
+    {false, 0x254, 4, cTint, 0},
+    {false, 0x2c0, 4, cPointPos, 0},
+    {false, 0x328, 4, cPointColor, 0},
+    {false, 0x378, 4, cPointPos + 1, 0},
+    {false, 0x3e0, 4, cPointColor + 1, 0},
+    {false, 0x430, 4, cPointPos + 2, 0},
+    {false, 0x498, 4, cPointColor + 2, 0},
+    {false, 0x4e8, 4, cPointPos + 3, 0},
+    {false, 0x550, 4, cPointColor + 3, 0},
+    {false, 0x5cc, 4, cPsCamera, 0},
+    {false, 0x5d0, 8, cDir, 0},
+    {false, 0x5d4, 8, cMaterial, 0},
+    {false, 0x5d8, 8, cMul, 0},
+    {false, 0x5dc, 1, cMisc, 1},
+    {false, 0x5e0, 4, cExposure, 0},
+    {false, 0x5e4, 4, cAmbientTint, 0},
+    {false, 0x5ec, 4, cAmbient, 0},
+    {false, 0x5f0, 8, cLight, 0},
+    {false, 0x744, 1, cMisc, 0},
+    {false, 0xa78, 8, cDistFog, 0},
+    {false, 0xae0, 1, cMisc, 2},
+    {false, 0xae4, 1, cMisc, 3},
+    {false, 0xae8, 1, cMisc2, 2},
+    {false, 0xaec, 1, cUvBlock, 0},
+    {false, 0xb30, 1, cPsFlags, 0},
+    {false, 0xb34, 4, cOutScale, 0},
+    {false, 0xb8c, 2, cPsFlags, 1},
+    {false, 0xb90, 4, cMask1, 0},
+    {false, 0xb94, 1, cMask0, 2},
+    {false, 0xb98, 1, cMisc2, 3},
+    {false, 0xcb4, 2, cMask2, 0},
+    {false, 0xd18, 4, cMask3, 0},
+    {false, 0xd1c, 2, cMask4, 0},
+    {false, 0xd20, 1, cMask4, 2},
+    {false, 0xdd8, 2, cMask5, 0},
+    {false, 0xddc, 1, cMask4, 3},
+    {false, 0xe24, 1, cPsFlags, 0},
+    {false, 0xe40, 4, cBlend, 0},
+};
+constexpr Load kPsLoadsNte[] = {
+    {false, 0x40, 8, cUvBlock, 0},
+    {false, 0x40, 4, cUvScale, 0},
+    {false, 0xd4, 1, cPsFlags, 0},
+    {false, 0x108, 2, cPsFlags, 1},
+    {false, 0x1e0, 4, cShadowMap, 0},
+    {false, 0x214, 4, cShadowMap, 0},
+    {false, 0x24c, 4, cTintBase, 0},
+    {false, 0x2a4, 4, cTint, 0},
+    {false, 0x310, 4, cPointPos, 0},
+    {false, 0x378, 4, cPointColor, 0},
+    {false, 0x3c8, 4, cPointPos + 1, 0},
+    {false, 0x430, 4, cPointColor + 1, 0},
+    {false, 0x480, 4, cPointPos + 2, 0},
+    {false, 0x4e8, 4, cPointColor + 2, 0},
+    {false, 0x538, 4, cPointPos + 3, 0},
+    {false, 0x5a0, 4, cPointColor + 3, 0},
+    {false, 0x628, 1, cMisc, 1},
+    {false, 0x634, 4, cAmbient, 0},
+    {false, 0x638, 4, cExposure, 0},
+    {false, 0x63c, 1, cMisc, 0},
+    {false, 0x640, 8, cDir, 0},
+    {false, 0x658, 4, cPsCamera, 0},
+    {false, 0x65c, 8, cMul, 0},
+    {false, 0x6d0, 8, cMaterial, 0},
+    {false, 0x730, 4, cAmbientTint, 0},
+    {false, 0x7e8, 8, cLight, 0},
+    {false, 0xb38, 8, cDistFog, 0},
+    {false, 0xbac, 1, cMisc, 2},
+    {false, 0xbb0, 1, cMisc, 3},
+    {false, 0xbb4, 1, cMisc2, 2},
+    {false, 0xbb8, 4, cOutScale, 0},
+    {false, 0xc04, 4, cBlend, 0},
+    {false, 0xc64, 1, cPsFlags, 3},
+};
+constexpr Load kPsLoadsB2dutRef[] = {
+    {false, 0x28, 1, cPsFlags, 0},
+    {false, 0x2c, 2, cPsFlags, 1},
+    {false, 0x44, 8, cUvBlock, 0},
+    {false, 0x44, 4, cUvScale, 0},
+    {false, 0x1cc, 4, cShadowMap, 0},
+    {false, 0x20c, 4, cShadowMap, 0},
+    {false, 0x234, 4, cTintBase, 0},
+    {false, 0x28c, 4, cTint, 0},
+    {false, 0x2f8, 4, cPointPos, 0},
+    {false, 0x360, 4, cPointColor, 0},
+    {false, 0x3b0, 4, cPointPos + 1, 0},
+    {false, 0x418, 4, cPointColor + 1, 0},
+    {false, 0x468, 4, cPointPos + 2, 0},
+    {false, 0x4d0, 4, cPointColor + 2, 0},
+    {false, 0x520, 4, cPointPos + 3, 0},
+    {false, 0x588, 4, cPointColor + 3, 0},
+    {false, 0x5c8, 4, cPsCamera, 0},
+    {false, 0x6f4, 8, cMaterial, 0},
+    {false, 0x6fc, 4, cAmbientTint, 0},
+    {false, 0x704, 1, cMisc, 0},
+    {false, 0x710, 8, cDir, 0},
+    {false, 0x714, 2, cReflectPs, 0},
+    {false, 0x718, 4, cExposure, 0},
+    {false, 0x71c, 4, cAmbient, 0},
+    {false, 0x7e0, 8, cLight, 0},
+    {false, 0x808, 8, cMul, 0},
+    {false, 0xbf4, 8, cDistFog, 0},
+    {false, 0xc54, 1, cPsFlags, 0},
+    {false, 0xc64, 1, cMisc, 2},
+    {false, 0xc68, 1, cMisc, 3},
+    {false, 0xc6c, 1, cMisc2, 2},
+    {false, 0xc70, 4, cOutScale, 0},
+    {false, 0xcc0, 2, cPsFlags, 1},
+    {false, 0xcf4, 1, cMask0, 0},
+    {false, 0xcf8, 4, cMask1, 0},
+    {false, 0xcfc, 1, cMask0, 1},
+    {false, 0xd00, 1, cMask0, 2},
+    {false, 0xd04, 1, cMisc2, 3},
+    {false, 0xe30, 2, cMask2, 0},
+    {false, 0xe8c, 2, cMask2, 2},
+    {false, 0xe90, 1, cMask0, 3},
+    {false, 0xf64, 4, cMask3, 0},
+    {false, 0xf68, 2, cMask4, 0},
+    {false, 0xf6c, 1, cMask4, 2},
+    {false, 0x1024, 2, cMask5, 0},
+    {false, 0x1028, 1, cMask4, 3},
+    {false, 0x106c, 1, cPsFlags, 0},
+    {false, 0x1080, 4, cBlend, 0},
+    {false, 0x10d8, 1, cPsFlags, 3},
+};
+constexpr Load kPsLoadsM2duRef[] = {
+    {false, 0x18, 1, cPsFlags, 0},
+    {false, 0x1c, 2, cPsFlags, 1},
+    {false, 0x34, 4, cUvScale, 0},
+    {false, 0x178, 4, cShadowMap, 0},
+    {false, 0x1b8, 4, cShadowMap, 0},
+    {false, 0x1e0, 4, cTintBase, 0},
+    {false, 0x238, 4, cTint, 0},
+    {false, 0x2a4, 4, cPointPos, 0},
+    {false, 0x30c, 4, cPointColor, 0},
+    {false, 0x35c, 4, cPointPos + 1, 0},
+    {false, 0x3c4, 4, cPointColor + 1, 0},
+    {false, 0x414, 4, cPointPos + 2, 0},
+    {false, 0x47c, 4, cPointColor + 2, 0},
+    {false, 0x4cc, 4, cPointPos + 3, 0},
+    {false, 0x534, 4, cPointColor + 3, 0},
+    {false, 0x574, 4, cPsCamera, 0},
+    {false, 0x5c8, 2, cMisc2, 0},
+    {false, 0x60c, 8, cMaterial, 0},
+    {false, 0x6d8, 4, cAmbientTint, 0},
+    {false, 0x6e0, 4, cExposure, 0},
+    {false, 0x6e8, 4, cAmbient, 0},
+    {false, 0x704, 8, cDir, 0},
+    {false, 0x708, 8, cMul, 0},
+    {false, 0x710, 1, cMisc, 0},
+    {false, 0x714, 2, cReflectPs, 0},
+    {false, 0x7ac, 8, cLight, 0},
+    {false, 0xbe8, 8, cDistFog, 0},
+    {false, 0xc48, 1, cPsFlags, 0},
+    {false, 0xc58, 1, cMisc, 2},
+    {false, 0xc5c, 1, cMisc, 3},
+    {false, 0xc60, 1, cMisc2, 2},
+    {false, 0xc64, 4, cOutScale, 0},
+    {false, 0xcb4, 2, cPsFlags, 1},
+    {false, 0xce8, 1, cMask0, 0},
+    {false, 0xcec, 4, cMask1, 0},
+    {false, 0xcf0, 1, cMask0, 1},
+    {false, 0xcf4, 1, cMask0, 2},
+    {false, 0xcf8, 1, cMisc2, 3},
+    {false, 0xe24, 2, cMask2, 0},
+    {false, 0xe80, 2, cMask2, 2},
+    {false, 0xe84, 1, cMask0, 3},
+    {false, 0xf58, 4, cMask3, 0},
+    {false, 0xf5c, 2, cMask4, 0},
+    {false, 0xf60, 1, cMask4, 2},
+    {false, 0x1018, 2, cMask5, 0},
+    {false, 0x101c, 1, cMask4, 3},
+    {false, 0x1060, 1, cPsFlags, 0},
+    {false, 0x1074, 4, cBlend, 0},
+    {false, 0x10cc, 1, cPsFlags, 3},
+};
+constexpr Load kPsLoadsO1d[] = {
+    {false, 0x20, 1, cPsFlags, 0},
+    {false, 0x44, 2, cPsFlags, 1},
+    {false, 0xb8, 4, cShadowMap, 0},
+    {false, 0xec, 4, cShadowMap, 0},
+    {false, 0x124, 4, cTintBase, 0},
+    {false, 0x17c, 4, cTint, 0},
+    {false, 0x1e8, 4, cPointPos, 0},
+    {false, 0x250, 4, cPointColor, 0},
+    {false, 0x2a0, 4, cPointPos + 1, 0},
+    {false, 0x308, 4, cPointColor + 1, 0},
+    {false, 0x358, 4, cPointPos + 2, 0},
+    {false, 0x3c0, 4, cPointColor + 2, 0},
+    {false, 0x410, 4, cPointPos + 3, 0},
+    {false, 0x478, 4, cPointColor + 3, 0},
+    {false, 0x4f0, 4, cPsCamera, 0},
+    {false, 0x4f4, 8, cDir, 0},
+    {false, 0x4f8, 8, cMaterial, 0},
+    {false, 0x4fc, 4, cExposure, 0},
+    {false, 0x500, 4, cAmbientTint, 0},
+    {false, 0x504, 1, cMisc, 1},
+    {false, 0x508, 4, cAmbient, 0},
+    {false, 0x534, 8, cMul, 0},
+    {false, 0x614, 8, cLight, 0},
+    {false, 0x694, 1, cMisc, 0},
+    {false, 0x984, 8, cDistFog, 0},
+    {false, 0x9f8, 1, cMisc, 2},
+    {false, 0x9fc, 1, cMisc, 3},
+    {false, 0xa00, 1, cMisc2, 2},
+    {false, 0xa04, 1, cPsFlags, 0},
+    {false, 0xa08, 4, cOutScale, 0},
+    {false, 0xa70, 2, cPsFlags, 1},
+    {false, 0xa74, 1, cMask0, 0},
+    {false, 0xa78, 4, cMask1, 0},
+    {false, 0xa7c, 1, cMask0, 1},
+    {false, 0xa80, 1, cMask0, 2},
+    {false, 0xa84, 1, cMisc2, 3},
+    {false, 0xbc8, 2, cMask2, 0},
+    {false, 0xc24, 2, cMask2, 2},
+    {false, 0xc28, 1, cMask0, 3},
+    {false, 0xcf8, 4, cMask3, 0},
+    {false, 0xcfc, 2, cMask4, 0},
+    {false, 0xd00, 1, cMask4, 2},
+    {false, 0xdbc, 2, cMask5, 0},
+    {false, 0xdc0, 1, cMask4, 3},
+    {false, 0xe0c, 1, cPsFlags, 0},
+    {false, 0xe28, 4, cBlend, 0},
+    {false, 0xe9c, 1, cPsFlags, 3},
+};
+constexpr Load kPsLoadsA2d[] = {
+    {false, 0x30, 4, cUvScale, 0},
+    {false, 0x94, 1, cPsFlags, 0},
+    {false, 0xc8, 2, cPsFlags, 1},
+    {false, 0x190, 4, cShadowMap, 0},
+    {false, 0x1c4, 4, cShadowMap, 0},
+    {false, 0x1fc, 4, cTintBase, 0},
+    {false, 0x254, 4, cTint, 0},
+    {false, 0x2c0, 4, cPointPos, 0},
+    {false, 0x328, 4, cPointColor, 0},
+    {false, 0x378, 4, cPointPos + 1, 0},
+    {false, 0x3e0, 4, cPointColor + 1, 0},
+    {false, 0x430, 4, cPointPos + 2, 0},
+    {false, 0x498, 4, cPointColor + 2, 0},
+    {false, 0x4e8, 4, cPointPos + 3, 0},
+    {false, 0x550, 4, cPointColor + 3, 0},
+    {false, 0x5c0, 4, cPsCamera, 0},
+    {false, 0x5c4, 8, cDir, 0},
+    {false, 0x5c8, 8, cMaterial, 0},
+    {false, 0x5cc, 8, cMul, 0},
+    {false, 0x5d0, 4, cExposure, 0},
+    {false, 0x5d8, 4, cAmbientTint, 0},
+    {false, 0x5dc, 1, cMisc, 1},
+    {false, 0x5e4, 4, cAmbient, 0},
+    {false, 0x684, 8, cLight, 0},
+    {false, 0x760, 1, cMisc, 0},
+    {false, 0xac8, 8, cDistFog, 0},
+    {false, 0xb3c, 1, cMisc, 2},
+    {false, 0xb40, 1, cMisc, 3},
+    {false, 0xb44, 1, cMisc2, 2},
+    {false, 0xb48, 1, cPsFlags, 0},
+    {false, 0xb4c, 4, cOutScale, 0},
+    {false, 0xbb4, 2, cPsFlags, 1},
+    {false, 0xbb8, 1, cMask0, 0},
+    {false, 0xbbc, 4, cMask1, 0},
+    {false, 0xbc0, 1, cMask0, 1},
+    {false, 0xbc4, 1, cMask0, 2},
+    {false, 0xbc8, 1, cMisc2, 3},
+    {false, 0xd0c, 2, cMask2, 0},
+    {false, 0xd68, 2, cMask2, 2},
+    {false, 0xd6c, 1, cMask0, 3},
+    {false, 0xe3c, 4, cMask3, 0},
+    {false, 0xe40, 2, cMask4, 0},
+    {false, 0xe44, 1, cMask4, 2},
+    {false, 0xf00, 2, cMask5, 0},
+    {false, 0xf04, 1, cMask4, 3},
+    {false, 0xf50, 1, cPsFlags, 0},
+    {false, 0xf6c, 4, cBlend, 0},
+    {false, 0xfe0, 1, cPsFlags, 3},
+};
 
 struct VertexShaderInfo {
     const char* name;
@@ -1042,9 +1324,15 @@ const Variant kVariants[] = {
     {"r_p1dut[ref].fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define MATERIAL_ALPHA_TEST\n#define REFLECT_MATERIAL\n", kPsLoadsRefPdut, count(kPsLoadsRefPdut), {0x54, 0x16c, 0, 0x838, 0x830, 0x6f4, 0, 0xc60, 0xc84, 0}, 3, 0x67c},
     {"r_o1dut_m(vr)2d[ref].fxo", "#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define KEEP_PRIMARY_NORMAL\n#define DIFFUSE_DETAIL_ONLY\n", kPsLoadsRefM2d, count(kPsLoadsRefM2d), {0x54, 0x160, 0x7f0, 0x844, 0x894, 0x710, 0, 0xca8, 0xcb0, 0}, 4, 0x6a4},
     {"r_o1d[ag].fxo", "#define SIMPLE_MATERIAL\n#define GEOMETRIC_NORMAL\n#define DIFFUSE_MATERIAL\n", kPsLoadsD, count(kPsLoadsD), {0, 0xd8, 0, 0x610, 0x590, 0, 0, 0x964, 0x96c, 0}, 5},
+    {"r_b1dst.fxo", "#define SIMPLE_MATERIAL\n#define MODULATED_ALPHA_TEST\n#define RASTER_DEPTH_MASK\n#define BLEND_ALPHA_BOTH\n", kPsLoadsB1dst, count(kPsLoadsB1dst), {0x4c, 0x178, 0, 0x710, 0x754, 0x810, 0, 0, 0xba8, 0}, 1},
+    {"r_o1dst_b(vr)2dst[nte].fxo", "#define DETAIL_NORMAL\n#define DETAIL_BLEND\n#define NO_EDGE_MASK\n", kPsLoadsNte, count(kPsLoadsNte), {0x7c, 0x1c8, 0x84, 0x7e0, 0x6c4, 0x834, 0x890, 0, 0, 0x74}, 0},
+    {"r_o1dut_b(vr)2dut[ref].fxo", "#define DETAIL_NORMAL\n#define DETAIL_BLEND\n#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define REFLECT_DETAIL_BLEND\n", kPsLoadsB2dutRef, count(kPsLoadsB2dutRef), {0x7c, 0x1b4, 0x84, 0x884, 0x8c4, 0x6e8, 0x6e0, 0xce4, 0xcec, 0x74}, 4, 0x6d0},
+    {"r_o1dut_m(vr)2du[ref].fxo", "#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define KEEP_PRIMARY_NORMAL\n#define MULTIPLY_DETAIL_REF\n", kPsLoadsM2duRef, count(kPsLoadsM2duRef), {0x54, 0x160, 0x6bc, 0x8ac, 0x8dc, 0x6fc, 0x604, 0xcd8, 0xce0, 0}, 4, 0x6b4},
+    {"r_o1d.fxo", "#define SIMPLE_MATERIAL\n#define GEOMETRIC_NORMAL\n#define BARE_MATERIAL\n", kPsLoadsO1d, count(kPsLoadsO1d), {0, 0xa0, 0, 0x664, 0x6b0, 0, 0, 0xa94, 0xa9c, 0}, 5},
+    {"r_o1dut_a(vr)2d.fxo", "#define KEEP_PRIMARY_NORMAL\n#define SPECULAR_GREEN\n#define AMBIENT_DETAIL_ADD\n", kPsLoadsA2d, count(kPsLoadsA2d), {0x4c, 0x178, 0x818, 0x74c, 0x7a0, 0x7c8, 0, 0xbd8, 0xbe0, 0}, 0},
 };
 
-constexpr int kVariantCount = 16;
+constexpr int kVariantCount = 22;
 constexpr VertexShaderInfo kVertexShaders[6] = {
     {"r_b1dst_a(vr)2d.fxo", "", kVsLoads, count(kVsLoads), {3, 4, 4, 4, 2, 2, 4}, 7},
     {"r_b1dst.fxo", "#define SIMPLE_MATERIAL\n", kVsLoadsSimple, count(kVsLoadsSimple), {3, 3, 4, 4, 2, 4, 0}, 6},
@@ -1281,6 +1569,12 @@ void main() {
     float ni = inversesqrt(mac(gn.z, gn.z, mac(gn.y, gn.y, mul(gn.x, gn.x))));
     vec3 N = vec3(mul(gn.x, ni), mul(gn.y, ni), mul(gn.z, ni));
 #else
+#ifdef BARE_MATERIAL
+    vec3 P = a6.xyz, gn = a3.xyz;
+    vec3 N = normalize(gn);
+    vec4 detail4 = vec4(1.0);
+    float dw = 0.0;
+#else
     vec3 P = a7.xyz, gn = a3.xyz, tg = a6.xyz;
     vec3 bt = cross(gn, tg) * a6.w;
 #ifdef SIMPLE_MATERIAL
@@ -1292,6 +1586,9 @@ void main() {
 #ifdef SIMPLE_MATERIAL
     vec4 detail4 = vec4(1.0);
     float dw = 0.0;
+#elif defined(MULTIPLY_DETAIL_REF)
+    vec4 detail4 = at(2, uv1);
+    precise float dw = detail4.a * flatten;
 #elif defined(DETAIL_BLEND)
     // Toward the detail textures by their alpha too.
     vec4 detail4 = at(2, uv1);
@@ -1320,6 +1617,7 @@ void main() {
     vec3 N = normalize(gn); // r_o1du[ref]: no normal map
 #else
     vec3 N = normalize(tg * nxy.x + bt * nxy.y + gn * nz);
+#endif
 #endif
 #endif
 
@@ -1416,24 +1714,54 @@ void main() {
     if (cf(70).x > base.a) demote;
 #endif
     vec3 detail = detail4.rgb;
+#ifdef BARE_MATERIAL
+    vec3 specMat = vec3(1.0);
+#else
 #ifdef SPECULAR_GREEN
     vec4 specSample = at(5, uv0 * cf(21).xy);
     vec3 specMat = vec3(specSample.g);
 #else
     vec3 specMat = at(5, uv0 * cf(21).xy).rgb;
 #endif
-#if defined(SIMPLE_MATERIAL) || defined(DIFFUSE_DETAIL_ONLY)
+#endif
+#ifdef REFLECT_DETAIL_BLEND
+    vec4 specDetailSample = at(6, uv1 * cf(71).xy);
+#endif
+#ifdef MULTIPLY_DETAIL_REF
+    vec4 specDetailSample = at(6, uv1 * cf(44).xy);
+#endif
+#if defined(SIMPLE_MATERIAL) || defined(DIFFUSE_DETAIL_ONLY) || defined(AMBIENT_DETAIL_ADD)
     vec3 specDetail = vec3(1.0);
 #elif defined(DETAIL_NORMAL)
+#ifdef REFLECT_DETAIL_BLEND
+    vec3 specDetail = specDetailSample.rgb;
+#else
     vec3 specDetail = at(6, uv1 * cf(71).xy).rgb;
+#endif
+#else
+#ifdef MULTIPLY_DETAIL_REF
+    vec3 specDetail = specDetailSample.rgb;
 #else
     vec3 specDetail = at(6, uv1 * cf(44).xy).rgb;
+#endif
 #endif
 #ifdef SPECULAR_GREEN
     specDetail = vec3(specDetail.g);
 #endif
     vec4 screenLight = at(3, ruv) / cf(39).z;
-#ifdef DIFFUSE_DETAIL_ONLY
+#ifdef AMBIENT_DETAIL_ADD
+    vec3 adjBase = base.rgb * base.rgb;
+    vec3 adjSpec = specMat;
+#elif defined(MULTIPLY_DETAIL_REF)
+    vec3 adjBase;
+    for (int i = 0; i < 3; ++i) {
+        float fade = mac(-mul(detail[i], detail[i]), dw, dw);
+        float b2 = mul(base[i], base[i]);
+        adjBase[i] = mac(b2, -fade, b2);
+    }
+    float sf = mac(-specDetailSample.g, dw, dw);
+    vec3 adjSpec = vec3(mac(-specSample.g, sf, specSample.g));
+#elif defined(DIFFUSE_DETAIL_ONLY)
     // new_ps: 0x8f0/0x938 squares red detail first. Green (0x984/0x988)
     // and blue (0x8f4/0x8f8) multiply the weight first.
     vec3 fade;
@@ -1475,6 +1803,10 @@ void main() {
     vec3 indSpec = T * specularColor * bp + vec3(screenLight.a * shG);
     spec += itint * lobe1 * indSpec;
     vec3 lin = adjBase * diffuse + adjSpec * spec;
+#ifdef AMBIENT_DETAIL_ADD
+    for (int i = 0; i < 3; ++i)
+        lin[i] = mac(mul(mul(itint[i], indDiffuse[i]), dw), mul(detail[i], detail[i]), lin[i]);
+#endif
 #ifdef REFLECT_MATERIAL
     // The environment: reflected about N (its x mirrored, as the shader's cube lookup takes it),
     // decoded (rgb / (4 a), squared), lit by the first shadow remap and the light's angle.
@@ -1489,7 +1821,18 @@ void main() {
         float angular = clamp(0.75 - dot(d0, N), 0.0, 1.0);
         float rlight = max(shR1 * shG1 * angular, cf(73).y);
 #ifdef SPECULAR_GREEN
-#ifdef DIFFUSE_DETAIL_ONLY
+#ifdef REFLECT_DETAIL_BLEND
+        float red = mac(specDetailSample.r - specSample.r, dw, specSample.r);
+        float weight = mul(mul(red, a3.w), rlight);
+        for (int i = 0; i < 3; ++i)
+            lin[i] = mac(dec[i], mul(weight, dec[i]), lin[i]);
+#elif defined(MULTIPLY_DETAIL_REF)
+        float rf = mac(-specDetailSample.r, dw, dw);
+        float red = mac(-specSample.r, rf, specSample.r);
+        float weight = mul(mul(red, a3.w), rlight);
+        for (int i = 0; i < 3; ++i)
+            lin[i] = mac(dec[i], mul(weight, dec[i]), lin[i]);
+#elif defined(DIFFUSE_DETAIL_ONLY)
         // new_ps 0x88c..0x890, then 0x8bc/0xa0c, 0xa60/0xa9c, 0xaa0/0xb18.
         float weight = mul(mul(specSample.r, a3.w), rlight);
         for (int i = 0; i < 3; ++i)
@@ -1550,14 +1893,26 @@ void main() {
         color = tc * (1.0 - fogAmount) + df0.xyz * fogAmount;
 #endif
     }
+#ifdef MODULATED_ALPHA_TEST
+    float alphaGain = mul(mul(misc.z, misc.w), cf(44).z);
+    alphaGain = mul(alphaGain, base.a);
+    if (mac(alphaGain, a1.w, -cf(70).x) < 0.0) demote;
+    float alpha = mul(alphaGain, a1.w);
+#else
     float alpha = misc.z * misc.w * mul0.w * base.a;
+#endif
     if (!has(flags, 8u)) { vec4 os = cf(49); color *= os.xyz; alpha *= os.w; }
 
     float mask = 0.0;
+#ifndef NO_EDGE_MASK
     if (!has(flags, 0x2000000u)) {
         uint mf = cb.c[44].w;
         vec4 k0 = cf(50), k1 = cf(51), k2 = cf(52), k3 = cf(53), k4 = cf(54), k5 = cf(55);
+#ifdef RASTER_DEPTH_MASK
+        float z = gl_FragCoord.z;
+#else
         float z = depthAt(ruv);
+#endif
         vec3 sn = 2.0 * at(8, ruv).rgb - 1.0;
         float dStart = k1.x, dNear = k1.y, dEnd = k1.z, minRadius = k1.w;
 #ifdef DIFFUSE_MATERIAL
@@ -1608,6 +1963,7 @@ void main() {
             normalEdge = nearRamp * (1.0 - sup);
 #endif
         }
+#ifndef RASTER_DEPTH_MASK
         if (has(mf, 8u)) {
             float dr = nearRamp * max(minRadius, k2.z * radiusFade);
             float dp = depthAt(ruv + sdir * dr), dm = depthAt(ruv - sdir * dr);
@@ -1623,6 +1979,7 @@ void main() {
             depthEdge = nearRamp * (1.0 - sup);
 #endif
         }
+#endif
         if (has(mf, 2u)) {
 #ifdef DIFFUSE_MATERIAL
             float facing = clamp(-mac(away.z, N.z, mac(away.y, N.y, mul(N.x, away.x))), 0.0, 1.0);
@@ -1660,6 +2017,7 @@ void main() {
 #endif
         mask *= k4.w <= mask ? 1.0 : 0.0;
     }
+#endif
 
     float alpha1 = alpha;
     if (has(flags, 0x800000u)) {
@@ -1671,6 +2029,9 @@ void main() {
 #endif
         mask *= bl.w;
         alpha1 = alpha * bl.w;
+#ifdef BLEND_ALPHA_BOTH
+        alpha = alpha1;
+#endif
     }
     float alpha0 = has(pf.w, 1u) ? clamp(uintBitsToFloat(0x3a4d9a68u) * gl_FragCoord.z, 0.0, 1.0) : alpha;
     uvec4 so = cb.c[69];
