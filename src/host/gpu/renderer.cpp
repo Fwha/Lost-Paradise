@@ -5965,7 +5965,7 @@ void main() {
     // translated draw goes on as usual, and before anything else is recorded the two results are
     // compared on the GPU. Every 10 seconds: per role and target, the draws compared and the pixels
     // that differ (by more than half an 8-bit step; depth: any bit), with the largest difference.
-    static constexpr uint32_t kComparePerFrame = 24;
+    static constexpr uint32_t kComparePerFrame = 8; // a role
     static constexpr uint32_t kCompareRoles = 16;
     static constexpr uint32_t kCompareSlots = kCompareRoles * 9; // role * 9 + target (8: depth)
     struct CompareSlot {
@@ -6076,9 +6076,11 @@ void main() {
     }
     // Before the translated draw: the copies, and the native pass's draw into them.
     void nativeCompare(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
-        if (compareFrame_ != frame_) compareFrame_ = frame_, compareCount_ = 0;
+        if (compareFrame_ != frame_) compareFrame_ = frame_, std::fill(std::begin(compareCount_), std::end(compareCount_), 0u);
+        // A budget per role: a role drawn late in the frame is compared too.
+        uint32_t& budget = compareCount_[std::min<uint32_t>(a.psm->nativeRole, kCompareRoles - 1)];
         // Spread over the frame's draws: every fourth, starting at a different one each frame.
-        if (compareCount_ >= kComparePerFrame || (compareSeq_++ + frame_) % 4) return;
+        if (budget >= kComparePerFrame || (compareSeq_++ + frame_) % 4) return;
         native::Draw nd;
         Surface* written[8]{};
         Surface* depthWritten = nullptr;
@@ -6122,7 +6124,7 @@ void main() {
         endPass();
         barrier();
         nativeDrawn(nullptr, nullptr);
-        ++compareCount_;
+        ++budget;
         if (!drawn) {
             ++compareDeclined_[std::min<uint32_t>(role, kCompareRoles - 1)];
             return;
@@ -6231,7 +6233,7 @@ void main() {
     Image compareImages_[9];
     PendingCompare pendingCompare_;
     uint64_t compareFrame_ = ~0ull, compareSeq_ = 0;
-    uint32_t compareCount_ = 0;
+    uint32_t compareCount_[kCompareRoles] = {};
     uint64_t compareDrawn_[kCompareRoles] = {}, compareDeclined_[kCompareRoles] = {};
     std::unordered_map<uint32_t, std::string> compareInfo_; // since the last report
     CompareSlot compareSeen_[kCompareSlots] = {};
