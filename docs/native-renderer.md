@@ -196,3 +196,19 @@ Fwha measured ~45 fps with Native Renderer on against ~88 off at a busy town spo
   two copied load maps in the analysis (now built once per cached program and shared).
 
 Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
+
+### Reflective materials, and posters behind the walls
+
+- The `[ref]` family: `r_o1dst[ref]`, `r_o1dut[ref]`, `r_o1du[ref]`, `r_p1dut[ref]`, with their
+  environment cube map at its own binding and the `r_b1dst[ref]` / `r_b1dut[ref]` vertex shaders.
+- Indoors, posters on the walls went black with Native Renderer on: they were drawn behind the
+  walls. The simple and `[ref]` vertex shaders load the camera three times (for the position, for
+  fog, for the reflection), each in its own branch, and the last listed load won. With vertex fog
+  off, the fog branch's load is not taken and reads 0, so the camera sat at the origin. A load that
+  reads 0 no longer replaces a value another load of the same draw set (the raster-to-uv scale of
+  the pixel shaders has the same pattern, in the edge mask's branch).
+- Compare mode now logs, per role (each on its own line, not roles past 6 together) and target,
+  the first pixel differing by 8/255 or more: both values and the draw's constants, state and
+  vertex layout. In compare mode the material pass also checks its cached load offsets.
+- Native draws bind the index buffer as the translated draw does (from the buffer's start, with
+  the first index in the draw), so both read the same copy of it.
