@@ -1520,7 +1520,19 @@ private:
         }
         {
             std::shared_lock lock(offsetsMutex_);
-            if (auto it = offsets_.find(key); it != offsets_.end()) return it->second;
+            if (auto it = offsets_.find(key); it != offsets_.end()) {
+                if (kCompareOn) { // compare mode: the cached offsets checked against this draw's own
+                    for (size_t k = 0; k < it->second.size(); ++k) {
+                        const Load& l = k < vsCount ? vs[k] : ps[k - vsCount];
+                        const int64_t now = l.vs ? d.vsOffset(l.pc) : d.psOffset(l.pc);
+                        if (now != it->second[k] && cacheWarned_.fetch_add(1) < 32)
+                            std::fprintf(stderr, "[native] material: role %d's cached %s load 0x%x is at %lld, this draw's at %lld (%s)\n", role,
+                                         l.vs ? "vertex" : "pixel", l.pc, (long long)it->second[k], (long long)now,
+                                         d.vsName ? d.vsName->c_str() : "?");
+                    }
+                }
+                return it->second;
+            }
         }
         std::vector<int64_t> v(vsCount + psCount);
         for (size_t k = 0; k < v.size(); ++k) {
@@ -1531,6 +1543,7 @@ private:
         return offsets_.try_emplace(key, std::move(v)).first->second; // unordered_map: references stay valid
     }
     std::shared_mutex offsetsMutex_;
+    std::atomic<int> cacheWarned_{0};
     std::unordered_map<PairKey, std::vector<int64_t>, PairHash> offsets_;
 
     std::string lastDrawInfo() const override { return info_; }
