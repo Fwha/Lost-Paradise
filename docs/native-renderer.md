@@ -239,3 +239,13 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   translated draw's stencil state.
 - Compare run: `sm_b1ht` within 1/255. `sm_b1dzt[hair][cmask]` is within 4/255 on a few thousand
   pixels of a frame's blended layers.
+
+### Alpha-tested characters, the reflective two-uv blend
+
+- Character pass: `sm_p1dzt` (~38 draws a frame), which is `sm_o1dzt` with an alpha test. The
+  test inserts 0x1c bytes at 0x11b0, so later PCs shift, and two loads next to it are reordered.
+- Material pass: `r_o1dut_a(vr)2d[ref]` with `r_o1dut_m(vr)2d[ref]` (~70 draws a frame, role 15).
+  It keeps the primary normal, uses specular green and its red for the reflection, and applies the
+  detail texture to the diffuse only (`DIFFUSE_DETAIL_ONLY`, in the shader's own operation order).
+  Codex drafted it against `r_o1dst_m(vr)2ds` and `r_o1dut[ref]`.
+- Compare runs: both within 1/255, depth exact.
