@@ -1367,6 +1367,7 @@ public:
         if (d.instances != 1) return decline(role, "instanced");
         if (d.primitive != 4) return decline(role, "not a triangle list");
         uint32_t c[kConstants][4] = {};
+        uint64_t loaded[(kConstants * 4 + 63) / 64] = {};
         // The loads' offsets in the shaders' data, resolved once per shader pair.
         const Load* vsList = vsi.loads;
         const size_t vsCount = vsi.loadCount;
@@ -1380,7 +1381,14 @@ public:
                 std::snprintf(why, sizeof why, "no %s load at 0x%x", l.vs ? "vertex" : "pixel", l.pc);
                 return decline(role, why);
             }
-            for (uint32_t i = 0; i < l.n; ++i) c[l.index + (l.at + i) / 4][(l.at + i) % 4] = data[offs[k] + i];
+            // Some values are loaded at more than one place in a shader (the camera: for the position,
+            // for fog, for the reflection), each in its own branch. A load in a branch this draw
+            // did not take reads as 0: it must not undo a load the draw did take (the same value).
+            for (uint32_t i = 0; i < l.n; ++i) {
+                const uint32_t at = l.index * 4 + l.at + i, v = data[offs[k] + i];
+                if (v || !(loaded[at / 64] >> (at % 64) & 1)) c[at / 4][at % 4] = v;
+                loaded[at / 64] |= uint64_t(1) << (at % 64);
+            }
         }
         // The vertex inputs: v4 position, v8 normal, v12 tangent, v16 colour, v20 uv0, v24 uv1, v28 baked light.
         // r_b1dst: v4 position, v8 normal (xyz), v12 tangent, v16 colour, v20 uv, v24 baked light.
