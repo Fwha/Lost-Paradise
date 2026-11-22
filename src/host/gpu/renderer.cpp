@@ -5626,7 +5626,8 @@ void main() {
             const uint32_t isz = r.indexType ? 4 : 2;
             nd.indexed = true;
             nd.indexType = r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
-            if (!buffer(d.indexAddr + uint64_t(d.indexOffset) * isz, uint64_t(d.count) * isz, nd.index)) return false;
+            if (!buffer(d.indexAddr, uint64_t(d.indexOffset + d.count) * isz, nd.index)) return false;
+            nd.firstIndex = d.indexOffset;
         } else if (d.kind != DrawCall::kAuto) {
             return false; // indirect: not yet
         }

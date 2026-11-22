@@ -86,9 +86,11 @@ struct Draw {
     uint32_t primitive = 0;      // the game's primitive type (17: a rectangle list)
     uint32_t count = 0;          // vertices or indices
     uint32_t instances = 1;
-    // Indexed draws: the index buffer (from the first index drawn) and its type.
+    // Indexed draws: the index buffer and its type, and the first index drawn (the buffer is bound
+    // as the translated draw binds it, so both read the same copy of it).
     bool indexed = false;
     Buffer index;
+    uint32_t firstIndex = 0;
     VkIndexType indexType = VK_INDEX_TYPE_UINT16;
     VkViewport vkViewport{};     // as the translated draw sets it (depth range included)
     // The translated vertex shader's position adjustments: clip z from [-w, w] to [0, w]

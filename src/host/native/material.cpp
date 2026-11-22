@@ -1452,11 +1452,12 @@ public:
         const VkViewport vp = d.vkViewport;
         const VkRect2D sc{{d.scissor[0], d.scissor[1]}, {uint32_t(d.scissor[2]), uint32_t(d.scissor[3])}};
         const Buffer index = d.index;
+        const uint32_t firstIndex = d.firstIndex;
         std::array<VkDescriptorImageInfo, kTextures> imgs;
         std::memcpy(imgs.data(), images, sizeof images);
         std::array<VkDescriptorBufferInfo, 8> bs;
         std::memcpy(bs.data(), bufs, sizeof bufs);
-        gpu.record([pipe, layout = layout_, bs, imgs, cube, vp, sc, index, indexed = d.indexed, indexType = d.indexType, count = d.count,
+        gpu.record([pipe, layout = layout_, bs, imgs, cube, vp, sc, index, firstIndex, indexed = d.indexed, indexType = d.indexType, count = d.count,
                     pushSet = gpu.pushDescriptorSet()](VkCommandBuffer cmd) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             vkCmdSetViewport(cmd, 0, 1, &vp);
@@ -1486,7 +1487,7 @@ public:
             pushSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, n, w);
             if (indexed) {
                 vkCmdBindIndexBuffer(cmd, index.buffer, index.offset + index.byteOffset, indexType);
-                vkCmdDrawIndexed(cmd, count, 1, 0, 0, 0);
+                vkCmdDrawIndexed(cmd, count, 1, firstIndex, 0, 0);
             } else {
                 vkCmdDraw(cmd, count, 1, 0, 0);
             }

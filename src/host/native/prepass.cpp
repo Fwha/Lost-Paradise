@@ -267,7 +267,8 @@ public:
         const VkViewport vp = d.vkViewport;
         const VkRect2D sc{{d.scissor[0], d.scissor[1]}, {uint32_t(d.scissor[2]), uint32_t(d.scissor[3])}};
         const Buffer index = d.index;
-        gpu.record([pipe, layout = layouts_[role], push, bufs, images, alpha, vp, sc, index, indexed = d.indexed,
+        const uint32_t firstIndex = d.firstIndex;
+        gpu.record([pipe, layout = layouts_[role], push, bufs, images, alpha, vp, sc, index, firstIndex, indexed = d.indexed,
                     indexType = d.indexType, count = d.count, pushSet = gpu.pushDescriptorSet()](VkCommandBuffer c) {
             vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             vkCmdSetViewport(c, 0, 1, &vp);
@@ -294,7 +295,7 @@ public:
             vkCmdPushConstants(c, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, &push);
             if (indexed) {
                 vkCmdBindIndexBuffer(c, index.buffer, index.offset + index.byteOffset, indexType);
-                vkCmdDrawIndexed(c, count, 1, 0, 0, 0);
+                vkCmdDrawIndexed(c, count, 1, firstIndex, 0, 0);
             } else {
                 vkCmdDraw(c, count, 1, 0, 0);
             }
