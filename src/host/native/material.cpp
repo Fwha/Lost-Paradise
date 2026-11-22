@@ -866,6 +866,80 @@ constexpr Load kPsLoadsRefPdut[] = {
     {false, 0x106c,1, cPsFlags,        3},
 };
 
+// r_o1dut_a(vr)2d[ref] / r_o1dut_m(vr)2d[ref].
+// VS descriptor-table entries for offset/world/view/flags are shifted by 0x10 from m2ds.
+// VSV[0x10] supplies the reflection coefficient; VSV[0x00] still supplies UVs and misc.
+// Conditional position/fog camera loads and the unconditional reflection camera load
+// must all land in cCamera so the existing nonzero merge retains the value.
+constexpr Load kVsLoadsRefM2d[] = {
+    {true, 0x01c,  4, cOffset,    0},
+    {true, 0x020,  8, cWorld,     0},
+    {true, 0x024,  4, cWorld + 2, 0},
+    {true, 0x028,  1, cVsMisc,    2},
+    {true, 0x0b8,  4, cCamera,    0},
+    {true, 0x0dc,  4, cOffset2,   0},
+    {true, 0x118, 16, cProj + 3,  0},
+    {true, 0x168, 16, cFog,       0},
+    {true, 0x16c,  4, cFogDir,    0},
+    {true, 0x174,  4, cCamera,    0},
+    {true, 0x2f4,  8, cProj,      0},
+    {true, 0x2f8,  4, cProj + 2,  0},
+    {true, 0x2fc,  4, cCamera,    0},
+    {true, 0x300,  2, cVsMisc,    0},
+    {true, 0x304,  4, cUvOffset,  0},
+    {true, 0x308,  1, cReflectVs, 0},
+};
+constexpr Load kPsLoadsRefM2d[] = {
+    {false, 0x018, 1, cPsFlags,        0},
+    {false, 0x01c, 2, cPsFlags,        1},
+    {false, 0x034, 4, cUvScale,        0},
+    {false, 0x178, 4, cShadowMap,      0},
+    {false, 0x1b8, 4, cShadowMap,      0},
+    {false, 0x1e0, 4, cTintBase,       0},
+    {false, 0x238, 4, cTint,           0},
+    {false, 0x2a4, 4, cPointPos,       0},
+    {false, 0x30c, 4, cPointColor,     0},
+    {false, 0x35c, 4, cPointPos + 1,   0},
+    {false, 0x3c4, 4, cPointColor + 1, 0},
+    {false, 0x414, 4, cPointPos + 2,   0},
+    {false, 0x47c, 4, cPointColor + 2, 0},
+    {false, 0x4cc, 4, cPointPos + 3,   0},
+    {false, 0x534, 4, cPointColor + 3, 0},
+    {false, 0x574, 4, cPsCamera,       0},
+    {false, 0x5d8, 2, cReflectPs,      0},
+    {false, 0x634, 1, cMisc,           0},
+    {false, 0x6ac, 8, cDir,            0},
+    {false, 0x6b0, 8, cMaterial,       0},
+    {false, 0x784, 8, cLight,          0},
+    {false, 0x788, 8, cMul,            0},
+    {false, 0x7d4, 4, cAmbientTint,    0},
+    {false, 0x7fc, 4, cExposure,       0},
+    {false, 0x800, 4, cAmbient,        0},
+    {false, 0xbb8, 8, cDistFog,        0},
+    {false, 0xc18, 1, cPsFlags,        0},
+    {false, 0xc28, 1, cMisc,           2},
+    {false, 0xc2c, 1, cMisc,           3},
+    {false, 0xc30, 1, cMisc2,          2},
+    {false, 0xc34, 4, cOutScale,       0},
+    {false, 0xc84, 2, cPsFlags,        1},
+    {false, 0xcb8, 1, cMask0,          0},
+    {false, 0xcbc, 4, cMask1,          0},
+    {false, 0xcc0, 1, cMask0,          1},
+    {false, 0xcc4, 1, cMask0,          2},
+    {false, 0xcc8, 1, cMisc2,          3},
+    {false, 0xdf4, 2, cMask2,          0},
+    {false, 0xe50, 2, cMask2,          2},
+    {false, 0xe54, 1, cMask0,          3},
+    {false, 0xf28, 4, cMask3,          0},
+    {false, 0xf2c, 2, cMask4,          0},
+    {false, 0xf30, 1, cMask4,          2},
+    {false, 0xfe8, 2, cMask5,          0},
+    {false, 0xfec, 1, cMask4,          3},
+    {false, 0x1030,1, cPsFlags,        0},
+    {false, 0x1044,4, cBlend,          0},
+    {false, 0x109c,1, cPsFlags,        3},
+};
+
 struct VertexShaderInfo {
     const char* name;
     const char* defines;
@@ -900,14 +974,16 @@ const Variant kVariants[] = {
     {"r_o1dut[ref].fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n", kPsLoadsRefOdut, count(kPsLoadsRefOdut), {0x54, 0x16c, 0, 0x838, 0x830, 0x6f4, 0, 0xc44, 0xc68, 0}, 3, 0x67c},
     {"r_o1du[ref].fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define GEOMETRIC_NORMAL\n", kPsLoadsRefOdu, count(kPsLoadsRefOdu), {0, 0x94, 0, 0x7dc, 0x7ec, 0x640, 0, 0xba0, 0xba8, 0}, 3, 0x608},
     {"r_p1dut[ref].fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define MATERIAL_ALPHA_TEST\n#define REFLECT_MATERIAL\n", kPsLoadsRefPdut, count(kPsLoadsRefPdut), {0x54, 0x16c, 0, 0x838, 0x830, 0x6f4, 0, 0xc60, 0xc84, 0}, 3, 0x67c},
+    {"r_o1dut_m(vr)2d[ref].fxo", "#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define KEEP_PRIMARY_NORMAL\n#define DIFFUSE_DETAIL_ONLY\n", kPsLoadsRefM2d, count(kPsLoadsRefM2d), {0x54, 0x160, 0x7f0, 0x844, 0x894, 0x710, 0, 0xca8, 0xcb0, 0}, 4, 0x6a4},
 };
-constexpr int kVariantCount = 14;
+constexpr int kVariantCount = 15;
 
-constexpr VertexShaderInfo kVertexShaders[4] = {
+constexpr VertexShaderInfo kVertexShaders[5] = {
     {"r_b1dst_a(vr)2d.fxo", "", kVsLoads, count(kVsLoads), {3, 4, 4, 4, 2, 2, 4}, 7},
     {"r_b1dst.fxo", "#define SIMPLE_MATERIAL\n", kVsLoadsSimple, count(kVsLoadsSimple), {3, 3, 4, 4, 2, 4, 0}, 6},
     {"r_b1dst[ref].fxo", "#define SIMPLE_MATERIAL\n#define REFLECT_MATERIAL\n", kVsLoadsRefSt, count(kVsLoadsRefSt), {3, 3, 4, 4, 2, 4, 0}, 6},
     {"r_b1dut[ref].fxo", "#define SIMPLE_MATERIAL\n#define REFLECT_MATERIAL\n#define REFLECT_VERTEX_U\n", kVsLoadsRefUt, count(kVsLoadsRefUt), {3, 4, 4, 4, 2, 4, 0}, 6},
+    {"r_o1dut_a(vr)2d[ref].fxo", "#define REFLECT_MATERIAL\n#define REFLECT_VERTEX_U\n", kVsLoadsRefM2d, count(kVsLoadsRefM2d), {3, 4, 4, 4, 2, 2, 4}, 7},
 };
 
 constexpr const char* kHeader = R"(#version 450
@@ -1194,7 +1270,7 @@ void main() {
 #else
     vec3 specMat = at(5, uv0 * cf(21).xy).rgb;
 #endif
-#if defined(SIMPLE_MATERIAL)
+#if defined(SIMPLE_MATERIAL) || defined(DIFFUSE_DETAIL_ONLY)
     vec3 specDetail = vec3(1.0);
 #elif defined(DETAIL_NORMAL)
     vec3 specDetail = at(6, uv1 * cf(71).xy).rgb;
@@ -1205,7 +1281,20 @@ void main() {
     specDetail = vec3(specDetail.g);
 #endif
     vec4 screenLight = at(3, ruv) / cf(39).z;
-#ifdef DETAIL_BLEND
+#ifdef DIFFUSE_DETAIL_ONLY
+    // new_ps: 0x8f0/0x938 squares red detail first. Green (0x984/0x988)
+    // and blue (0x8f4/0x8f8) multiply the weight first.
+    vec3 fade;
+    fade.r = mac(-mul(detail.r, detail.r), dw, dw);
+    fade.g = mac(-mul(dw, detail.g), detail.g, dw);
+    fade.b = mac(-mul(dw, detail.b), detail.b, dw);
+    vec3 adjBase;
+    for (int i = 0; i < 3; ++i) {
+        float b2 = mul(base[i], base[i]);
+        adjBase[i] = mac(b2, -fade[i], b2);
+    }
+    vec3 adjSpec = specMat;
+#elif defined(DETAIL_BLEND)
     precise vec3 baseSq = base.rgb * base.rgb;
     precise vec3 dd = detail * detail - baseSq;
     precise vec3 adjBase = dw * dd + baseSq;
@@ -1248,7 +1337,14 @@ void main() {
         float angular = clamp(0.75 - dot(d0, N), 0.0, 1.0);
         float rlight = max(shR1 * shG1 * angular, cf(73).y);
 #ifdef SPECULAR_GREEN
+#ifdef DIFFUSE_DETAIL_ONLY
+        // new_ps 0x88c..0x890, then 0x8bc/0xa0c, 0xa60/0xa9c, 0xaa0/0xb18.
+        float weight = mul(mul(specSample.r, a3.w), rlight);
+        for (int i = 0; i < 3; ++i)
+            lin[i] = mac(dec[i], mul(weight, dec[i]), lin[i]);
+#else
         lin += envLin * (specSample.r * a3.w * rlight);
+#endif
 #else
         lin += envLin * rlight * (a3.w * point.x);
 #endif
