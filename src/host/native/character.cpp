@@ -1139,7 +1139,7 @@ void main() {
     effect=mul(F(P30,0x10c),effect);
     effect=mul(effect,add(B(0x40200000u),F(P70,0x68)));
     effect=mul(B(0x3dcccccdu),effect);
-    vec3 baseSquared=mul(base.rgb,base.rgb);
+    vec3 baseSquared=mul(F3(P30,0x110),mul(base.rgb,base.rgb)); // 0xb98/0xbf8/0xc98: the colour mask's tint
     baseSquared=mac(effect,mul(F3(P30,0x100),control.g),baseSquared);
 #endif
     float primaryLum=luminance(light0);
@@ -1985,7 +1985,7 @@ void main() {
     vec3 baseSquared = mul(base.rgb,base.rgb);
 #ifdef REF
     vec3 cubeDirection = NORM(reflectedV);
-    vec4 env = texture(environment,vec3(-cubeDirection.z,cubeDirection.x,cubeDirection.y));
+    vec4 env = texture(environment,vec3(-cubeDirection.x,cubeDirection.y,cubeDirection.z)); // 0x89c-0x918
     float envScale = mul(B(0x3e800000u),1.0/max(B(0x3b808081u),env.a));
     vec3 envColor = mul(env.rgb,envScale);
     baseSquared = mac(specTex.a,mac(envColor,envColor,-baseSquared),baseSquared);
