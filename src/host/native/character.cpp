@@ -229,6 +229,76 @@ constexpr Load kPsRigid[] = {
     P(0x1638, 4, cView, 0x230),
     P(0x16b0, 1, cView, 0x22c),
 };
+// sm_p1dzt: sm_o1dzt with an alpha test inserted at 0x11b0 (0x1c bytes; two loads after it reordered).
+constexpr Load kPsRigidAlpha[] = {
+    P(0x020, 1, cP60, 0x0dc),
+    P(0x074, 4, cP60, 0x0d0),
+    P(0x078, 4, cP60, 0x050),
+    P(0x0d4, 4, cP60, 0x090),
+    P(0x180, 1, cFlags, 0),
+    P(0x1cc, 2, cView, 0x218),
+    P(0x2c8, 4, cP10, 0x0f0),
+    P(0x1ac, 1, cP70, 0x0ac),
+    P(0xa24, 4, cP10, 0),
+    P(0xb6c, 1, cP70, 0x088),
+    P(0x378, 4, cP30, 0x0a0),
+    P(0x37c, 4, cP30, 0x020),
+    P(0x49c, 4, cP30, 0x0b0),
+    P(0x4a0, 4, cP30, 0x030),
+    P(0x5c4, 4, cP30, 0x0c0),
+    P(0x5c8, 4, cP30, 0x040),
+    P(0x6f8, 4, cP30, 0x0d0),
+    P(0x6fc, 4, cP30, 0x050),
+    P(0x908, 1, cView, 0x22c),
+    P(0x8f8, 16, cP20, 0x4f0),
+    P(0x900, 16, cP20, 0x530),
+    P(0x9ec, 8, cP30, 0x080),
+    P(0x9c4, 2, cP70, 0x068),
+    P(0x914, 2, cP0, 0x040),
+    P(0x9bc, 1, cP0, 0x048),
+    P(0x9c8, 1, cP90, 0x134),
+    P(0x9fc, 4, cP30, 0x060),
+    P(0xa20, 1, cP0, 0x00c),
+    P(0xa28, 4, cP30, 0x120),
+    P(0xd84, 4, cP20, 0x5b0),
+    P(0xb84, 4, cP60, 0x110),
+    P(0x9f8, 4, cP30, 0x100),
+    P(0xa10, 8, cP30, 0),
+    P(0x9e8, 4, cP30, 0x0e0),
+    P(0xaa4, 8, cP70, 0x090),
+    P(0xb70, 8, cP60, 0),
+    P(0xcc0, 16, cP20, 0x570),
+    P(0x100c, 16, cP0, 0),
+    P(0x114c, 4, cView, 0x220),
+    P(0x1150, 8, cP10, 0x010),
+    P(0x11f4, 1, cP50, 0x01c),
+    P(0x11dc, 1, cP70, 0x09c),
+    P(0x11f8, 1, cP60, 0x00c),
+    P(0x11fc, 1, cFlags, 0),
+    P(0x1200, 4, cP10, 0x030),
+    P(0x1268, 2, cView, 0x218),
+    P(0x126c, 1, cP0, 0x02c),
+    P(0x1270, 4, cP0, 0x284),
+    P(0x1274, 1, cP0, 0x03c),
+    P(0x1278, 1, cP0, 0x26c),
+    P(0x127c, 1, cP0, 0x00c),
+    P(0x13c0, 2, cP0, 0x270),
+    P(0x13c4, 1, cP0, 0x054),
+    P(0x142c, 2, cP0, 0x260),
+    P(0x1430, 1, cP0, 0x268),
+    P(0x1504, 4, cP0, 0x2a0),
+    P(0x1508, 2, cP0, 0x278),
+    P(0x150c, 1, cP0, 0x058),
+    P(0x1510, 1, cP0, 0x280),
+    P(0x15d4, 2, cP0, 0x294),
+    P(0x15d8, 1, cP0, 0x29c),
+    P(0x1628, 1, cFlags, 0),
+    P(0x162c, 1, cP60, 0x11c),
+    P(0x1654, 4, cView, 0x230),
+    P(0x16cc, 1, cView, 0x22c),
+    P(0x11b8, 1, cP70, 0x080), // the alpha test's reference
+};
+
 constexpr Load kVsHair[] = {
     V(0x114, 1, cV0, 0x12c),
     V(0x2dc, 4, cV0, 0x0d0),
@@ -375,6 +445,11 @@ const Variant kVariants[] = {
      kVsHair, kPsHairCmask,
      {0x128, 0x824, 0x250, 0xa8c, 0xa68, 0xb80,
       0x878, 0x8c8, 0x838, 0x8b0, 0, 0, 0, 0, 0}},
+    {"sm_p1dzt.fxo", "s_b1dst.fxo", "#define ALPHA_TEST\n",
+     kVsRigid, kPsRigidAlpha,
+     {0x150, 0x158, 0x2b0, 0xa04, 0xa30, 0x90c,
+      0, 0, 0, 0x128c, 0x1454, 0x146c,
+      0x1294, 0x132c, 0x1344}},
 };
 
 constexpr const char* kHeader = R"(#version 450
@@ -1151,6 +1226,9 @@ void main() {
     float nl1 = min(1.0,max(0.0,-rawNL1));
     vec4 control = at(3,uv);              // c3c / a04
     vec4 base = at(4,uv);                 // d6c / a30
+#ifdef ALPHA_TEST
+    if (F(P70,0x80) > base.a) demote; // sm_p1dzt 0x11c0: unscaled base alpha under the reference
+#endif
     // The image at this PC supplies its own entry s[4:7] sampler.
     vec4 screen = at(5,rasterUV);         // da0 / 90c
     float invScreen = 1.0/F(P10,8);
@@ -1437,13 +1515,13 @@ class Character final : public Pass {
 public:
     const char* name() const override { return "character"; }
     int claims(const std::string& psName) const override {
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < 5; ++i)
             if (named(psName, kVariants[i].ps)) return i + 1;
         return 0;
     }
 
     bool draw(int role, const Draw& d, Gpu& gpu) override {
-        if (role < 1 || role > 4) return false;
+        if (role < 1 || role > 5) return false;
         const Variant& var = kVariants[role - 1];
         if (!d.vsName || !named(*d.vsName, var.vs))
             return decline(role, "another vertex shader");
@@ -1851,8 +1929,8 @@ private:
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     std::mutex m_;
-    std::set<std::string> declined_[5];
-    std::atomic<bool> logged_[5]{};
+    std::set<std::string> declined_[6];
+    std::atomic<bool> logged_[6]{};
     std::shared_mutex offsetsMutex_;
     std::unordered_map<PairKey, std::vector<int64_t>, PairHash> offsets_;
     std::atomic<int> cacheWarned_{0};
