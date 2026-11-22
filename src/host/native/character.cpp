@@ -411,6 +411,190 @@ constexpr Load kPsHairCmask[] = {
     P(0x10cc, 4, cP10, 0x030),
     P(0x1118, 4, cView, 0x230),
 };
+constexpr Load kPsHairP[] = {
+    P(0x1c, 1, cP60, 0xdc),
+    P(0x74, 4, cP60, 0xd0),
+    P(0x78, 4, cP60, 0x50),
+    P(0xd4, 4, cP60, 0x90),
+    P(0x194, 1, cFlags, 0x0),
+    P(0x1b0, 2, cView, 0x218),
+    P(0x26c, 4, cP10, 0xf0),
+    P(0x2f8, 4, cP30, 0xa0),
+    P(0x2fc, 4, cP30, 0x20),
+    P(0x3c4, 4, cP30, 0xb0),
+    P(0x3c8, 4, cP30, 0x30),
+    P(0x49c, 4, cP30, 0xc0),
+    P(0x4a0, 4, cP30, 0x40),
+    P(0x570, 4, cP30, 0xd0),
+    P(0x574, 4, cP30, 0x50),
+    P(0x638, 8, cP30, 0x80),
+    P(0x6a8, 2, cP70, 0x68),
+    P(0x6ac, 8, cP70, 0x90),
+    P(0x6b0, 2, cP0, 0x40),
+    P(0x6b4, 1, cP0, 0x48),
+    P(0x6b8, 1, cP0, 0xc),
+    P(0x6c0, 4, cP20, 0x5b0),
+    P(0x6f8, 1, cView, 0x22c),
+    P(0x8d0, 16, cP20, 0x530),
+    P(0x948, 1, cP70, 0x88),
+    P(0x96c, 16, cP20, 0x4f0),
+    P(0x9bc, 4, cP30, 0x60),
+    P(0x9c4, 4, cP30, 0xe0),
+    P(0xa84, 16, cP20, 0x570),
+    P(0xad0, 4, cP30, 0x120),
+    P(0xb7c, 8, cP60, 0x0),
+    P(0xb80, 4, cP60, 0x110),
+    P(0xba8, 8, cP30, 0x100),
+    P(0xbb4, 4, cP10, 0x0),
+    P(0xbc8, 1, cP90, 0x134),
+    P(0xbcc, 8, cP30, 0x0),
+    P(0xf20, 16, cP0, 0x0),
+    P(0x105c, 4, cView, 0x220),
+    P(0x1060, 8, cP10, 0x10),
+    P(0x10c8, 1, cP70, 0x80),
+    P(0x10e4, 1, cP70, 0x9c),
+    P(0x1100, 1, cP50, 0x1c),
+    P(0x1104, 1, cP60, 0xc),
+    P(0x1108, 4, cP10, 0x30),
+    P(0x1158, 4, cView, 0x230),
+};
+constexpr Load kPsRef[] = {
+    P(0x20, 1, cP60, 0xdc),
+    P(0x74, 4, cP60, 0xd0),
+    P(0x78, 4, cP60, 0x50),
+    P(0xd4, 4, cP60, 0x90),
+    P(0x180, 1, cFlags, 0x0),
+    P(0x1ac, 1, cP70, 0xac),
+    P(0x1cc, 2, cView, 0x218),
+    P(0x2c4, 4, cP10, 0xf0),
+    P(0x360, 4, cP30, 0xa0),
+    P(0x364, 4, cP30, 0x20),
+    P(0x468, 4, cP30, 0xb0),
+    P(0x46c, 4, cP30, 0x30),
+    P(0x574, 4, cP30, 0xc0),
+    P(0x578, 4, cP30, 0x40),
+    P(0x684, 4, cP30, 0xd0),
+    P(0x688, 4, cP30, 0x50),
+    P(0x930, 4, cP30, 0x100),
+    P(0x934, 1, cView, 0x22c),
+    P(0x938, 1, cP0, 0xc),
+    P(0x93c, 2, cP70, 0x68),
+    P(0x940, 16, cP20, 0x530),
+    P(0x974, 8, cP70, 0x90),
+    P(0x98c, 2, cP0, 0x40),
+    P(0x9bc, 1, cP70, 0x88),
+    P(0x9c0, 4, cP30, 0xe0),
+    P(0x9c4, 4, cP30, 0x60),
+    P(0x9cc, 8, cP60, 0x0),
+    P(0x9e0, 1, cP90, 0x134),
+    P(0x9f0, 4, cP60, 0x110),
+    P(0x9f8, 1, cP0, 0x48),
+    P(0xa10, 4, cP20, 0x5b0),
+    P(0xa2c, 4, cP10, 0x0),
+    P(0xaac, 16, cP20, 0x4f0),
+    P(0xaf0, 8, cP30, 0x80),
+    P(0xba4, 8, cP30, 0x0),
+    P(0xcc4, 16, cP20, 0x570),
+    P(0xfb0, 16, cP0, 0x0),
+    P(0x10f0, 4, cView, 0x220),
+    P(0x10f4, 8, cP10, 0x10),
+    P(0x1178, 1, cP50, 0x1c),
+    P(0x117c, 1, cP70, 0x9c),
+    P(0x1180, 1, cP60, 0xc),
+    P(0x1184, 1, cFlags, 0x0),
+    P(0x1188, 4, cP10, 0x30),
+    P(0x11f0, 2, cView, 0x218),
+    P(0x11f4, 1, cP0, 0x2c),
+    P(0x11f8, 4, cP0, 0x284),
+    P(0x11fc, 1, cP0, 0x3c),
+    P(0x1200, 1, cP0, 0x26c),
+    P(0x1204, 1, cP0, 0xc),
+    P(0x1348, 2, cP0, 0x270),
+    P(0x13a4, 2, cP0, 0x260),
+    P(0x13a8, 1, cP0, 0x268),
+    P(0x147c, 4, cP0, 0x2a0),
+    P(0x1480, 2, cP0, 0x278),
+    P(0x1484, 1, cP0, 0x280),
+    P(0x153c, 2, cP0, 0x294),
+    P(0x1540, 1, cP0, 0x29c),
+    P(0x1590, 1, cFlags, 0x0),
+    P(0x1594, 1, cP60, 0x11c),
+    P(0x15bc, 4, cView, 0x230),
+    P(0x1634, 1, cView, 0x22c),
+};
+constexpr Load kPsEye[] = {
+    P(0x20, 1, cP60, 0xdc),
+    P(0x74, 4, cP60, 0xd0),
+    P(0x78, 4, cP60, 0x50),
+    P(0xd4, 4, cP60, 0x90),
+    P(0x180, 1, cFlags, 0x0),
+    P(0x1a8, 2, cView, 0x218),
+    P(0x264, 4, cP10, 0xf0),
+    P(0x2a4, 4, cP30, 0x80),
+    P(0x30c, 4, cP30, 0xa0),
+    P(0x310, 4, cP30, 0x20),
+    P(0x3e0, 4, cP30, 0xb0),
+    P(0x3e4, 4, cP30, 0x30),
+    P(0x4c4, 4, cP30, 0xc0),
+    P(0x4c8, 4, cP30, 0x40),
+    P(0x5a8, 4, cP30, 0xd0),
+    P(0x5ac, 4, cP30, 0x50),
+    P(0x68c, 4, cP30, 0xa0),
+    P(0x690, 1, cP30, 0x2c),
+    P(0x71c, 4, cP30, 0xb0),
+    P(0x720, 1, cP30, 0x3c),
+    P(0x7ac, 4, cP30, 0xc0),
+    P(0x7b0, 1, cP30, 0x4c),
+    P(0x848, 4, cP30, 0xd0),
+    P(0x84c, 1, cP30, 0x5c),
+    P(0x8f0, 16, cView, 0x30),
+    P(0x8f4, 4, cP70, 0x60),
+    P(0x8f8, 8, cP90, 0x40),
+    P(0x8fc, 16, cP20, 0x530),
+    P(0x904, 1, cView, 0x22c),
+    P(0xa00, 16, cP20, 0x570),
+    P(0xa94, 4, cP30, 0x90),
+    P(0xb18, 16, cP20, 0x4f0),
+    P(0xb20, 4, cP20, 0x5b0),
+    P(0xc30, 2, cP90, 0x130),
+    P(0xc70, 8, cP70, 0x90),
+    P(0xcc4, 4, cView, 0x70),
+    P(0xcc8, 4, cView, 0x0),
+    P(0xcec, 4, cP30, 0xe0),
+    P(0xcf0, 4, cP30, 0x60),
+    P(0xcf4, 4, cP90, 0x60),
+    P(0xd10, 1, cP0, 0x48),
+    P(0xd38, 1, cP0, 0xc),
+    P(0xd44, 8, cP30, 0x0),
+    P(0xd8c, 2, cP0, 0x40),
+    P(0xda0, 8, cP60, 0x0),
+    P(0xe38, 4, cP60, 0x110),
+    P(0xe68, 4, cP10, 0x0),
+    P(0x110c, 16, cP0, 0x0),
+    P(0x1240, 4, cView, 0x220),
+    P(0x1244, 8, cP10, 0x10),
+    P(0x12d8, 1, cP70, 0x9c),
+    P(0x12dc, 1, cP50, 0x1c),
+    P(0x12e0, 1, cP60, 0xc),
+    P(0x12e4, 4, cP10, 0x30),
+    P(0x1330, 4, cView, 0x230),
+};
+constexpr Load kVsEye[] = {
+    V(0x114, 1, cV0, 0x12c),
+    V(0x2e0, 4, cV0, 0xd0),
+    V(0x2e4, 4, cV0, 0x50),
+    V(0x2e8, 4, cV0, 0x90),
+    V(0x364, 1, cV40, 0x0),
+    V(0x368, 4, cV10, 0x170),
+    V(0x3b8, 4, cV30, 0x220),
+    V(0x3dc, 4, cV10, 0x160),
+    V(0x418, 16, cV30, 0x30),
+    V(0x41c, 4, cV30, 0x220),
+    V(0x48c, 4, cVF1, 0x80),
+    V(0x490, 16, cVF0, 0x40),
+    V(0x5b4, 8, cV30, 0x0),
+    V(0x5b8, 4, cV30, 0x20),
+};
 #undef V
 #undef P
 
@@ -425,6 +609,7 @@ struct Variant {
     const char *ps, *vs, *defines;
     std::span<const Load> vsLoads, psLoads;
     uint32_t texturePc[kTextures];
+    uint32_t cubePc = 0;
 };
 const Variant kVariants[] = {
     {"sm_o1dzt[skin].fxo", "s_b1dzt[skin].fxo", "#define SKIN\n",
@@ -450,6 +635,15 @@ const Variant kVariants[] = {
      {0x150, 0x158, 0x2b0, 0xa04, 0xa30, 0x90c,
       0, 0, 0, 0x128c, 0x1454, 0x146c,
       0x1294, 0x132c, 0x1344}},
+    {"sm_p1dzt[hair][cmask].fxo", "s_b1dt[hair].fxo", "#define HAIR\n#define HAIR_CMASK\n#define HAIR_P\n",
+     kVsHair, kPsHairP,
+     {0x128,0x7f8,0x254,0xb6c,0xa7c,0xb9c,0x8b4,0x8c4,0x83c,0x88c,0,0,0,0,0}},
+    {"s_o1dzt[ref].fxo", "s_b1dst.fxo", "#define REF\n",
+     kVsRigid, kPsRef,
+     {0x150,0x158,0x2ac,0,0x920,0x928,0,0,0,0x1214,0x13cc,0x13e4,0x121c,0x12b4,0x12cc},0x918},
+    {"s_o1dzt[eye][aref].fxo", "s_o1dzt[eye][aref].fxo", "#define EYE\n",
+     kVsEye, kPsEye,
+     {0x12c,0xccc,0x24c,0,0xe9c,0xe48,0,0,0,0,0,0,0,0,0},0xcb8},
 };
 
 constexpr const char* kHeader = R"(#version 450
@@ -524,6 +718,10 @@ layout(location = 2) out vec4 p2;
 layout(location = 3) out vec4 p3;
 layout(location = 4) out vec4 p4;
 layout(location = 5) out vec4 p5;
+#ifdef EYE
+layout(location = 6) out vec4 p6;
+layout(location = 7) out vec4 p7;
+#endif
 
 uint word(uint b, uint i) {
     switch (b) {
@@ -682,7 +880,14 @@ void main() {
     p2 = vec4(uv,0.0,0.0);
 #endif
 #endif
+#ifdef EYE
+    vec3 axis = NORM(vec3(M[0].z,M[1].z,M[2].z));
+    p6 = vec4(axis,0.0);
+    p7 = vec4(away,0.0);
+    p3 = vec4(-NORM(add(axis,F3(V30,0x60))),lp.x);
+#else
     p3 = vec4(away,lp.x);
+#endif
     p4 = vec4(normal,lp.y);
     p5 = vec4(tangent,handed);
 }
@@ -696,6 +901,13 @@ layout(location = 2) in vec4 a2;
 layout(location = 3) in vec4 a3;
 layout(location = 4) in vec4 a4;
 layout(location = 5) in vec4 a5;
+#ifdef EYE
+layout(location = 6) in vec4 a6;
+layout(location = 7) in vec4 a7;
+#endif
+#if defined(REF) || defined(EYE)
+layout(set = 0, binding = 9) uniform samplerCube environment;
+#endif
 layout(location = 0) out vec4 o0;
 layout(location = 1) out vec4 o1;
 
@@ -1064,6 +1276,9 @@ void main() {
         color=mul(F3(P10,0x30),color);
         alpha=mul(F(P10,0x3c),alpha);
     }
+#ifdef HAIR_P
+    float exportAlpha=alpha;
+#endif
     if (has(flags,0x800000u)) {
         vec4 b=F4(View,0x230);
 #ifdef HAIR_HT
@@ -1075,8 +1290,455 @@ void main() {
         alpha=mul(b.w,alpha);
     }
     uvec4 so=cb.c[455];
+#ifdef HAIR_P
+    float alpha0=has(viewFlags,1u)?sat(mul(B(0x3a4d9a68u),gl_FragCoord.z)):exportAlpha;
+    o0=swz(half4(vec4(color,alpha0)),so.x);
+#else
     o0=swz(half4(vec4(color,alpha)),so.x);
+#endif
     o1=swz(half4(vec4(0.0,0.0,0.0,alpha)),so.y);
+}
+#elif defined(EYE)
+void main() {
+    vec3 position=vec3(a3.w,a4.w,a0.w), unfolded=position;
+    if (F(P60,0xdc)>0.0) {
+        vec4 plane=F4(P60,0xd0), origin=F4(P60,0x50), shift=F4(P60,0x90);
+        float side=planeSide(plane,unfolded,origin.xyz);
+        if (abs(side)<origin.w) demote;
+        unfolded=mac(side>=0.0?1.0:0.0,-mul(shift.xyz,shift.w),unfolded);
+    }
+    uint flags=U(Flags,0), viewFlags=U(View,0x22c);
+    vec2 rasterUV=mul(F2(View,0x218),gl_FragCoord.xy);
+    vec3 gn=a4.xyz, t=a5.xyz, bt;
+    bt.x=mac(t.y,-gn.z,mul(gn.y,t.z));
+    bt.y=mac(t.z,-gn.x,mul(gn.z,t.x));
+    bt.z=mac(t.x,-gn.y,mul(gn.x,t.y));
+    bt=mul(a5.w,bt);
+    vec2 xy=mac(2.0,at(0,a2.xy).rg,vec2(-1.0));
+    float n2=mac(xy.y,xy.y,mul(xy.x,xy.x));
+    vec3 un=mul(t,xy.x);
+    un=mac(bt,xy.y,un);
+    un=mac(gn,sqrt(sat(sub(1.0,n2))),un);
+    vec3 N=NORM(un);
+    vec2 sh=vec2(1.0);
+    if (has(flags,8u)) {
+        vec2 raw=at(2,rasterUV).rg; vec4 remap=F4(P10,0xf0);
+        sh=vec2(mac(remap.x,raw.x,remap.y),mac(raw.y,remap.z,remap.w));
+    }
+    float halfLight=mac(-0.5,D3(F3(P30,0x80),a6.xyz),0.5);
+    vec3 point=vec3(0.0);
+    for (int i=0;i<4;++i) if (has(flags,0x10000u<<i)) {
+        vec4 pp=F4(P30,0xa0+16*i), pc=F4(P30,0x20+16*i);
+        vec3 delta=sub(position,pp.xyz);
+        float d2=D3(delta,delta);
+        bool diffuse=has(flags,1u);
+        float outside=max(0.0,sub(sqrt(diffuse?d2:max(B(0x3a83126fu),d2)),pc.w));
+        float den=mac(mul(pp.w,outside),outside,1.0);
+        float att=sat(mac(B(0x3f808102u),1.0/den,B(0xbb810205u)));
+        vec3 L=diffuse?mul(delta,inversesqrt(d2)):delta;
+        float candidate=mul(att,D3(a6.xyz,L));
+        candidate=mac(-0.5,candidate,mul(0.5,att));
+        halfLight=max(halfLight,candidate);
+        if (diffuse) {
+            float nl=min(1.0,max(0.0,-D3(N,L)));
+            vec3 diff=max(vec3(0.0),mul(mul(pc.rgb,att),nl));
+            if (i==0) point=diff; else point=add(point,diff);
+        }
+    }
+    // 8dc..10e8, in original instruction order.
+    float r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18, r19, r20, r21, r22, r23, r24, r25, r26, r27, r28, r29, r30, r31, r32, r33, r34, r35, r36, r37, r38, r39, r40, r41, r42, r43, r44, r45, r46, r47, r48, r49, r50, r51;
+    vec4 sampleValue;
+    r2=sh.x; r3=sh.y; r5=N.x; r8=N.y; r6=N.z;
+    r7=halfLight; r11=a7.x; r13=a3.y;
+    r24=position.x; r23=position.y; r22=position.z;
+    r26=point.r; r51=point.g; r27=point.b;
+    r28 = sat(add(0.5,r7));
+    r7 = a7.y;
+    r9 = F(View,0x44);
+    r10 = F(P70,0x60);
+    r14 = F(P90,0x40);
+    r15 = F(P90,0x44);
+    r14 = mac(-F(View,0x40),r10,r14);
+    r12 = F(View,0x48);
+    r16 = F(P90,0x48);
+    r19 = F(P70,0x64);
+    r15 = mac(-F(P70,0x60),r9,r15);
+    r9 = a3.x;
+    r14 = add(r9,r14);
+    r15 = add(r13,r15);
+    r10 = a3.z;
+    r14 = mac(-F(View,0x50),r19,r14);
+    r16 = mac(-F(P70,0x60),r12,r16);
+    r16 = add(r10,r16);
+    r15 = mac(-F(View,0x54),r19,r15);
+    r29 = F(P90,0x50);
+    r16 = mac(-F(View,0x58),r19,r16);
+    r19 = F(P70,0x68);
+    r29 = mac(-F(View,0x40),r19,r29);
+    r12 = a7.z;
+    r30 = F(P90,0x58);
+    r30 = mac(-F(View,0x48),r19,r30);
+    r9 = add(r9,r29);
+    r29 = F(P70,0x6c);
+    r9 = mac(-F(View,0x50),r29,r9);
+    r10 = add(r10,r30);
+    r30 = F(P90,0x54);
+    r30 = mac(-F(View,0x44),r19,r30);
+    r19 = mul(r14,r14);
+    r19 = mac(r15,r15,r19);
+    r19 = mac(r16,r16,r19);
+    r19 = inversesqrt(r19);
+    r15 = mul(r19,r15);
+    r13 = add(r13,r30);
+    r13 = mac(-F(View,0x54),r29,r13);
+    r10 = mac(-F(View,0x58),r29,r10);
+    r29 = mul(r19,r14);
+    r14 = mul(r19,r16);
+    r16 = mul(r5,r29);
+    r16 = mac(r15,r8,r16);
+    r16 = mac(r14,r6,r16);
+    r14 = max(0.0,-r16);
+    r14 = min(1.0,r14);
+    r29 = log2(r14);
+    r14 = mul(r11,r11);
+    r14 = mac(r7,r7,r14);
+    r14 = mac(r12,r12,r14);
+    r14 = inversesqrt(r14);
+    r33 = mul(r11,r14);
+    r11 = mul(r12,r14);
+    r12 = mul(r7,r14);
+    r7 = mul(r5,r33);
+    r15 = mac(r8,r12,r7);
+    r15 = mul(mac(r11,r6,r15),2.0);
+    r14 = F(P20,0x53c);
+    r33 = mac(r15,-r5,r33);
+    r35 = mul(r33,r33);
+    r12 = mac(r15,-r8,r12);
+    r35 = mac(r12,r12,r35);
+    r11 = mac(r15,-r6,r11);
+    r15 = mul(F(P30,0x80),r5);
+    r35 = mac(r11,r11,r35);
+    r19 = mac(F(P30,0x84),r8,r15);
+    r15 = mul(r5,r5);
+    r15 = mac(r8,r8,r15);
+    r15 = mac(r6,r6,r15);
+    r15 = inversesqrt(r15);
+    r34 = mul(r15,r5);
+    r19 = mac(F(P30,0x88),r6,r19);
+    r16 = mul(F(P30,0x90),r5);
+    r16 = mac(F(P30,0x94),r8,r16);
+    r16 = mac(F(P30,0x98),r6,r16);
+    r16 = max(0.0,-r16);
+    r16 = min(1.0,r16);
+    r30 = add(-1.0,r16);
+    r16 = mul(r9,r9);
+    r16 = mac(r13,r13,r16);
+    r16 = mac(r10,r10,r16);
+    r16 = inversesqrt(r16);
+    r31 = mul(r16,r9);
+    r7 = mul(r5,r31);
+    r9 = mul(r16,r10);
+    r10 = mul(r16,r13);
+    r7 = mac(r10,r8,r7);
+    r10 = mul(r15,r8);
+    r14 = mac(F(P20,0x534),r10,r14);
+    r7 = mac(r9,r6,r7);
+    r9 = mul(r15,r6);
+    r6 = max(0.0,-r7);
+    r5 = min(1.0,r6);
+    r7 = mac(F(P20,0x538),r9,r14);
+    r32 = log2(r5);
+    r5 = F(View,0x6c);
+    r5 = mac(F(View,0x60),r24,r5);
+    r31 = mac(r23,F(View,0x64),r5);
+    r31 = mac(F(View,0x68),r22,r31);
+    r39 = mul(F(View,0x38),r31);
+    r14 = F(P20,0x5bc);
+    r14 = mac(F(P20,0x5b4),r10,r14);
+    r6 = mul(F(P20,0x510),r34);
+    r5 = mac(F(P20,0x514),r10,r6);
+    r6 = mul(F(P20,0x590),r34);
+    r5 = mac(F(P20,0x518),r9,r5);
+    r6 = mac(F(P20,0x594),r10,r6);
+    r6 = mac(F(P20,0x598),r9,r6);
+    r7 = mac(r5,r10,r7);
+    r5 = mac(F(P20,0x5b8),r9,r14);
+    r14 = mul(F(P20,0x520),r34);
+    r14 = mac(F(P20,0x524),r10,r14);
+    r14 = mac(F(P20,0x528),r9,r14);
+    r5 = mac(r6,r10,r5);
+    r7 = mac(F(P20,0x51c),r10,r7);
+    r5 = mac(F(P20,0x59c),r10,r5);
+    r7 = mac(r14,r9,r7);
+    r14 = mul(F(P20,0x5a0),r34);
+    r14 = mac(F(P20,0x5a4),r10,r14);
+    r14 = mac(F(P20,0x5a8),r9,r14);
+    r5 = mac(r14,r9,r5);
+    r14 = inversesqrt(r35);
+    r15 = mul(r14,r33);
+    r15 = mul(-1.0,r15);
+    r13 = mac(F(P20,0x52c),r9,r7);
+    r7 = mul(r14,r12);
+    r12 = mul(F(P20,0x580),r34);
+    r33 = mac(F(P20,0x584),r10,r12);
+    r33 = mac(F(P20,0x588),r9,r33);
+    r12 = mul(F(P20,0x560),r34);
+    r6 = mac(F(P20,0x5ac),r9,r5);
+    r5 = mul(r14,r11);
+    vec3 cubeDirection = vec3(r15,r7,r5);
+    r14 = mul(F(P20,0x500),r34);
+    r16 = mac(F(P20,0x504),r10,r14);
+    r14 = min(r2,r3);
+    r2 = mul(r2,r3);
+    r11 = mul(F(P20,0x540),r34);
+    r2 = has(viewFlags,2u)?r2:r14;
+    r35 = mac(F(P20,0x544),r10,r11);
+    r16 = mac(F(P20,0x508),r9,r16);
+    r2 = add(-1.0,r2);
+    r35 = mac(F(P20,0x548),r9,r35);
+    r11 = mul(F(P20,0x550),r34);
+    r3 = F(P20,0x58c);
+    r3 = add(F(P20,0x5b0),r3);
+    r11 = mac(F(P20,0x554),r10,r11);
+    r3 = add(r3,r33);
+    r11 = mac(F(P20,0x558),r9,r11);
+    r12 = mac(F(P20,0x564),r10,r12);
+    r6 = mac(r3,r34,r6);
+    r12 = mac(F(P20,0x568),r9,r12);
+    r3 = max(B(0x3d800000u),r6);
+    r33 = F(P20,0x54c);
+    r15 = F(P20,0x50c);
+    r15 = add(F(P20,0x530),r15);
+    r15 = add(r15,r16);
+    r13 = mac(r15,r34,r13);
+    r36 = max(B(0x3d800000u),r13);
+    r13 = F(P20,0x57c);
+    r13 = mac(F(P20,0x574),r10,r13);
+    r13 = mac(F(P20,0x578),r9,r13);
+    r13 = mac(r11,r10,r13);
+    r13 = mac(F(P20,0x55c),r10,r13);
+    r13 = mac(r12,r9,r13);
+    r37 = mac(F(P20,0x56c),r9,r13);
+    sampleValue = texture(environment,cubeDirection); r13 = sampleValue.x; r14 = sampleValue.y; r15 = sampleValue.z; r16 = sampleValue.w;
+    r7 = add(F(P20,0x570),r33);
+    sampleValue = at(1,a2.xy); r9 = sampleValue.x; r10 = sampleValue.y; r11 = sampleValue.z; r12 = sampleValue.w;
+    r5 = mac(F(P90,0x130),r2,1.0);
+    r2 = add(r7,r35);
+    r6 = mac(F(P90,0x130),r30,1.0);
+    r37 = mac(r2,r34,r37);
+    r2 = F(View,0x34);
+    r35 = add(F(View,0x30),r2);
+    r2 = max(0.0,-r19);
+    r2 = min(1.0,r2);
+    r7 = F(View,0x7c);
+    r2 = add(-1.0,r2);
+    r7 = mac(F(View,0x70),r24,r7);
+    r38 = mac(r23,F(View,0x74),r7);
+    r7 = mac(F(P90,0x130),r2,1.0);
+    r30 = F(P30,0xe0);
+    r38 = mac(F(View,0x78),r22,r38);
+    r37 = max(B(0x3d800000u),r37);
+    r39 = mac(F(View,0x3c),r38,r39);
+    r39 = mac(0.5,r35,r39);
+    r40 = F(P30,0xe4);
+    r34 = mac(F(P20,0x4f0),r36,r30);
+    r36 = mac(F(P20,0x4f0),r37,r40);
+    r37 = F(P30,0xe8);
+    r40 = sub(F(P30,0x64),r40);
+    r33 = mul(F(P90,0x60),r29);
+    r29 = mul(F(View,0x8),r31);
+    r29 = mac(F(View,0xc),r38,r29);
+    r38 = mac(0.5,r8,0.5);
+    r31 = mac(F(P20,0x4f0),r3,r37);
+    r37 = sub(F(P30,0x68),r37);
+    r3 = 1.0/r39;
+    r31 = mac(r38,r37,r31);
+    r35 = F(P0,0x44);
+    r35 = sub(F(P0,0x48),r35);
+    r35 = 1.0/r35;
+    r19 = mul(-r19,r35);
+    r19 = sat(mac(-F(P0,0x44),r35,r19));
+    r19 = add(-1.0,r19);
+    r2 = mul(F(P30,0x10),r6);
+    r37 = sub(F(P30,0x60),r30);
+    r30 = F(View,0x4);
+    r30 = add(F(View,0x0),r30);
+    r29 = mac(0.5,r30,r29);
+    r30 = mul(F(P30,0x0),r7);
+    r3 = mul(r3,r29);
+    r29 = B(0xc1200001u);
+    r32 = mul(F(P90,0x64),r32);
+    r3 = sat(mac(r29,-r3,B(0xc0600001u)));
+    r29 = mul(F(P30,0x8),r7);
+    r31 = mac(r29,r5,r31);
+    r34 = mac(r30,r5,r34);
+    r36 = mac(r38,r40,r36);
+    r34 = mac(F(P90,0x134),r2,r34);
+    r37 = mac(r37,r8,r37);
+    r48 = mac(0.5,r37,r34);
+    r35 = mac(F(P0,0x40),r19,1.0);
+    r19 = F(P60,0x18);
+    r41 = mul(F(P70,0xa8),r19);
+    r19 = F(P60,0x14);
+    r40 = mul(F(P70,0xa4),r19);
+    sampleValue = at(5,rasterUV); r17 = sampleValue.x; r18 = sampleValue.y; r19 = sampleValue.z;
+    r34 = F(P60,0x8);
+    r45 = mul(r28,r3);
+    r3 = mul(F(P30,0x14),r6);
+    r28 = mul(F(P30,0x18),r6);
+    r44 = mac(F(P90,0x134),r28,r31);
+    r31 = mul(F(P30,0x4),r7);
+    r36 = mac(r31,r5,r36);
+    r5 = F(P60,0x4);
+    r46 = 1.0/F(P10,0x8);
+    r47 = mac(F(P90,0x134),r3,r36);
+    r36 = F(P60,0x10);
+    r49 = mul(F(P70,0xa0),r36);
+    r43 = mul(F(P70,0x94),r5);
+    sampleValue = at(4,a2.xy); r5 = sampleValue.x; r6 = sampleValue.y; r7 = sampleValue.z; r8 = sampleValue.w;
+    r20 = F(P60,0x0);
+    r42 = mul(F(P70,0x98),r34);
+    r34 = F(P60,0x11c);
+    r39 = mul(F(P70,0x90),r20);
+    r20 = a0.x;
+    r36 = mul(F(P10,0x0),r20);
+    r20 = a0.y;
+    r37 = mul(F(P10,0x0),r20);
+    r20 = a0.z;
+    r38 = mul(F(P10,0x0),r20);
+    r21 = B(0x3e19999au);
+    r20 = B(0x3fb0852eu);
+    r11 = mul(F(P70,0xac),r11);
+    r11 = max(1.0,r11);
+    r33 = mul(r33,r11);
+    r32 = mul(r32,r11);
+    r11 = mul(F(P90,0x6c),r12);
+    r12 = max(B(0x3b808081u),r16);
+    r12 = 1.0/r12;
+    r12 = mul(B(0x3e800000u),r12);
+    r32 = exp2(r32);
+    r14 = mul(r14,r12);
+    r15 = mul(r15,r12);
+    r50 = mul(r11,r14);
+    r16 = mul(r13,r12);
+    r12 = exp2(r33);
+    r12 = mul(F(P90,0x4c),r12);
+    r12 = mac(F(P90,0x5c),r32,r12);
+    r32 = mul(r40,r12);
+    r13 = mul(r41,r12);
+    r41 = mul(r11,r15);
+    r33 = sat(mul(F(P30,0x4),r32));
+    r32 = mul(r9,r45);
+    r13 = sat(mul(F(P30,0x8),r13));
+    r40 = mul(r32,r33);
+    r32 = mul(r32,r13);
+    r33 = mul(r11,r16);
+    r11 = mul(r49,r12);
+    r11 = sat(mul(F(P30,0x0),r11));
+    r45 = mul(r45,r11);
+    r26 = mac(r46,r17,r26);
+    r51 = mac(r46,r18,r51);
+    r27 = mac(r46,r19,r27);
+    r19 = mac(r48,r35,r26);
+    r18 = mac(r47,r35,r51);
+    r17 = mac(r44,r35,r27);
+    r25 = mul(r10,r18);
+    r18 = mul(r10,r19);
+    r17 = mul(r10,r17);
+    r10 = max(r17,max(r18,r25));
+    r19 = sat(add(F(P90,0x68),r10));
+    r10 = mul(r45,r19);
+    r6 = mul(r6,r6);
+    r7 = mul(r7,r7);
+    r6 = mac(r14,r50,r6);
+    r7 = mac(r15,r41,r7);
+    r6 = mul(r43,r6);
+    r7 = mul(r42,r7);
+    r6 = mul(r6,r25);
+    r11 = mul(r7,r17);
+    r6 = mac(r19,r40,r6);
+    r11 = mac(r19,r32,r11);
+    r12 = mul(r5,r5);
+    r5 = mac(F(P60,0x114),r34,r6);
+    r5 = mac(-F(P60,0x11c),r6,r5);
+    r12 = mac(r16,r33,r12);
+    r6 = mul(r39,r12);
+    r7 = mul(r6,r18);
+    r7 = mac(r10,r9,r7);
+    r9 = mac(F(P60,0x118),r34,r11);
+    r9 = mac(-F(P60,0x11c),r11,r9);
+    r6 = mul(mul(r37,r5),2.0);
+    r5 = mul(mul(r38,r9),2.0);
+    r9 = mac(B(0x3e19999au),r5,0.5);
+    r9 = mac(r5,r9,B(0x3d75c290u));
+    r9 = 1.0/r9;
+    r14 = mac(r21,r5,B(0x3d4ccccdu));
+    r5 = mac(r14,r5,B(0x3b83126fu));
+    r14 = mac(r21,r6,B(0x3d4ccccdu));
+    r5 = mul(r9,r5);
+    r9 = mac(F(P60,0x110),r34,r7);
+    r9 = mac(-F(P60,0x11c),r7,r9);
+    r7 = mul(mul(r36,r9),2.0);
+    r9 = mac(B(0x3e19999au),r6,0.5);
+    r9 = mac(r6,r9,B(0x3d75c290u));
+    r9 = 1.0/r9;
+    r6 = mac(r14,r6,B(0x3b83126fu));
+    r14 = mac(r21,r7,B(0x3d4ccccdu));
+    r6 = mul(r9,r6);
+    r9 = mac(B(0x3e19999au),r7,0.5);
+    r9 = mac(r7,r9,B(0x3d75c290u));
+    r9 = 1.0/r9;
+    r7 = mac(r14,r7,B(0x3b83126fu));
+    r7 = mul(r9,r7);
+    r7 = sat(mac(r20,r7,B(0xbdbc49cau)));
+    r6 = sat(mac(r20,r6,B(0xbdbc49cau)));
+    r5 = sat(mac(r20,r5,B(0xbdbc49cau)));
+    r7 = sqrt(r7);
+    r6 = sqrt(r6);
+    r5 = sqrt(r5);
+    vec3 toned=vec3(r7,r6,r5);
+    if (has(U(P0,0x0c),1u)) {
+        float g=add(r51,r31), b=add(r27,r29), r=add(r26,r30);
+        g=add(g,r3); b=add(b,r28); r=add(r,r2);
+        float brightness=mac(add(g,b),B(0x3eaaaaabu),mul(B(0x3eaaaaabu),r));
+        float om=sub(1.0,brightness);
+        float low=sat(mul(om,om));
+        float mid=mac(-om,om,1.0); mid=sat(mac(brightness,-brightness,mid));
+        float high=sat(mul(brightness,brightness));
+        float black=F(P0,0x1c), invRange=1.0/sub(sub(1.0,black),black);
+        for (int i=0;i<3;++i) {
+            vec3 c=F3(P0,0x10+16*i);
+            float e=mul(c.x,low); e=mac(c.y,mid,e); e=mac(c.z,high,e);
+            e=add(F(P0,4*i),e);
+            toned[i]=sat(POW(sat(mac(invRange,toned[i],-black)),e));
+        }
+    }
+    vec3 color=toned;
+    if (has(flags,4u)) color=add(toned,a1.rgb);
+    if (has(flags,0x400000u) && !has(flags,4u)) {
+        vec3 delta=sub(F3(View,0x220),position);
+        float f=sat(mac(F(P10,0x28),sqrt(D3(delta,delta)),F(P10,0x2c)));
+        color=mac(F3(P10,0x10),f,toned);
+        color=mac(f,-toned,color);
+    }
+    float specAlpha=sat(max(0.0,r10));
+    float materialAlpha=add(r8,specAlpha);
+    materialAlpha=mac(specAlpha,-r8,materialAlpha);
+    float alpha=mul(F(P70,0x9c),materialAlpha);
+    alpha=mul(F(P50,0x1c),alpha); alpha=mul(F(P60,0x0c),alpha);
+    if (!has(flags,8u)) {
+        color=mul(F3(P10,0x30),color); alpha=mul(F(P10,0x3c),alpha);
+    }
+    float alpha1=alpha;
+    if (has(flags,0x800000u)) {
+        vec4 b=F4(View,0x230);
+        color=mac(b.w,color,b.rgb); color=mac(-b.rgb,b.w,color);
+        alpha1=mul(b.w,alpha);
+    }
+    float alpha0=has(viewFlags,1u)?sat(mul(B(0x3a4d9a68u),gl_FragCoord.z)):alpha;
+    uvec4 so=cb.c[455];
+    o0=swz(half4(vec4(color,alpha0)),so.x);
+    o1=swz(half4(vec4(0.0,0.0,0.0,alpha1)),so.y);
 }
 #else
 void main() {
@@ -1109,7 +1771,12 @@ void main() {
     bt = mul(a5.w,bt);
 
     vec2 encodedXY = at(0,uv).rg;        // 1c8 / 150
+#ifdef REF
+    vec4 specTex = at(1,uv);
+    vec3 specMaterial = specTex.rgb;
+#else
     vec3 specMaterial = at(1,uv).rgb;    // 1d0 / 158
+#endif
     vec2 nxy = mac(2.0,encodedXY,vec2(-1.0));
     float xy2 = mul(nxy.x,nxy.x);
     xy2 = mac(nxy.y,nxy.y,xy2);
@@ -1209,10 +1876,12 @@ void main() {
     vec3 ambient = mac(F(P20,0x4f0),poly,lower);
     vec3 difference = sub(upper,lower);
     float hemisphere = mac(0.5,N.y,0.5);
-#ifdef SKIN
+#if defined(SKIN) || defined(REF)
     float red = difference.r;
     red = mac(difference.r,N.y,red);
+#ifndef REF
     ambient.r = mac(0.5,red,ambient.r);
+#endif
     ambient.gb = mac(hemisphere,difference.gb,ambient.gb);
 #else
     ambient = mac(hemisphere,difference,ambient);
@@ -1224,7 +1893,11 @@ void main() {
     float rawNL0 = D3(direction0,N), rawNL1 = D3(direction1,N);
     float nl0 = min(1.0,max(0.0,-rawNL0));
     float nl1 = min(1.0,max(0.0,-rawNL1));
+#ifdef REF
+    vec4 control = vec4(1.0,1.0,0.0,1.0);
+#else
     vec4 control = at(3,uv);              // c3c / a04
+#endif
     vec4 base = at(4,uv);                 // d6c / a30
 #ifdef ALPHA_TEST
     if (F(P70,0x80) > base.a) demote; // sm_p1dzt 0x11c0: unscaled base alpha under the reference
@@ -1234,12 +1907,22 @@ void main() {
     float invScreen = 1.0/F(P10,8);
     vec3 indirectDiffuse = mac(screen.rgb,invScreen,pointDiffuse);
     vec3 indirectSpecular = mac(invScreen,vec3(screen.a),pointSpecular);
+#ifdef REF
+    float materialShadow = combinedShadow;
+#else
     float materialShadow = mac(control.r,sub(combinedShadow,1.0),1.0);
+#endif
     vec3 primary = mul(light0,nl0);
     primary = mul(materialShadow,primary);
     vec3 secondary = mul(light1,nl1);
     vec3 directionalDiffuse = mac(secondaryGain,secondary,primary);
+#ifdef REF
+    vec3 diffuseLighting = mac(mul(light0,nl0),materialShadow,ambient);
+    diffuseLighting = mac(secondaryGain,secondary,diffuseLighting);
+    diffuseLighting.r = mac(0.5,red,diffuseLighting.r);
+#else
     vec3 diffuseLighting = add(ambient,directionalDiffuse);
+#endif
 
 #ifdef SKIN
     float rampY = mac(sub(F(P70,0x78),F(P70,0x7c)),a2.z,F(P70,0x7c));
@@ -1300,8 +1983,16 @@ void main() {
     effect = mul(B(0x3dcccccdu),effect);
 #endif
     vec3 baseSquared = mul(base.rgb,base.rgb);
+#ifdef REF
+    vec3 cubeDirection = NORM(reflectedV);
+    vec4 env = texture(environment,vec3(-cubeDirection.z,cubeDirection.x,cubeDirection.y));
+    float envScale = mul(B(0x3e800000u),1.0/max(B(0x3b808081u),env.a));
+    vec3 envColor = mul(env.rgb,envScale);
+    baseSquared = mac(specTex.a,mac(envColor,envColor,-baseSquared),baseSquared);
+#endif
     vec3 effectColor = mul(F3(P30,0x100),control.g);
     baseSquared = mac(effect,effectColor,baseSquared);
+#ifndef REF
 
     float primaryLuminance = luminance(light0);
     float occlusionLight = max(0.0,sub(F(P30,0x124),rawNL0));
@@ -1313,13 +2004,16 @@ void main() {
     float materialOcclusion = sub(1.0,control.a);
     materialOcclusion = mac(suppression,-materialOcclusion,materialOcclusion);
     float occlusion = sat(mac(-F(P30,0x120),materialOcclusion,1.0));
+#endif
 
     vec3 diffuseMultiplier = mul(F3(P70,0x90),specMaterial.g);
     diffuseMultiplier = mul(F3(P60,0),diffuseMultiplier);
     vec3 diffuseMaterial = mul(diffuseMultiplier,baseSquared);
     vec3 linearColor = mul(diffuseMaterial,diffuseLighting);
     linearColor = mac(specularLighting,specMaterial.r,linearColor);
+#ifndef REF
     linearColor = mul(occlusion,linearColor);
+#endif
     vec3 oldColor = linearColor;
     float linearWeight = F(P60,0x11c);
     linearColor = mac(F3(P60,0x110),linearWeight,oldColor);
@@ -1416,7 +2110,9 @@ void main() {
             float gate = sat(mac(agreement,agreement,passed));
             float suppress = mac(sub(1.0,k.x),gate,k.x);
             normalEdge = mac(-nearRamp,suppress,nearRamp);
+#ifndef REF
             normalEdge = mul(mac(-control.b,F(P0,0x54),1.0),normalEdge);
+#endif
         }
         if (has(maskFlags,8u)) {
             vec2 k = F2(P0,0x260);
@@ -1445,8 +2141,12 @@ void main() {
             float fd = mul(-negativeDepth,invRange);
             fd = sat(mac(nearDistance,-invRange,fd));
             float width = mac(fd,sub(fc.y,df.z),df.z);
+#ifdef REF
+            float widthRamp = nearRamp;
+#else
             float widthRamp = mac(-control.b,F(P0,0x58),1.0);
             widthRamp = mul(widthRamp,nearRamp);
+#endif
             float den = mac(widthRamp,width,B(0x3b808081u));
             float normalizedFacing = sat(mul(1.0/den,add(facing,B(0x3b808081u))));
             float gain = mul(sub(1.0,fc.x),normalizedFacing);
@@ -1515,13 +2215,13 @@ class Character final : public Pass {
 public:
     const char* name() const override { return "character"; }
     int claims(const std::string& psName) const override {
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i < 8; ++i)
             if (named(psName, kVariants[i].ps)) return i + 1;
         return 0;
     }
 
     bool draw(int role, const Draw& d, Gpu& gpu) override {
-        if (role < 1 || role > 5) return false;
+        if (role < 1 || role > 8) return false;
         const Variant& var = kVariants[role - 1];
         if (!d.vsName || !named(*d.vsName, var.vs))
             return decline(role, "another vertex shader");
@@ -1629,6 +2329,17 @@ public:
             images[t] = {x->sampler, x->view, VK_IMAGE_LAYOUT_GENERAL};
             std::memcpy(&c[cTexScale + t / 2][(t & 1) * 2], x->scale, sizeof x->scale);
         }
+        VkDescriptorImageInfo cube{};
+        if (var.cubePc) {
+            const Texture* x = nullptr;
+            for (const Texture& candidate : d.textures)
+                if (candidate.pc == var.cubePc) x = &candidate;
+            if (!x || !x->view || !x->sampler)
+                return decline(role, "no environment cube texture and sampler");
+            if (x->scale[0] != 1.0f || x->scale[1] != 1.0f)
+                return decline(role, "a scaled cube texture");
+            cube = {x->sampler,x->view,VK_IMAGE_LAYOUT_GENERAL};
+        }
         for (int i = 0; i < 2; ++i) {
             int32_t sw[4];
             swizzle(d.color[i], sw);
@@ -1655,7 +2366,7 @@ public:
         std::array<uint32_t, 6> st;
         for (int i = 0; i < 2; ++i) st[i * 3] = d.stencilRef[i], st[i * 3 + 1] = d.stencilCompare[i], st[i * 3 + 2] = d.stencilWrite[i];
         gpu.beginRendering(d.color, 2, d.depth, d.hasStencil);
-        gpu.record([pipe, layout = layout_, buffers, images, viewport, scissor,
+        gpu.record([pipe, layout = layout_, buffers, images, cube, viewport, scissor,
                     index = d.index, firstIndex = d.firstIndex, indexed = d.indexed,
                     indexType = d.indexType, count = d.count, st, bc = std::to_array(d.blendConstants),
                     pushSet = gpu.pushDescriptorSet()](VkCommandBuffer cmd) {
@@ -1669,7 +2380,7 @@ public:
             }
             vkCmdSetViewport(cmd, 0, 1, &viewport);
             vkCmdSetScissor(cmd, 0, 1, &scissor);
-            VkWriteDescriptorSet writes[9]{};
+            VkWriteDescriptorSet writes[10]{};
             for (uint32_t i = 0; i < 8; ++i) {
                 writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 writes[i].dstBinding = i;
@@ -1682,7 +2393,14 @@ public:
             writes[8].descriptorCount = kTextures;
             writes[8].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             writes[8].pImageInfo = images.data();
-            pushSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 9, writes);
+            if (cube.imageView) {
+                writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[9].dstBinding = 9;
+                writes[9].descriptorCount = 1;
+                writes[9].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                writes[9].pImageInfo = &cube;
+            }
+            pushSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, cube.imageView ? 10 : 9, writes);
             if (indexed) {
                 vkCmdBindIndexBuffer(cmd, index.buffer, index.offset + index.byteOffset, indexType);
                 vkCmdDrawIndexed(cmd, count, 1, firstIndex, 0, 0);
@@ -1839,7 +2557,7 @@ private:
         VkPipeline& out = pipes_[key];
         const VkDevice dev = gpu.device();
         if (!layout_) {
-            VkDescriptorSetLayoutBinding bindings[9]{};
+            VkDescriptorSetLayoutBinding bindings[10]{};
             for (uint32_t i = 0; i < 8; ++i)
                 bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                                VkShaderStageFlags(i < 7 ? VK_SHADER_STAGE_VERTEX_BIT :
@@ -1848,7 +2566,9 @@ private:
                            VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
             VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
             dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-            dl.bindingCount = 9;
+            bindings[9] = {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                           VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+            dl.bindingCount = 10;
             dl.pBindings = bindings;
             if (!setLayout_ && vkCreateDescriptorSetLayout(dev, &dl, nullptr, &setLayout_) != VK_SUCCESS)
                 return out = VK_NULL_HANDLE;
@@ -1929,8 +2649,8 @@ private:
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     std::mutex m_;
-    std::set<std::string> declined_[6];
-    std::atomic<bool> logged_[6]{};
+    std::set<std::string> declined_[9];
+    std::atomic<bool> logged_[9]{};
     std::shared_mutex offsetsMutex_;
     std::unordered_map<PairKey, std::vector<int64_t>, PairHash> offsets_;
     std::atomic<int> cacheWarned_{0};
