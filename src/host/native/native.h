@@ -74,6 +74,9 @@ struct Draw {
     uint32_t colorCount = 0;     // targets 0..colorCount-1 (unwritten ones have no view)
     uint32_t writeMask = 0;      // 4 bits per target
     bool blend = false;          // any target blends
+    // Each target's blend state as the translated pipeline has it, and the blend constants.
+    VkPipelineColorBlendAttachmentState blendState[8]{};
+    float blendConstants[4] = {};
     bool depthTest = false, depthWrite = false, stencil = false;
     // The depth/stencil buffer bound (no view: none) and its state as the translated pipeline
     // would have it; the masks and reference per face (front, back) are dynamic.
