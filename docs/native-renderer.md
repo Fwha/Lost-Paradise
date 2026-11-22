@@ -212,3 +212,17 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   vertex layout. In compare mode the material pass also checks its cached load offsets.
 - Native draws bind the index buffer as the translated draw does (from the buffer's start, with
   the first index in the draw), so both read the same copy of it.
+
+### Characters: skin and the plain character material
+
+- `native/character.cpp`, a pass of its own: characters light differently from the stage
+  (ambient polynomial, Fresnel lobes, skin ramps, an extra lobe, material occlusion and grading).
+  `s_b1dzt[skin]` + `sm_o1dzt[skin]` and `s_b1dst` + `sm_o1dzt` (~110 draws a frame). Both
+  vertex shaders skin four bones from the palette in their own operation order, and move
+  vertices by the deformation planes. Draws with more than one plane are declined, because the
+  analysis keeps only one entry's loads. Codex's reading is in `docs/shaders/sm_o1dzt[skin].md`,
+  and Codex drafted the port from it.
+- Compare run (`LPN_NATIVE_COMPARE=character`), ~25,000 draws: colour within 1/255 and depth
+  exact. A few thousand pixels of the edge mask (target 1) differ by up to ~115/255: as with the
+  stage, it is a threshold and a sampled-offset test that rounding can move. Draws of
+  `sm_o1dzt` with other vertex shaders (~4%) are still left to the translated path.
