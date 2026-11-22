@@ -77,7 +77,8 @@ enum : uint32_t {
     cUvBlock = 70,   // (SIMPLE_MATERIAL: 70.x is the alpha test's reference, PSV[0x70] 0x80)   // 2 (dst variants): PSV[0x70] 0x40..0x5f; 71: specular detail xy, normal detail zw
     cReflectVs = 72, // x: the reflection coefficient (VSV[0x10] 0x0, [ref] vertex shaders)
     cReflectPs = 73, // PSV[0x30] 0xf0 (the secondary specular gain) and 0xf4 (the reflection light's floor)
-    kConstants = 74,
+    cDiffuseView = 74, // 2: PSView 0x210; raster scale zw, camera in next xyz
+    kConstants = 76,
 };
 
 // A scalar load of the game's shaders and where its dwords go: vec4 `index`, from component `at`.
@@ -939,6 +940,71 @@ constexpr Load kPsLoadsRefM2d[] = {
     {false, 0x1044,4, cBlend,          0},
     {false, 0x109c,1, cPsFlags,        3},
 };
+// r_b1d / r_o1d[ag]: five vertex inputs, geometric normal, diffuse lighting only.
+constexpr Load kVsLoadsD[] = {
+    {true, 0x01c, 4, cOffset, 0},
+    {true, 0x020, 8, cWorld, 0},
+    {true, 0x024, 4, cWorld + 2, 0},
+    {true, 0x028, 1, cVsMisc, 2},
+    {true, 0x0b8, 4, cCamera, 0},
+    {true, 0x0dc, 4, cOffset2, 0},
+    {true, 0x118, 16, cProj + 3, 0},
+    {true, 0x168, 16, cFog, 0},
+    {true, 0x16c, 4, cFogDir, 0},
+    {true, 0x174, 4, cCamera, 0},
+    {true, 0x2cc, 4, cProj + 2, 0},
+    {true, 0x30c, 8, cProj, 0},
+    {true, 0x310, 1, cVsMisc, 1},
+    {true, 0x314, 2, cUvOffset, 0},
+};
+constexpr Load kPsLoadsD[] = {
+    {false, 0x014, 8, cDiffuseView, 0},
+    {false, 0x054, 1, cPsFlags, 0},
+    {false, 0x0f0, 4, cShadowMap, 0},
+    {false, 0x124, 4, cShadowMap, 0},
+    {false, 0x15c, 4, cTintBase, 0},
+    {false, 0x1b4, 4, cTint, 0},
+    {false, 0x208, 4, cPointPos, 0},
+    {false, 0x268, 4, cPointColor, 0},
+    {false, 0x2c0, 4, cPointPos + 1, 0},
+    {false, 0x320, 4, cPointColor + 1, 0},
+    {false, 0x378, 4, cPointPos + 2, 0},
+    {false, 0x3d8, 4, cPointColor + 2, 0},
+    {false, 0x430, 4, cPointPos + 3, 0},
+    {false, 0x490, 4, cPointColor + 3, 0},
+    {false, 0x4f4, 8, cDir, 0},
+    {false, 0x4f8, 8, cLight, 0},
+    {false, 0x510, 1, cMul + 1, 3},
+    {false, 0x514, 4, cMul, 0},
+    {false, 0x530, 4, cAmbientTint, 0},
+    {false, 0x59c, 4, cMaterial, 0},
+    {false, 0x5ac, 4, cAmbient, 0},
+    {false, 0x5b0, 4, cExposure, 0},
+    {false, 0x620, 1, cMisc, 0},
+    {false, 0x858, 8, cDistFog, 0},
+    {false, 0x8c0, 1, cMisc, 2},
+    {false, 0x8c4, 1, cMisc, 3},
+    {false, 0x8c8, 1, cMisc2, 2},
+    {false, 0x8cc, 4, cOutScale, 0},
+    {false, 0x8d0, 1, cPsFlags, 0},
+    {false, 0x940, 2, cPsFlags, 1},
+    {false, 0x944, 1, cMask0, 0},
+    {false, 0x948, 4, cMask1, 0},
+    {false, 0x94c, 1, cMask0, 1},
+    {false, 0x950, 1, cMask0, 2},
+    {false, 0x954, 1, cMisc2, 3},
+    {false, 0xa90, 2, cMask2, 0},
+    {false, 0xaf0, 2, cMask2, 2},
+    {false, 0xaf4, 1, cMask0, 3},
+    {false, 0xbbc, 4, cMask3, 0},
+    {false, 0xbc0, 2, cMask4, 0},
+    {false, 0xc2c, 1, cMask4, 2},
+    {false, 0xc90, 2, cMask5, 0},
+    {false, 0xc94, 1, cMask4, 3},
+    {false, 0xce0, 1, cPsFlags, 0},
+    {false, 0xcfc, 4, cBlend, 0},
+    {false, 0xd60, 1, cPsFlags, 3},
+};
 
 struct VertexShaderInfo {
     const char* name;
@@ -975,15 +1041,17 @@ const Variant kVariants[] = {
     {"r_o1du[ref].fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define GEOMETRIC_NORMAL\n", kPsLoadsRefOdu, count(kPsLoadsRefOdu), {0, 0x94, 0, 0x7dc, 0x7ec, 0x640, 0, 0xba0, 0xba8, 0}, 3, 0x608},
     {"r_p1dut[ref].fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define MATERIAL_ALPHA_TEST\n#define REFLECT_MATERIAL\n", kPsLoadsRefPdut, count(kPsLoadsRefPdut), {0x54, 0x16c, 0, 0x838, 0x830, 0x6f4, 0, 0xc60, 0xc84, 0}, 3, 0x67c},
     {"r_o1dut_m(vr)2d[ref].fxo", "#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define KEEP_PRIMARY_NORMAL\n#define DIFFUSE_DETAIL_ONLY\n", kPsLoadsRefM2d, count(kPsLoadsRefM2d), {0x54, 0x160, 0x7f0, 0x844, 0x894, 0x710, 0, 0xca8, 0xcb0, 0}, 4, 0x6a4},
+    {"r_o1d[ag].fxo", "#define SIMPLE_MATERIAL\n#define GEOMETRIC_NORMAL\n#define DIFFUSE_MATERIAL\n", kPsLoadsD, count(kPsLoadsD), {0, 0xd8, 0, 0x610, 0x590, 0, 0, 0x964, 0x96c, 0}, 5},
 };
-constexpr int kVariantCount = 15;
 
-constexpr VertexShaderInfo kVertexShaders[5] = {
+constexpr int kVariantCount = 16;
+constexpr VertexShaderInfo kVertexShaders[6] = {
     {"r_b1dst_a(vr)2d.fxo", "", kVsLoads, count(kVsLoads), {3, 4, 4, 4, 2, 2, 4}, 7},
     {"r_b1dst.fxo", "#define SIMPLE_MATERIAL\n", kVsLoadsSimple, count(kVsLoadsSimple), {3, 3, 4, 4, 2, 4, 0}, 6},
     {"r_b1dst[ref].fxo", "#define SIMPLE_MATERIAL\n#define REFLECT_MATERIAL\n", kVsLoadsRefSt, count(kVsLoadsRefSt), {3, 3, 4, 4, 2, 4, 0}, 6},
     {"r_b1dut[ref].fxo", "#define SIMPLE_MATERIAL\n#define REFLECT_MATERIAL\n#define REFLECT_VERTEX_U\n", kVsLoadsRefUt, count(kVsLoadsRefUt), {3, 4, 4, 4, 2, 4, 0}, 6},
     {"r_o1dut_a(vr)2d[ref].fxo", "#define REFLECT_MATERIAL\n#define REFLECT_VERTEX_U\n", kVsLoadsRefM2d, count(kVsLoadsRefM2d), {3, 4, 4, 4, 2, 2, 4}, 7},
+    {"r_b1d.fxo", "#define SIMPLE_MATERIAL\n#define DIFFUSE_MATERIAL\n", kVsLoadsD, count(kVsLoadsD), {3, 3, 4, 2, 4, 0, 0}, 5},
 };
 
 constexpr const char* kHeader = R"(#version 450
@@ -1080,19 +1148,37 @@ void main() {
         float cosine = -dot(cf(19).xyz, d) * inversesqrt(dot(d, d));
         float r = inversesqrt(f1.w + f2.w * cosine);
         vec3 phase = f1.xyz * (cosine * cosine + f3.w) + f2.xyz * (r * r * r);
+#ifdef DIFFUSE_MATERIAL
+        float dd = mac(d.z, d.z, mac(d.y, d.y, mul(d.x, d.x)));
+        float fd = mac(cf(19).z, d.z, mac(cf(19).y, d.y, mul(cf(19).x, d.x)));
+        cosine = mul(-inversesqrt(dd), fd);
+        r = inversesqrt(mac(f2.w, cosine, f1.w));
+        float rr = mul(mul(r, r), r);
+        float cc = mac(cosine, cosine, f3.w);
+        for (int i = 0; i < 3; ++i) {
+            float ph = mac(f2[i], rr, mul(f1[i], cc));
+            float amp = mul(f3[i], ph);
+            scatter[i] = mac(amp, -T[i], mul(f3.w, amp));
+        }
+#else
         scatter = (vec3(f3.w) - T) * (f3.xyz * phase);
+#endif
     }
     if ((flags & 0x40000u) != 0u) scatter = vec3(0.0);
     const float k = uintBitsToFloat(0x40008102u);
-#ifdef SIMPLE_MATERIAL
+#ifdef DIFFUSE_MATERIAL
+    vec4 n = fetch(1u), col = fetch(2u), b = fetch(4u);
+#elif defined(SIMPLE_MATERIAL)
     vec4 n = fetch(1u), t = fetch(2u), col = fetch(3u), b = fetch(5u);
 #else
     vec4 n = fetch(1u), t = fetch(2u), col = fetch(3u), b = fetch(6u);
 #endif
     // Rounded as the game's shader (each product, then each sum), as the prepass does.
     vec3 on = vec3(mac(k, n.x, -1.0), mac(k, n.y, -1.0), mac(k, n.z, -1.0));
+#ifndef DIFFUSE_MATERIAL
     vec3 ot = vec3(mac(k, t.x, -1.0), mac(k, t.y, -1.0), mac(k, t.z, -1.0));
     float handed = mac(k, t.w, -1.0);
+#endif
 #ifdef SIMPLE_MATERIAL
     float flatten = 0.0;
 #else
@@ -1105,7 +1191,9 @@ void main() {
     precise vec3 b1 = 0.25 * b0;
     precise vec3 baked = b1 * b1;
     vec4 uvo = cf(13);
-#ifdef SIMPLE_MATERIAL
+#ifdef DIFFUSE_MATERIAL
+    p0 = vec4(fetch(3u).xy + uvo.xy, 0.0, 0.0);
+#elif defined(SIMPLE_MATERIAL)
     p0 = vec4(fetch(4u).xy + uvo.xy, 0.0, 0.0);
 #else
     p0 = vec4(fetch(4u).xy + uvo.xy, fetch(5u).xy + uvo.zw);
@@ -1135,8 +1223,13 @@ void main() {
 #endif
     p4 = vec4(baked, 0.0);
     p5 = vec4(T, 0.0);
+#ifdef DIFFUSE_MATERIAL
+    p6 = vec4(lp, 0.0);
+    p7 = vec4(0.0);
+#else
     p6 = vec4(dot3(W[0], ot), dot3(W[1], ot), dot3(W[2], ot), handed);
     p7 = vec4(lp, 0.0);
+#endif
 }
 )";
 
@@ -1166,15 +1259,28 @@ float tone(float v, float exposure) {
     float den = x * (uintBitsToFloat(0x3e19999au) * x + 0.5) + uintBitsToFloat(0x3d75c290u);
     return sqrt(clamp(uintBitsToFloat(0x3fb0852eu) * (num / den) + uintBitsToFloat(0xbdbc49cau), 0.0, 1.0));
 }
+#ifdef DIFFUSE_MATERIAL
+float depthAt(vec2 uv) { vec4 m = cf(50); return mul(m.y, 1.0 / (m.x + at(7, uv).r)); }
+#else
 float depthAt(vec2 uv) { vec4 m = cf(50); return m.y / (at(7, uv).r + m.x); }
+#endif
 vec4 swz(vec4 v, uint s) { return vec4(v[s & 3u], v[(s >> 2) & 3u], v[(s >> 4) & 3u], v[(s >> 6) & 3u]); }
 vec4 half4(vec4 v) { return vec4(unpackHalf2x16(packHalf2x16(v.xy)), unpackHalf2x16(packHalf2x16(v.zw))); }
 void main() {
     uvec4 pf = cb.c[20];
     uint flags = pf.x;
+#ifdef DIFFUSE_MATERIAL
+    vec2 rasterToUV = cf(74).zw;
+#else
     vec2 rasterToUV = uintBitsToFloat(pf.yz);
+#endif
     vec2 uv0 = a0.xy, uv1 = a0.zw;
     vec2 ruv = gl_FragCoord.xy * rasterToUV;
+#ifdef DIFFUSE_MATERIAL
+    vec3 P = a6.xyz, gn = a3.xyz;
+    float ni = inversesqrt(mac(gn.z, gn.z, mac(gn.y, gn.y, mul(gn.x, gn.x))));
+    vec3 N = vec3(mul(gn.x, ni), mul(gn.y, ni), mul(gn.z, ni));
+#else
     vec3 P = a7.xyz, gn = a3.xyz, tg = a6.xyz;
     vec3 bt = cross(gn, tg) * a6.w;
 #ifdef SIMPLE_MATERIAL
@@ -1215,6 +1321,7 @@ void main() {
 #else
     vec3 N = normalize(tg * nxy.x + bt * nxy.y + gn * nz);
 #endif
+#endif
 
     float shR = 1.0, shG = 1.0, cover = 1.0, shR1 = 1.0, shG1 = 1.0;
     vec4 rm = cf(22);
@@ -1222,35 +1329,80 @@ void main() {
         vec4 g = at(1, ruv);
         shR = g.r, shG = g.g, cover = g.a;
         for (int i = 0; i < 2; ++i) {
+#ifdef DIFFUSE_MATERIAL
+            shR = mac(rm.x, shR, rm.y); shG = mac(shG, rm.z, rm.w);
+#else
             shR = rm.x * shR + rm.y; shG = shG * rm.z + rm.w;
+#endif
             if (i == 0) shR1 = shR, shG1 = shG; // [ref]'s reflection light takes the first remap
         }
     }
     vec3 tb = cf(23).xyz;
+#ifdef DIFFUSE_MATERIAL
+    vec3 dirTint;
+    for (int i = 0; i < 3; ++i) dirTint[i] = mac(1.0 - tb[i], mul(shR, shG), tb[i]);
+#else
     vec3 dirTint = tb + (1.0 - tb) * (shR * shG);
+#endif
     vec3 indTint = dirTint;
+#ifdef DIFFUSE_MATERIAL
+    if (has(flags, 8u)) {
+        vec4 tt = cf(24);
+        for (int i = 0; i < 3; ++i) indTint[i] = mul(tt.z + tt.w, mac(dirTint[i], tt.x, tt.y));
+    }
+#else
     if (has(flags, 8u)) { vec4 tt = cf(24); indTint = (tt.z + tt.w) * (dirTint * tt.x + vec3(tt.y)); }
+#endif
 
     vec3 point = vec3(0.0);
     for (int i = 0; i < 4; ++i) {
         if (!has(flags, 0x10000u << uint(i))) continue;
         vec4 pp = cf(25 + i), pc = cf(29 + i);
         vec3 d = P - pp.xyz;
+#ifdef DIFFUSE_MATERIAL
+        float d2 = mac(d.z, d.z, mac(d.y, d.y, mul(d.x, d.x)));
+        float nd = mac(d.z, N.z, mac(N.y, d.y, mul(N.x, d.x)));
+        float lam = clamp(mul(-inversesqrt(d2), nd), 0.0, 1.0);
+#else
         float d2 = dot(d, d);
         float lam = clamp(-dot(N, d) * inversesqrt(d2), 0.0, 1.0);
+#endif
         if (lam > 0.0) {
             float o = max(0.0, sqrt(d2) - pc.w);
+#ifdef DIFFUSE_MATERIAL
+            float att = clamp(mac(uintBitsToFloat(0x3f808102u),
+                                  1.0 / mac(mul(pp.w, o), o, 1.0),
+                                  uintBitsToFloat(0xbb810205u)), 0.0, 1.0);
+            float weight = mul(lam, att);
+            for (int j = 0; j < 3; ++j)
+                point[j] = i == 0 ? mul(pc[j], weight) : mac(pc[j], weight, point[j]);
+#else
             float att = clamp(uintBitsToFloat(0x3f808102u) / (1.0 + pp.w * o * o) + uintBitsToFloat(0xbb810205u), 0.0, 1.0);
             point += pc.rgb * (lam * att);
+#endif
         }
     }
+#ifdef DIFFUSE_MATERIAL
+    vec4 camv = cf(75);
+#else
 
     vec4 camv = cf(33);
+#endif
     vec3 cs = P - camv.xyz;
+#ifdef DIFFUSE_MATERIAL
+    float cd2 = mac(cs.z, cs.z, mac(cs.y, cs.y, mul(cs.x, cs.x)));
+#else
     float cd2 = dot(cs, cs);
+#endif
     vec3 away = cs * inversesqrt(cd2);
     vec3 d0 = cf(41).xyz, d1 = cf(42).xyz;
+#ifdef DIFFUSE_MATERIAL
+    float nl0 = min(1.0, max(0.0, -mac(d0.z, N.z, mac(d0.y, N.y, mul(d0.x, N.x)))));
+    float nl1 = min(1.0, max(0.0, -mac(d1.z, N.z, mac(d1.y, N.y, mul(d1.x, N.x)))));
+#else
     float nl0 = clamp(-dot(d0, N), 0.0, 1.0), nl1 = clamp(-dot(d1, N), 0.0, 1.0);
+#endif
+#ifndef DIFFUSE_MATERIAL
     vec3 h0 = away + d0, h1 = away + vec3(0.0, uintBitsToFloat(0xbe99999au), 0.0);
     vec4 m0 = cf(37), m1 = cf(38), mul0 = cf(34), mul1 = cf(35), misc = cf(36);
     float lobe0 = exp2(m1.w * log2(clamp(-dot(N, h0) * inversesqrt(dot(h0, h0)), 0.0, 1.0)));
@@ -1353,13 +1505,50 @@ void main() {
 
     float exposure = cf(39).x;
     vec3 tc = vec3(tone(lin.r, exposure), tone(lin.g, exposure), tone(lin.b, exposure));
+#else
+    vec4 mul0 = cf(34), misc = cf(36);
+    vec4 base = at(4, uv0);
+    vec3 screen = at(3, ruv).rgb;
+    float invExposure = 1.0 / cf(39).z;
+    float blendBase = mac(1.0 - misc.x, shG, misc.x);
+    vec3 tc;
+    // new_ps 0x500..0x7f0: products before multiply-adds, exposure before lighting.
+    for (int i = 0; i < 3; ++i) {
+        float ld = mul(mul(cf(45)[i], dirTint[i]), nl0);
+        ld = mac(mul(cf(46)[i], shG), nl1, ld);
+        float b2 = mul(base[i], base[i]);
+        float ambient = mac(mul(cf(35).w, cf(43)[i]), b2, cf(40)[i]);
+        float dc = mul(cf(37)[i], mul0[i]);
+        float direct = mul(mul(a1[i], cover), mac(dc, ld, ambient));
+        float indirect = mul(mul(a5[i], dc), a4[i] + point[i]);
+        indirect = mac(mul(screen[i], invExposure), shG, indirect);
+        indirect = mul(mul(cover, indTint[i]), indirect);
+        direct = mac(blendBase, indirect, direct);
+        float tx = mul(mul(mul(cf(39).x, b2), direct), 2.0);
+        float den = mac(uintBitsToFloat(0x3e19999au), tx, 0.5);
+        den = mac(tx, den, uintBitsToFloat(0x3d75c290u));
+        float num = mac(uintBitsToFloat(0x3e19999au), tx, uintBitsToFloat(0x3d4ccccdu));
+        num = mac(num, tx, uintBitsToFloat(0x3b83126fu));
+        float curve = mul(1.0 / den, num);
+        tc[i] = sqrt(clamp(mac(uintBitsToFloat(0x3fb0852eu), curve,
+                               uintBitsToFloat(0xbdbc49cau)), 0.0, 1.0));
+    }
+#endif
     vec3 color = tc;
     float fogAmount = 0.0;
     if (has(flags, 4u)) color += a2.rgb;
     vec4 df0 = cf(47), df1 = cf(48);
     if (has(flags, 0x400000u) && !has(flags, 4u)) {
+#ifdef DIFFUSE_MATERIAL
+        fogAmount = clamp(mac(df1.z, sqrt(cd2), df1.w), 0.0, 1.0);
+#else
         fogAmount = clamp(df1.z * sqrt(cd2) + df1.w, 0.0, 1.0);
+#endif
+#ifdef DIFFUSE_MATERIAL
+        for (int i = 0; i < 3; ++i) color[i] = mac(fogAmount, -tc[i], mac(df0[i], fogAmount, tc[i]));
+#else
         color = tc * (1.0 - fogAmount) + df0.xyz * fogAmount;
+#endif
     }
     float alpha = misc.z * misc.w * mul0.w * base.a;
     if (!has(flags, 8u)) { vec4 os = cf(49); color *= os.xyz; alpha *= os.w; }
@@ -1371,32 +1560,86 @@ void main() {
         float z = depthAt(ruv);
         vec3 sn = 2.0 * at(8, ruv).rgb - 1.0;
         float dStart = k1.x, dNear = k1.y, dEnd = k1.z, minRadius = k1.w;
+#ifdef DIFFUSE_MATERIAL
+        float radiusFade = clamp(mac(-(z - dStart), 1.0 / (dEnd - dStart), 1.0), 0.0, 1.0);
+#else
         float radiusFade = clamp(1.0 - (z - dStart) / (dEnd - dStart), 0.0, 1.0);
+#endif
+#ifdef DIFFUSE_MATERIAL
+        float ir = 1.0 / (dStart - dNear);
+        float nearRamp = clamp(mac(-dNear, ir, mul(z, ir)), 0.0, 1.0);
+#else
         float nearRamp = clamp((z - dNear) / (dStart - dNear), 0.0, 1.0);
+#endif
         vec2 sdir = rasterToUV * vec2(sn.x, -sn.y);
         float nr = nearRamp * max(minRadius, k0.z * radiusFade);
         vec3 np = at(8, ruv + sdir * nr).rgb, nm = at(8, ruv - sdir * nr).rgb;
+#ifdef DIFFUSE_MATERIAL
+        float snsum = (sn.x + sn.y) + sn.z;
+        float rp = mul(mul(np.x, sn.x), 2.0);
+        rp = mac(2.0, mul(np.y, sn.y), rp);
+        rp = mac(2.0, mul(np.z, sn.z), rp) - snsum;
+        float rmn = mul(mul(nm.x, sn.x), 2.0);
+        rmn = mac(2.0, mul(nm.y, sn.y), rmn);
+        rmn = mac(2.0, mul(nm.z, sn.z), rmn) - snsum;
+#else
         float rp = dot(sn, 2.0 * np - 1.0), rmn = dot(sn, 2.0 * nm - 1.0);
+#endif
         float normalEdge = 0.0, depthEdge = 0.0, facingMask = 0.0;
         const float eps = uintBitsToFloat(0x3b808081u);
         if (has(mf, 4u)) {
+#ifdef DIFFUSE_MATERIAL
+            float ag = mac(0.5, rmn, 0.5);
+            ag = mul(mac(rp, ag, ag), 0.5);
+#else
             float ag = 0.25 * (rp + 1.0) * (rmn + 1.0);
+#endif
             float ag2 = ag * ag;
+#ifdef DIFFUSE_MATERIAL
+            float passed = ag2 + eps >= mac(-k2.y, nearRamp, 1.0) ? 1.0 : 0.0;
+#else
             float passed = ag2 + eps >= 1.0 - k2.y * nearRamp ? 1.0 : 0.0;
+#endif
+#ifdef DIFFUSE_MATERIAL
+            float sup = mac(1.0 - k2.x, clamp(passed + ag2, 0.0, 1.0), k2.x);
+            normalEdge = mac(-nearRamp, sup, nearRamp);
+#else
             float sup = k2.x + (1.0 - k2.x) * clamp(passed + ag2, 0.0, 1.0);
             normalEdge = nearRamp * (1.0 - sup);
+#endif
         }
         if (has(mf, 8u)) {
             float dr = nearRamp * max(minRadius, k2.z * radiusFade);
             float dp = depthAt(ruv + sdir * dr), dm = depthAt(ruv - sdir * dr);
+#ifdef DIFFUSE_MATERIAL
+            float resp = mac(-0.5, (mul(-2.0, z) + dp) + dm, 1.0);
+            float passed = resp + eps >= mac(-k0.w, nearRamp, 1.0) ? 1.0 : 0.0;
+            float sup = mac(1.0 - k2.w, clamp(passed + resp, 0.0, 1.0), k2.w);
+            depthEdge = mac(-nearRamp, sup, nearRamp);
+#else
             float resp = 1.0 - 0.5 * (-2.0 * z + dp + dm);
             float passed = resp + eps >= 1.0 - k0.w * nearRamp ? 1.0 : 0.0;
             float sup = k2.w + (1.0 - k2.w) * clamp(passed + resp, 0.0, 1.0);
             depthEdge = nearRamp * (1.0 - sup);
+#endif
         }
         if (has(mf, 2u)) {
+#ifdef DIFFUSE_MATERIAL
+            float facing = clamp(-mac(away.z, N.z, mac(away.y, N.y, mul(N.x, away.x))), 0.0, 1.0);
+#else
             float facing = clamp(-dot(N, away), 0.0, 1.0);
+#endif
             float far_ = k3.x, near_ = min(k3.y, far_ + uintBitsToFloat(0xba83126fu));
+#ifdef DIFFUSE_MATERIAL
+            float invRange = 1.0 / (far_ - near_);
+            float ramp = clamp(mac(near_, -invRange, mul(z, invRange)), 0.0, 1.0);
+            float width = mac(ramp, k4.y - k3.z, k3.z);
+            float nf = clamp(mul(1.0 / mac(nearRamp, width, eps), facing + eps), 0.0, 1.0);
+            float fs = clamp(mac(mul(1.0 - k4.x, nf), nf, k4.x), 0.0, 1.0);
+            float cand = mac(nearRamp, -fs, nearRamp);
+            float thr = mac(k4.z - k3.w, ramp, k3.w);
+            float resp = mac(-rp, rmn, 1.0);
+#else
             float ramp = clamp((z - near_) / (far_ - near_), 0.0, 1.0);
             float width = k3.z + ramp * (k4.y - k3.z);
             float nf = clamp((facing + eps) / (nearRamp * width + eps), 0.0, 1.0);
@@ -1404,18 +1647,28 @@ void main() {
             float cand = nearRamp * (1.0 - fs);
             float thr = k3.w + ramp * (k4.z - k3.w);
             float resp = 1.0 - rp * rmn;
+#endif
             facingMask = thr > 0.0 ? cand * (resp >= thr ? 1.0 : 0.0) : cand;
         }
         mask = max(depthEdge, max(facingMask, normalEdge));
+#ifdef DIFFUSE_MATERIAL
+        mask = mul(max(1.0 - k5.y, clamp(mac(-(z - dStart), 1.0 / (k5.x - dStart), 1.0), 0.0, 1.0)), mask);
+        mask = mac(mask, -fogAmount, mask);
+#else
         mask *= max(1.0 - k5.y, clamp(1.0 - (z - dStart) / (k5.x - dStart), 0.0, 1.0));
         mask *= 1.0 - fogAmount;
+#endif
         mask *= k4.w <= mask ? 1.0 : 0.0;
     }
 
     float alpha1 = alpha;
     if (has(flags, 0x800000u)) {
         vec4 bl = cf(56);
+#ifdef DIFFUSE_MATERIAL
+        for (int i = 0; i < 3; ++i) color[i] = mac(-bl[i], bl.w, mac(bl.w, color[i], bl[i]));
+#else
         color = bl.xyz + bl.w * color - bl.xyz * bl.w;
+#endif
         mask *= bl.w;
         alpha1 = alpha * bl.w;
     }
