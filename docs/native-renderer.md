@@ -249,3 +249,25 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   detail texture to the diffuse only (`DIFFUSE_DETAIL_ONLY`, in the shader's own operation order).
   Codex drafted it against `r_o1dst_m(vr)2ds` and `r_o1dut[ref]`.
 - Compare runs: both within 1/255, depth exact.
+
+### Alpha-tested hair, reflective characters, eyes, a plain stage material
+
+- Character pass, roles 6 to 8:
+  - `sm_p1dzt[hair][cmask]`
+  - `s_o1dzt[ref]` (an environment cube, sampled at (-x, y, z))
+  - `s_o1dzt[eye][aref]` (its own skinning vertex shader with the eye's view terms)
+
+  The cmask hair also multiplies its squared base colour by PSV[0x30] 0x110. Role 4 was missing
+  that too, which made hair ~12% too bright where the tint was 0.78.
+- Material pass, role 16: `r_b1d` with `r_o1d[ag]`, a material with no normal map or specular.
+- Compare mode: each role now has its own draw budget, 8 a frame, so roles drawn late in the
+  frame are compared too. There is room for 24 roles.
+- Compare runs:
+  - Eyes are exact.
+  - Hair is within 2/255.
+  - Role 16 is within 1/255.
+  - `s_o1dzt[ref]` and the material role 15 are within 1/255, except on a few bright
+    reflection pixels: up to ~40/255 and ~12/255, from the cube's sampling.
+- Codex drafted these. Its full-file drafts are merged keeping the existing code. One draft
+  rewrote a verified table, wrongly, and was caught by checking that the older variants'
+  preprocessed GLSL is unchanged.
