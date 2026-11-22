@@ -5510,6 +5510,15 @@ void main() {
             nd.writeMask |= mask << (i * 4);
             if ((r.ctx[reg::kCbBlendControl + i] >> 30) & 1) nd.blend = true;
         }
+        {
+            GraphicsState bs{};
+            for (uint32_t i = 0; i < nd.colorCount; ++i) bs.colorFormats[i] = uint32_t(nd.color[i].format), bs.blend[i] = r.ctx[reg::kCbBlendControl + i];
+            bs.writeMasks = nd.writeMask;
+            VkFormat formats[8];
+            uint32_t n = 0;
+            blendState(bs, nd.blendState, formats, n);
+            std::memcpy(nd.blendConstants, &r.ctx[reg::kCbBlendRed], 16);
+        }
         const uint32_t depthControl = r.ctx[reg::kDbDepthControl];
         if (const uint32_t zInfo = r.ctx[reg::kDbZInfo]; zInfo & 3) {
             const bool stencil = r.ctx[reg::kDbStencilInfo] & 1;

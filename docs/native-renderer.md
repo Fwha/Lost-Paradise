@@ -226,3 +226,16 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   exact. A few thousand pixels of the edge mask (target 1) differ by up to ~115/255: as with the
   stage, it is a threshold and a sampled-offset test that rounding can move. Draws of
   `sm_o1dzt` with other vertex shaders (~4%) are still left to the translated path.
+
+### Characters: hair
+
+- The character pass draws hair: `s_b1dt[hair]` with `sm_b1ht[hair][offset][dedit]` and
+  `sm_b1dzt[hair][cmask]` (~100 draws a frame). Two anisotropic lookup lobes take the place of
+  the reflected-vector specular. The hair vertex shader has its own constant bindings and passes
+  the specular shift as interpolants. The alpha test is done with demote.
+- Every hair draw blends or marks stencil. Native draws now carry their targets' blend state and
+  blend constants, as the renderer converts them for the translated pipeline
+  (`native::Draw::blendState`, `blendConstants`). The character pass draws with those, and with the
+  translated draw's stencil state.
+- Compare run: `sm_b1ht` within 1/255. `sm_b1dzt[hair][cmask]` is within 4/255 on a few thousand
+  pixels of a frame's blended layers.
