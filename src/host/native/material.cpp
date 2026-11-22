@@ -2073,7 +2073,6 @@ public:
         if (d.depthBias) return decline(role, "a polygon offset");
         if (d.colorCount != 2 || !d.color[0].view || !d.color[1].view || !d.depth.view)
             return decline(role, "not two colour targets with depth");
-        if (d.blend || d.stencil) return decline(role, "blending or stencil");
         if (d.instances != 1) return decline(role, "instanced");
         if (d.primitive != 4) return decline(role, "not a triangle list");
         uint32_t c[kConstants][4] = {};
@@ -2175,9 +2174,18 @@ public:
         std::memcpy(imgs.data(), images, sizeof images);
         std::array<VkDescriptorBufferInfo, 8> bs;
         std::memcpy(bs.data(), bufs, sizeof bufs);
+        std::array<uint32_t, 6> st;
+        for (int i = 0; i < 2; ++i) st[i * 3] = d.stencilRef[i], st[i * 3 + 1] = d.stencilCompare[i], st[i * 3 + 2] = d.stencilWrite[i];
         gpu.record([pipe, layout = layout_, bs, imgs, cube, vp, sc, index, firstIndex, indexed = d.indexed, indexType = d.indexType, count = d.count,
-                    pushSet = gpu.pushDescriptorSet()](VkCommandBuffer cmd) {
+                    st, bc = std::to_array(d.blendConstants), pushSet = gpu.pushDescriptorSet()](VkCommandBuffer cmd) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            vkCmdSetBlendConstants(cmd, bc.data());
+            for (int i = 0; i < 2; ++i) {
+                const VkStencilFaceFlags face = i ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
+                vkCmdSetStencilReference(cmd, face, st[i * 3]);
+                vkCmdSetStencilCompareMask(cmd, face, st[i * 3 + 1]);
+                vkCmdSetStencilWriteMask(cmd, face, st[i * 3 + 2]);
+            }
             vkCmdSetViewport(cmd, 0, 1, &vp);
             vkCmdSetScissor(cmd, 0, 1, &sc);
             VkWriteDescriptorSet w[10]{};
@@ -2311,9 +2319,25 @@ private:
 
     VkPipeline pipeline(Gpu& gpu, int role, const Draw& d) {
         const VkPipelineDepthStencilStateCreateInfo& z = d.depthStencil;
+        // Blending and stencil as the translated pipeline has them.
+        uint64_t blendKey = 0, stencilKey = 0;
+        for (int i = 0; i < 2; ++i) {
+            const VkPipelineColorBlendAttachmentState& b = d.blendState[i];
+            const uint64_t v = uint64_t(b.blendEnable) | uint64_t(b.srcColorBlendFactor) << 1 | uint64_t(b.dstColorBlendFactor) << 6 |
+                               uint64_t(b.colorBlendOp) << 11 | uint64_t(b.srcAlphaBlendFactor) << 14 |
+                               uint64_t(b.dstAlphaBlendFactor) << 19 | uint64_t(b.alphaBlendOp) << 24;
+            blendKey |= v << (32 * i);
+        }
+        const bool stencil = d.stencil && d.hasStencil && z.stencilTestEnable;
+        if (stencil)
+            for (int i = 0; i < 2; ++i) {
+                const VkStencilOpState& o = i ? z.back : z.front;
+                stencilKey |= uint64_t(o.failOp | o.passOp << 3 | o.depthFailOp << 6 | o.compareOp << 9) << (16 * i);
+            }
+        stencilKey |= uint64_t(stencil) << 40;
         const auto key = std::make_tuple(role, int(d.color[0].format), int(d.color[1].format), int(d.writeMask & 0xFF), int(d.depth.format),
                                          bool(d.hasStencil), z.depthTestEnable, z.depthWriteEnable, int(z.depthCompareOp),
-                                         int(d.cull), int(d.frontFace));
+                                         int(d.cull), int(d.frontFace), blendKey, stencilKey);
         // Most draws repeat the last pipeline on their recorder thread: no lock, no lookup.
         thread_local std::remove_const_t<decltype(key)> lastKey{};
         thread_local VkPipeline lastPipe = VK_NULL_HANDLE;
@@ -2374,15 +2398,18 @@ private:
         ds.depthTestEnable = z.depthTestEnable;
         ds.depthWriteEnable = z.depthWriteEnable;
         ds.depthCompareOp = z.depthCompareOp;
-        VkPipelineColorBlendAttachmentState att[2]{};
+        if (stencil) ds.stencilTestEnable = VK_TRUE, ds.front = z.front, ds.back = z.back;
+        VkPipelineColorBlendAttachmentState att[2] = {d.blendState[0], d.blendState[1]};
         att[0].colorWriteMask = d.writeMask & 0xF;
         att[1].colorWriteMask = (d.writeMask >> 4) & 0xF;
         VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         cb.attachmentCount = 2;
         cb.pAttachments = att;
-        const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        const VkDynamicState dyn[6] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+                                       VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+                                       VK_DYNAMIC_STATE_STENCIL_WRITE_MASK};
         VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dy.dynamicStateCount = 2;
+        dy.dynamicStateCount = 6;
         dy.pDynamicStates = dyn;
         const VkFormat colors[2] = {d.color[0].format, d.color[1].format};
         VkPipelineRenderingCreateInfo rinfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
@@ -2407,7 +2434,7 @@ private:
         return out;
     }
 
-    std::map<std::tuple<int, int, int, int, int, bool, VkBool32, VkBool32, int, int, int>, VkPipeline> pipes_;
+    std::map<std::tuple<int, int, int, int, int, bool, VkBool32, VkBool32, int, int, int, uint64_t, uint64_t>, VkPipeline> pipes_;
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     std::atomic<bool> logged_[kVariantCount + 1] = {};
