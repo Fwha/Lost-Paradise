@@ -37,7 +37,9 @@ enum : uint32_t {
     cTexScale = 214,
     cFetch = 215,       // eleven input descriptions
     cPalette = 226,     // four independent instruction descriptions
-    kConstants = 230,
+    cVsTexScale = 230, // ten independent sample coordinate scales
+    kConstants = 240,
+    kVsTextures = 10,
     kFetches = 11,
     kPalettes = 4,
 };
@@ -208,21 +210,22 @@ struct Variant {
     std::span<const Load> loads;
     std::array<uint32_t, kPalettes> palettePc;
     uint32_t material, flags;
+    std::array<uint32_t, kVsTextures> texturePc;
 };
 
 constexpr Variant kVariants[] = {
     {"vs_ptc_bill_xx_xx_x_x_x_x.vso", "#define PTC_XX\n",
-     kVsXX, {0x56c,0x574,0x57c,0x58c}, cV30,cV60},
+     kVsXX, {0x56c,0x574,0x57c,0x58c}, cV30,cV60, {0x128,0x130,0x140,0x150,0x24c,0x254,0x3f8,0x400,0xccc,0xcd4}},
     {"vs_ptc_bill_xx_xx_x_x_x_n.vso", "#define PTC_XN\n#define DISTANCE_ALPHA\n",
-     kVsXN, {0x56c,0x574,0x57c,0x58c}, cV30,cV60},
+     kVsXN, {0x56c,0x574,0x57c,0x58c}, cV30,cV60, {0x128,0x130,0x140,0x150,0x24c,0x254,0x3f8,0x400,0xcd4,0xcdc}},
     {"vs_ptc_bill_xx_xx_f_x_x_n.vso",
      "#define PTC_FN\n#define VELOCITY_ALIGNED\n#define DISTANCE_ALPHA\n",
-     kVsFN, {0x63c,0x644,0x64c,0x65c}, cV30,cV60},
+     kVsFN, {0x63c,0x644,0x64c,0x65c}, cV30,cV60, {0x128,0x130,0x140,0x150,0x258,0x260,0x4c8,0x4d0,0xf28,0xf30}},
     {"vs_ptc_bill_xx_xx_f_x_x_x.vso", "#define PTC_FX\n#define VELOCITY_ALIGNED\n",
-     kVsFX, {0x63c,0x644,0x64c,0x65c}, cV30,cV60},
+     kVsFX, {0x63c,0x644,0x64c,0x65c}, cV30,cV60, {0x128,0x130,0x140,0x150,0x258,0x260,0x4c8,0x4d0,0xf18,0xf20}},
     {"vs_ptc_bill_xx_lv_x_x_x_n.vso",
      "#define PTC_LV\n#define VERTEX_LIGHTING\n#define DISTANCE_ALPHA\n",
-     kVsLV, {0x594,0x59c,0x5a4,0x5b4}, cV40,cV70},
+     kVsLV, {0x594,0x59c,0x5a4,0x5b4}, cV40,cV70, {0x128,0x130,0x140,0x150,0x258,0x260,0x420,0x428,0xd6c,0xd74}},
 };
 
 constexpr const char* kHeader = R"(#version 450
@@ -274,6 +277,7 @@ layout(set=0,binding=0,std430) readonly buffer FetchBuffer {
 layout(set=0,binding=1,std430) readonly buffer PaletteBuffer {
     uint w[];
 } paletteData[4];
+layout(set=0,binding=4) uniform sampler2D animationImage[10];
 
 layout(location=0) out vec4 p0;
 layout(location=1) out vec4 p1;
@@ -349,6 +353,79 @@ vec4 palette(uint b,uint index) {
                                 paletteWord(b,i+2u),paletteWord(b,i+3u)));
 }
 
+// Each image_sample_lz has its own PC, sampler and normalized-coordinate scale.
+vec4 animationSample(uint i,vec2 coordinate) {
+    vec2 scale=uintBitsToFloat(cb.c[230+int(i)].xy);
+    coordinate=mul(coordinate,scale);
+    switch (i) {
+    case 0u: return textureLod(animationImage[0],coordinate,0.0);
+    case 1u: return textureLod(animationImage[1],coordinate,0.0);
+    case 2u: return textureLod(animationImage[2],coordinate,0.0);
+    case 3u: return textureLod(animationImage[3],coordinate,0.0);
+    case 4u: return textureLod(animationImage[4],coordinate,0.0);
+    case 5u: return textureLod(animationImage[5],coordinate,0.0);
+    case 6u: return textureLod(animationImage[6],coordinate,0.0);
+    case 7u: return textureLod(animationImage[7],coordinate,0.0);
+    case 8u: return textureLod(animationImage[8],coordinate,0.0);
+    default: return textureLod(animationImage[9],coordinate,0.0);
+    }
+}
+void animationFrame(float phase,out float next,out float previous,out float blend) {
+    float frames=F(M,0x94);
+    float frame=floor(mul(frames,phase));
+    float inverseWidth=1.0/F(M,0x90);
+    next=mul(inverseWidth,add(1.5,frame));
+    previous=mul(inverseWidth,add(0.5,frame));
+    blend=mac(frames,phase,-frame);
+}
+uint atlasUint(float x) {
+    if (isnan(x) || x<=0.0) return 0u;
+    if (x>=4294967296.0) return 0xffffffffu;
+    return uint(x);
+}
+uint atlasInt(float x) {
+    if (isnan(x)) return 0u;
+    if (x>=2147483648.0) return 0x7fffffffu;
+    if (x<=-2147483648.0) return 0x80000000u;
+    return uint(int(x));
+}
+// The reciprocal/mul-hi/carry sequences implement unsigned div/rem.
+// Compare masks are consumed in the same lane; no cross-lane data is read.
+// The zero-divisor quotient is all ones, and subtraction leaves the dividend.
+uint atlasDivide(uint a,uint b) {
+    if (b==0u) return 0xffffffffu;
+    return a/b;
+}
+uint atlasRemainder(uint a,uint b) {
+    return a-atlasDivide(a,b)*b;
+}
+vec4 atlasCoordinates(vec4 atlas,vec2 uv,uint age,float t) {
+    uint x=atlasUint(atlas.x);
+    uint y=atlasUint(atlas.y);
+    uint z=atlasUint(atlas.z);
+    uint w=atlasUint(atlas.w);
+    x+=atlasDivide(age,atlasInt(F(M,0x08)))*atlasInt(F(M,0x70));
+    x=atlasRemainder(x,atlasInt(F(M,0x10)));
+    y+=x;
+    uint q0=atlasDivide(y,atlasInt(F(M,0x18)));
+    uint r0=y-q0*atlasInt(F(M,0x18));
+    z+=atlasDivide(age,atlasInt(F(M,0x0c)))*atlasInt(F(M,0x74));
+    z=atlasRemainder(z,atlasInt(F(M,0x14)));
+    w+=z;
+    uint q1=atlasDivide(w,atlasInt(F(M,0x1c)));
+    uint r1=w-q1*atlasInt(F(M,0x1c));
+    vec4 base=vec4(add(uv.x,fract(atlas.x)),add(fract(atlas.y),uv.y),
+                   add(uv.x,fract(atlas.z)),add(fract(atlas.w),uv.y));
+    base.x=mac(F(M,0x30),t,base.x);
+    base.y=mac(t,F(M,0x34),base.y);
+    base.z=mac(F(M,0x38),t,base.z);
+    base.w=mac(F(M,0x3c),t,base.w);
+    return vec4(mac(F(M,0x20),float(r0),base.x),
+                mac(F(M,0x24),float(q0),base.y),
+                mac(float(r1),F(M,0x28),base.z),
+                mac(float(q1),F(M,0x2c),base.w));
+}
+
 // q*p*conjugate(q), retaining the instruction boundaries and accumulation
 // order. The input quaternion is not implicitly normalized.
 vec3 rotatePoint(vec4 q,vec3 p,vec3 origin) {
@@ -377,6 +454,30 @@ vec3 rotatePoint(vec4 q,vec3 p,vec3 origin) {
     r.y=mac(x,q.z,r.y);
     r.z=mac(w,q.z,r.z);
     return r;
+}
+vec3 rotateAnimation(vec4 q,vec3 p) {
+    float x=mul(p.x,q.w);
+    float z=mul(-q.y,p.x);
+    float y=mac(-q.z,p.y,x);
+    float w=mul(p.x,q.z);
+    float scalar=mul(p.x,q.x);
+    z=mac(q.x,p.y,z);
+    w=mac(q.w,p.y,w);
+    y=mac(q.y,p.z,y);
+    scalar=mac(q.y,p.y,scalar);
+    z=mac(q.w,p.z,z);
+    w=mac(p.z,-q.x,w);
+    float rx=mul(q.w,y);
+    float ry=mul(q.w,w);
+    float rz=mul(q.w,z);
+    scalar=mac(q.z,p.z,scalar);
+    rx=mac(q.x,scalar,rx);
+    ry=mac(q.x,-z,ry);
+    rz=mac(w,q.x,rz);
+    rx=mac(z,q.y,rx);
+    ry=mac(scalar,q.y,ry);
+    rz=mac(q.y,-y,rz);
+    return vec3(mac(-w,q.z,rx),mac(q.z,y,ry),mac(q.z,scalar,rz));
 }
 vec3 rotateVector(vec4 q,vec3 p) {
     float x=mul(q.w,p.x);
@@ -457,6 +558,8 @@ void main() {
     vec4 sizeAngle=fetch(9u);
     vec3 variation=fetch(10u).xyz;
 
+    vec4 atlas=fetch(8u);
+
     // The atlas input at slot 8 is unused in the accepted flag configuration.
     // Keep the fetch contract identical across all five variants.
     p0=p1=p2=p3=vec4(0.0);
@@ -471,6 +574,8 @@ void main() {
 
     uint flags=U(Flags,0);
     float t=float(age);
+    float normalizedAge=mul(t,1.0/float(life));
+    vec3 animationVariation=vec3(0.0);
     float halfTime=mul(mac(t,t,t),0.5);
     int ramp=int(F(M,0x80));
     float rampF=float(ramp);
@@ -493,6 +598,27 @@ void main() {
     vec3 local=mac(velocity,travel,start.xyz);
     vec3 sourceOrigin=F3(M,0x40);
     vec4 sourceRotation=F4(M,0x50);
+    if (has(flags,0x20u)) {
+        float phase=float(int(uint(int(F(M,0xa4)))-uint(age)));
+        phase=mac(phase,1.0/float(int(F(M,0x00))),B(0x461c4000u));
+        phase=fract(phase);
+        float next,previous,blend;
+        animationFrame(phase,next,previous,blend);
+        vec4 qa=animationSample(0u,vec2(next,0.25));
+        vec4 qb=animationSample(1u,vec2(previous,0.25));
+        vec3 pa=animationSample(2u,vec2(next,B(0x3daaaaabu))).xyz;
+        vec3 pb=animationSample(3u,vec2(previous,B(0x3daaaaabu))).xyz;
+        sourceRotation=mac(sub(qa,qb),blend,qb);
+        sourceRotation=mul(inversesqrt(D4(sourceRotation,sourceRotation)),sourceRotation);
+        sourceOrigin=mac(sub(pa,pb),blend,pb);
+    }
+    if (has(flags,0x40u)) {
+        float next,previous,blend;
+        animationFrame(normalizedAge,next,previous,blend);
+        vec3 a=animationSample(4u,vec2(next,B(0x3ed55555u))).xyz;
+        vec3 b=animationSample(5u,vec2(previous,B(0x3ed55555u))).xyz;
+        animationVariation=mac(blend,sub(a,b),b);
+    }
     vec3 moved=rotatePoint(sourceRotation,local,sourceOrigin);
     moved=mac(halfTime,accelerationLife.xyz,moved);
 
@@ -503,6 +629,16 @@ void main() {
     vec3 derivative=rotateVector(sourceRotation,mul(velocity,rate));
     derivative=mac(t,accelerationLife.xyz,derivative);
 #endif
+
+    if (has(flags,0x200u)) {
+        float next,previous,blend;
+        animationFrame(normalizedAge,next,previous,blend);
+        vec4 a=animationSample(6u,vec2(next,B(0x3f6aaaabu)));
+        vec4 b=animationSample(7u,vec2(previous,B(0x3f6aaaabu)));
+        vec4 q=mac(sub(a,b),blend,b);
+        q=mul(inversesqrt(D4(q,q)),q);
+        moved=rotateAnimation(q,moved);
+    }
 
     vec3 scale=F3(M,0x60);
     vec3 scaled=mul(scale,moved);
@@ -547,8 +683,9 @@ void main() {
     }
 
     // Animation-texture variations are zero in the accepted configuration.
-    sizeAngle.x=mac(0.0,variation.x,sizeAngle.x);
-    sizeAngle.y=mac(0.0,variation.y,sizeAngle.y);
+
+    sizeAngle.x=mac(animationVariation.x,variation.x,sizeAngle.x);
+    sizeAngle.y=mac(animationVariation.y,variation.y,sizeAngle.y);
     float cornerX=mul(corner.x,sizeAngle.x);
     float cornerY=mul(corner.y,sizeAngle.y);
 
@@ -563,9 +700,9 @@ void main() {
 
     float angle=add(F(M,0xfc),sizeAngle.z);
 #ifdef PTC_XX
-    angle=mac(0.0,variation.z,angle);
+    angle=mac(animationVariation.z,variation.z,angle);
 #else
-    angle=mac(variation.z,0.0,angle);
+    angle=mac(variation.z,animationVariation.z,angle);
 #endif
     angle=mac(sizeAngle.w,t,angle);
     angle=mul(B(0x3e22f983u),angle);
@@ -626,6 +763,18 @@ void main() {
         clip[i]=mac(row.w,view.w,v);
     }
 
+    vec4 atlasUv=vec4(uv.xy,uv.xy);
+    if (has(flags,0x100u))
+        atlasUv=atlasCoordinates(atlas,uv.xy,uint(age),t);
+
+    if (has(flags,0x80u)) {
+        float next,previous,blend;
+        animationFrame(normalizedAge,next,previous,blend);
+        vec4 a=animationSample(8u,vec2(next,B(0x3f400000u)));
+        vec4 b=animationSample(9u,vec2(previous,B(0x3f400000u)));
+        colour=mac(blend,sub(a,b),add(b,colour));
+    }
+
     vec4 overrideColour=F4(M,0x120);
     if (overrideColour.w>0.0) colour.rgb=overrideColour.rgb;
 
@@ -683,7 +832,7 @@ void main() {
     if (cb.c[213].z!=0u)
         gl_Position.z=mul(add(gl_Position.z,gl_Position.w),0.5);
     p0=vec4(rgb,alpha);
-    p1=vec4(uv.xy,uv.xy);
+    p1=atlasUv;
     p2=vec4(0.0,0.0,clip.z,clip.w);
     p3=vec4(fog,0.0,0.0,0.0);
 }
@@ -966,10 +1115,6 @@ public:
             return decline("a scalar load window is missing");
 
         const uint32_t flags = c[var.flags][0];
-        if (flags & 0x2e0u)
-            return decline("vertex texture animation is enabled");
-        if (flags & 0x100u)
-            return decline("the atlas lane-mask path is enabled");
 
         const VertexBuffer* slots[kFetches] = {};
         const VertexBuffer* palettes[kPalettes] = {};
@@ -1033,6 +1178,25 @@ public:
             texture->sampler, texture->view, VK_IMAGE_LAYOUT_GENERAL};
         std::memcpy(c[cTexScale], texture->scale, sizeof texture->scale);
 
+        std::array<VkDescriptorImageInfo, kVsTextures> vsImages{};
+        constexpr uint32_t sampleFlags[kVsTextures] = {
+            0x20,0x20,0x20,0x20,0x40,0x40,0x200,0x200,0x80,0x80};
+        for (uint32_t i = 0; i < kVsTextures; ++i) {
+            vsImages[i] = image; // valid unused descriptor
+            if (!(flags & sampleFlags[i])) continue;
+            const Texture* sample = nullptr;
+            for (const Texture& t : d.vsTextures)
+                if (t.pc == var.texturePc[i]) {
+                    if (sample) return decline("duplicate vertex sample PC");
+                    sample = &t;
+                }
+            if (!sample || !sample->view || !sample->sampler)
+                return decline("a vertex texture or sampler is missing at its sample PC");
+            vsImages[i] = {
+                sample->sampler, sample->view, VK_IMAGE_LAYOUT_GENERAL};
+            std::memcpy(c[cVsTexScale + i], sample->scale, sizeof sample->scale);
+        }
+
         for (uint32_t i = 0; i < d.colorCount; ++i) {
             int32_t sw[4];
             swizzle(d.color[i], sw);
@@ -1077,7 +1241,7 @@ public:
             std::fprintf(stderr, "[native] particle: drawing %s natively\n", var.vs);
 
         gpu.beginRendering(d.color, d.colorCount, d.depth, d.hasStencil);
-        gpu.record([pipe, layout = layout_, buffers, image, viewport, scissor, stencil,
+        gpu.record([pipe, layout = layout_, buffers, image, vsImages, viewport, scissor, stencil,
                     bc = std::to_array(d.blendConstants), indexed = d.indexed,
                     index = d.index, indexType = d.indexType, firstIndex = d.firstIndex,
                     count = d.count, instances = d.instances, pushSet = gpu.pushDescriptorSet()](VkCommandBuffer cmd) {
@@ -1092,8 +1256,8 @@ public:
                 vkCmdSetStencilCompareMask(cmd, face, stencil[i * 3 + 1]);
                 vkCmdSetStencilWriteMask(cmd, face, stencil[i * 3 + 2]);
             }
-            VkWriteDescriptorSet writes[4]{};
-            for (uint32_t i = 0; i < 4; ++i) {
+            VkWriteDescriptorSet writes[5]{};
+            for (uint32_t i = 0; i < 5; ++i) {
                 writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 writes[i].dstBinding = i;
                 writes[i].descriptorCount = 1;
@@ -1106,7 +1270,10 @@ public:
             writes[2].pBufferInfo = &buffers.back();
             writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             writes[3].pImageInfo = &image;
-            pushSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 4, writes);
+            writes[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[4].descriptorCount = kVsTextures;
+            writes[4].pImageInfo = vsImages.data();
+            pushSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 5, writes);
             if (indexed) {
                 vkCmdBindIndexBuffer(cmd, index.buffer, index.offset + index.byteOffset, indexType);
                 vkCmdDrawIndexed(cmd, count, instances, firstIndex, 0, 0);
@@ -1168,11 +1335,13 @@ private:
                  VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
                 {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                  VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+                {4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kVsTextures,
+                 VK_SHADER_STAGE_VERTEX_BIT, nullptr},
             };
             VkDescriptorSetLayoutCreateInfo dl{
                 VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
             dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-            dl.bindingCount = 4;
+            dl.bindingCount = 5;
             dl.pBindings = bindings;
             if (vkCreateDescriptorSetLayout(device, &dl, nullptr, &setLayout_) != VK_SUCCESS)
                 return out = VK_NULL_HANDLE;
