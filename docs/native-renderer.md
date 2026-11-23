@@ -297,3 +297,19 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   in compare mode until it matches.
 - Compare runs: every other role within 1 to 5/255, except for a few cube-reflection highlight
   pixels (roles 15 and 20) and the usual edge-mask thresholds in target 1.
+
+### Particles
+
+- `native/particle.cpp`, a pass of its own: `ps_ptc_xxx` with the five billboard vertex shaders
+  (`vs_ptc_bill_xx_xx_x_x_x_x`, `_x_n`, `_f_x_x_x`, `_f_x_x_n`, `xx_lv_x_x_x_n`), ~86 of a fight
+  frame's 95 particle draws. Codex drafted it from the disassembly.
+- What the particle draws needed from the framework:
+  - instanced draws (fetch slots that the fetch shader indexes by v1-v3 read the instance, as the
+    translator sets those registers)
+  - every primitive type the translated pipeline draws, with rectangle and quad lists completed
+    by the same geometry shaders the translated pipeline uses (`Gpu::Stage::Geometry`)
+  - the vertex shader's sampled images (`native::Draw::vsTextures`), for the texture-driven
+    animation (flags 0x20/0x40/0x80/0x200, `image_sample_lz`) and the atlas path (0x100)
+- Compare run in a fight (`LPN_NATIVE_COMPARE=particle`): ~5,100 draws, within 1/255, depth exact.
+  Particles drawn by other vertex shaders (`vs_ptc_bill_mn_*`, `mf_*`) are still translated.
+- Open: compare mode froze once during a heat action (twice tried; a normal run there is fine).
