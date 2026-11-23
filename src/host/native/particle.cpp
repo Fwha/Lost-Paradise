@@ -320,7 +320,8 @@ uint conv(uint raw,uint bits,uint nfmt) {
 }
 vec4 fetch(uint b) {
     uvec4 s=cb.c[215+int(b)];
-    uint index=uint(gl_VertexIndex);
+    // A slot the fetch shader indexes by v1-v3 reads the instance (as the translator sets them).
+    uint index=(s.z&0x100u)!=0u?uint(gl_InstanceIndex):uint(gl_VertexIndex);
     if (index>=s.w) return vec4(0.0);
     uint i=s.x+index*s.y;
     uint dfmt=s.z&15u, nfmt=(s.z>>4)&7u;
@@ -779,7 +780,7 @@ uint32_t formatBytes(uint32_t dfmt) {
 }
 
 bool decodable(const VertexBuffer& v) {
-    if (!v.data.buffer || v.indexVgpr || !v.stride || v.stride % 4 ||
+    if (!v.data.buffer || !v.stride || v.stride % 4 ||
         (uint64_t(v.data.byteOffset) + v.offset) % 4)
         return false;
     if (!formatComponents(v.dfmt)) return false;
@@ -821,7 +822,6 @@ public:
         if (d.upscaler) return decline("an upscaler is on");
         if (d.pixelPositions) return decline("positions in pixels");
         if (d.depthBias) return decline("a polygon offset");
-        if (d.instances != 1) return decline("instanced");
         if (d.primitive != 4) return decline("not a triangle list");
         if (!d.count || d.count % 3) return decline("an incomplete triangle list");
         if (d.colorCount < 1 || d.colorCount > 2)
@@ -920,7 +920,7 @@ public:
                 return decline("a fetch address layout outside its range");
             c[cFetch + i][0] = uint32_t((uint64_t(v->data.byteOffset) + v->offset) / 4);
             c[cFetch + i][1] = v->stride / 4;
-            c[cFetch + i][2] = v->dfmt | v->nfmt << 4;
+            c[cFetch + i][2] = v->dfmt | v->nfmt << 4 | (v->indexVgpr ? 0x100u : 0u);
             c[cFetch + i][3] = v->records;
         }
 
@@ -999,7 +999,7 @@ public:
         gpu.record([pipe, layout = layout_, buffers, image, viewport, scissor, stencil,
                     bc = std::to_array(d.blendConstants), indexed = d.indexed,
                     index = d.index, indexType = d.indexType, firstIndex = d.firstIndex,
-                    count = d.count, pushSet = gpu.pushDescriptorSet()](VkCommandBuffer cmd) {
+                    count = d.count, instances = d.instances, pushSet = gpu.pushDescriptorSet()](VkCommandBuffer cmd) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             vkCmdSetViewport(cmd, 0, 1, &viewport);
             vkCmdSetScissor(cmd, 0, 1, &scissor);
@@ -1028,9 +1028,9 @@ public:
             pushSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 4, writes);
             if (indexed) {
                 vkCmdBindIndexBuffer(cmd, index.buffer, index.offset + index.byteOffset, indexType);
-                vkCmdDrawIndexed(cmd, count, 1, firstIndex, 0, 0);
+                vkCmdDrawIndexed(cmd, count, instances, firstIndex, 0, 0);
             } else {
-                vkCmdDraw(cmd, count, 1, 0, 0);
+                vkCmdDraw(cmd, count, instances, 0, 0);
             }
         });
         return true;
