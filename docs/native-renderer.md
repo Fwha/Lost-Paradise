@@ -271,3 +271,29 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
 - Codex drafted these. Its full-file drafts are merged keeping the existing code. One draft
   rewrote a verified table, wrongly, and was caught by checking that the older variants'
   preprocessed GLSL is unchanged.
+
+### Seven more scene shaders; the stage material blends
+
+- Census (`lpn-captures/capture-5/passmap-7997.txt`, the rt1 passes): before this stage, native
+  passes drew 2,947 of a town frame's 3,354 material draws.
+- Material roles 17 to 22:
+  - `r_b1dst`'s own pixel shader
+  - `r_o1dst_b(vr)2dst[nte]`
+  - `r_o1dut_b(vr)2dut[ref]`
+  - `r_o1dut_m(vr)2du[ref]`
+  - `r_o1d`
+  - `r_o1dut_a(vr)2d`
+- Character role 9: `sm_p1ht[hair][offset][dedit]`.
+- The material pass blends and uses stencil as the translated pipeline does, as the character
+  pass already did.
+- Two pixel shaders read a register after a later fetch had replaced its contents, and the port
+  had kept the older value:
+  - `r_o1dst[ref]` (role 11): 0x870 loads the specular texture's alpha over the point light's red.
+    The reflection is weighted by that alpha and multiplied by the specular colour. With no point
+    lights, the port had drawn no reflection at all, up to 138/255 off.
+  - `r_o1dut_a(vr)2d` (role 22): 0x818 loads the detail alpha over the indirect light. The
+    added term is detail alpha times the squared detail.
+- `r_o1dut_b(vr)2dut[ref]` (role 19) is still darker than the game, up to ~60/255. It is drawn only
+  in compare mode until it matches.
+- Compare runs: every other role within 1 to 5/255, except for a few cube-reflection highlight
+  pixels (roles 15 and 20) and the usual edge-mask thresholds in target 1.
