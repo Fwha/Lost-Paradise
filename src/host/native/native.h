@@ -110,6 +110,8 @@ struct Draw {
     std::function<bool(uint32_t pc, uint32_t* out, uint32_t n)> vsLoad;
     // The pixel shader's sampled images, in the order the shader declares them.
     std::vector<Texture> textures;
+    // The vertex shader's sampled images, likewise (pc: from the vertex shader's start).
+    std::vector<Texture> vsTextures;
     // `n` dwords of the scalar load at `pc` (an offset from the pixel shader's start), as the
     // shader read them for this draw. False when the shader has no such load.
     std::function<bool(uint32_t pc, uint32_t* out, uint32_t n)> load;
