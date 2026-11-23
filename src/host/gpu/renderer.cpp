@@ -5311,6 +5311,7 @@ void main() {
         VkShaderModule shader(const std::string& glsl, Stage stage) override {
             const gcn::GlslStage s = stage == Stage::Vertex     ? gcn::GlslStage::Vertex
                                      : stage == Stage::Compute ? gcn::GlslStage::Compute
+                                     : stage == Stage::Geometry ? gcn::GlslStage::Geometry
                                                                : gcn::GlslStage::Fragment;
             std::lock_guard lock(r_.nativeModulesMutex_); // recorder threads draw natively too
             auto it = r_.nativeModules_.find(glsl);

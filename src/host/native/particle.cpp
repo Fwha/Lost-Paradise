@@ -689,6 +689,47 @@ void main() {
 }
 )";
 
+// The translated pipeline's rectangle expansion (renderer.cpp expandShader for outputs 0-3), word
+// for word: the corner whose edges are perpendicular, then the parallelogram's fourth vertex.
+constexpr const char* kRectGs = R"(#version 450
+layout(triangles) in;
+layout(triangle_strip, max_vertices = 4) out;
+in gl_PerVertex { vec4 gl_Position; } gl_in[];
+out gl_PerVertex { vec4 gl_Position; };
+layout(location = 0) in vec4 iP0[];
+layout(location = 0) out vec4 oP0;
+layout(location = 1) in vec4 iP1[];
+layout(location = 1) out vec4 oP1;
+layout(location = 2) in vec4 iP2[];
+layout(location = 2) out vec4 oP2;
+layout(location = 3) in vec4 iP3[];
+layout(location = 3) out vec4 oP3;
+void emit(int i) {
+    gl_Position = gl_in[i].gl_Position;
+    oP0 = iP0[i];
+    oP1 = iP1[i];
+    oP2 = iP2[i];
+    oP3 = iP3[i];
+    EmitVertex();
+}
+void main() {
+    vec2 p0 = gl_in[0].gl_Position.xy / gl_in[0].gl_Position.w;
+    vec2 p1 = gl_in[1].gl_Position.xy / gl_in[1].gl_Position.w;
+    vec2 p2 = gl_in[2].gl_Position.xy / gl_in[2].gl_Position.w;
+    float d0 = abs(dot(p1 - p0, p2 - p0)), d1 = abs(dot(p0 - p1, p2 - p1)), d2 = abs(dot(p0 - p2, p1 - p2));
+    int c = (d0 <= d1 && d0 <= d2) ? 0 : (d1 <= d2 ? 1 : 2);
+    int a = (c + 1) % 3, b = (c + 2) % 3;
+    emit(c); emit(a); emit(b);
+    gl_Position = gl_in[a].gl_Position + gl_in[b].gl_Position - gl_in[c].gl_Position;
+    oP0 = iP0[a] + iP0[b] - iP0[c];
+    oP1 = iP1[a] + iP1[b] - iP1[c];
+    oP2 = iP2[a] + iP2[b] - iP2[c];
+    oP3 = iP3[a] + iP3[b] - iP3[c];
+    EmitVertex();
+    EndPrimitive();
+}
+)";
+
 constexpr const char* kFs = R"(
 layout(set=0,binding=3) uniform sampler2D image0;
 layout(location=0) in vec4 a0;
@@ -822,8 +863,10 @@ public:
         if (d.upscaler) return decline("an upscaler is on");
         if (d.pixelPositions) return decline("positions in pixels");
         if (d.depthBias) return decline("a polygon offset");
-        if (d.primitive != 4) return decline("not a triangle list");
-        if (!d.count || d.count % 3) return decline("an incomplete triangle list");
+        // Rectangle lists (17: three corners each) as the translated pipeline draws them: its
+        // geometry shader completes each rectangle (renderer.cpp's expandShader).
+        if (d.primitive != 4 && d.primitive != 17) return decline("not a triangle or rectangle list");
+        if (!d.count || d.count % 3) return decline("an incomplete triangle or rectangle list");
         if (d.colorCount < 1 || d.colorCount > 2)
             return decline("not one or two colour targets");
         for (uint32_t i = 0; i < d.colorCount; ++i)
@@ -1074,6 +1117,7 @@ private:
                     uint32_t(s.depthFailOp), uint32_t(s.compareOp)});
             }
 
+        key.push_back(d.primitive == 17);
         std::lock_guard lock(m_);
         if (auto it = pipes_.find(key); it != pipes_.end()) return it->second;
         VkPipeline& out = pipes_[key];
@@ -1111,8 +1155,11 @@ private:
             header.substr(header.find('\n') + 1);
         const VkShaderModule fs = gpu.shader(fragmentHeader + kFs, Gpu::Stage::Fragment);
         if (!vs || !fs) return out = VK_NULL_HANDLE;
+        const bool rects = d.primitive == 17;
+        const VkShaderModule gs = rects ? gpu.shader(kRectGs, Gpu::Stage::Geometry) : VK_NULL_HANDLE;
+        if (rects && !gs) return out = VK_NULL_HANDLE;
 
-        VkPipelineShaderStageCreateInfo stages[2]{};
+        VkPipelineShaderStageCreateInfo stages[3]{};
         stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
                      VK_SHADER_STAGE_VERTEX_BIT, vs, "main", nullptr};
         stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
@@ -1174,6 +1221,10 @@ private:
         VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         pi.pNext = &rendering;
         pi.stageCount = 2;
+        if (rects) {
+            stages[2] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_GEOMETRY_BIT, gs, "main", nullptr};
+            pi.stageCount = 3;
+        }
         pi.pStages = stages;
         pi.pVertexInputState = &vi;
         pi.pInputAssemblyState = &ia;

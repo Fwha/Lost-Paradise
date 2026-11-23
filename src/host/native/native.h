@@ -137,7 +137,7 @@ public:
     // buffer; `byteOffset` 0). False when there is no room.
     virtual bool upload(const void* data, uint32_t bytes, Buffer& out) = 0;
     // A shader module from GLSL (compiled once, kept in the SPIR-V cache); null on an error.
-    enum class Stage { Vertex, Fragment, Compute };
+    enum class Stage { Vertex, Fragment, Compute, Geometry };
     virtual VkShaderModule shader(const std::string& glsl, Stage stage) = 0;
     // Starts rendering into these attachments (loaded and stored), or carries on in the native
     // pass already open on the same ones: consecutive native draws share one render pass, as the
