@@ -5311,6 +5311,7 @@ void main() {
         VkShaderModule shader(const std::string& glsl, Stage stage) override {
             const gcn::GlslStage s = stage == Stage::Vertex     ? gcn::GlslStage::Vertex
                                      : stage == Stage::Compute ? gcn::GlslStage::Compute
+                                     : stage == Stage::Geometry ? gcn::GlslStage::Geometry
                                                                : gcn::GlslStage::Fragment;
             std::lock_guard lock(r_.nativeModulesMutex_); // recorder threads draw natively too
             auto it = r_.nativeModules_.find(glsl);
@@ -5575,6 +5576,16 @@ void main() {
             t.address = im.base(), t.width = im.width(), t.height = im.height();
             t.pc = uint32_t(im.pc - a.ps.launch.entry);
             nd.textures.push_back(t);
+        }
+        for (const gcn::ImageResource& im : a.vs.images) {
+            if (im.storage) return false;
+            const ImageBinding b = resolveImage(im);
+            native::Texture t;
+            t.view = b.view, t.sampler = b.sampler;
+            t.scale[0] = b.scale[0], t.scale[1] = b.scale[1];
+            t.address = im.base(), t.width = im.width(), t.height = im.height();
+            t.pc = uint32_t(im.pc - a.vs.launch.entry);
+            nd.vsTextures.push_back(t);
         }
         if (!a.psLoads || !a.vsLoads) return false;
         auto loads = [](const gcn::Program& p, const std::map<uint64_t, uint32_t>& m) {
