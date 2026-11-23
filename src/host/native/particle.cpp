@@ -730,6 +730,34 @@ void main() {
 }
 )";
 
+// The translated pipeline's quad expansion (expandShader with quads): corners 0, 1, 3, 2 as a strip.
+constexpr const char* kQuadGs = R"(#version 450
+layout(lines_adjacency) in;
+layout(triangle_strip, max_vertices = 4) out;
+in gl_PerVertex { vec4 gl_Position; } gl_in[];
+out gl_PerVertex { vec4 gl_Position; };
+layout(location = 0) in vec4 iP0[];
+layout(location = 0) out vec4 oP0;
+layout(location = 1) in vec4 iP1[];
+layout(location = 1) out vec4 oP1;
+layout(location = 2) in vec4 iP2[];
+layout(location = 2) out vec4 oP2;
+layout(location = 3) in vec4 iP3[];
+layout(location = 3) out vec4 oP3;
+void emit(int i) {
+    gl_Position = gl_in[i].gl_Position;
+    oP0 = iP0[i];
+    oP1 = iP1[i];
+    oP2 = iP2[i];
+    oP3 = iP3[i];
+    EmitVertex();
+}
+void main() {
+    emit(0); emit(1); emit(3); emit(2);
+    EndPrimitive();
+}
+)";
+
 constexpr const char* kFs = R"(
 layout(set=0,binding=3) uniform sampler2D image0;
 layout(location=0) in vec4 a0;
@@ -865,8 +893,18 @@ public:
         if (d.depthBias) return decline("a polygon offset");
         // Rectangle lists (17: three corners each) as the translated pipeline draws them: its
         // geometry shader completes each rectangle (renderer.cpp's expandShader).
-        if (d.primitive != 4 && d.primitive != 17) return decline("not a triangle or rectangle list");
-        if (!d.count || d.count % 3) return decline("an incomplete triangle or rectangle list");
+        // As the translated pipeline maps them: 1 points, 2 lines, 3 line strip, 4 triangles, 5 fan,
+        // 6 strip, 17 rectangles (3 corners) and 19 quads (4 corners) through a geometry shader.
+        switch (d.primitive) {
+        case 1: case 2: case 3: case 4: case 5: case 6: case 17: case 19: break;
+        default: {
+            char why[48];
+            std::snprintf(why, sizeof why, "primitive type %u", d.primitive);
+            return decline(why);
+        }
+        }
+        if (!d.count || ((d.primitive == 4 || d.primitive == 17) && d.count % 3) || (d.primitive == 19 && d.count % 4))
+            return decline("an incomplete primitive list");
         if (d.colorCount < 1 || d.colorCount > 2)
             return decline("not one or two colour targets");
         for (uint32_t i = 0; i < d.colorCount; ++i)
@@ -1117,7 +1155,7 @@ private:
                     uint32_t(s.depthFailOp), uint32_t(s.compareOp)});
             }
 
-        key.push_back(d.primitive == 17);
+        key.push_back(d.primitive);
         std::lock_guard lock(m_);
         if (auto it = pipes_.find(key); it != pipes_.end()) return it->second;
         VkPipeline& out = pipes_[key];
@@ -1155,8 +1193,8 @@ private:
             header.substr(header.find('\n') + 1);
         const VkShaderModule fs = gpu.shader(fragmentHeader + kFs, Gpu::Stage::Fragment);
         if (!vs || !fs) return out = VK_NULL_HANDLE;
-        const bool rects = d.primitive == 17;
-        const VkShaderModule gs = rects ? gpu.shader(kRectGs, Gpu::Stage::Geometry) : VK_NULL_HANDLE;
+        const bool rects = d.primitive == 17 || d.primitive == 19;
+        const VkShaderModule gs = rects ? gpu.shader(d.primitive == 19 ? kQuadGs : kRectGs, Gpu::Stage::Geometry) : VK_NULL_HANDLE;
         if (rects && !gs) return out = VK_NULL_HANDLE;
 
         VkPipelineShaderStageCreateInfo stages[3]{};
@@ -1168,7 +1206,15 @@ private:
             VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         VkPipelineInputAssemblyStateCreateInfo ia{
             VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        switch (d.primitive) {
+        case 1: ia.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
+        case 2: ia.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+        case 3: ia.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
+        case 5: ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
+        case 6: ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
+        case 19: ia.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY; break;
+        default: ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
+        }
         VkPipelineViewportStateCreateInfo vp{
             VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
         vp.viewportCount = vp.scissorCount = 1;
