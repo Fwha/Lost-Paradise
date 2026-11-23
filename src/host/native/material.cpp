@@ -1333,6 +1333,7 @@ const Variant kVariants[] = {
 };
 
 constexpr int kVariantCount = 22;
+constexpr int kUnmatchedRole = 19; // r_o1dut_b(vr)2dut[ref]
 constexpr VertexShaderInfo kVertexShaders[6] = {
     {"r_b1dst_a(vr)2d.fxo", "", kVsLoads, count(kVsLoads), {3, 4, 4, 4, 2, 2, 4}, 7},
     {"r_b1dst.fxo", "#define SIMPLE_MATERIAL\n", kVsLoadsSimple, count(kVsLoadsSimple), {3, 3, 4, 4, 2, 4, 0}, 6},
@@ -2073,6 +2074,9 @@ public:
 
     bool draw(int role, const Draw& d, Gpu& gpu) override {
         if (role < 1 || role > kVariantCount) return false;
+        // r_o1dut_b(vr)2dut[ref] still differs from the game's shader (darker, up to ~60/255): drawn
+        // only in compare mode, where it is checked, until it matches.
+        if (role == kUnmatchedRole && !kCompareOn) return decline(role, "not yet matched (drawn in compare mode only)");
         const Variant& var = kVariants[role - 1];
         const VertexShaderInfo& vsi = kVertexShaders[var.vs];
         const char* vsWanted = vsi.name;
