@@ -1593,6 +1593,9 @@ void main() {
     // Toward the detail textures by their alpha too.
     vec4 detail4 = at(2, uv1);
     precise float dw = detail4.a * flatten;
+#elif defined(AMBIENT_DETAIL_ADD)
+    vec4 detail4 = at(2, uv1);
+    float dw = flatten;
 #else
     vec4 detail4 = vec4(at(2, uv1).rgb, 1.0);
     float dw = flatten;
@@ -1810,7 +1813,7 @@ void main() {
     vec3 lin = adjBase * diffuse + adjSpec * spec;
 #ifdef AMBIENT_DETAIL_ADD
     for (int i = 0; i < 3; ++i)
-        lin[i] = mac(mul(mul(itint[i], indDiffuse[i]), dw), mul(detail[i], detail[i]), lin[i]);
+        lin[i] = mac(mul(detail4.a, dw), mul(detail[i], detail[i]), lin[i]);
 #endif
 #ifdef REFLECT_MATERIAL
     // The environment: reflected about N (its x mirrored, as the shader's cube lookup takes it),
@@ -2284,8 +2287,8 @@ private:
     static void describe(const uint32_t (&c)[kConstants][4], const VertexBuffer* const* slot, int inputs, const Draw& d) {
         std::string s;
         char b[200];
-        std::snprintf(b, sizeof b, "vs %s; ps flags 0x%x, 0x22c 0x%x, vs flags 0x%x, mask flags 0x%x, out swizzles 0x%x 0x%x",
-                      d.vsName ? d.vsName->c_str() : "?", c[cPsFlags][0], c[cPsFlags][3], c[cVsMisc][2], c[cMisc2][3], c[cOut][0], c[cOut][1]);
+        std::snprintf(b, sizeof b, "vs %s; ps %s; ps flags 0x%x, 0x22c 0x%x, vs flags 0x%x, mask flags 0x%x, out swizzles 0x%x 0x%x",
+                      d.vsName ? d.vsName->c_str() : "?", d.psName ? d.psName->c_str() : "?", c[cPsFlags][0], c[cPsFlags][3], c[cVsMisc][2], c[cMisc2][3], c[cOut][0], c[cOut][1]);
         s += b;
         std::snprintf(b, sizeof b, "; target formats %d %d", int(d.color[0].format), int(d.color[1].format));
         s += b;
@@ -2295,7 +2298,7 @@ private:
         s += b;
         std::snprintf(b, sizeof b, "; %zu buffers, viewport %g %g %g %g", d.vertex.size(), d.viewport[0], d.viewport[1], d.viewport[2], d.viewport[3]);
         s += b;
-        const int show[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 21, 22, 23, 24, 25, 29, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 51, 56, 57, 58, 59};
+        const int show[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 21, 22, 23, 24, 25, 29, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45, 46, 47, 48, 49, 50, 51, 56, 57, 58, 59, 60, 61, 70, 71, 72, 73};
         for (int i : show) {
             float f[4];
             std::memcpy(f, c[i], sizeof f);
