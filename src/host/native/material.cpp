@@ -1721,7 +1721,12 @@ void main() {
     vec4 specSample = at(5, uv0 * cf(21).xy);
     vec3 specMat = vec3(specSample.g);
 #else
+#ifdef REFLECT_MATERIAL
+    vec4 specSample = at(5, uv0 * cf(21).xy);
+    vec3 specMat = specSample.rgb;
+#else
     vec3 specMat = at(5, uv0 * cf(21).xy).rgb;
+#endif
 #endif
 #endif
 #ifdef REFLECT_DETAIL_BLEND
@@ -1841,7 +1846,9 @@ void main() {
         lin += envLin * (specSample.r * a3.w * rlight);
 #endif
 #else
-        lin += envLin * rlight * (a3.w * point.x);
+        // 0x870 loads the specular texture's alpha over the point light's red (v12); the reflection goes
+        // into the specular sum, multiplied by the specular colour (0x938.., 0x96c..).
+        lin += adjSpec * envLin * rlight * (a3.w * specSample.a);
 #endif
     }
 #endif
