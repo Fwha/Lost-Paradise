@@ -246,6 +246,12 @@ void probeScene(uint64_t g) {
 
 // LPN_ENGINE_SCENE_CHECK (engine_capture.h, docs/engine/user-data.md).
 bool gSceneCheck = false;
+bool gPrepass = false; // LPN_ENGINE_PREPASS
+bool gPrepassCheck = false; // LPN_ENGINE_PREPASS_CHECK
+std::mutex gPrepassMutex;
+std::vector<std::shared_ptr<const EnginePrepass>> gPrepasses(1 << 15);
+std::vector<uint32_t> gPrepassIds(1 << 15, ~0u);
+uint32_t gNextPrepass = 0;
 constexpr uint32_t kScenes = 1 << 15;
 std::mutex gSceneMutex;
 std::vector<EngineSceneDraw> gScenes(kScenes);
@@ -282,7 +288,8 @@ void ordinaryResourceFormat(uint32_t* d, bool texture) {
 }
 
 // One stage (l: 1 PS, 2 VS) as the engine is about to set it up for this draw.
-void decodeStage(uint64_t g, uint64_t s, uint32_t l, uint64_t record, EngineStage& st) {
+void decodeStage(uint64_t g, uint64_t s, uint32_t l, uint64_t record, EngineStage& st,
+                 const std::vector<std::array<uint32_t, 4>>* attributes = nullptr) {
     uint64_t code = 0, prog = 0;
     uint32_t variant = 0;
     if (!rd(record, code) || !rd(record + 0x10, prog) || !rd(record + 0x1c, variant)) return;
@@ -317,6 +324,10 @@ void decodeStage(uint64_t g, uint64_t s, uint32_t l, uint64_t record, EngineStag
     rd(s + 0x6a8 + 0x220 * b, resType), rd(s + 0x16c8 + 0x110 * b, extraType);
     uint32_t d[8];
     uint16_t map;
+    // eabdb0 places the generated vertex attributes before the ordinary bindings.
+    if (attributes)
+        for (uint32_t i = 0; i < attributes->size(); ++i)
+            if (rd(m + 0x104 + 2 * i, map)) place(map, (*attributes)[i].data(), 4);
     bits(cbUse, [&](uint32_t i) {
         if (probeRead(s + 0x1d38 + 0x210 * b + 0x20 * i, d, 16) && rd(m + 0xdc + 2 * i, map)) place(map, d, 4);
     });
@@ -381,6 +392,274 @@ void captureScene(uint64_t g) {
     tEngineCheckId = id + 1;
 }
 
+// LPN_ENGINE_PREPASS's capture (Codex's draft): the fetch program's inputs, the constants the native
+// prepass reads (by its load pcs) and, for _pt, its textures and alpha reference.
+uint64_t bufferBase(const uint32_t* v) {
+    return uint64_t(v[0]) | (uint64_t(v[1] & 0xFFFF) << 32);
+}
+bool bufferWords(const uint32_t* v, uint32_t offset, uint32_t* out, uint32_t n) {
+    const uint32_t stride = (v[1] >> 16) & 0x3FFF;
+    const uint64_t bytes = stride ? uint64_t(stride) * v[2] : v[2];
+    if (uint64_t(offset) + 4ull * n > bytes) return false;
+    return probeRead(bufferBase(v) + offset, out, 4u * n);
+}
+// The scalar descriptor state needed by a fetch program and the _pt PS prefix.
+// Table pointers stay symbolic: no transient GPU table address is needed.
+struct EngineScalars {
+    const EngineStage& stage;
+    uint32_t v[104] = {};
+    bool known[104] = {};
+    int32_t table[104];
+    explicit EngineScalars(const EngineStage& s) : stage(s) {
+        std::fill(std::begin(table), std::end(table), -1);
+        for (uint32_t i = 0; i < 16; ++i) {
+            v[i] = s.sgpr[i];
+            known[i] = (s.sgprKnown >> i) & 1;
+        }
+        for (uint32_t i = 0; i < s.pointerCount; ++i) {
+            const auto& p = s.pointers[i];
+            if (p.sgpr < 103) {
+                table[p.sgpr] = int32_t(p.dword);
+                known[p.sgpr] = known[p.sgpr + 1] = false;
+            }
+        }
+    }
+    bool get(uint32_t at, uint32_t* out, uint32_t n) const {
+        if (at + n > 104) return false;
+        for (uint32_t i = 0; i < n; ++i)
+            if (!known[at + i]) return false;
+        std::memcpy(out, v + at, 4u * n);
+        return true;
+    }
+    void put(uint32_t at, const uint32_t* in, uint32_t n) {
+        // Invalidate symbolic pointers overlapped by the write.
+        for (uint32_t i = at ? at - 1 : 0; i < at + n && i < 104; ++i)
+            table[i] = -1;
+        for (uint32_t i = 0; i < n; ++i)
+            v[at + i] = in[i], known[at + i] = true;
+    }
+    bool memory(uint32_t pair, uint32_t offset, uint32_t* out, uint32_t n) const {
+        if (pair + 1 >= 104 || (offset & 3)) return false;
+        if (table[pair] >= 0) {
+            const uint64_t at = uint64_t(table[pair]) + offset / 4;
+            if (at + n > stage.table.size()) return false;
+            for (uint32_t i = 0; i < n; ++i)
+                if (!stage.tableKnown[size_t(at) + i]) return false;
+            std::memcpy(out, stage.table.data() + at, 4u * n);
+            return true;
+        }
+        uint32_t p[2];
+        if (!get(pair, p, 2)) return false;
+        return probeRead((uint64_t(p[0]) | (uint64_t(p[1]) << 32)) + offset, out, 4u * n);
+    }
+    bool smrd(uint32_t w, std::vector<uint32_t>* value = nullptr) {
+        if ((w & 0xF8000000) != 0xC0000000 || !(w & 0x100)) return false;
+        const uint32_t op = (w >> 22) & 31;
+        if (op > 4 && (op < 8 || op > 12)) return false;
+        const uint32_t n = 1u << (op & 7), dst = (w >> 15) & 127;
+        const uint32_t base = ((w >> 9) & 63) * 2, offset = (w & 255) * 4;
+        if (dst + n > 104) return false;
+        uint32_t words[16];
+        if (op < 8) {
+            if (!memory(base, offset, words, n)) return false;
+        } else {
+            uint32_t sharp[4];
+            if (!get(base, sharp, 4) || !bufferWords(sharp, offset, words, n)) return false;
+        }
+        put(dst, words, n);
+        if (value) value->assign(words, words + n);
+        return true;
+    }
+};
+bool generatedAttributes(uint64_t s, uint32_t baseVertex, uint64_t& fetch,
+                         std::vector<std::array<uint32_t, 4>>& out) {
+    uint64_t f = 0, entries = 0;
+    uint32_t n = 0;
+    if (!rd(s + 0x698, f) || !rd(f, fetch) || !rd(f + 0x10, entries) ||
+        !rd(f + 0x18, n) || !n || n > 32)
+        return false;
+    out.resize(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t a[2], stream[5];
+        if (!probeRead(entries + 8ull * i, a, sizeof a)) return false;
+        const uint32_t j = (a[0] >> 8) & 255;
+        if (j >= 32 || (a[0] & 0xFF0000)) return false; // instanced input
+        if (!probeRead(s + 0x288 + 0x20ull * j, stream, sizeof stream)) return false;
+        const uint32_t format = stream[4];
+        if (!(format >> 4)) return false; // constant/zero-stride fetch: not this path
+        uint64_t base = uint64_t(stream[0]) | (uint64_t(stream[1]) << 32);
+        base += uint32_t((a[0] & 255) * 4 + stream[2]);
+        base += uint32_t((format >> 4) * baseVertex);
+        const uint64_t low = (base & 0xFFFFFFFFFFFull) | (uint64_t(format) << 44);
+        out[i] = {uint32_t(low), uint32_t(low >> 32),
+                  std::min(stream[3], 0xFFFFFFu), a[1]};
+    }
+    return true;
+}
+// Accept the ordinary descriptor-load / formatted-buffer-load fetch program.
+// This reads the engine's fetch code, not a translated draw's analysis.
+bool prepassFetch(uint64_t code, const EngineStage& stage, bool alpha,
+                  std::vector<EnginePrepass::Input>& inputs) {
+    EngineScalars q(stage);
+    const uint32_t slots = alpha ? 3 : 2;
+    bool have[3] = {};
+    for (uint32_t pc = 0; pc < 1024;) {
+        uint32_t w = 0;
+        if (!rd(code + pc, w)) return false;
+        if ((w & 0xFF80FF00) == 0xBE801D00) { // s_setpc_b64: fetch returns
+            for (uint32_t i = 0; i < slots; ++i)
+                if (!have[i]) return false;
+            return true;
+        }
+        if ((w & 0xF8000000) == 0xC0000000) {
+            if (((w >> 22) & 31) > 4 || !q.smrd(w)) return false;
+            pc += 4;
+            continue;
+        }
+        if ((w & 0xFFFF0000) == 0xBF8C0000 || // s_waitcnt
+            (w & 0xFFFF0000) == 0xBF800000) { // s_nop
+            pc += 4;
+            continue;
+        }
+        if ((w & 0xFC000000) != 0xE0000000) return false; // MUBUF
+        uint32_t w1 = 0;
+        if (!rd(code + pc + 4, w1)) return false;
+        const uint32_t op = (w >> 18) & 127;
+        const uint32_t dst = (w1 >> 8) & 255;
+        // BUFFER_LOAD_FORMAT_{X,XY,XYZ,XYZW}, idxen, no offen/addr64/LDS/TFE.
+        if (op > 3 || !(w & 0x2000) || (w & 0x19000) ||
+            (w1 & 0x00800000) || (w1 >> 24) != 128 || (w1 & 255) != 0 ||
+            dst < 4 || (dst - 4) % 4)
+            return false;
+        const uint32_t slot = (dst - 4) / 4;
+        if (slot >= slots || have[slot]) return false;
+        EnginePrepass::Input in;
+        in.slot = slot, in.components = op + 1, in.offset = w & 0xFFF;
+        if (!q.get(((w1 >> 16) & 31) * 4, in.sharp, 4)) return false;
+        inputs.push_back(in);
+        have[slot] = true;
+        pc += 8;
+    }
+    return false;
+}
+bool stageTableDescriptor(const EngineStage& s, uint32_t pair, uint32_t offset, uint32_t* out) {
+    EngineScalars q(s);
+    return q.memory(pair, offset, out, 4);
+}
+bool prepassConstants(EnginePrepass& c) {
+    const EngineStage& s = c.stages.vs;
+    uint32_t off[4], world[4], view[4], flags[4];
+    EngineScalars q(s);
+    if (!q.get(4, off, 4) || !q.get(8, world, 4) ||
+        !stageTableDescriptor(s, 12, 0, view) ||
+        !stageTableDescriptor(s, 12, 0x10, flags))
+        return false;
+    auto load = [&](uint32_t pc, const uint32_t* sharp, uint32_t baseReg,
+                    uint32_t offset, uint32_t n) {
+        // Check the runtime instruction as well: the _pt listing was not supplied.
+        uint32_t w = 0;
+        if (!rd(s.code + pc, w) || (w & 0xF8000000) != 0xC0000000 ||
+            !(w & 0x100) || ((w >> 22) & 31) < 8 ||
+            ((w >> 22) & 31) > 12 ||
+            (1u << (((w >> 22) & 31) - 8)) != n ||
+            (((w >> 9) & 63) * 2) != baseReg || (w & 255) * 4 != offset)
+            return false;
+        auto& value = c.vsLoads[pc];
+        value.resize(n);
+        return bufferWords(sharp, offset, value.data(), n);
+    };
+    const uint32_t rot = c.alpha ? 0x10C : 0xE0;
+    if (!load(0x10, off, 4, 0x170, 4) ||
+        !load(0x14, world, 8, 0, 8) ||
+        !load(0x18, world, 8, 0x20, 4) ||
+        !load(0x20, flags, 0, 0, 1) ||
+        !load(rot, view, 36, 0x40, 8) ||
+        !load(rot + 4, view, 36, 0, 16) ||
+        !load(rot + 8, view, 36, 0x60, 4))
+        return false;
+    const uint32_t f = c.vsLoads[0x20][0];
+    return ((f & 0x80000) && !(f & 0x100000)) ||
+           load(0xA0, view, 0, 0x220, 4);
+}
+// Only the prefix needed by ps_normal_pt's two samples and threshold load.
+// Any unexpected scalar computation/control flow leaves the translated draw available.
+bool prepassPixel(EnginePrepass& c) {
+    EngineScalars q(c.stages.ps);
+    for (uint32_t pc = 0; pc < 0x48;) {
+        uint32_t w = 0, w1 = 0;
+        if (!rd(c.stages.ps.code + pc, w)) return false;
+        if ((w & 0xF8000000) == 0xC0000000) {
+            std::vector<uint32_t> value;
+            if (!q.smrd(w, &value)) return false;
+            if (((w >> 22) & 31) >= 8) c.psLoads[pc] = std::move(value);
+            pc += 4;
+        } else if ((w & 0xFC000000) == 0xF0000000) { // MIMG
+            if ((pc != 0x34 && pc != 0x3C) || ((w >> 18) & 127) != 32 ||
+                !rd(c.stages.ps.code + pc + 4, w1))
+                return false; // plain image_sample only
+            EnginePrepass::Image im;
+            im.pc = pc;
+            if (!q.get(((w1 >> 16) & 31) * 4, im.t, 8) ||
+                !q.get(((w1 >> 21) & 31) * 4, im.s, 4))
+                return false;
+            c.images.push_back(im);
+            pc += 8;
+        } else if ((w & 0xFF800000) == 0xBE800000) { // SOP1, special-register writes only
+            const uint32_t dst = (w >> 16) & 127, op = (w >> 8) & 255;
+            if (dst < 104 || op >= 28) return false;
+            pc += (w & 255) == 255 ? 8 : 4;
+        } else if ((w & 0xFFFF0000) == 0xBF8C0000) { // s_waitcnt
+            pc += 4;
+        } else if ((w & 0xFC000000) == 0xC8000000) { // VINTRP
+            pc += 4;
+        } else if (!(w & 0x80000000)) { // VOP1/VOP2/VOPC, including a literal
+            const bool literal = (w & 511) == 255;
+            const uint32_t op = (w >> 25) & 63;
+            const bool madLiteral = (w & 0xFE000000) < 0x7C000000 && (op == 32 || op == 33);
+            pc += literal || madLiteral ? 8 : 4;
+        } else {
+            return false;
+        }
+    }
+    const auto it = c.psLoads.find(0x44);
+    return c.images.size() == 2 && it != c.psLoads.end() && it->second.size() == 1;
+}
+void capturePrepass(uint64_t g, uint32_t count, uint32_t first, uint32_t baseVertex) {
+    uint64_t s = 0, vs = 0, ps = 0, vcode = 0, pcode = 0;
+    if (!rd(g + 0x320, s) || !rd(s + 0x100, vs) || !rd(s + 0xF0, ps) ||
+        !rd(vs, vcode) || !rd(ps, pcode))
+        return;
+    auto c = std::make_shared<EnginePrepass>();
+    c->vsName = shaderNameAt(vcode, probeRead);
+    c->psName = shaderNameAt(pcode, probeRead);
+    c->alpha = c->vsName == "vs_normal_rigid_pt.vso" && c->psName == "ps_normal_pt.pso";
+    if (!c->alpha &&
+        !(c->vsName == "vs_normal_rigid.vso" && c->psName == "ps_normal.pso"))
+        return;
+    uint64_t fetch = 0;
+    std::vector<std::array<uint32_t, 4>> attributes;
+    if (!generatedAttributes(s, baseVertex, fetch, attributes)) return;
+    decodeStage(g, s, 2, vs, c->stages.vs, &attributes);
+    decodeStage(g, s, 1, ps, c->stages.ps);
+    if (!c->stages.vs.ok || !c->stages.ps.ok ||
+        !prepassFetch(fetch, c->stages.vs, c->alpha, c->vertex) ||
+        !prepassConstants(*c) || (c->alpha && !prepassPixel(*c)))
+        return;
+    uint64_t indexBase = 0;
+    if (!rd(s + 0x688, indexBase) || !rd(s + 0x690, c->indexWord) ||
+        !rd(g + 0x28, c->indexModifier))
+        return;
+    c->count = count, c->first = first, c->baseVertex = baseVertex;
+    c->indexAddr = indexBase +
+        uint32_t((first << ((c->indexWord >> 31) + 1)) + (c->indexWord & 0x7FFFFFFF));
+    std::lock_guard lock(gPrepassMutex);
+    const uint32_t id = gNextPrepass++ & 0x7FFFFFFF;
+    gPrepasses[id % gPrepasses.size()] = std::move(c);
+    gPrepassIds[id % gPrepassIds.size()] = id;
+    if (gPrepassCheck) tEngineCheckId = id + 1;
+    else tEnginePrepassId = id + 1;
+}
+
 uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVertex, uint64_t r8, uint64_t r9) {
     const auto* frame = static_cast<const uint64_t*>(LPN_GUEST_FRAME());
     const uint64_t base = reinterpret_cast<uint64_t>(gBase);
@@ -400,6 +679,7 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
     tForcedOrigin = o;
     if (gProbe && site == 0x3700) probeScene(ctx);
     if (gSceneCheck && site == 0x3700) captureScene(ctx);
+    if (gPrepass && site == 0x3700 && (displaySettingsNative() || gPrepassCheck)) capturePrepass(ctx, uint32_t(count), uint32_t(first), uint32_t(baseVertex));
     if (engineSite(site)) {
         const uint64_t s = at<uint64_t>(ctx + 0x320);
         EngineDraw d;
@@ -470,7 +750,7 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
         ++(captured ? gDrawsCaptured : gDrawsGame);
     }
     tForcedOrigin = {}; // not left for another draw when this one wrote none
-    tEngineDrawId = 0;
+    tEngineDrawId = 0, tEnginePrepassId = 0, tEngineCheckId = 0;
     return r;
 }
 
@@ -492,6 +772,19 @@ bool takeEngineDraw(EngineDraw& out) {
 
 bool engineCheckOn() { return gOn && !gShadows; }
 bool engineSceneCheckOn() { return gSceneCheck; }
+bool enginePrepassOn() { return gPrepass; }
+bool enginePrepassCheckOn() { return gPrepassCheck; }
+std::atomic<bool> gPrepassAllowed{false};
+void setEnginePrepassAllowed(bool on) { gPrepassAllowed.store(on, std::memory_order_relaxed); }
+bool enginePrepassUsable(uint32_t id, uint32_t count, uint64_t indexAddr) {
+    if (!gPrepassAllowed.load(std::memory_order_relaxed)) return false;
+    const auto c = enginePrepass(id);
+    return c && c->count == count && c->indexAddr == indexAddr;
+}
+std::shared_ptr<const EnginePrepass> enginePrepass(uint32_t id) {
+    std::lock_guard lock(gPrepassMutex);
+    return gPrepassIds[id % gPrepassIds.size()] == id ? gPrepasses[id % gPrepasses.size()] : nullptr;
+}
 bool engineScene(uint32_t id, EngineSceneDraw& out) {
     std::lock_guard lock(gSceneMutex);
     if (gSceneIds[id % kScenes] != id) return false;
@@ -519,7 +812,11 @@ bool installEngineCapture(Module& eboot) {
     gShadows = es ? *es && *es != '0' : !check;
     gProbe = on("LPN_ENGINE_PROBE");
     gSceneCheck = on("LPN_ENGINE_SCENE_CHECK");
-    if (!check && !gShadows && !gProbe && !gSceneCheck) return false;
+    gPrepass = on("LPN_ENGINE_PREPASS");
+    gPrepassCheck = on("LPN_ENGINE_PREPASS_CHECK");
+    gPrepass = gPrepass || gPrepassCheck;
+    if (gPrepassCheck) gSceneCheck = false; // its NOP carries the prepass capture's id
+    if (!check && !gShadows && !gProbe && !gSceneCheck && !gPrepass) return false;
     // push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov eax, ecx
     const Hook hooks[] = {
         {kDrawIndex, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x89, 0xc8}, guestHook<&drawIndex>(),

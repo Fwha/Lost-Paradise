@@ -71,6 +71,13 @@ int32_t sceGnmDrawIndex(uint32_t* cmd, uint32_t size, uint32_t count, uint64_t i
         w.packet(kOpNop, {native::kEngineTag, id - 1});
         return w.finish(__func__);
     }
+    if (const uint32_t id = native::tEnginePrepassId) { // LPN_ENGINE_PREPASS: the renderer draws the capture here
+        native::tEnginePrepassId = 0, native::tEngineCheckId = 0;
+        native::tPendingOrigin = {};
+        // With the draw's own arguments, for drawing it as it was when the capture cannot be.
+        w.packet(kOpNop, {native::kEnginePrepassTag, id - 1, count, uint32_t(indexAddr), uint32_t(indexAddr >> 32)});
+        return w.finish(__func__);
+    }
     if (const uint32_t id = native::tEngineCheckId) { // LPN_ENGINE_SCENE_CHECK: the engine's description ahead of the draw
         native::tEngineCheckId = 0;
         native::tPendingOrigin = {};
