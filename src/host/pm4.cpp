@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "host/pm4.h"
 #include "host/native/draw_origin.h"
 #include "host/native/engine_capture.h"
@@ -282,7 +283,9 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
                     d.indexAddr = address(b[3], b[4]);
                     std::memset(tOrigin, 0, sizeof tOrigin);
                     tOrigin[0] = 0x3700;
-                    if (b[0] == native::kEnginePrepassTag && (geometryShaderDraw(d) || !native::enginePrepassUsable(b[1], d.count, d.indexAddr)))
+                    if (b[0] == native::kEnginePrepassTag && (geometryShaderDraw(d) || !native::enginePrepassUsable(b[1], d.count, d.indexAddr) ||
+                                                                 !std::all_of(gListeners.begin(), gListeners.end(),
+                                                                              [](DrawListener* l) { return l->enginePrepassAccepts(*tRegs); })))
                         const_cast<uint32_t*>(b)[0] = native::kEnginePrepassTag + 1;
                     if (b[0] != native::kEnginePrepassTag) {
                         draw(d, st);

@@ -5713,6 +5713,19 @@ void main() {
         std::lock_guard lock(m_);
         enginePrepassDraw(id, e, DrawRegs::of(gr));
     }
+    // What the native prepass declines from the registers (prepass.cpp): one colour target with
+    // depth, no blending, stencil or polygon offset. Decided before the game's draw is dropped.
+    bool enginePrepassAccepts(const GpuRegs& gr) override {
+        const uint32_t* c = gr.ctx;
+        const uint32_t mask = c[reg::kCbTargetMask] & c[reg::kCbShaderMask];
+        if ((mask & 0xF) == 0 || (mask >> 4) != 0) return false;
+        if (!((c[reg::kCbColorBase + ::gpu::ctx::kCbColorInfo] >> 2) & 0x1F)) return false;
+        if (!(c[reg::kDbZInfo] & 3)) return false;
+        if (c[reg::kCbBlendControl] & (1u << 30)) return false;
+        if (c[reg::kDbDepthControl] & 1) return false;
+        if (c[reg::kPaSuScModeCntl] & (3u << 11)) return false;
+        return true;
+    }
     // Declines are counted (the game's draw is gone by then: its analysis was skipped).
     void enginePrepassDraw(uint32_t id, const DrawCall& original, const DrawRegs& r) {
         const auto capture = native::enginePrepass(id);
