@@ -99,9 +99,26 @@ struct EngineStage {
 };
 struct EngineSceneDraw {
     EngineStage vs, ps;
+    bool attributes = false; // the vertex attributes generated for it are in vs's table
 };
 bool engineSceneCheckOn();
 bool engineScene(uint32_t id, EngineSceneDraw& out);
+
+// LPN_ENGINE_FEED: the native passes' list draws (material, character) analysed from the engine's
+// user data instead of the registers': each stage's SGPRs as the engine sets them, its pointers
+// into the descriptor table moved to a copy of the engine's table at an address of its own (the
+// feed range, served to the analysis by feedRead). The draws carry the capture's id as the scene
+// check's do (DrawCall::engineCheck); with LPN_ENGINE_SCENE_CHECK too, each is also checked.
+bool engineFeedOn();
+constexpr uint64_t kFeedBase = 0x7F0000000000ull, kFeedSlotBytes = 0x2000;
+// Frames of draws: a slot is reused long after the analyses and the recorder are done with it
+// (and never between two analyses of one worker, so the analysis' repeat shortcut holds).
+constexpr uint32_t kFeedSlots = 1 << 16;
+inline bool feedAddress(uint64_t a) { return a - kFeedBase < uint64_t(kFeedSlots) * kFeedSlotBytes; }
+// The address a copy of these dwords is served at (the same for the same dwords while they stay
+// in the ring), 0 when it doesn't fit.
+uint64_t feedTable(const uint32_t* words, uint32_t n);
+bool feedRead(uint64_t addr, void* dst, size_t size);
 
 // LPN_ENGINE_PREPASS: the list prepass (vs_normal_rigid[_pt] with ps_normal[_pt]) drawn from the
 // engine's description (docs/engine/, Codex's design): the engine still prepares the draw, but the

@@ -7,6 +7,7 @@
 #include "host/crash.h"
 #include "host/display_settings.h"
 #include "host/native/shader_names.h"
+#include "host/native/native.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +18,8 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
 #include <string>
 
 namespace host::native {
@@ -246,6 +249,7 @@ void probeScene(uint64_t g) {
 
 // LPN_ENGINE_SCENE_CHECK (engine_capture.h, docs/engine/user-data.md).
 bool gSceneCheck = false;
+bool gFeed = false; // LPN_ENGINE_FEED
 bool gPrepass = false; // LPN_ENGINE_PREPASS
 bool gPrepassCheck = false; // LPN_ENGINE_PREPASS_CHECK
 std::mutex gPrepassMutex;
@@ -373,17 +377,40 @@ void decodeStage(uint64_t g, uint64_t s, uint32_t l, uint64_t record, EngineStag
         if (rd(g + 0x94 + 0x40 * l, v94)) value(hdr[0xd], v94, 1);
     }
     if (l == 2) {
-        if (hdr[3] & 4) pointer(hdr[5], offs[1]); // M+0x14 (M+4: the fetch shader, installed inside drawIndex)
+        if (hdr[3] & 4) {
+            pointer(hdr[5], offs[1]); // M+0x14
+            // M+4: the fetch shader (G+0x108, installed inside drawIndex: read where drawIndex
+            // takes it from, the fetch metadata at state+0x698).
+            uint64_t f = 0, fetch = 0;
+            if (rd(s + 0x698, f) && rd(f, fetch) && fetch) value(hdr[4], fetch, 2);
+        }
         uint16_t a = 0, c = 0;
         if (hdr[0xe] != 0xFF && rd(g + 0x2c8, a) && rd(g + 0x2ca, c)) value(hdr[0xe], uint32_t(a) * c, 1);
     }
     st.ok = true;
 }
 
-void captureScene(uint64_t g) {
+bool generatedAttributes(uint64_t s, uint32_t baseVertex, uint64_t& fetch, std::vector<std::array<uint32_t, 4>>& out);
+// LPN_ENGINE_FEED: whether the draw's pixel shader is one the material or character pass draws.
+bool feedClaimed(uint64_t g) {
+    uint64_t s = 0, ps = 0, code = 0;
+    if (!rd(g + 0x320, s) || !rd(s + 0xF0, ps) || !rd(ps, code)) return false;
+    thread_local std::unordered_map<uint64_t, bool> claimed;
+    if (const auto it = claimed.find(code); it != claimed.end()) return it->second;
+    if (!shaderNamesReady()) return false; // not remembered: the names come later
+    const Claim c = claim(shaderNameAt(code, probeRead));
+    const bool yes = c.pass && (!std::strcmp(c.pass->name(), "material") || !std::strcmp(c.pass->name(), "character"));
+    if (claimed.size() < 4096) claimed.emplace(code, yes);
+    return yes;
+}
+void captureScene(uint64_t g, uint32_t baseVertex) {
     const uint64_t s = at<uint64_t>(g + 0x320);
     EngineSceneDraw e;
-    decodeStage(g, s, 2, at<uint64_t>(s + 0x100), e.vs);
+    // The vertex attributes drawIndex is about to generate (else the table holds the last draw's).
+    uint64_t fetch = 0;
+    std::vector<std::array<uint32_t, 4>> attributes;
+    e.attributes = generatedAttributes(s, baseVertex, fetch, attributes);
+    decodeStage(g, s, 2, at<uint64_t>(s + 0x100), e.vs, e.attributes ? &attributes : nullptr);
     decodeStage(g, s, 1, at<uint64_t>(s + 0xf0), e.ps);
     std::lock_guard lock(gSceneMutex);
     const uint32_t id = gNextScene++;
@@ -696,7 +723,7 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
     }
     tForcedOrigin = o;
     if (gProbe && site == 0x3700) probeScene(ctx);
-    if (gSceneCheck && site == 0x3700) captureScene(ctx);
+    if ((gSceneCheck || (gFeed && feedClaimed(ctx))) && site == 0x3700) captureScene(ctx, uint32_t(baseVertex));
     if (gPrepass && site == 0x3700 && (displaySettingsNative() || gPrepassCheck)) capturePrepass(ctx, uint32_t(count), uint32_t(first), uint32_t(baseVertex));
     if (engineSite(site)) {
         const uint64_t s = at<uint64_t>(ctx + 0x320);
@@ -803,6 +830,49 @@ std::shared_ptr<const EnginePrepass> enginePrepass(uint32_t id) {
     std::lock_guard lock(gPrepassMutex);
     return gPrepassIds[id % gPrepassIds.size()] == id ? gPrepasses[id % gPrepasses.size()] : nullptr;
 }
+bool engineFeedOn() { return gFeed; }
+// The feed range: a ring of table copies, found again by their contents (consecutive draws with
+// the same table get the same address, as the game's own copies repeat, so the analysis' repeat
+// shortcut still works). Written by the command processor's analysis pass, read by the workers.
+struct FeedSlot {
+    uint64_t hash = 0;
+    std::vector<uint32_t> words;
+};
+std::shared_mutex gFeedMutex;
+std::vector<FeedSlot> gFeedSlots(kFeedSlots);
+std::unordered_map<uint64_t, uint32_t> gFeedIndex; // hash: slot
+uint32_t gFeedNext = 0;
+uint64_t feedTable(const uint32_t* words, uint32_t n) {
+    if (!n || 4ull * n > kFeedSlotBytes) return 0;
+    uint64_t h = 0xcbf29ce484222325ull ^ n;
+    for (uint32_t i = 0; i < n; ++i) h = (h ^ words[i]) * 0x100000001b3ull;
+    {
+        std::shared_lock lock(gFeedMutex);
+        if (const auto it = gFeedIndex.find(h); it != gFeedIndex.end()) {
+            const FeedSlot& f = gFeedSlots[it->second];
+            if (f.words.size() == n && !std::memcmp(f.words.data(), words, 4ull * n)) return kFeedBase + it->second * kFeedSlotBytes;
+        }
+    }
+    std::unique_lock lock(gFeedMutex);
+    const uint32_t slot = gFeedNext++ % kFeedSlots;
+    FeedSlot& f = gFeedSlots[slot];
+    if (const auto it = gFeedIndex.find(f.hash); it != gFeedIndex.end() && it->second == slot) gFeedIndex.erase(it);
+    f.hash = h;
+    f.words.assign(words, words + n);
+    gFeedIndex[h] = slot;
+    return kFeedBase + uint64_t(slot) * kFeedSlotBytes;
+}
+bool feedRead(uint64_t addr, void* dst, size_t size) {
+    const uint64_t off = addr - kFeedBase;
+    const uint32_t slot = uint32_t(off / kFeedSlotBytes);
+    const uint64_t at = off % kFeedSlotBytes;
+    if (slot >= kFeedSlots) return false;
+    std::shared_lock lock(gFeedMutex);
+    const FeedSlot& f = gFeedSlots[slot];
+    if (at + size > 4ull * f.words.size()) return false;
+    std::memcpy(dst, reinterpret_cast<const uint8_t*>(f.words.data()) + at, size);
+    return true;
+}
 bool engineScene(uint32_t id, EngineSceneDraw& out) {
     std::lock_guard lock(gSceneMutex);
     if (gSceneIds[id % kScenes] != id) return false;
@@ -835,8 +905,9 @@ bool installEngineCapture(Module& eboot) {
     gPrepass = ep ? *ep && *ep != '0' : !check;
     gPrepassCheck = on("LPN_ENGINE_PREPASS_CHECK");
     gPrepass = gPrepass || gPrepassCheck;
-    if (gPrepassCheck) gSceneCheck = false; // its NOP carries the prepass capture's id
-    if (!check && !gShadows && !gProbe && !gSceneCheck && !gPrepass) return false;
+    gFeed = on("LPN_ENGINE_FEED");
+    if (gPrepassCheck) gSceneCheck = gFeed = false; // its NOP carries the prepass capture's id
+    if (!check && !gShadows && !gProbe && !gSceneCheck && !gPrepass && !gFeed) return false;
     // push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov eax, ecx
     const Hook hooks[] = {
         {kDrawIndex, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x89, 0xc8}, guestHook<&drawIndex>(),
@@ -858,6 +929,7 @@ bool installEngineCapture(Module& eboot) {
         if (gTiming) std::fprintf(stderr, "[native] engine timing: the stage caster loop is timed (LPN_ENGINE_TIMING)\n");
     }
     if (gShadows) std::fprintf(stderr, "[native] engine capture: the stage's opaque shadow casters are drawn from the engine (LPN_ENGINE_SHADOWS)\n");
+    if (gFeed) std::fprintf(stderr, "[native] engine capture: the material and character draws are analysed from the engine's user data (LPN_ENGINE_FEED)\n");
     if (gPrepassCheck) std::fprintf(stderr, "[native] engine capture: the prepass captures are checked against the game's draws (LPN_ENGINE_PREPASS_CHECK)\n");
     else if (gPrepass) std::fprintf(stderr, "[native] engine capture: the prepass is drawn from the engine (LPN_ENGINE_PREPASS)\n");
     else std::fprintf(stderr, "[native] engine capture: checking the stage shadow casters against their draws (LPN_ENGINE_CHECK)\n");

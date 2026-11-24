@@ -118,6 +118,7 @@ const bool gSyscallReads = getenv("LPN_SYSCALL_READS") != nullptr;
 #endif
 
 bool readGuest(uint64_t addr, void* dst, size_t size) {
+    if (native::feedAddress(addr)) return native::feedRead(addr, dst, size); // LPN_ENGINE_FEED's tables
     if (!addr || addr >= (1ull << 40)) return false;
 #ifndef _WIN32
     if (gSyscallReads) {
@@ -340,6 +341,7 @@ class PageCache {
 public:
     explicit PageCache(Overlays& o) : overlays_(o) {}
     bool read(uint64_t addr, void* dst, size_t size) {
+        if (native::feedAddress(addr)) return native::feedRead(addr, dst, size); // LPN_ENGINE_FEED's tables
         if (!readPages(addr, dst, size)) return false;
         // Overlays are few but live across many draws: their ranges are checked without the
         // lock, from a copy taken when they change.
@@ -887,6 +889,7 @@ public:
         j.kind = DrawJob::kNone;
         if (d.kind == DrawCall::kDispatch) prepareDispatch(r, j);
         else if (!computeOnly_ && (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed)) prepareDraw(r, j);
+        if (j.kind == DrawJob::kDraw && d.engineCheck && native::engineFeedOn()) feed(d.engineCheck - 1, j);
         if (pending_.size() >= kAnalysisBatch) submitBatch();
     }
     void onAnalyzeFlush() override { submitBatch(); }
@@ -8196,6 +8199,55 @@ void main() {
         j.prefetch = any;
     }
 
+    // LPN_ENGINE_FEED (native/engine_capture.h): the draw's VS and PS launches take the engine's
+    // user data in place of the registers', when the engine set every user SGPR the shader has
+    // (its pointers moved to copies of the engine's tables). Both stages or neither.
+    void feed(uint32_t id, DrawJob& j) {
+        auto& st = feedStats_;
+        native::EngineSceneDraw e;
+        int why = 0;
+        uint32_t vs[16], ps[16];
+        auto stage = [&](const native::EngineStage& es, const gcn::LaunchState& l, uint32_t* out) {
+            if (!es.ok) return 2;
+            if (es.code != l.entry) return 3;
+            std::memcpy(out, l.userData, sizeof l.userData);
+            uint32_t covered = es.sgprKnown;
+            for (uint32_t i = 0; i < 16; ++i)
+                if (es.sgprKnown >> i & 1) out[i] = es.sgpr[i];
+            for (uint32_t p = 0; p < es.pointerCount; ++p) {
+                const auto& ptr = es.pointers[p];
+                if (ptr.sgpr + 1 >= 16 || ptr.dword >= es.table.size()) continue;
+                const uint64_t at = native::feedTable(es.table.data() + ptr.dword, uint32_t(es.table.size() - ptr.dword));
+                if (!at) return 4;
+                out[ptr.sgpr] = uint32_t(at), out[ptr.sgpr + 1] = uint32_t(at >> 32);
+                covered |= 3u << ptr.sgpr;
+            }
+            const uint32_t n = l.userSgprs();
+            if ((covered & ((1u << n) - 1)) != (1u << n) - 1) return 5;
+            return 0;
+        };
+        if (!native::engineScene(id, e)) why = 1;
+        else if (!e.attributes) why = 6;
+        else if (!(why = stage(e.vs, j.vs, vs)) && j.hasPs) why = stage(e.ps, j.ps, ps);
+        if (!why) {
+            std::memcpy(j.vs.userData, vs, sizeof vs);
+            if (j.hasPs) std::memcpy(j.ps.userData, ps, sizeof ps);
+        }
+        ++st.counts[why];
+        const auto now = std::chrono::steady_clock::now();
+        if (now - st.last < std::chrono::seconds(10)) return;
+        st.last = now;
+        static const char* const kWhy[7] = {"fed", "capture gone", "stage undecoded", "other code", "table too big",
+                                            "user SGPRs the engine didn't set", "vertex attributes not generated"};
+        std::string line;
+        for (int i = 0; i < 7; ++i)
+            if (st.counts[i]) line += std::string(line.empty() ? "" : ", ") + std::to_string(st.counts[i]) + " " + kWhy[i];
+        std::fprintf(stderr, "[native] engine feed: %s\n", line.c_str());
+    }
+    struct {
+        uint64_t counts[7] = {};
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    } feedStats_;
     // On a worker: analyses one draw or dispatch into its DrawAnalysis.
     void runJob(AnalysisCtx& c, DrawJob& j) {
         DrawAnalysis& a = *j.out;
