@@ -118,6 +118,7 @@ const bool gSyscallReads = getenv("LPN_SYSCALL_READS") != nullptr;
 #endif
 
 bool readGuest(uint64_t addr, void* dst, size_t size) {
+    if (native::feedAddress(addr)) return native::feedRead(addr, dst, size); // LPN_ENGINE_FEED's tables
     if (!addr || addr >= (1ull << 40)) return false;
 #ifndef _WIN32
     if (gSyscallReads) {
@@ -340,6 +341,7 @@ class PageCache {
 public:
     explicit PageCache(Overlays& o) : overlays_(o) {}
     bool read(uint64_t addr, void* dst, size_t size) {
+        if (native::feedAddress(addr)) return native::feedRead(addr, dst, size); // LPN_ENGINE_FEED's tables
         if (!readPages(addr, dst, size)) return false;
         // Overlays are few but live across many draws: their ranges are checked without the
         // lock, from a copy taken when they change.
@@ -887,6 +889,7 @@ public:
         j.kind = DrawJob::kNone;
         if (d.kind == DrawCall::kDispatch) prepareDispatch(r, j);
         else if (!computeOnly_ && (d.kind == DrawCall::kAuto || d.kind == DrawCall::kIndexed)) prepareDraw(r, j);
+        if (j.kind == DrawJob::kDraw && d.engineCheck && native::engineFeedOn()) feed(d.engineCheck - 1, j);
         if (pending_.size() >= kAnalysisBatch) submitBatch();
     }
     void onAnalyzeFlush() override { submitBatch(); }
@@ -5710,6 +5713,19 @@ void main() {
         std::lock_guard lock(m_);
         enginePrepassDraw(id, e, DrawRegs::of(gr));
     }
+    // What the native prepass declines from the registers (prepass.cpp): one colour target with
+    // depth, no blending, stencil or polygon offset. Decided before the game's draw is dropped.
+    bool enginePrepassAccepts(const GpuRegs& gr) override {
+        const uint32_t* c = gr.ctx;
+        const uint32_t mask = c[reg::kCbTargetMask] & c[reg::kCbShaderMask];
+        if ((mask & 0xF) == 0 || (mask >> 4) != 0) return false;
+        if (!((c[reg::kCbColorBase + ::gpu::ctx::kCbColorInfo] >> 2) & 0x1F)) return false;
+        if (!(c[reg::kDbZInfo] & 3)) return false;
+        if (c[reg::kCbBlendControl] & (1u << 30)) return false;
+        if (c[reg::kDbDepthControl] & 1) return false;
+        if (c[reg::kPaSuScModeCntl] & (3u << 11)) return false;
+        return true;
+    }
     // Declines are counted (the game's draw is gone by then: its analysis was skipped).
     void enginePrepassDraw(uint32_t id, const DrawCall& original, const DrawRegs& r) {
         const auto capture = native::enginePrepass(id);
@@ -6012,6 +6028,7 @@ void main() {
                 if (!(es.sgprKnown >> i & 1)) continue;
                 const bool same = r.sh[userData + i] == es.sgpr[i];
                 ++st.sgpr[k][same ? 0 : 1];
+                if (!same) ++st.sgprBy[native::shaderNameAt(code, &readGuest) + " s" + std::to_string(i)];
                 if (!same && st.sgpr[k][1] <= 10)
                     std::fprintf(stderr, "[native] scene check: %s %s s%u 0x%08x, engine 0x%08x\n", name,
                                  native::shaderNameAt(code, &readGuest).c_str(), i, r.sh[userData + i], es.sgpr[i]);
@@ -6046,6 +6063,12 @@ void main() {
                          (unsigned long long)st.sgpr[k][0], (unsigned long long)st.sgpr[k][1], (unsigned long long)st.table[k][0],
                          (unsigned long long)st.table[k][1], (unsigned long long)st.table[k][2], (unsigned long long)st.undecoded[k]);
         if (st.lost) std::fprintf(stderr, "[native] scene check: %llu descriptions lost\n", (unsigned long long)st.lost);
+        uint64_t after[2];
+        native::engineTableAfter(after);
+        std::fprintf(stderr, "[native] scene check: placed table dwords after drawIndex: %llu as placed, %llu changed\n",
+                     (unsigned long long)after[0], (unsigned long long)after[1]);
+        for (const auto& [what, n] : st.sgprBy)
+            std::fprintf(stderr, "[native] scene check:   %llu x %s differ\n", (unsigned long long)n, what.c_str());
     }
     // LPN_ENGINE_PREPASS_CHECK: a list prepass draw's capture against the native::Draw its analysis
     // builds: the vertex inputs, the constants by load pc, the textures and the index range.
@@ -6148,6 +6171,7 @@ void main() {
     std::chrono::steady_clock::time_point prepassLast_ = std::chrono::steady_clock::now();
     struct SceneStats {
         uint64_t code[2][2] = {}, sgpr[2][2] = {}, table[2][3] = {}, undecoded[2] = {}, lost = 0;
+        std::map<std::string, uint64_t> sgprBy; // differing SGPRs by shader and register
         std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     } sceneStats_;
     void engineCheck(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
@@ -7854,6 +7878,8 @@ void main() {
         gcn::LaunchState vs, ps; // a dispatch's launch is vs
         GraphicsState gs{};
         DrawAnalysis* out = nullptr;
+        bool fedCheck = false;          // LPN_ENGINE_FEED_CHECK: regVs/regPs are the registers' launches
+        gcn::LaunchState regVs, regPs;
     };
     static constexpr size_t kAnalysisBatch = 32;
 
@@ -8196,6 +8222,57 @@ void main() {
         j.prefetch = any;
     }
 
+    // LPN_ENGINE_FEED (native/engine_capture.h): the draw's VS and PS launches take the engine's
+    // user data in place of the registers', when the engine set every user SGPR the shader has
+    // (its pointers moved to copies of the engine's tables). Both stages or neither.
+    void feed(uint32_t id, DrawJob& j) {
+        auto& st = feedStats_;
+        native::EngineSceneDraw e;
+        int why = 0;
+        uint32_t vs[16], ps[16];
+        auto stage = [&](const native::EngineStage& es, const gcn::LaunchState& l, uint32_t* out) {
+            if (!es.ok) return 2;
+            if (es.code != l.entry) return 3;
+            std::memcpy(out, l.userData, sizeof l.userData);
+            uint32_t covered = es.sgprKnown;
+            for (uint32_t i = 0; i < 16; ++i)
+                if (es.sgprKnown >> i & 1) out[i] = es.sgpr[i];
+            for (uint32_t p = 0; p < es.pointerCount; ++p) {
+                const auto& ptr = es.pointers[p];
+                if (ptr.sgpr + 1 >= 16 || ptr.dword >= es.table.size()) continue;
+                const uint64_t at = native::feedTable(es.table.data() + ptr.dword, uint32_t(es.table.size() - ptr.dword));
+                if (!at) return 4;
+                out[ptr.sgpr] = uint32_t(at), out[ptr.sgpr + 1] = uint32_t(at >> 32);
+                covered |= 3u << ptr.sgpr;
+            }
+            const uint32_t n = l.userSgprs();
+            if ((covered & ((1u << n) - 1)) != (1u << n) - 1) return 5;
+            return 0;
+        };
+        if (!native::engineScene(id, e)) why = 1;
+        else if (!e.attributes) why = 6;
+        else if (!(why = stage(e.vs, j.vs, vs)) && j.hasPs) why = stage(e.ps, j.ps, ps);
+        static const bool check = getenv("LPN_ENGINE_FEED_CHECK") != nullptr;
+        if (!why && check) j.fedCheck = true, j.regVs = j.vs, j.regPs = j.ps;
+        if (!why) {
+            std::memcpy(j.vs.userData, vs, sizeof vs);
+            if (j.hasPs) std::memcpy(j.ps.userData, ps, sizeof ps);
+        }
+        ++st.counts[why];
+        const auto now = std::chrono::steady_clock::now();
+        if (now - st.last < std::chrono::seconds(10)) return;
+        st.last = now;
+        static const char* const kWhy[7] = {"fed", "capture gone", "stage undecoded", "other code", "table too big",
+                                            "user SGPRs the engine didn't set", "vertex attributes not generated"};
+        std::string line;
+        for (int i = 0; i < 7; ++i)
+            if (st.counts[i]) line += std::string(line.empty() ? "" : ", ") + std::to_string(st.counts[i]) + " " + kWhy[i];
+        std::fprintf(stderr, "[native] engine feed: %s\n", line.c_str());
+    }
+    struct {
+        uint64_t counts[7] = {};
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    } feedStats_;
     // On a worker: analyses one draw or dispatch into its DrawAnalysis.
     void runJob(AnalysisCtx& c, DrawJob& j) {
         DrawAnalysis& a = *j.out;
@@ -8211,6 +8288,26 @@ void main() {
         }
         if (j.kind != DrawJob::kDraw) return;
         ++c.draws;
+        // LPN_ENGINE_FEED_CHECK: the registers' analysis first (the cached programs are re-targeted
+        // in place, so its parts are copied), then the engine-fed one, compared.
+        struct Snap {
+            uint64_t entry = 0;
+            std::vector<uint32_t> data;
+            std::vector<gcn::BufferResource> buffers;
+            std::vector<gcn::ImageResource> images;
+            uint32_t fetchSlots = 0;
+            bool ok = false;
+        } snap[2];
+        if (j.fedCheck) {
+            auto take = [&](const gcn::LaunchState& l, uint32_t base, Snap& o) {
+                if (CachedProgram* p = analyzed(c, l, base)) {
+                    o.ok = true, o.entry = l.entry, o.data = p->prog.data, o.buffers = p->prog.buffers;
+                    o.images = p->prog.images, o.fetchSlots = p->prog.fetchSlots;
+                }
+            };
+            take(j.regVs, 0, snap[0]);
+            if (j.hasPs) take(j.regPs, kPsBindingBase, snap[1]);
+        }
         CachedProgram* vsc = analyzed(c, j.vs, 0);
         if (!vsc) return;
         a.repeat = c.memoHit;
@@ -8230,7 +8327,53 @@ void main() {
                 a.repeat = a.repeat && c.memoHit;
                 a.psc = psc;
             }
+        if (j.fedCheck) feedCheck(snap[0], a.vs, "vs"), feedCheck(snap[1], a.ps, "ps");
         prefetchPipeline(c, j, a);
+    }
+    template <typename Snap> void feedCheck(const Snap& r, const gcn::Program& e, const char* stage) {
+        if (!r.ok) return;
+        std::string why;
+        char b[160];
+        if (r.fetchSlots != e.fetchSlots) std::snprintf(b, sizeof b, "fetch slots %u, fed %u; ", r.fetchSlots, e.fetchSlots), why += b;
+        if (r.data.size() != e.data.size()) std::snprintf(b, sizeof b, "data %zu words, fed %zu; ", r.data.size(), e.data.size()), why += b;
+        else
+            for (size_t i = gcn::data::kUserData + 16; i < r.data.size(); ++i)
+                if (r.data[i] != e.data[i]) {
+                    std::snprintf(b, sizeof b, "data[%zu] 0x%x, fed 0x%x; ", i, r.data[i], e.data[i]);
+                    why += b;
+                    break;
+                }
+        if (r.buffers.size() != e.buffers.size()) std::snprintf(b, sizeof b, "%zu buffers, fed %zu; ", r.buffers.size(), e.buffers.size()), why += b;
+        else
+            for (size_t i = 0; i < r.buffers.size(); ++i)
+                if (r.buffers[i].pc != e.buffers[i].pc || std::memcmp(r.buffers[i].sharp, e.buffers[i].sharp, sizeof r.buffers[i].sharp) ||
+                    r.buffers[i].known != e.buffers[i].known) {
+                    std::snprintf(b, sizeof b, "buffer %zu pc 0x%llx V# %08x %08x, fed pc 0x%llx %08x %08x known %d/%d; ", i,
+                                  (unsigned long long)(r.buffers[i].pc - r.entry), r.buffers[i].sharp[0], r.buffers[i].sharp[1],
+                                  (unsigned long long)(e.buffers[i].pc - r.entry), e.buffers[i].sharp[0], e.buffers[i].sharp[1],
+                                  r.buffers[i].known, e.buffers[i].known);
+                    why += b;
+                    break;
+                }
+        if (r.images.size() != e.images.size()) std::snprintf(b, sizeof b, "%zu images, fed %zu; ", r.images.size(), e.images.size()), why += b;
+        else
+            for (size_t i = 0; i < r.images.size(); ++i)
+                if (r.images[i].pc != e.images[i].pc || std::memcmp(r.images[i].t, e.images[i].t, sizeof r.images[i].t) ||
+                    std::memcmp(r.images[i].s, e.images[i].s, sizeof r.images[i].s)) {
+                    std::snprintf(b, sizeof b, "image %zu pc 0x%llx differs; ", i, (unsigned long long)(r.images[i].pc - r.entry));
+                    why += b;
+                    break;
+                }
+        static std::atomic<uint64_t> same{0}, differ{0};
+        static std::atomic<std::chrono::steady_clock::rep> last{0};
+        const uint64_t n = why.empty() ? ++same : ++differ;
+        if (!why.empty() && n <= 30)
+            std::fprintf(stderr, "[native] feed check: %s %s %s\n", stage, native::shaderNameAt(r.entry, &readGuest).c_str(), why.c_str());
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto was = last.load();
+        if (now - was > std::chrono::steady_clock::duration(std::chrono::seconds(10)).count() && last.compare_exchange_strong(was, now))
+            std::fprintf(stderr, "[native] feed check: %llu stages the same, %llu differ\n", (unsigned long long)same.load(),
+                         (unsigned long long)differ.load());
     }
 
     // The analysis runs ahead of the recorder (by up to a frame): it works out each draw's

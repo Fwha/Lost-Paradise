@@ -56,6 +56,8 @@ public:
     // LPN_ENGINE_PREPASS (native/engine_capture.h): a list prepass draw the engine described, with
     // the draw as the game made it (`d`) for when the capture cannot be drawn.
     virtual void onEnginePrepass(uint32_t /*id*/, const DrawCall& d, const GpuRegs& regs) { onDraw(d, regs); }
+    // Whether the registers let the native prepass draw it (else the game's draw goes on).
+    virtual bool enginePrepassAccepts(const GpuRegs& /*regs*/) { return true; }
     // A draw through the geometry shader pipeline (export, geometry and copy shaders), which is
     // not rendered yet: it gets this instead of onDraw (and no analysis).
     virtual void onGeometryShaderDraw(const DrawCall&, const GpuRegs&) {}
