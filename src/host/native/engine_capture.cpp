@@ -869,6 +869,7 @@ void engineTableAfter(uint64_t out[2]) { out[0] = gTableAfter[0], out[1] = gTabl
 // shortcut still works). Written by the command processor's analysis pass, read by the workers.
 struct FeedSlot {
     uint64_t hash = 0;
+    uint32_t made = 0; // gFeedNext when it was written
     std::vector<uint32_t> words;
 };
 std::shared_mutex gFeedMutex;
@@ -882,8 +883,12 @@ uint64_t feedTable(const uint32_t* words, uint32_t n) {
     {
         std::shared_lock lock(gFeedMutex);
         if (const auto it = gFeedIndex.find(h); it != gFeedIndex.end()) {
+            // Only a slot written in the last half of the ring: an older one may be the next to be
+            // overwritten, under the draw that was just given it (Codex found this: tables that
+            // repeat every frame kept their first slot until the ring came round to it).
             const FeedSlot& f = gFeedSlots[it->second];
-            if (f.words.size() == n && !std::memcmp(f.words.data(), words, 4ull * n)) return kFeedBase + it->second * kFeedSlotBytes;
+            if (gFeedNext - f.made < kFeedSlots / 2 && f.words.size() == n && !std::memcmp(f.words.data(), words, 4ull * n))
+                return kFeedBase + it->second * kFeedSlotBytes;
         }
     }
     std::unique_lock lock(gFeedMutex);
@@ -891,6 +896,7 @@ uint64_t feedTable(const uint32_t* words, uint32_t n) {
     FeedSlot& f = gFeedSlots[slot];
     if (const auto it = gFeedIndex.find(f.hash); it != gFeedIndex.end() && it->second == slot) gFeedIndex.erase(it);
     f.hash = h;
+    f.made = gFeedNext;
     f.words.assign(words, words + n);
     gFeedIndex[h] = slot;
     return kFeedBase + uint64_t(slot) * kFeedSlotBytes;
