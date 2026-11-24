@@ -379,10 +379,10 @@ void decodeStage(uint64_t g, uint64_t s, uint32_t l, uint64_t record, EngineStag
     if (l == 2) {
         if (hdr[3] & 4) {
             pointer(hdr[5], offs[1]); // M+0x14
-            // M+4: the fetch shader (G+0x108, installed inside drawIndex: read where drawIndex
-            // takes it from, the fetch metadata at state+0x698).
-            uint64_t f = 0, fetch = 0;
-            if (rd(s + 0x698, f) && rd(f, fetch) && fetch) value(hdr[4], fetch, 2);
+            // M+4: the fetch shader, G+0x108 as drawIndex installs it (eabfb5 -> eba8c0): filled
+            // in after the original drawIndex (fetchInstalled). The fetch metadata's own code
+            // pointer (state+0x698) isn't always the one installed (~1.6% of draws).
+            if (hdr[4] < 15) st.fetchSgpr = hdr[4];
         }
         uint16_t a = 0, c = 0;
         if (hdr[0xe] != 0xFF && rd(g + 0x2c8, a) && rd(g + 0x2ca, c)) value(hdr[0xe], uint32_t(a) * c, 1);
@@ -403,7 +403,18 @@ bool feedClaimed(uint64_t g) {
     if (claimed.size() < 4096) claimed.emplace(code, yes);
     return yes;
 }
-void captureScene(uint64_t g, uint32_t baseVertex) {
+// After the original drawIndex: the fetch shader it installed, into the scene capture.
+void fetchInstalled(uint64_t g, uint32_t id) {
+    uint64_t fetch = 0;
+    if (!rd(g + 0x108, fetch)) return;
+    std::lock_guard lock(gSceneMutex);
+    if (gSceneIds[id % kScenes] != id) return;
+    EngineStage& vs = gScenes[id % kScenes].vs;
+    if (vs.fetchSgpr >= 15) return;
+    vs.sgpr[vs.fetchSgpr] = uint32_t(fetch), vs.sgpr[vs.fetchSgpr + 1] = uint32_t(fetch >> 32);
+    vs.sgprKnown |= uint16_t(3u << vs.fetchSgpr);
+}
+uint32_t captureScene(uint64_t g, uint32_t baseVertex) {
     const uint64_t s = at<uint64_t>(g + 0x320);
     EngineSceneDraw e;
     // The vertex attributes drawIndex is about to generate (else the table holds the last draw's).
@@ -417,6 +428,7 @@ void captureScene(uint64_t g, uint32_t baseVertex) {
     gScenes[id % kScenes] = std::move(e);
     gSceneIds[id % kScenes] = id;
     tEngineCheckId = id + 1;
+    return id + 1;
 }
 
 // LPN_ENGINE_PREPASS's capture (Codex's draft): the fetch program's inputs, the constants the native
@@ -723,7 +735,8 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
     }
     tForcedOrigin = o;
     if (gProbe && site == 0x3700) probeScene(ctx);
-    if ((gSceneCheck || (gFeed && feedClaimed(ctx))) && site == 0x3700) captureScene(ctx, uint32_t(baseVertex));
+    uint32_t scene = 0;
+    if ((gSceneCheck || (gFeed && feedClaimed(ctx))) && site == 0x3700) scene = captureScene(ctx, uint32_t(baseVertex));
     if (gPrepass && site == 0x3700 && (displaySettingsNative() || gPrepassCheck)) capturePrepass(ctx, uint32_t(count), uint32_t(first), uint32_t(baseVertex));
     if (engineSite(site)) {
         const uint64_t s = at<uint64_t>(ctx + 0x320);
@@ -790,6 +803,7 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
     const bool captured = tEngineDrawId != 0;
     const int64_t t = timed ? nowNs() : 0;
     const uint64_t r = gDrawIndex(ctx, count, first, baseVertex, r8, r9);
+    if (scene) fetchInstalled(ctx, scene - 1);
     if (timed) {
         gDrawNs += uint64_t(nowNs() - t);
         ++(captured ? gDrawsCaptured : gDrawsGame);

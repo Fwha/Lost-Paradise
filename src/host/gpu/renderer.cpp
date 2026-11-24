@@ -6015,6 +6015,7 @@ void main() {
                 if (!(es.sgprKnown >> i & 1)) continue;
                 const bool same = r.sh[userData + i] == es.sgpr[i];
                 ++st.sgpr[k][same ? 0 : 1];
+                if (!same) ++st.sgprBy[native::shaderNameAt(code, &readGuest) + " s" + std::to_string(i)];
                 if (!same && st.sgpr[k][1] <= 10)
                     std::fprintf(stderr, "[native] scene check: %s %s s%u 0x%08x, engine 0x%08x\n", name,
                                  native::shaderNameAt(code, &readGuest).c_str(), i, r.sh[userData + i], es.sgpr[i]);
@@ -6049,6 +6050,8 @@ void main() {
                          (unsigned long long)st.sgpr[k][0], (unsigned long long)st.sgpr[k][1], (unsigned long long)st.table[k][0],
                          (unsigned long long)st.table[k][1], (unsigned long long)st.table[k][2], (unsigned long long)st.undecoded[k]);
         if (st.lost) std::fprintf(stderr, "[native] scene check: %llu descriptions lost\n", (unsigned long long)st.lost);
+        for (const auto& [what, n] : st.sgprBy)
+            std::fprintf(stderr, "[native] scene check:   %llu x %s differ\n", (unsigned long long)n, what.c_str());
     }
     // LPN_ENGINE_PREPASS_CHECK: a list prepass draw's capture against the native::Draw its analysis
     // builds: the vertex inputs, the constants by load pc, the textures and the index range.
@@ -6151,6 +6154,7 @@ void main() {
     std::chrono::steady_clock::time_point prepassLast_ = std::chrono::steady_clock::now();
     struct SceneStats {
         uint64_t code[2][2] = {}, sgpr[2][2] = {}, table[2][3] = {}, undecoded[2] = {}, lost = 0;
+        std::map<std::string, uint64_t> sgprBy; // differing SGPRs by shader and register
         std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     } sceneStats_;
     void engineCheck(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {

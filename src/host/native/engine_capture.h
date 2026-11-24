@@ -93,6 +93,7 @@ struct EngineStage {
         uint32_t dword;              // where it points in the table (dwords)
     } pointers[8] = {};
     uint32_t pointerCount = 0;
+    uint8_t fetchSgpr = 0xFF;        // VS: the fetch shader's pair (M+4), set once drawIndex installs it
     std::vector<uint32_t> table;     // the descriptor table as the engine is about to copy it
     std::vector<uint8_t> tableKnown; // the dwords placed for this draw (the rest is stale)
     bool ok = false;
