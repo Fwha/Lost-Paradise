@@ -7865,6 +7865,8 @@ void main() {
         gcn::LaunchState vs, ps; // a dispatch's launch is vs
         GraphicsState gs{};
         DrawAnalysis* out = nullptr;
+        bool fedCheck = false;          // LPN_ENGINE_FEED_CHECK: regVs/regPs are the registers' launches
+        gcn::LaunchState regVs, regPs;
     };
     static constexpr size_t kAnalysisBatch = 32;
 
@@ -8237,6 +8239,8 @@ void main() {
         if (!native::engineScene(id, e)) why = 1;
         else if (!e.attributes) why = 6;
         else if (!(why = stage(e.vs, j.vs, vs)) && j.hasPs) why = stage(e.ps, j.ps, ps);
+        static const bool check = getenv("LPN_ENGINE_FEED_CHECK") != nullptr;
+        if (!why && check) j.fedCheck = true, j.regVs = j.vs, j.regPs = j.ps;
         if (!why) {
             std::memcpy(j.vs.userData, vs, sizeof vs);
             if (j.hasPs) std::memcpy(j.ps.userData, ps, sizeof ps);
@@ -8271,6 +8275,26 @@ void main() {
         }
         if (j.kind != DrawJob::kDraw) return;
         ++c.draws;
+        // LPN_ENGINE_FEED_CHECK: the registers' analysis first (the cached programs are re-targeted
+        // in place, so its parts are copied), then the engine-fed one, compared.
+        struct Snap {
+            uint64_t entry = 0;
+            std::vector<uint32_t> data;
+            std::vector<gcn::BufferResource> buffers;
+            std::vector<gcn::ImageResource> images;
+            uint32_t fetchSlots = 0;
+            bool ok = false;
+        } snap[2];
+        if (j.fedCheck) {
+            auto take = [&](const gcn::LaunchState& l, uint32_t base, Snap& o) {
+                if (CachedProgram* p = analyzed(c, l, base)) {
+                    o.ok = true, o.entry = l.entry, o.data = p->prog.data, o.buffers = p->prog.buffers;
+                    o.images = p->prog.images, o.fetchSlots = p->prog.fetchSlots;
+                }
+            };
+            take(j.regVs, 0, snap[0]);
+            if (j.hasPs) take(j.regPs, kPsBindingBase, snap[1]);
+        }
         CachedProgram* vsc = analyzed(c, j.vs, 0);
         if (!vsc) return;
         a.repeat = c.memoHit;
@@ -8290,7 +8314,53 @@ void main() {
                 a.repeat = a.repeat && c.memoHit;
                 a.psc = psc;
             }
+        if (j.fedCheck) feedCheck(snap[0], a.vs, "vs"), feedCheck(snap[1], a.ps, "ps");
         prefetchPipeline(c, j, a);
+    }
+    template <typename Snap> void feedCheck(const Snap& r, const gcn::Program& e, const char* stage) {
+        if (!r.ok) return;
+        std::string why;
+        char b[160];
+        if (r.fetchSlots != e.fetchSlots) std::snprintf(b, sizeof b, "fetch slots %u, fed %u; ", r.fetchSlots, e.fetchSlots), why += b;
+        if (r.data.size() != e.data.size()) std::snprintf(b, sizeof b, "data %zu words, fed %zu; ", r.data.size(), e.data.size()), why += b;
+        else
+            for (size_t i = gcn::data::kUserData + 16; i < r.data.size(); ++i)
+                if (r.data[i] != e.data[i]) {
+                    std::snprintf(b, sizeof b, "data[%zu] 0x%x, fed 0x%x; ", i, r.data[i], e.data[i]);
+                    why += b;
+                    break;
+                }
+        if (r.buffers.size() != e.buffers.size()) std::snprintf(b, sizeof b, "%zu buffers, fed %zu; ", r.buffers.size(), e.buffers.size()), why += b;
+        else
+            for (size_t i = 0; i < r.buffers.size(); ++i)
+                if (r.buffers[i].pc != e.buffers[i].pc || std::memcmp(r.buffers[i].sharp, e.buffers[i].sharp, sizeof r.buffers[i].sharp) ||
+                    r.buffers[i].known != e.buffers[i].known) {
+                    std::snprintf(b, sizeof b, "buffer %zu pc 0x%llx V# %08x %08x, fed pc 0x%llx %08x %08x known %d/%d; ", i,
+                                  (unsigned long long)(r.buffers[i].pc - r.entry), r.buffers[i].sharp[0], r.buffers[i].sharp[1],
+                                  (unsigned long long)(e.buffers[i].pc - r.entry), e.buffers[i].sharp[0], e.buffers[i].sharp[1],
+                                  r.buffers[i].known, e.buffers[i].known);
+                    why += b;
+                    break;
+                }
+        if (r.images.size() != e.images.size()) std::snprintf(b, sizeof b, "%zu images, fed %zu; ", r.images.size(), e.images.size()), why += b;
+        else
+            for (size_t i = 0; i < r.images.size(); ++i)
+                if (r.images[i].pc != e.images[i].pc || std::memcmp(r.images[i].t, e.images[i].t, sizeof r.images[i].t) ||
+                    std::memcmp(r.images[i].s, e.images[i].s, sizeof r.images[i].s)) {
+                    std::snprintf(b, sizeof b, "image %zu pc 0x%llx differs; ", i, (unsigned long long)(r.images[i].pc - r.entry));
+                    why += b;
+                    break;
+                }
+        static std::atomic<uint64_t> same{0}, differ{0};
+        static std::atomic<std::chrono::steady_clock::rep> last{0};
+        const uint64_t n = why.empty() ? ++same : ++differ;
+        if (!why.empty() && n <= 30)
+            std::fprintf(stderr, "[native] feed check: %s %s %s\n", stage, native::shaderNameAt(r.entry, &readGuest).c_str(), why.c_str());
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto was = last.load();
+        if (now - was > std::chrono::steady_clock::duration(std::chrono::seconds(10)).count() && last.compare_exchange_strong(was, now))
+            std::fprintf(stderr, "[native] feed check: %llu stages the same, %llu differ\n", (unsigned long long)same.load(),
+                         (unsigned long long)differ.load());
     }
 
     // The analysis runs ahead of the recorder (by up to a frame): it works out each draw's
