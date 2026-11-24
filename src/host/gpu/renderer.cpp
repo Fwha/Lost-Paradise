@@ -5488,85 +5488,10 @@ void main() {
                      Surface*& depthWritten) {
         // Analysed before the claim: without its scalar loads (the next draws have them).
         if (!a.nativeLoads) return false;
-        const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
         nd.psName = a.psm->gameName;
         nd.primitive = r.prim;
         nd.count = d.count;
-        const uint32_t targetMask = r.ctx[reg::kCbTargetMask] & r.ctx[reg::kCbShaderMask];
-        for (uint32_t i = 0; i < 8 && cbMode == 1; ++i) {
-            const uint32_t* cb = &r.ctx[reg::kCbColorBase + i * reg::kCbColorStride];
-            const uint32_t info = cb[::gpu::ctx::kCbColorInfo];
-            const uint32_t fmt = (info >> 2) & 0x1F, num = (info >> 8) & 7;
-            const uint32_t mask = (targetMask >> (i * 4)) & 0xF;
-            if (!fmt || !mask) continue;
-            const VkFormat vf = colorFormat(fmt, num);
-            if (vf == VK_FORMAT_UNDEFINED) return false;
-            const uint32_t pitch = ((cb[::gpu::ctx::kCbColorPitch] & 0x7FF) + 1) * 8;
-            const uint32_t slice = ((cb[::gpu::ctx::kCbColorSlice] & 0x3FFFFF) + 1) * 64;
-            Surface* s = colorSurface(uint64_t(cb[0]) << 8, pitch, slice / pitch, vf, bytesPerElement(fmt));
-            if (!s) return false;
-            written[i] = s;
-            nd.color[i] = {view(s->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), s->img.image, vf, s->img.width, s->img.height,
-                           uint64_t(cb[0]) << 8, uint8_t(a.ps.launch.colorSwap[i] & 3), a.ps.launch.colorComps[i]};
-            nd.colorCount = i + 1;
-            nd.writeMask |= mask << (i * 4);
-            if ((r.ctx[reg::kCbBlendControl + i] >> 30) & 1) nd.blend = true;
-        }
-        {
-            GraphicsState bs{};
-            for (uint32_t i = 0; i < nd.colorCount; ++i) bs.colorFormats[i] = uint32_t(nd.color[i].format), bs.blend[i] = r.ctx[reg::kCbBlendControl + i];
-            bs.writeMasks = nd.writeMask;
-            VkFormat formats[8];
-            uint32_t n = 0;
-            blendState(bs, nd.blendState, formats, n);
-            std::memcpy(nd.blendConstants, &r.ctx[reg::kCbBlendRed], 16);
-        }
-        const uint32_t depthControl = r.ctx[reg::kDbDepthControl];
-        if (const uint32_t zInfo = r.ctx[reg::kDbZInfo]; zInfo & 3) {
-            const bool stencil = r.ctx[reg::kDbStencilInfo] & 1;
-            const VkFormat f = stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : (zInfo & 3) == 1 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
-            const uint32_t size = r.ctx[reg::kDbDepthSize];
-            const uint32_t dw = ((size & 0x7FF) + 1) * 8, dh = (((size >> 11) & 0x7FF) + 1) * 8;
-            Surface* s = depthSurface(uint64_t(r.ctx[reg::kDbZReadBase]) << 8, dw, dh, f);
-            if (!s) return false;
-            nd.depth = {view(s->img, f, VK_IMAGE_VIEW_TYPE_2D, kIdentity, s->img.aspect), s->img.image, f, s->img.width,
-                        s->img.height, uint64_t(r.ctx[reg::kDbZReadBase]) << 8};
-            nd.hasStencil = stencil;
-            nd.stencil = stencil && (depthControl & 1);
-            nd.depthTest = (depthControl >> 1) & 1;
-            nd.depthWrite = (depthControl >> 2) & 1;
-            GraphicsState gs{};
-            gs.depthFormat = f, gs.stencil = stencil, gs.depthControl = depthControl;
-            gs.stencilControl = r.ctx[reg::kDbStencilControl];
-            depthState(gs, nd.depthStencil);
-            const uint32_t front = r.ctx[reg::kDbStencilRefMask];
-            const uint32_t back = (depthControl >> 7) & 1 ? r.ctx[reg::kDbStencilRefMaskBf] : front;
-            for (int i = 0; i < 2; ++i) {
-                const uint32_t m = i ? back : front;
-                nd.stencilRef[i] = m & 0xFF, nd.stencilCompare[i] = (m >> 8) & 0xFF, nd.stencilWrite[i] = (m >> 16) & 0xFF;
-            }
-            if (nd.depthWrite || (nd.stencil && (nd.stencilWrite[0] || nd.stencilWrite[1]))) depthWritten = s;
-        }
-        // The viewport and scissor as setViewportScissor makes them (without the HUD's layout).
-        const native::Target& first = nd.colorCount ? nd.color[0] : nd.depth;
-        const uint32_t tw = first.width, th = first.height;
-        VkViewport vp = gameViewport(r, tw, th);
-        if (vp.width < 0) vp.x += vp.width, vp.width = -vp.width;
-        if (vp.height < 0) vp.y += vp.height, vp.height = -vp.height;
-        nd.viewport[0] = vp.x, nd.viewport[1] = vp.y, nd.viewport[2] = vp.width, nd.viewport[3] = vp.height;
-        int32_t x0 = 0, y0 = 0, x1 = int32_t(tw), y1 = int32_t(th);
-        auto clip = [&](uint32_t tl, uint32_t br) {
-            if (!br) return; // never programmed
-            x0 = std::max<int32_t>(x0, tl & 0x7FFF);
-            y0 = std::max<int32_t>(y0, (tl >> 16) & 0x7FFF);
-            x1 = std::min<int32_t>(x1, br & 0x7FFF);
-            y1 = std::min<int32_t>(y1, (br >> 16) & 0x7FFF);
-        };
-        clip(r.ctx[reg::kScreenScissorTl], r.ctx[reg::kScreenScissorBr]);
-        clip(r.ctx[reg::kGenericScissorTl], r.ctx[reg::kGenericScissorBr]);
-        clip(r.ctx[reg::kWindowScissorTl], r.ctx[reg::kWindowScissorBr]);
-        if ((r.ctx[0x292] >> 1) & 1) clip(r.ctx[reg::kVportScissorTl], r.ctx[reg::kVportScissorBr]);
-        nd.scissor[0] = x0, nd.scissor[1] = y0, nd.scissor[2] = std::max(0, x1 - x0), nd.scissor[3] = std::max(0, y1 - y0);
+        if (!nativeTargets(r, a.ps.launch.colorSwap, a.ps.launch.colorComps, nd, written, depthWritten)) return false;
         R().sampledSurfaces_.clear(); // filled by resolveImage: render targets the draw samples
         for (const gcn::ImageResource& im : a.ps.images) {
             if (im.storage) return false;
@@ -5652,27 +5577,114 @@ void main() {
         } else if (d.kind != DrawCall::kAuto) {
             return false; // indirect: not yet
         }
-        {
-            const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
-            const uint32_t vte = r.ctx[reg::kPaClVteCntl];
-            const float zs = (vte & 16) ? v[4] : 1, zo = (vte & 32) ? v[5] : 0;
-            const bool dx = (r.ctx[reg::kPaClClipCntl] >> 19) & 1;
-            nd.clipZHalf = !dx;
-            nd.pixelPositions = !(vte & 0xF);
-            nd.upscaler = upOn_;
-            nd.vkViewport = gameViewport(r, tw, th);
-            nd.vkViewport.minDepth = std::clamp(dx ? zo : zo - zs, 0.0f, 1.0f);
-            nd.vkViewport.maxDepth = std::clamp(zo + zs, 0.0f, 1.0f);
-            if (nd.vkViewport.width < 0) nd.vkViewport.x += nd.vkViewport.width, nd.vkViewport.width = -nd.vkViewport.width;
-            GraphicsState gs{};
-            gs.topology = r.prim;
-            gs.modeCntl = r.ctx[reg::kPaSuScModeCntl];
-            VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-            rasterState(gs, rs);
-            nd.cull = rs.cullMode, nd.frontFace = rs.frontFace;
-            nd.depthBias = rs.depthBiasEnable;
-        }
+        nativeFixed(r, nd);
         return true;
+    }
+    // A native draw's targets, depth state, viewport and scissor from the registers (nativeBuild's,
+    // and an engine draw's): the colour targets' component swap and count as the pixel shader
+    // exports them.
+    bool nativeTargets(const DrawRegs& r, const uint8_t* colorSwap, const uint8_t* colorComps, native::Draw& nd, Surface** written,
+                       Surface*& depthWritten) {
+        const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
+        const uint32_t targetMask = r.ctx[reg::kCbTargetMask] & r.ctx[reg::kCbShaderMask];
+        for (uint32_t i = 0; i < 8 && cbMode == 1; ++i) {
+            const uint32_t* cb = &r.ctx[reg::kCbColorBase + i * reg::kCbColorStride];
+            const uint32_t info = cb[::gpu::ctx::kCbColorInfo];
+            const uint32_t fmt = (info >> 2) & 0x1F, num = (info >> 8) & 7;
+            const uint32_t mask = (targetMask >> (i * 4)) & 0xF;
+            if (!fmt || !mask) continue;
+            const VkFormat vf = colorFormat(fmt, num);
+            if (vf == VK_FORMAT_UNDEFINED) return false;
+            const uint32_t pitch = ((cb[::gpu::ctx::kCbColorPitch] & 0x7FF) + 1) * 8;
+            const uint32_t slice = ((cb[::gpu::ctx::kCbColorSlice] & 0x3FFFFF) + 1) * 64;
+            Surface* s = colorSurface(uint64_t(cb[0]) << 8, pitch, slice / pitch, vf, bytesPerElement(fmt));
+            if (!s) return false;
+            written[i] = s;
+            nd.color[i] = {view(s->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), s->img.image, vf, s->img.width, s->img.height,
+                           uint64_t(cb[0]) << 8, uint8_t(colorSwap[i] & 3), colorComps[i]};
+            nd.colorCount = i + 1;
+            nd.writeMask |= mask << (i * 4);
+            if ((r.ctx[reg::kCbBlendControl + i] >> 30) & 1) nd.blend = true;
+        }
+        {
+            GraphicsState bs{};
+            for (uint32_t i = 0; i < nd.colorCount; ++i) bs.colorFormats[i] = uint32_t(nd.color[i].format), bs.blend[i] = r.ctx[reg::kCbBlendControl + i];
+            bs.writeMasks = nd.writeMask;
+            VkFormat formats[8];
+            uint32_t n = 0;
+            blendState(bs, nd.blendState, formats, n);
+            std::memcpy(nd.blendConstants, &r.ctx[reg::kCbBlendRed], 16);
+        }
+        const uint32_t depthControl = r.ctx[reg::kDbDepthControl];
+        if (const uint32_t zInfo = r.ctx[reg::kDbZInfo]; zInfo & 3) {
+            const bool stencil = r.ctx[reg::kDbStencilInfo] & 1;
+            const VkFormat f = stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : (zInfo & 3) == 1 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
+            const uint32_t size = r.ctx[reg::kDbDepthSize];
+            const uint32_t dw = ((size & 0x7FF) + 1) * 8, dh = (((size >> 11) & 0x7FF) + 1) * 8;
+            Surface* s = depthSurface(uint64_t(r.ctx[reg::kDbZReadBase]) << 8, dw, dh, f);
+            if (!s) return false;
+            nd.depth = {view(s->img, f, VK_IMAGE_VIEW_TYPE_2D, kIdentity, s->img.aspect), s->img.image, f, s->img.width,
+                        s->img.height, uint64_t(r.ctx[reg::kDbZReadBase]) << 8};
+            nd.hasStencil = stencil;
+            nd.stencil = stencil && (depthControl & 1);
+            nd.depthTest = (depthControl >> 1) & 1;
+            nd.depthWrite = (depthControl >> 2) & 1;
+            GraphicsState gs{};
+            gs.depthFormat = f, gs.stencil = stencil, gs.depthControl = depthControl;
+            gs.stencilControl = r.ctx[reg::kDbStencilControl];
+            depthState(gs, nd.depthStencil);
+            const uint32_t front = r.ctx[reg::kDbStencilRefMask];
+            const uint32_t back = (depthControl >> 7) & 1 ? r.ctx[reg::kDbStencilRefMaskBf] : front;
+            for (int i = 0; i < 2; ++i) {
+                const uint32_t m = i ? back : front;
+                nd.stencilRef[i] = m & 0xFF, nd.stencilCompare[i] = (m >> 8) & 0xFF, nd.stencilWrite[i] = (m >> 16) & 0xFF;
+            }
+            if (nd.depthWrite || (nd.stencil && (nd.stencilWrite[0] || nd.stencilWrite[1]))) depthWritten = s;
+        }
+        // The viewport and scissor as setViewportScissor makes them (without the HUD's layout).
+        const native::Target& first = nd.colorCount ? nd.color[0] : nd.depth;
+        const uint32_t tw = first.width, th = first.height;
+        VkViewport vp = gameViewport(r, tw, th);
+        if (vp.width < 0) vp.x += vp.width, vp.width = -vp.width;
+        if (vp.height < 0) vp.y += vp.height, vp.height = -vp.height;
+        nd.viewport[0] = vp.x, nd.viewport[1] = vp.y, nd.viewport[2] = vp.width, nd.viewport[3] = vp.height;
+        int32_t x0 = 0, y0 = 0, x1 = int32_t(tw), y1 = int32_t(th);
+        auto clip = [&](uint32_t tl, uint32_t br) {
+            if (!br) return; // never programmed
+            x0 = std::max<int32_t>(x0, tl & 0x7FFF);
+            y0 = std::max<int32_t>(y0, (tl >> 16) & 0x7FFF);
+            x1 = std::min<int32_t>(x1, br & 0x7FFF);
+            y1 = std::min<int32_t>(y1, (br >> 16) & 0x7FFF);
+        };
+        clip(r.ctx[reg::kScreenScissorTl], r.ctx[reg::kScreenScissorBr]);
+        clip(r.ctx[reg::kGenericScissorTl], r.ctx[reg::kGenericScissorBr]);
+        clip(r.ctx[reg::kWindowScissorTl], r.ctx[reg::kWindowScissorBr]);
+        if ((r.ctx[0x292] >> 1) & 1) clip(r.ctx[reg::kVportScissorTl], r.ctx[reg::kVportScissorBr]);
+        nd.scissor[0] = x0, nd.scissor[1] = y0, nd.scissor[2] = std::max(0, x1 - x0), nd.scissor[3] = std::max(0, y1 - y0);
+        return true;
+    }
+    // Its clip, viewport depth range and rasterizer state (after nativeTargets).
+    void nativeFixed(const DrawRegs& r, native::Draw& nd) {
+        const native::Target& first = nd.colorCount ? nd.color[0] : nd.depth;
+        const uint32_t tw = first.width, th = first.height;
+        const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
+        const uint32_t vte = r.ctx[reg::kPaClVteCntl];
+        const float zs = (vte & 16) ? v[4] : 1, zo = (vte & 32) ? v[5] : 0;
+        const bool dx = (r.ctx[reg::kPaClClipCntl] >> 19) & 1;
+        nd.clipZHalf = !dx;
+        nd.pixelPositions = !(vte & 0xF);
+        nd.upscaler = upOn_;
+        nd.vkViewport = gameViewport(r, tw, th);
+        nd.vkViewport.minDepth = std::clamp(dx ? zo : zo - zs, 0.0f, 1.0f);
+        nd.vkViewport.maxDepth = std::clamp(zo + zs, 0.0f, 1.0f);
+        if (nd.vkViewport.width < 0) nd.vkViewport.x += nd.vkViewport.width, nd.vkViewport.width = -nd.vkViewport.width;
+        GraphicsState gs{};
+        gs.topology = r.prim;
+        gs.modeCntl = r.ctx[reg::kPaSuScModeCntl];
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rasterState(gs, rs);
+        nd.cull = rs.cullMode, nd.frontFace = rs.frontFace;
+        nd.depthBias = rs.depthBiasEnable;
     }
 
     // LPN_ENGINE_SHADOWS (native/engine_capture.h): a stage shadow caster the engine described,
