@@ -31,6 +31,7 @@ GpuRegs gRecordRegs, gAnalysisRegs;
 thread_local GpuRegs* tRegs = &gRecordRegs;
 thread_local bool tDry = false; // the analysis thread: no side effects, analysis hooks only
 thread_local uint32_t tOrigin[3] = {}; // the next draw's origin, from the NOP ahead of it
+thread_local uint32_t tEngineCheck = 0; // the next draw's engine description (id + 1), from a NOP ahead of it
 bool commandProcessorIsAsync();
 // Analysis hooks run inline, just before their counterparts: without the command processor
 // thread, or with LPN_NO_ANALYSIS_THREAD=1 (for comparison).
@@ -52,6 +53,8 @@ void draw(const DrawCall& dc, Pm4Stats* st) {
     if (d.kind < DrawCall::kDispatch) {
         std::memcpy(d.origin, tOrigin, sizeof tOrigin);
         std::memset(tOrigin, 0, sizeof tOrigin);
+        d.engineCheck = tEngineCheck;
+        tEngineCheck = 0;
     }
     if (geometryShaderDraw(d)) {
         if (tDry) return;
@@ -267,7 +270,32 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
             case kOpNop: // a draw's origin, ahead of it (native/draw_origin.h), or an engine draw
                 if (native::isOriginNop(b, count + 1))
                     for (int i = 0; i < 3; ++i) tOrigin[i] = b[i] & ~native::kOriginMask;
-                else if (count + 1 >= 2 && b[0] == native::kEngineTag && !tDry) {
+                else if (count + 1 >= 2 && b[0] == native::kEngineCheckTag) {
+                    tEngineCheck = b[1] + 1;
+                    tOrigin[0] = 0x3700; // the list draws' origin (in place of the origin NOP)
+                } else if (count + 1 >= 5 && (b[0] == native::kEnginePrepassTag || b[0] == native::kEnginePrepassTag + 1)) {
+                    // Decided once, by the first pass to see it (the analysis pass when there is one): a
+                    // capture drawn natively has no analysis; otherwise the draw goes on as the game made it,
+                    // and the tag says so (+1) to the drawing pass, so the analyses stay in step.
+                    DrawCall d{DrawCall::kIndexed};
+                    d.count = b[2];
+                    d.indexAddr = address(b[3], b[4]);
+                    std::memset(tOrigin, 0, sizeof tOrigin);
+                    tOrigin[0] = 0x3700;
+                    if (b[0] == native::kEnginePrepassTag && (geometryShaderDraw(d) || !native::enginePrepassUsable(b[1], d.count, d.indexAddr)))
+                        const_cast<uint32_t*>(b)[0] = native::kEnginePrepassTag + 1;
+                    if (b[0] != native::kEnginePrepassTag) {
+                        draw(d, st);
+                    } else if (!tDry) {
+                        tEngineCheck = 0;
+                        std::memset(tOrigin, 0, sizeof tOrigin);
+                        d.origin[0] = 0x3700;
+                        ++st->draws;
+                        for (DrawListener* l : gListeners) l->onEnginePrepass(b[1], d, *tRegs);
+                    } else {
+                        std::memset(tOrigin, 0, sizeof tOrigin);
+                    }
+                } else if (count + 1 >= 2 && b[0] == native::kEngineTag && !tDry) {
                     ++st->draws;
                     for (DrawListener* l : gListeners) l->onEngineDraw(b[1], *tRegs);
                 }

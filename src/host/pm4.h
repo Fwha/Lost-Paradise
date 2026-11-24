@@ -36,13 +36,14 @@ struct GpuRegs {
 struct DrawCall {
     // kEngine: a draw the engine described (DrawListener::onEngineDraw), queued with the others;
     // `count` holds the capture's id.
-    enum Kind { kIndexed, kAuto, kIndexedIndirect, kIndirect, kDispatch, kDispatchIndirect, kEngine } kind;
+    enum Kind { kIndexed, kAuto, kIndexedIndirect, kIndirect, kDispatch, kDispatchIndirect, kEngine, kEnginePrepass } kind;
     uint32_t count = 0;              // indices or vertices
     uint32_t indexOffset = 0;        // first index for DRAW_INDEX_OFFSET_2
     uint64_t indexAddr = 0;          // index buffer for kIndexed
     uint32_t groups[3] = {};         // thread groups for kDispatch
     uint32_t indirectOffset = 0;     // into GpuRegs::indirectBase
     uint32_t origin[3] = {};         // eboot offsets of the engine code that drew it (native/draw_origin.h)
+    uint32_t engineCheck = 0;        // LPN_ENGINE_SCENE_CHECK: the engine's description of it (id + 1), 0: none
 };
 
 class DrawListener {
@@ -52,6 +53,9 @@ public:
     // A draw the engine described itself (native/engine_capture.h): the capture's id, with the
     // registers as the game's draw would have had them.
     virtual void onEngineDraw(uint32_t /*id*/, const GpuRegs&) {}
+    // LPN_ENGINE_PREPASS (native/engine_capture.h): a list prepass draw the engine described, with
+    // the draw as the game made it (`d`) for when the capture cannot be drawn.
+    virtual void onEnginePrepass(uint32_t /*id*/, const DrawCall& d, const GpuRegs& regs) { onDraw(d, regs); }
     // A draw through the geometry shader pipeline (export, geometry and copy shaders), which is
     // not rendered yet: it gets this instead of onDraw (and no analysis).
     virtual void onGeometryShaderDraw(const DrawCall&, const GpuRegs&) {}

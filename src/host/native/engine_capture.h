@@ -9,8 +9,11 @@
 // (LPN_ENGINE_CHECK=1): when they agree, the capture can take the game's place.
 #pragma once
 
+#include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace host {
@@ -73,5 +76,68 @@ bool engineSite(uint32_t origin);
 bool takeEngineDraw(EngineDraw& out);
 
 bool engineCheckOn();
+
+// LPN_ENGINE_SCENE_CHECK: the scene's draw-command-list draws (back at 0x3700) described from the
+// engine's state alone (docs/engine/user-data.md): each stage's code and the user data the engine
+// is about to give it (descriptors in SGPRs, pointers into its descriptor table and that table),
+// checked by the renderer against the draw's registers. A NOP {kEngineCheckTag, id} goes ahead of
+// the draw (in place of its origin NOP); the draw itself still runs.
+constexpr uint32_t kEngineCheckTag = 0x4B43454C; // "LECK"
+inline thread_local uint32_t tEngineCheckId = 0;
+struct EngineStage {
+    uint64_t code = 0;
+    uint32_t sgpr[16] = {};
+    uint16_t sgprKnown = 0;          // bit per SGPR the engine sets with a descriptor or a value
+    struct Pointer {
+        uint8_t sgpr;                // the pair's first SGPR
+        uint32_t dword;              // where it points in the table (dwords)
+    } pointers[8] = {};
+    uint32_t pointerCount = 0;
+    std::vector<uint32_t> table;     // the descriptor table as the engine is about to copy it
+    std::vector<uint8_t> tableKnown; // the dwords placed for this draw (the rest is stale)
+    bool ok = false;
+};
+struct EngineSceneDraw {
+    EngineStage vs, ps;
+};
+bool engineSceneCheckOn();
+bool engineScene(uint32_t id, EngineSceneDraw& out);
+
+// LPN_ENGINE_PREPASS: the list prepass (vs_normal_rigid[_pt] with ps_normal[_pt]) drawn from the
+// engine's description (docs/engine/, Codex's design): the engine still prepares the draw, but the
+// packet helper writes a NOP {kEnginePrepassTag, id, count, index address} in place of its draw
+// packet, and the renderer draws the capture natively there (or the draw as it was, from the NOP's
+// arguments, when it cannot).
+constexpr uint32_t kEnginePrepassTag = 0x5052504C; // "LPRP"
+inline thread_local uint32_t tEnginePrepassId = 0;   // id + 1
+struct EnginePrepass {
+    std::string vsName, psName;
+    EngineSceneDraw stages;
+    struct Input {
+        uint32_t sharp[4] = {};
+        uint32_t slot = 0, components = 0, indexVgpr = 0, offset = 0;
+    };
+    struct Image {
+        uint32_t t[8] = {}, s[4] = {};
+        uint32_t pc = 0;
+    };
+    std::vector<Input> vertex;
+    std::vector<Image> images;
+    std::map<uint32_t, std::vector<uint32_t>> vsLoads, psLoads; // load pc: the values it reads
+    uint32_t count = 0, first = 0, baseVertex = 0;
+    uint32_t indexWord = 0, indexModifier = 0;
+    uint64_t indexAddr = 0;
+    bool alpha = false;
+};
+std::shared_ptr<const EnginePrepass> enginePrepass(uint32_t id);
+// Whether the capture behind a NOP is there and is the draw the NOP stands for (the same answer on
+// the command processor's analysis and drawing passes).
+bool enginePrepassUsable(uint32_t id, uint32_t count, uint64_t indexAddr);
+// Set by the renderer each frame: whether it draws these natively (Native Renderer on, no upscaler).
+void setEnginePrepassAllowed(bool on);
+bool enginePrepassOn();
+// LPN_ENGINE_PREPASS_CHECK: the captures are made but the game's draws still run, each carrying its
+// capture's id (DrawCall::engineCheck), and the renderer checks the capture against the draw's analysis.
+bool enginePrepassCheckOn();
 
 } // namespace host::native

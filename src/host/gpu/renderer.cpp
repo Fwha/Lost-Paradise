@@ -1098,6 +1098,7 @@ public:
         if (upIn_.on && smaaSeen_ && !upEffect_ && upLastScene_) upscaleEffect(d, r, *held);
         if (passMap_.active()) passMap_.onDraw(d, r, &readGuest);
         if (native::engineCheckOn() && d.kind == DrawCall::kIndexed && native::engineSite(d.origin[0])) engineCheck(d, r, *held);
+        if (d.engineCheck && native::engineSceneCheckOn()) sceneCheck(d, r);
         // A draw a native pass takes is recorded here, in order (see nativeDraw).
         const bool native = nativeOn_ && d.kind != DrawCall::kDispatch && nativeClaimed(*held);
         if (comparePending_) { // LPN_NATIVE_COMPARE: before a recorder thread takes the next draw
@@ -1181,6 +1182,10 @@ public:
     void recordDraw(const DrawCall& d, const DrawRegs& r, std::unique_ptr<DrawAnalysis>& held) {
         if (d.kind == DrawCall::kEngine) { // onEngineDraw's, in a segment: no analysis
             engineDraw(d.count, r);
+            return;
+        }
+        if (d.kind == DrawCall::kEnginePrepass) { // onEnginePrepass's, in a segment: no analysis
+            enginePrepassDraw(d.groups[0], d, r);
             return;
         }
         DrawAnalysis& a = *held;
@@ -1328,6 +1333,8 @@ public:
         for (native::Pass* np : native::passes()) np->frameEnd();
         passMap_.onFrameEnd(frame_, pendingCapture_); // F12: the next frame's pass map beside its trace
         nativeOn_ = displaySettings().nativeRenderer;
+        // The engine prepass only where the native prepass draws (not with an upscaler: it reads the camera from these draws).
+        native::setEnginePrepassAllowed(nativeOn_ && !upOn_ && compareWith_.empty());
         // Anisotropic Filtering changed: remembered bindings hold the old samplers.
         if (const int a = displaySettings().anisotropy; a != anisoSeen_) anisoSeen_ = a, ++imageGen_;
         ++frame_;
@@ -5487,85 +5494,10 @@ void main() {
                      Surface*& depthWritten) {
         // Analysed before the claim: without its scalar loads (the next draws have them).
         if (!a.nativeLoads) return false;
-        const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
         nd.psName = a.psm->gameName;
         nd.primitive = r.prim;
         nd.count = d.count;
-        const uint32_t targetMask = r.ctx[reg::kCbTargetMask] & r.ctx[reg::kCbShaderMask];
-        for (uint32_t i = 0; i < 8 && cbMode == 1; ++i) {
-            const uint32_t* cb = &r.ctx[reg::kCbColorBase + i * reg::kCbColorStride];
-            const uint32_t info = cb[::gpu::ctx::kCbColorInfo];
-            const uint32_t fmt = (info >> 2) & 0x1F, num = (info >> 8) & 7;
-            const uint32_t mask = (targetMask >> (i * 4)) & 0xF;
-            if (!fmt || !mask) continue;
-            const VkFormat vf = colorFormat(fmt, num);
-            if (vf == VK_FORMAT_UNDEFINED) return false;
-            const uint32_t pitch = ((cb[::gpu::ctx::kCbColorPitch] & 0x7FF) + 1) * 8;
-            const uint32_t slice = ((cb[::gpu::ctx::kCbColorSlice] & 0x3FFFFF) + 1) * 64;
-            Surface* s = colorSurface(uint64_t(cb[0]) << 8, pitch, slice / pitch, vf, bytesPerElement(fmt));
-            if (!s) return false;
-            written[i] = s;
-            nd.color[i] = {view(s->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), s->img.image, vf, s->img.width, s->img.height,
-                           uint64_t(cb[0]) << 8, uint8_t(a.ps.launch.colorSwap[i] & 3), a.ps.launch.colorComps[i]};
-            nd.colorCount = i + 1;
-            nd.writeMask |= mask << (i * 4);
-            if ((r.ctx[reg::kCbBlendControl + i] >> 30) & 1) nd.blend = true;
-        }
-        {
-            GraphicsState bs{};
-            for (uint32_t i = 0; i < nd.colorCount; ++i) bs.colorFormats[i] = uint32_t(nd.color[i].format), bs.blend[i] = r.ctx[reg::kCbBlendControl + i];
-            bs.writeMasks = nd.writeMask;
-            VkFormat formats[8];
-            uint32_t n = 0;
-            blendState(bs, nd.blendState, formats, n);
-            std::memcpy(nd.blendConstants, &r.ctx[reg::kCbBlendRed], 16);
-        }
-        const uint32_t depthControl = r.ctx[reg::kDbDepthControl];
-        if (const uint32_t zInfo = r.ctx[reg::kDbZInfo]; zInfo & 3) {
-            const bool stencil = r.ctx[reg::kDbStencilInfo] & 1;
-            const VkFormat f = stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : (zInfo & 3) == 1 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
-            const uint32_t size = r.ctx[reg::kDbDepthSize];
-            const uint32_t dw = ((size & 0x7FF) + 1) * 8, dh = (((size >> 11) & 0x7FF) + 1) * 8;
-            Surface* s = depthSurface(uint64_t(r.ctx[reg::kDbZReadBase]) << 8, dw, dh, f);
-            if (!s) return false;
-            nd.depth = {view(s->img, f, VK_IMAGE_VIEW_TYPE_2D, kIdentity, s->img.aspect), s->img.image, f, s->img.width,
-                        s->img.height, uint64_t(r.ctx[reg::kDbZReadBase]) << 8};
-            nd.hasStencil = stencil;
-            nd.stencil = stencil && (depthControl & 1);
-            nd.depthTest = (depthControl >> 1) & 1;
-            nd.depthWrite = (depthControl >> 2) & 1;
-            GraphicsState gs{};
-            gs.depthFormat = f, gs.stencil = stencil, gs.depthControl = depthControl;
-            gs.stencilControl = r.ctx[reg::kDbStencilControl];
-            depthState(gs, nd.depthStencil);
-            const uint32_t front = r.ctx[reg::kDbStencilRefMask];
-            const uint32_t back = (depthControl >> 7) & 1 ? r.ctx[reg::kDbStencilRefMaskBf] : front;
-            for (int i = 0; i < 2; ++i) {
-                const uint32_t m = i ? back : front;
-                nd.stencilRef[i] = m & 0xFF, nd.stencilCompare[i] = (m >> 8) & 0xFF, nd.stencilWrite[i] = (m >> 16) & 0xFF;
-            }
-            if (nd.depthWrite || (nd.stencil && (nd.stencilWrite[0] || nd.stencilWrite[1]))) depthWritten = s;
-        }
-        // The viewport and scissor as setViewportScissor makes them (without the HUD's layout).
-        const native::Target& first = nd.colorCount ? nd.color[0] : nd.depth;
-        const uint32_t tw = first.width, th = first.height;
-        VkViewport vp = gameViewport(r, tw, th);
-        if (vp.width < 0) vp.x += vp.width, vp.width = -vp.width;
-        if (vp.height < 0) vp.y += vp.height, vp.height = -vp.height;
-        nd.viewport[0] = vp.x, nd.viewport[1] = vp.y, nd.viewport[2] = vp.width, nd.viewport[3] = vp.height;
-        int32_t x0 = 0, y0 = 0, x1 = int32_t(tw), y1 = int32_t(th);
-        auto clip = [&](uint32_t tl, uint32_t br) {
-            if (!br) return; // never programmed
-            x0 = std::max<int32_t>(x0, tl & 0x7FFF);
-            y0 = std::max<int32_t>(y0, (tl >> 16) & 0x7FFF);
-            x1 = std::min<int32_t>(x1, br & 0x7FFF);
-            y1 = std::min<int32_t>(y1, (br >> 16) & 0x7FFF);
-        };
-        clip(r.ctx[reg::kScreenScissorTl], r.ctx[reg::kScreenScissorBr]);
-        clip(r.ctx[reg::kGenericScissorTl], r.ctx[reg::kGenericScissorBr]);
-        clip(r.ctx[reg::kWindowScissorTl], r.ctx[reg::kWindowScissorBr]);
-        if ((r.ctx[0x292] >> 1) & 1) clip(r.ctx[reg::kVportScissorTl], r.ctx[reg::kVportScissorBr]);
-        nd.scissor[0] = x0, nd.scissor[1] = y0, nd.scissor[2] = std::max(0, x1 - x0), nd.scissor[3] = std::max(0, y1 - y0);
+        if (!nativeTargets(r, a.ps.launch.colorSwap, a.ps.launch.colorComps, nd, written, depthWritten)) return false;
         R().sampledSurfaces_.clear(); // filled by resolveImage: render targets the draw samples
         for (const gcn::ImageResource& im : a.ps.images) {
             if (im.storage) return false;
@@ -5651,28 +5583,253 @@ void main() {
         } else if (d.kind != DrawCall::kAuto) {
             return false; // indirect: not yet
         }
-        {
-            const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
-            const uint32_t vte = r.ctx[reg::kPaClVteCntl];
-            const float zs = (vte & 16) ? v[4] : 1, zo = (vte & 32) ? v[5] : 0;
-            const bool dx = (r.ctx[reg::kPaClClipCntl] >> 19) & 1;
-            nd.clipZHalf = !dx;
-            nd.pixelPositions = !(vte & 0xF);
-            nd.upscaler = upOn_;
-            nd.vkViewport = gameViewport(r, tw, th);
-            nd.vkViewport.minDepth = std::clamp(dx ? zo : zo - zs, 0.0f, 1.0f);
-            nd.vkViewport.maxDepth = std::clamp(zo + zs, 0.0f, 1.0f);
-            if (nd.vkViewport.width < 0) nd.vkViewport.x += nd.vkViewport.width, nd.vkViewport.width = -nd.vkViewport.width;
-            GraphicsState gs{};
-            gs.topology = r.prim;
-            gs.modeCntl = r.ctx[reg::kPaSuScModeCntl];
-            VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-            rasterState(gs, rs);
-            nd.cull = rs.cullMode, nd.frontFace = rs.frontFace;
-            nd.depthBias = rs.depthBiasEnable;
-        }
+        nativeFixed(r, nd);
         return true;
     }
+    // A native draw's targets, depth state, viewport and scissor from the registers (nativeBuild's,
+    // and an engine draw's): the colour targets' component swap and count as the pixel shader
+    // exports them.
+    bool nativeTargets(const DrawRegs& r, const uint8_t* colorSwap, const uint8_t* colorComps, native::Draw& nd, Surface** written,
+                       Surface*& depthWritten) {
+        const uint32_t cbMode = (r.ctx[reg::kCbColorControl] >> 4) & 7;
+        const uint32_t targetMask = r.ctx[reg::kCbTargetMask] & r.ctx[reg::kCbShaderMask];
+        for (uint32_t i = 0; i < 8 && cbMode == 1; ++i) {
+            const uint32_t* cb = &r.ctx[reg::kCbColorBase + i * reg::kCbColorStride];
+            const uint32_t info = cb[::gpu::ctx::kCbColorInfo];
+            const uint32_t fmt = (info >> 2) & 0x1F, num = (info >> 8) & 7;
+            const uint32_t mask = (targetMask >> (i * 4)) & 0xF;
+            if (!fmt || !mask) continue;
+            const VkFormat vf = colorFormat(fmt, num);
+            if (vf == VK_FORMAT_UNDEFINED) return false;
+            const uint32_t pitch = ((cb[::gpu::ctx::kCbColorPitch] & 0x7FF) + 1) * 8;
+            const uint32_t slice = ((cb[::gpu::ctx::kCbColorSlice] & 0x3FFFFF) + 1) * 64;
+            Surface* s = colorSurface(uint64_t(cb[0]) << 8, pitch, slice / pitch, vf, bytesPerElement(fmt));
+            if (!s) return false;
+            written[i] = s;
+            nd.color[i] = {view(s->img, vf, VK_IMAGE_VIEW_TYPE_2D, kIdentity), s->img.image, vf, s->img.width, s->img.height,
+                           uint64_t(cb[0]) << 8, uint8_t(colorSwap[i] & 3), colorComps[i]};
+            nd.colorCount = i + 1;
+            nd.writeMask |= mask << (i * 4);
+            if ((r.ctx[reg::kCbBlendControl + i] >> 30) & 1) nd.blend = true;
+        }
+        {
+            GraphicsState bs{};
+            for (uint32_t i = 0; i < nd.colorCount; ++i) bs.colorFormats[i] = uint32_t(nd.color[i].format), bs.blend[i] = r.ctx[reg::kCbBlendControl + i];
+            bs.writeMasks = nd.writeMask;
+            VkFormat formats[8];
+            uint32_t n = 0;
+            blendState(bs, nd.blendState, formats, n);
+            std::memcpy(nd.blendConstants, &r.ctx[reg::kCbBlendRed], 16);
+        }
+        const uint32_t depthControl = r.ctx[reg::kDbDepthControl];
+        if (const uint32_t zInfo = r.ctx[reg::kDbZInfo]; zInfo & 3) {
+            const bool stencil = r.ctx[reg::kDbStencilInfo] & 1;
+            const VkFormat f = stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : (zInfo & 3) == 1 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
+            const uint32_t size = r.ctx[reg::kDbDepthSize];
+            const uint32_t dw = ((size & 0x7FF) + 1) * 8, dh = (((size >> 11) & 0x7FF) + 1) * 8;
+            Surface* s = depthSurface(uint64_t(r.ctx[reg::kDbZReadBase]) << 8, dw, dh, f);
+            if (!s) return false;
+            nd.depth = {view(s->img, f, VK_IMAGE_VIEW_TYPE_2D, kIdentity, s->img.aspect), s->img.image, f, s->img.width,
+                        s->img.height, uint64_t(r.ctx[reg::kDbZReadBase]) << 8};
+            nd.hasStencil = stencil;
+            nd.stencil = stencil && (depthControl & 1);
+            nd.depthTest = (depthControl >> 1) & 1;
+            nd.depthWrite = (depthControl >> 2) & 1;
+            GraphicsState gs{};
+            gs.depthFormat = f, gs.stencil = stencil, gs.depthControl = depthControl;
+            gs.stencilControl = r.ctx[reg::kDbStencilControl];
+            depthState(gs, nd.depthStencil);
+            const uint32_t front = r.ctx[reg::kDbStencilRefMask];
+            const uint32_t back = (depthControl >> 7) & 1 ? r.ctx[reg::kDbStencilRefMaskBf] : front;
+            for (int i = 0; i < 2; ++i) {
+                const uint32_t m = i ? back : front;
+                nd.stencilRef[i] = m & 0xFF, nd.stencilCompare[i] = (m >> 8) & 0xFF, nd.stencilWrite[i] = (m >> 16) & 0xFF;
+            }
+            if (nd.depthWrite || (nd.stencil && (nd.stencilWrite[0] || nd.stencilWrite[1]))) depthWritten = s;
+        }
+        // The viewport and scissor as setViewportScissor makes them (without the HUD's layout).
+        const native::Target& first = nd.colorCount ? nd.color[0] : nd.depth;
+        const uint32_t tw = first.width, th = first.height;
+        VkViewport vp = gameViewport(r, tw, th);
+        if (vp.width < 0) vp.x += vp.width, vp.width = -vp.width;
+        if (vp.height < 0) vp.y += vp.height, vp.height = -vp.height;
+        nd.viewport[0] = vp.x, nd.viewport[1] = vp.y, nd.viewport[2] = vp.width, nd.viewport[3] = vp.height;
+        int32_t x0 = 0, y0 = 0, x1 = int32_t(tw), y1 = int32_t(th);
+        auto clip = [&](uint32_t tl, uint32_t br) {
+            if (!br) return; // never programmed
+            x0 = std::max<int32_t>(x0, tl & 0x7FFF);
+            y0 = std::max<int32_t>(y0, (tl >> 16) & 0x7FFF);
+            x1 = std::min<int32_t>(x1, br & 0x7FFF);
+            y1 = std::min<int32_t>(y1, (br >> 16) & 0x7FFF);
+        };
+        clip(r.ctx[reg::kScreenScissorTl], r.ctx[reg::kScreenScissorBr]);
+        clip(r.ctx[reg::kGenericScissorTl], r.ctx[reg::kGenericScissorBr]);
+        clip(r.ctx[reg::kWindowScissorTl], r.ctx[reg::kWindowScissorBr]);
+        if ((r.ctx[0x292] >> 1) & 1) clip(r.ctx[reg::kVportScissorTl], r.ctx[reg::kVportScissorBr]);
+        nd.scissor[0] = x0, nd.scissor[1] = y0, nd.scissor[2] = std::max(0, x1 - x0), nd.scissor[3] = std::max(0, y1 - y0);
+        return true;
+    }
+    // Its clip, viewport depth range and rasterizer state (after nativeTargets).
+    void nativeFixed(const DrawRegs& r, native::Draw& nd) {
+        const native::Target& first = nd.colorCount ? nd.color[0] : nd.depth;
+        const uint32_t tw = first.width, th = first.height;
+        const float* v = reinterpret_cast<const float*>(&r.ctx[reg::kVportXScale]);
+        const uint32_t vte = r.ctx[reg::kPaClVteCntl];
+        const float zs = (vte & 16) ? v[4] : 1, zo = (vte & 32) ? v[5] : 0;
+        const bool dx = (r.ctx[reg::kPaClClipCntl] >> 19) & 1;
+        nd.clipZHalf = !dx;
+        nd.pixelPositions = !(vte & 0xF);
+        nd.upscaler = upOn_;
+        nd.vkViewport = gameViewport(r, tw, th);
+        nd.vkViewport.minDepth = std::clamp(dx ? zo : zo - zs, 0.0f, 1.0f);
+        nd.vkViewport.maxDepth = std::clamp(zo + zs, 0.0f, 1.0f);
+        if (nd.vkViewport.width < 0) nd.vkViewport.x += nd.vkViewport.width, nd.vkViewport.width = -nd.vkViewport.width;
+        GraphicsState gs{};
+        gs.topology = r.prim;
+        gs.modeCntl = r.ctx[reg::kPaSuScModeCntl];
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rasterState(gs, rs);
+        nd.cull = rs.cullMode, nd.frontFace = rs.frontFace;
+        nd.depthBias = rs.depthBiasEnable;
+    }
+
+    // LPN_ENGINE_PREPASS (native/engine_capture.h): a list prepass draw the engine described, drawn
+    // natively from the capture (Codex's design): its vertex inputs, constants and textures from the
+    // engine's state, its targets and fixed-function state from the registers. In a segment with the
+    // draws around it, like onEngineDraw's.
+    void onEnginePrepass(uint32_t id, const DrawCall& d, const GpuRegs& gr) override {
+        DrawCall e = d;
+        e.kind = DrawCall::kEnginePrepass;
+        e.groups[0] = id;
+        if (recordThreads_ && !computeOnly_ && frame_ != traceFrame_ && frame_ != timingFrame_) {
+            std::unique_ptr<DrawAnalysis> none;
+            addToSegment(e, gr, none);
+            return;
+        }
+        if (recordThreads_) drainSegments(0);
+        std::lock_guard lock(m_);
+        enginePrepassDraw(id, e, DrawRegs::of(gr));
+    }
+    // Declines are counted (the game's draw is gone by then: its analysis was skipped).
+    void enginePrepassDraw(uint32_t id, const DrawCall& original, const DrawRegs& r) {
+        const auto capture = native::enginePrepass(id);
+        auto lost = [&](const char* why) {
+            const uint32_t n = enginePrepassLost_.fetch_add(1);
+            if (n < 10 || (n & (n - 1)) == 0) std::fprintf(stderr, "[native] engine prepass: a draw lost (%s; %u so far)\n", why, n + 1);
+        };
+        if (!capture) return lost("its capture is gone");
+        const native::EnginePrepass& c = *capture;
+        const native::Claim claim = native::claim(c.psName);
+        if (!claim.pass) return lost("no native pass");
+        bool sharedTry = R().worker_;
+    retry:
+        R().abort_ = false;
+        WLock wl(*this, sharedTry);
+        auto again = [&] {
+            if (!R().abort_) return false;
+            wl.unlock();
+            sharedTry = false;
+            ++R().prof_.sharedRetries;
+            return true;
+        };
+        native::Draw nd;
+        nd.vsName = &c.vsName, nd.psName = &c.psName;
+        nd.primitive = r.prim;
+        nd.count = c.count;
+        nd.instances = std::max(r.numInstances, 1u);
+        Surface* written[8] = {};
+        Surface* depthWritten = nullptr;
+        // The prepass exports one four-component target (ps_normal's swizzle as the register says).
+        uint8_t swap[8] = {}, comps[8] = {};
+        for (uint32_t i = 0; i < 8; ++i) {
+            const uint32_t info = r.ctx[reg::kCbColorBase + i * reg::kCbColorStride + ::gpu::ctx::kCbColorInfo];
+            gcn::LaunchState l;
+            psTargetLaunch(l, i, (info >> 2) & 0x1F, (info >> 8) & 7, info);
+            swap[i] = l.colorSwap[i], comps[i] = l.colorComps[i];
+        }
+        if (!nativeTargets(r, swap, comps, nd, written, depthWritten)) {
+            if (again()) goto retry;
+            return lost("its targets");
+        }
+        nativeFixed(r, nd);
+        auto loads = [](const std::map<uint32_t, std::vector<uint32_t>>& values) {
+            return [&values](uint32_t pc, uint32_t* out, uint32_t n) {
+                const auto it = values.find(pc);
+                if (it == values.end() || n > it->second.size()) return false;
+                std::memcpy(out, it->second.data(), 4u * n);
+                return true;
+            };
+        };
+        nd.vsLoad = loads(c.vsLoads);
+        nd.load = loads(c.psLoads);
+        auto buffer = [&](uint64_t base, uint64_t bytes, native::Buffer& out) {
+            VkDeviceSize off = 0;
+            if (!vramBuffer(base, bytes, out.buffer, off) && !guestBuffer(base, bytes, out.buffer, off)) return false;
+            out.offset = off & ~(storageAlign_ - 1);
+            out.byteOffset = uint32_t(off - out.offset);
+            out.range = std::min<VkDeviceSize>(bytes + out.byteOffset, vk_.props.limits.maxStorageBufferRange);
+            return true;
+        };
+        for (const auto& in : c.vertex) {
+            const uint32_t* v = in.sharp;
+            native::VertexBuffer vb;
+            vb.slot = int32_t(in.slot);
+            vb.components = in.components, vb.indexVgpr = in.indexVgpr, vb.offset = in.offset;
+            vb.stride = (v[1] >> 16) & 0x3FFF;
+            vb.records = v[2];
+            vb.dfmt = (v[3] >> 15) & 15;
+            vb.nfmt = (v[3] >> 12) & 7;
+            vb.dstSel = v[3] & 0xFFF;
+            const uint64_t base = uint64_t(v[0]) | (uint64_t(v[1] & 0xFFF) << 32);
+            const uint64_t bytes = std::max<uint64_t>(uint64_t(vb.stride) * vb.records, 16);
+            if (!buffer(base, bytes, vb.data)) {
+                if (again()) goto retry;
+                return lost("a vertex buffer");
+            }
+            nd.vertex.push_back(vb);
+        }
+        R().sampledSurfaces_.clear(); // filled by resolveImage
+        for (const auto& image : c.images) {
+            gcn::ImageResource im{};
+            std::memcpy(im.t, image.t, sizeof im.t);
+            std::memcpy(im.s, image.s, sizeof im.s);
+            im.pc = image.pc;
+            const ImageBinding b = resolveImage(im);
+            if (!b.view || !b.sampler) {
+                if (again()) goto retry;
+                return lost("a texture");
+            }
+            native::Texture t;
+            t.view = b.view, t.sampler = b.sampler;
+            t.scale[0] = b.scale[0], t.scale[1] = b.scale[1];
+            t.address = im.base(), t.width = im.width(), t.height = im.height();
+            t.pc = image.pc;
+            nd.textures.push_back(t);
+        }
+        if (r.indexType > 1) return lost("the index type");
+        nd.indexed = true;
+        nd.indexType = r.indexType ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+        nd.firstIndex = 0; // the capture's index address is its first index's
+        if (!buffer(original.indexAddr, uint64_t(original.count) * (r.indexType ? 4 : 2), nd.index)) {
+            if (again()) goto retry;
+            return lost("the index buffer");
+        }
+        for (Surface* sf : written)
+            if (sf) gpuWrote(*sf);
+        if (depthWritten) gpuWrote(*depthWritten);
+        if (again()) goto retry;
+        if (!R().worker_ && !ringFits(1 << 12)) flush();
+        begin();
+        NativeGpu gpu(*this);
+        if (!claim.pass->draw(claim.role, nd, gpu)) return lost("the pass declined it");
+        std::vector<VkImage>& wrote = R().nativeWrote_;
+        wrote.clear();
+        for (Surface* sf : written)
+            if (sf) wrote.push_back(sf->img.image);
+        if (depthWritten) wrote.push_back(depthWritten->img.image);
+        nativeDrawn(nullptr, nullptr, &wrote);
+    }
+    std::atomic<uint32_t> enginePrepassLost_{0};
 
     // LPN_ENGINE_SHADOWS (native/engine_capture.h): a stage shadow caster the engine described,
     // drawn natively where the game's draw would have been. Its depth target and state come from
@@ -5827,6 +5984,172 @@ void main() {
 
     // LPN_ENGINE_CHECK (native/engine_capture.h): a draw of the stage shadow casters against the
     // engine's own description of it, kept at its drawIndex call.
+    // LPN_ENGINE_SCENE_CHECK (native/engine_capture.h): a list draw's stages as the engine's state
+    // describes them, against the registers its draw packet runs with. Per stage: the code
+    // address, the user-data SGPRs the engine sets, and each table pointer's dwords placed for
+    // this draw (read through the pointer the SGPRs hold). Counted, with the first differences
+    // logged, and reported every 10 s.
+    void sceneCheck(const DrawCall& d, const GpuRegs& r) {
+        native::EngineSceneDraw e;
+        auto& st = sceneStats_;
+        if (!native::engineScene(d.engineCheck - 1, e)) {
+            ++st.lost;
+            return;
+        }
+        auto stage = [&](const native::EngineStage& es, uint32_t pgmLo, uint32_t userData, const char* name, int k) {
+            if (!es.ok) {
+                ++st.undecoded[k];
+                return;
+            }
+            const uint64_t code = shaderAddress(r, pgmLo);
+            if (code != es.code) {
+                if (st.code[k][1]++ < 5)
+                    std::fprintf(stderr, "[native] scene check: %s code 0x%" PRIx64 ", engine 0x%" PRIx64 "\n", name, code, es.code);
+                return;
+            }
+            ++st.code[k][0];
+            for (uint32_t i = 0; i < 16; ++i) {
+                if (!(es.sgprKnown >> i & 1)) continue;
+                const bool same = r.sh[userData + i] == es.sgpr[i];
+                ++st.sgpr[k][same ? 0 : 1];
+                if (!same && st.sgpr[k][1] <= 10)
+                    std::fprintf(stderr, "[native] scene check: %s %s s%u 0x%08x, engine 0x%08x\n", name,
+                                 native::shaderNameAt(code, &readGuest).c_str(), i, r.sh[userData + i], es.sgpr[i]);
+            }
+            for (uint32_t p = 0; p < es.pointerCount; ++p) {
+                const auto& ptr = es.pointers[p];
+                if (ptr.sgpr + 1 >= 16) continue;
+                const uint64_t at = r.sh[userData + ptr.sgpr] | uint64_t(r.sh[userData + ptr.sgpr + 1] & 0xFFFF) << 32;
+                for (uint32_t w = ptr.dword; w < es.table.size(); ++w) {
+                    if (!es.tableKnown[w]) continue;
+                    uint32_t v = 0;
+                    if (!readGuest(at + 4ull * (w - ptr.dword), &v, 4)) {
+                        ++st.table[k][2];
+                        continue;
+                    }
+                    const bool same = v == es.table[w];
+                    ++st.table[k][same ? 0 : 1];
+                    if (!same && st.table[k][1] <= 10)
+                        std::fprintf(stderr, "[native] scene check: %s %s table (s%u) dword %u: 0x%08x, engine 0x%08x\n", name,
+                                     native::shaderNameAt(code, &readGuest).c_str(), ptr.sgpr, w, v, es.table[w]);
+                }
+            }
+        };
+        stage(e.vs, reg::kPgmLoVs, reg::kUserDataVs, "vs", 0);
+        stage(e.ps, reg::kPgmLoPs, reg::kUserDataPs, "ps", 1);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - st.last < std::chrono::seconds(10)) return;
+        st.last = now;
+        for (int k = 0; k < 2; ++k)
+            std::fprintf(stderr, "[native] scene check %s: code %llu same, %llu differ; sgprs %llu same, %llu differ; table dwords %llu same, %llu differ, %llu unreadable; %llu undecoded\n",
+                         k ? "ps" : "vs", (unsigned long long)st.code[k][0], (unsigned long long)st.code[k][1],
+                         (unsigned long long)st.sgpr[k][0], (unsigned long long)st.sgpr[k][1], (unsigned long long)st.table[k][0],
+                         (unsigned long long)st.table[k][1], (unsigned long long)st.table[k][2], (unsigned long long)st.undecoded[k]);
+        if (st.lost) std::fprintf(stderr, "[native] scene check: %llu descriptions lost\n", (unsigned long long)st.lost);
+    }
+    // LPN_ENGINE_PREPASS_CHECK: a list prepass draw's capture against the native::Draw its analysis
+    // builds: the vertex inputs, the constants by load pc, the textures and the index range.
+    void prepassCheck(const DrawCall& d, const DrawRegs& gr, DrawAnalysis& a) {
+        std::lock_guard checkLock(prepassCheckMutex_); // recorder threads check too: the counters
+        auto& st = prepassStats_;
+        const auto c = native::enginePrepass(d.engineCheck - 1);
+        if (!c) {
+            ++st[3];
+            return;
+        }
+        native::Draw nd;
+        Surface* written[8] = {};
+        Surface* depthWritten = nullptr;
+        bool sharedTry = R().worker_;
+    retry:
+        R().abort_ = false;
+        WLock wl(*this, sharedTry);
+        if (!a.ok || !a.psm || !a.psm->nativePass || !nativeBuild(d, gr, a, nd, written, depthWritten)) {
+            if (R().abort_) {
+                wl.unlock();
+                sharedTry = false;
+                nd = native::Draw{};
+                goto retry;
+            }
+            ++st[2];
+            return;
+        }
+        wl.unlock();
+        std::string why;
+        char b[200];
+        const uint64_t index = d.indexAddr + uint64_t(d.indexOffset) * (gr.indexType ? 4 : 2);
+        if (index != c->indexAddr || d.count != c->count) {
+            std::snprintf(b, sizeof b, "indices 0x%" PRIx64 " x%u, capture 0x%" PRIx64 " x%u; ", index, d.count, c->indexAddr, c->count);
+            why += b;
+        }
+        for (const auto& in : c->vertex) {
+            const native::VertexBuffer* v = nullptr;
+            for (const native::VertexBuffer& x : nd.vertex)
+                if (x.slot == int32_t(in.slot) && x.components) v = &x;
+            const uint64_t base = uint64_t(in.sharp[0]) | (uint64_t(in.sharp[1] & 0xFFF) << 32);
+            const uint32_t stride = (in.sharp[1] >> 16) & 0x3FFF, dfmt = (in.sharp[3] >> 15) & 15, nfmt = (in.sharp[3] >> 12) & 7;
+            if (!v) {
+                std::snprintf(b, sizeof b, "slot %u missing; ", in.slot);
+                why += b;
+                continue;
+            }
+            const uint64_t vbase = 0; // the analysis' buffer base is in v->data; compare the layout
+            (void)vbase;
+            if (v->stride != stride || v->dfmt != dfmt || v->nfmt != nfmt || v->dstSel != (in.sharp[3] & 0xFFF) ||
+                v->components != in.components || v->offset != in.offset || v->records != in.sharp[2]) {
+                std::snprintf(b, sizeof b, "slot %u: stride %u/%u fmt %u.%u/%u.%u sel 0x%x/0x%x comps %u/%u offset %u/%u records %u/%u; ", in.slot,
+                              v->stride, stride, v->dfmt, v->nfmt, dfmt, nfmt, v->dstSel, in.sharp[3] & 0xFFF, v->components, in.components,
+                              v->offset, in.offset, v->records, in.sharp[2]);
+                why += b;
+            }
+            (void)base;
+        }
+        auto loads = [&](const std::map<uint32_t, std::vector<uint32_t>>& m, const std::function<bool(uint32_t, uint32_t*, uint32_t)>& f,
+                         const char* stage) {
+            for (const auto& [pc, vals] : m) {
+                std::vector<uint32_t> got(vals.size());
+                if (!f || !f(pc, got.data(), uint32_t(got.size()))) {
+                    std::snprintf(b, sizeof b, "%s load 0x%x missing; ", stage, pc);
+                    why += b;
+                    continue;
+                }
+                for (size_t i = 0; i < vals.size(); ++i)
+                    if (got[i] != vals[i]) {
+                        std::snprintf(b, sizeof b, "%s load 0x%x[%zu] 0x%x, capture 0x%x; ", stage, pc, i, got[i], vals[i]);
+                        why += b;
+                        break;
+                    }
+            }
+        };
+        loads(c->vsLoads, nd.vsLoad, "vs");
+        loads(c->psLoads, nd.load, "ps");
+        for (const auto& im : c->images) {
+            const native::Texture* t = nullptr;
+            for (const native::Texture& x : nd.textures)
+                if (x.pc == im.pc) t = &x;
+            gcn::ImageResource r{};
+            std::memcpy(r.t, im.t, sizeof r.t);
+            if (!t || t->address != r.base() || t->width != r.width() || t->height != r.height()) {
+                std::snprintf(b, sizeof b, "texture 0x%x differs; ", im.pc);
+                why += b;
+            }
+        }
+        ++st[why.empty() ? 0 : 1];
+        if (!why.empty() && st[1] <= 20) std::fprintf(stderr, "[native] prepass check: %s %s\n", c->vsName.c_str(), why.c_str());
+        const auto now = std::chrono::steady_clock::now();
+        if (now - prepassLast_ >= std::chrono::seconds(10)) {
+            prepassLast_ = now;
+            std::fprintf(stderr, "[native] prepass check: %llu same, %llu differ, %llu not built natively, %llu captures gone\n",
+                         (unsigned long long)st[0], (unsigned long long)st[1], (unsigned long long)st[2], (unsigned long long)st[3]);
+        }
+    }
+    uint64_t prepassStats_[4] = {};
+    std::mutex prepassCheckMutex_;
+    std::chrono::steady_clock::time_point prepassLast_ = std::chrono::steady_clock::now();
+    struct SceneStats {
+        uint64_t code[2][2] = {}, sgpr[2][2] = {}, table[2][3] = {}, undecoded[2] = {}, lost = 0;
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    } sceneStats_;
     void engineCheck(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
         static const std::map<uint64_t, uint32_t> kNone;
         const std::map<uint64_t, uint32_t>& vsLoads = a.vsLoads ? *a.vsLoads : kNone;
@@ -8211,6 +8534,7 @@ void main() {
         }
 
         if (!a.ok) return;
+        if (d.engineCheck && native::enginePrepassCheckOn()) prepassCheck(d, r, a);
         if (upOn_ && a.psm && a.psm->smaa && upscaleSmaa(r, a.psm->smaa, a)) return;
         if (nativeOn_ && !R().worker_) {
             runCompare(); // the last compared draw's: its translated draw is recorded by now
