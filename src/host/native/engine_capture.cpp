@@ -830,7 +830,9 @@ bool installEngineCapture(Module& eboot) {
     gShadows = es ? *es && *es != '0' : !check;
     gProbe = on("LPN_ENGINE_PROBE");
     gSceneCheck = on("LPN_ENGINE_SCENE_CHECK");
-    gPrepass = on("LPN_ENGINE_PREPASS");
+    // On by default too (checked 1.34M draws, 0 differ); LPN_ENGINE_PREPASS=0 turns it off.
+    const char* ep = std::getenv("LPN_ENGINE_PREPASS");
+    gPrepass = ep ? *ep && *ep != '0' : !check;
     gPrepassCheck = on("LPN_ENGINE_PREPASS_CHECK");
     gPrepass = gPrepass || gPrepassCheck;
     if (gPrepassCheck) gSceneCheck = false; // its NOP carries the prepass capture's id

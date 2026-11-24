@@ -313,3 +313,17 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
 - Compare run in a fight (`LPN_NATIVE_COMPARE=particle`): ~5,100 draws, within 1/255, depth exact.
   Particles drawn by other vertex shaders (`vs_ptc_bill_mn_*`, `mf_*`) are still translated.
 - Open: compare mode froze once during a heat action (twice tried; a normal run there is fine).
+
+### Engine-driven prepass
+
+- The list prepass draws (`vs_normal_rigid` with `ps_normal` / `ps_normal_pt`, return 0x3700 from
+  `eac430`) are captured in the engine's `drawIndex`: the fetch program's vertex inputs, the
+  constants the native prepass loads, `_pt`'s textures and alpha reference, and the index range.
+  `sceGnmDrawIndex` then writes a NOP `{kEnginePrepassTag, id, count, address}` in place of the
+  draw, and the renderer builds the `native::Draw` from the capture without the GPU registers.
+- `LPN_ENGINE_PREPASS_CHECK=1` keeps the game's draws and compares each capture against the draw
+  the translated analysis builds: 1.34M draws, 0 differ. With the fixed reader ~86% of the list
+  prepass draws are captured; the rest (a constant read the capture can't follow) stay translated.
+- On by default with the Native Renderer; `LPN_ENGINE_PREPASS=0` turns it off. Fwha's run: no
+  glitches, fps as before.
+- The engine docs it rests on: `docs/engine/draw-command-lists.md`, `draw-state.md`, `user-data.md`.
