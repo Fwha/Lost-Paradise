@@ -263,6 +263,24 @@ uint32_t physicalBank(uint32_t l, uint32_t active) {
     return l;
 }
 
+// e584d0 / e58680 (Codex's reading): an ordinary resource whose format reads 0x6d is given format
+// 0x10 before it is placed (words 1 and 3 change); `d` holds the V# (4 words) or T# (8 words).
+void ordinaryResourceFormat(uint32_t* d, bool texture) {
+    const uint32_t w1 = d[1], w3 = d[3];
+    constexpr uint32_t to = 0x10;
+    if (texture) { // fa6d10, fa6cd0
+        const uint32_t f = ((w1 >> 6) & 3) | ((w1 >> 28) & 0xC) | ((w3 & 0x04000000) ? 0x10 : 0x60);
+        if (f != 0x6D) return;
+        d[1] = (w1 & 0x3FFFFF3F) | ((to & 3) << 6) | ((to & 0xFFFFFFFCu) << 28);
+        d[3] = (w3 & 0xFBFFFFFF) | ((to & 0x10) << 22);
+    } else { // f9e030, f9dcb0
+        const uint32_t f = ((w1 >> 14) & 3) | ((w1 >> 7) & 0x60) | ((w3 >> 25) & 0x1C);
+        if (f != 0x6D) return;
+        d[1] = (w1 & 0xFFFF0FFF) | ((to & 3) << 14) | ((to & 0x60) << 7);
+        d[3] = (w3 & 0xC7FFFFFF) | ((to & 0x1C) << 25);
+    }
+}
+
 // One stage (l: 1 PS, 2 VS) as the engine is about to set it up for this draw.
 void decodeStage(uint64_t g, uint64_t s, uint32_t l, uint64_t record, EngineStage& st) {
     uint64_t code = 0, prog = 0;
@@ -305,7 +323,10 @@ void decodeStage(uint64_t g, uint64_t s, uint32_t l, uint64_t record, EngineStag
     bits(resUse, [&](uint32_t i) {
         uint64_t p = 0;
         const uint32_t words = (resType >> i & 1) ? 8 : 4;
-        if (rd(s + 0x6c8 + 0x220 * b + 8 * i, p) && probeRead(p, d, 4 * words) && rd(m + 0x1c + 2 * i, map)) place(map, d, words);
+        if (rd(s + 0x6c8 + 0x220 * b + 8 * i, p) && probeRead(p, d, 4 * words) && rd(m + 0x1c + 2 * i, map)) {
+            ordinaryResourceFormat(d, words == 8);
+            place(map, d, words);
+        }
     });
     bits(sampUse, [&](uint32_t i) {
         uint64_t p = 0;
