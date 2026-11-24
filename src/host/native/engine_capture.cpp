@@ -506,7 +506,7 @@ bool prepassFetch(uint64_t code, const EngineStage& stage, bool alpha,
     for (uint32_t pc = 0; pc < 1024;) {
         uint32_t w = 0;
         if (!rd(code + pc, w)) return false;
-        if ((w & 0xFF80FF00) == 0xBE801D00) { // s_setpc_b64: fetch returns
+        if ((w & 0xFF80FF00) == 0xBE802000) { // s_setpc_b64 (op 32 on GCN2): fetch returns
             for (uint32_t i = 0; i < slots; ++i)
                 if (!have[i]) return false;
             return true;
