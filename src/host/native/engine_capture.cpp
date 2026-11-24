@@ -6,6 +6,7 @@
 #include "host/native/draw_origin.h"
 #include "host/crash.h"
 #include "host/display_settings.h"
+#include "host/native/shader_names.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -14,7 +15,9 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <map>
 #include <mutex>
+#include <string>
 
 namespace host::native {
 
@@ -175,6 +178,71 @@ template <typename T> T at(uint64_t a) {
 
 // rdi: the Gnm context, whose state block is at +0x320 (render-decomp.md); esi: indices, edx:
 // first index, ecx: base vertex.
+
+// LPN_ENGINE_PROBE: for the scene's draw-command-list draws (0xea3f40 tail-calls drawIndex, so
+// they come back to 0x3700), which shaders the engine state points at, and through which field:
+// candidates from docs/engine/draw-state.md (S+0xf0 = the PS object's +0x58, S+0x100 = the VS
+// object's +0x38, G+0xc0, G+0xf8, G+0x100) read as Gnm stage registers (PGM_LO, PGM_HI) and as
+// code pointers, named by the shader index. Logged every 10 s.
+bool gProbe = false;
+std::mutex gProbeMutex;
+std::map<std::string, uint64_t> gProbeCounts;
+std::map<std::string, std::string> gProbeSample;
+int64_t gProbeStart = 0;
+
+// Guarded: a candidate field can hold anything (a fault is caught, as renderer.cpp's readGuest does).
+bool probeRead(uint64_t a, void* d, size_t n) {
+    if (!readable(a) || !readable(a + n)) return false;
+    struct Copy {
+        void* dst;
+        uint64_t addr;
+        size_t size;
+    } c{d, a, n};
+    return host::guarded([](void* p) {
+        auto& c = *static_cast<Copy*>(p);
+        std::memcpy(c.dst, reinterpret_cast<const void*>(c.addr), c.size);
+    }, &c);
+}
+
+// The names a pointer field can lead to: as stage registers (lo << 8 | (hi & 0xff) << 40) and as
+// a pointer to code.
+std::string probeNames(uint64_t p) {
+    uint32_t w[2];
+    if (!probeRead(p, w, 8)) return "-";
+    std::string out;
+    const uint64_t regs = (uint64_t(w[0]) << 8) | (uint64_t(w[1] & 0xff) << 40);
+    if (readable(regs)) out += "regs:" + shaderNameAt(regs, probeRead);
+    const uint64_t ptr = uint64_t(w[0]) | uint64_t(w[1]) << 32;
+    if (readable(ptr)) out += " ptr:" + shaderNameAt(ptr, probeRead);
+    out += " self:" + shaderNameAt(p, probeRead);
+    return out;
+}
+
+void probeScene(uint64_t g) {
+    const uint64_t s = at<uint64_t>(g + 0x320);
+    std::string key;
+    char b[96];
+    const std::pair<const char*, uint64_t> fields[] = {{"S+0xf0", at<uint64_t>(s + 0xf0)}, {"S+0x100", at<uint64_t>(s + 0x100)},
+                                                       {"G+0xc0", at<uint64_t>(g + 0xc0)}, {"G+0xf8", at<uint64_t>(g + 0xf8)},
+                                                       {"G+0x100", at<uint64_t>(g + 0x100)}};
+    for (const auto& [name, p] : fields) key += std::string(name) + " " + probeNames(p) + "; ";
+    std::snprintf(b, sizeof b, "masks: cb ps 0x%x vs 0x%x, res ps 0x%llx vs 0x%llx", at<uint32_t>(s + 0x190), at<uint32_t>(s + 0x1b0),
+                  (unsigned long long)at<uint64_t>(s + 0x180), (unsigned long long)at<uint64_t>(s + 0x1a0));
+    const int64_t now = nowNs();
+    std::lock_guard lock(gProbeMutex);
+    if (++gProbeCounts[key] == 1) gProbeSample[key] = b;
+    if (!gProbeStart) gProbeStart = now;
+    if (now - gProbeStart < 10'000'000'000ll) return;
+    gProbeStart = now;
+    std::vector<std::pair<uint64_t, std::string>> v;
+    for (const auto& [k, n] : gProbeCounts) v.push_back({n, k});
+    std::sort(v.rbegin(), v.rend());
+    std::fprintf(stderr, "[native] engine probe: %zu kinds of list draws in 10 s\n", v.size());
+    for (size_t i = 0; i < v.size() && i < 25; ++i)
+        std::fprintf(stderr, "[native]   %llu x %s(%s)\n", (unsigned long long)v[i].first, v[i].second.c_str(), gProbeSample[v[i].second].c_str());
+    gProbeCounts.clear();
+}
+
 uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVertex, uint64_t r8, uint64_t r9) {
     const auto* frame = static_cast<const uint64_t*>(LPN_GUEST_FRAME());
     const uint64_t base = reinterpret_cast<uint64_t>(gBase);
@@ -192,6 +260,7 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
         fp = reinterpret_cast<const uint64_t*>(fp[0]);
     }
     tForcedOrigin = o;
+    if (gProbe && site == 0x3700) probeScene(ctx);
     if (engineSite(site)) {
         const uint64_t s = at<uint64_t>(ctx + 0x320);
         EngineDraw d;
@@ -302,7 +371,8 @@ bool installEngineCapture(Module& eboot) {
     const char* es = std::getenv("LPN_ENGINE_SHADOWS");
     const bool check = on("LPN_ENGINE_CHECK");
     gShadows = es ? *es && *es != '0' : !check;
-    if (!check && !gShadows) return false;
+    gProbe = on("LPN_ENGINE_PROBE");
+    if (!check && !gShadows && !gProbe) return false;
     // push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov eax, ecx
     const Hook hooks[] = {
         {kDrawIndex, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x89, 0xc8}, guestHook<&drawIndex>(),
