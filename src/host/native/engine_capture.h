@@ -104,6 +104,8 @@ struct EngineSceneDraw {
 };
 bool engineSceneCheckOn();
 bool engineScene(uint32_t id, EngineSceneDraw& out);
+// The placed table dwords as decodeStage had them before drawIndex: [0] the same after it, [1] not.
+void engineTableAfter(uint64_t out[2]);
 
 // LPN_ENGINE_FEED: the native passes' list draws (material, character) analysed from the engine's
 // user data instead of the registers': each stage's SGPRs as the engine sets them, its pointers

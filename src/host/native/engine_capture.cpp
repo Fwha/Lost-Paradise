@@ -403,16 +403,34 @@ bool feedClaimed(uint64_t g) {
     if (claimed.size() < 4096) claimed.emplace(code, yes);
     return yes;
 }
-// After the original drawIndex: the fetch shader it installed, into the scene capture.
+// After the original drawIndex, into the scene capture: the fetch shader it installed, and each
+// stage's table as it copied it from the staging area (the dwords decodeStage doesn't place are
+// whatever the staging area held, which the reconstruction only knows from before the call).
+std::atomic<uint64_t> gTableAfter[2]{}; // placed dwords the same after the call, different
 void fetchInstalled(uint64_t g, uint32_t id) {
-    uint64_t fetch = 0;
-    if (!rd(g + 0x108, fetch)) return;
+    uint64_t fetch = 0, staging = 0;
+    if (!rd(g + 0x108, fetch) || !rd(g + 0x68, staging)) return;
     std::lock_guard lock(gSceneMutex);
     if (gSceneIds[id % kScenes] != id) return;
-    EngineStage& vs = gScenes[id % kScenes].vs;
-    if (vs.fetchSgpr >= 15) return;
-    vs.sgpr[vs.fetchSgpr] = uint32_t(fetch), vs.sgpr[vs.fetchSgpr + 1] = uint32_t(fetch >> 32);
-    vs.sgprKnown |= uint16_t(3u << vs.fetchSgpr);
+    EngineSceneDraw& e = gScenes[id % kScenes];
+    EngineStage& vs = e.vs;
+    if (vs.fetchSgpr < 15) {
+        vs.sgpr[vs.fetchSgpr] = uint32_t(fetch), vs.sgpr[vs.fetchSgpr + 1] = uint32_t(fetch >> 32);
+        vs.sgprKnown |= uint16_t(3u << vs.fetchSgpr);
+    }
+    auto after = [&](EngineStage& st, uint32_t l) {
+        if (!st.ok || st.table.empty()) return;
+        std::vector<uint32_t> t(st.table.size());
+        if (!probeRead(staging + 0x1800 * l, t.data(), 4 * t.size())) return;
+        uint64_t same = 0, differ = 0;
+        for (size_t i = 0; i < t.size(); ++i)
+            if (st.tableKnown[i]) ++(t[i] == st.table[i] ? same : differ);
+        gTableAfter[0] += same, gTableAfter[1] += differ;
+        st.table = std::move(t);
+        st.tableKnown.assign(st.table.size(), 1);
+    };
+    after(e.vs, 2);
+    after(e.ps, 1);
 }
 uint32_t captureScene(uint64_t g, uint32_t baseVertex) {
     const uint64_t s = at<uint64_t>(g + 0x320);
@@ -845,6 +863,7 @@ std::shared_ptr<const EnginePrepass> enginePrepass(uint32_t id) {
     return gPrepassIds[id % gPrepassIds.size()] == id ? gPrepasses[id % gPrepasses.size()] : nullptr;
 }
 bool engineFeedOn() { return gFeed; }
+void engineTableAfter(uint64_t out[2]) { out[0] = gTableAfter[0], out[1] = gTableAfter[1]; }
 // The feed range: a ring of table copies, found again by their contents (consecutive draws with
 // the same table get the same address, as the game's own copies repeat, so the analysis' repeat
 // shortcut still works). Written by the command processor's analysis pass, read by the workers.

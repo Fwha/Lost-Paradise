@@ -6050,6 +6050,10 @@ void main() {
                          (unsigned long long)st.sgpr[k][0], (unsigned long long)st.sgpr[k][1], (unsigned long long)st.table[k][0],
                          (unsigned long long)st.table[k][1], (unsigned long long)st.table[k][2], (unsigned long long)st.undecoded[k]);
         if (st.lost) std::fprintf(stderr, "[native] scene check: %llu descriptions lost\n", (unsigned long long)st.lost);
+        uint64_t after[2];
+        native::engineTableAfter(after);
+        std::fprintf(stderr, "[native] scene check: placed table dwords after drawIndex: %llu as placed, %llu changed\n",
+                     (unsigned long long)after[0], (unsigned long long)after[1]);
         for (const auto& [what, n] : st.sgprBy)
             std::fprintf(stderr, "[native] scene check:   %llu x %s differ\n", (unsigned long long)n, what.c_str());
     }
