@@ -624,31 +624,49 @@ bool prepassPixel(EnginePrepass& c) {
     const auto it = c.psLoads.find(0x44);
     return c.images.size() == 2 && it != c.psLoads.end() && it->second.size() == 1;
 }
+// Why list draws were or weren't captured, printed now and then (a run with no check lines
+// otherwise can't tell "nothing captured" from "the mode wasn't on").
+std::atomic<uint64_t> gPrepassWhy[9]{};
+void prepassTally(int why) {
+    static const char* const kWhy[9] = {"captured", "unreadable", "other shaders", "attributes", "stage decode",
+                                        "vertex fetch", "constants", "pixel prefix", "indices"};
+    const uint64_t n = ++gPrepassWhy[why];
+    uint64_t total = 0;
+    for (auto& x : gPrepassWhy) total += x.load(std::memory_order_relaxed);
+    if (total != 1 && (total & ((1u << 18) - 1))) return;
+    std::string line;
+    for (int i = 0; i < 9; ++i) {
+        const uint64_t v = i == why ? n : gPrepassWhy[i].load(std::memory_order_relaxed);
+        if (v) line += std::string(line.empty() ? "" : ", ") + std::to_string(v) + " " + kWhy[i];
+    }
+    std::fprintf(stderr, "[native] prepass captures: %s\n", line.c_str());
+}
 void capturePrepass(uint64_t g, uint32_t count, uint32_t first, uint32_t baseVertex) {
     uint64_t s = 0, vs = 0, ps = 0, vcode = 0, pcode = 0;
     if (!rd(g + 0x320, s) || !rd(s + 0x100, vs) || !rd(s + 0xF0, ps) ||
         !rd(vs, vcode) || !rd(ps, pcode))
-        return;
+        return prepassTally(1);
     auto c = std::make_shared<EnginePrepass>();
     c->vsName = shaderNameAt(vcode, probeRead);
     c->psName = shaderNameAt(pcode, probeRead);
     c->alpha = c->vsName == "vs_normal_rigid_pt.vso" && c->psName == "ps_normal_pt.pso";
     if (!c->alpha &&
         !(c->vsName == "vs_normal_rigid.vso" && c->psName == "ps_normal.pso"))
-        return;
+        return prepassTally(2);
     uint64_t fetch = 0;
     std::vector<std::array<uint32_t, 4>> attributes;
-    if (!generatedAttributes(s, baseVertex, fetch, attributes)) return;
+    if (!generatedAttributes(s, baseVertex, fetch, attributes)) return prepassTally(3);
     decodeStage(g, s, 2, vs, c->stages.vs, &attributes);
     decodeStage(g, s, 1, ps, c->stages.ps);
-    if (!c->stages.vs.ok || !c->stages.ps.ok ||
-        !prepassFetch(fetch, c->stages.vs, c->alpha, c->vertex) ||
-        !prepassConstants(*c) || (c->alpha && !prepassPixel(*c)))
-        return;
+    if (!c->stages.vs.ok || !c->stages.ps.ok) return prepassTally(4);
+    if (!prepassFetch(fetch, c->stages.vs, c->alpha, c->vertex)) return prepassTally(5);
+    if (!prepassConstants(*c)) return prepassTally(6);
+    if (c->alpha && !prepassPixel(*c)) return prepassTally(7);
     uint64_t indexBase = 0;
     if (!rd(s + 0x688, indexBase) || !rd(s + 0x690, c->indexWord) ||
         !rd(g + 0x28, c->indexModifier))
-        return;
+        return prepassTally(8);
+    prepassTally(0);
     c->count = count, c->first = first, c->baseVertex = baseVertex;
     c->indexAddr = indexBase +
         uint32_t((first << ((c->indexWord >> 31) + 1)) + (c->indexWord & 0x7FFFFFFF));
@@ -838,6 +856,8 @@ bool installEngineCapture(Module& eboot) {
         if (gTiming) std::fprintf(stderr, "[native] engine timing: the stage caster loop is timed (LPN_ENGINE_TIMING)\n");
     }
     if (gShadows) std::fprintf(stderr, "[native] engine capture: the stage's opaque shadow casters are drawn from the engine (LPN_ENGINE_SHADOWS)\n");
+    if (gPrepassCheck) std::fprintf(stderr, "[native] engine capture: the prepass captures are checked against the game's draws (LPN_ENGINE_PREPASS_CHECK)\n");
+    else if (gPrepass) std::fprintf(stderr, "[native] engine capture: the prepass is drawn from the engine (LPN_ENGINE_PREPASS)\n");
     else std::fprintf(stderr, "[native] engine capture: checking the stage shadow casters against their draws (LPN_ENGINE_CHECK)\n");
     return true;
 }
