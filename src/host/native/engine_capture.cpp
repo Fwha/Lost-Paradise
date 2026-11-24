@@ -293,7 +293,7 @@ void ordinaryResourceFormat(uint32_t* d, bool texture) {
 
 // One stage (l: 1 PS, 2 VS) as the engine is about to set it up for this draw.
 void decodeStage(uint64_t g, uint64_t s, uint32_t l, uint64_t record, EngineStage& st,
-                 const std::vector<std::array<uint32_t, 4>>* attributes = nullptr) {
+                 const std::vector<std::array<uint32_t, 4>>* attributes = nullptr, bool tableBefore = true) {
     uint64_t code = 0, prog = 0;
     uint32_t variant = 0;
     if (!rd(record, code) || !rd(record + 0x10, prog) || !rd(record + 0x1c, variant)) return;
@@ -306,7 +306,9 @@ void decodeStage(uint64_t g, uint64_t s, uint32_t l, uint64_t record, EngineStag
     const uint32_t b = physicalBank(l, active);
     st.table.assign(n, 0);
     st.tableKnown.assign(n, 0);
-    if (n) probeRead(staging + 0x1800 * l, st.table.data(), 4u * n);
+    // The table's own dwords: only the scene check needs them before drawIndex (the feed takes the
+    // whole table after it, fetchInstalled).
+    if (n && tableBefore) probeRead(staging + 0x1800 * l, st.table.data(), 4u * n);
     auto place = [&](uint16_t map, const uint32_t* d, uint32_t words) {
         if (map == 0xFFFF) return;
         const uint32_t at = map & 0x3FFF;
@@ -422,10 +424,12 @@ void fetchInstalled(uint64_t g, uint32_t id) {
         if (!st.ok || st.table.empty()) return;
         std::vector<uint32_t> t(st.table.size());
         if (!probeRead(staging + 0x1800 * l, t.data(), 4 * t.size())) return;
-        uint64_t same = 0, differ = 0;
-        for (size_t i = 0; i < t.size(); ++i)
-            if (st.tableKnown[i]) ++(t[i] == st.table[i] ? same : differ);
-        gTableAfter[0] += same, gTableAfter[1] += differ;
+        if (gSceneCheck) {
+            uint64_t same = 0, differ = 0;
+            for (size_t i = 0; i < t.size(); ++i)
+                if (st.tableKnown[i]) ++(t[i] == st.table[i] ? same : differ);
+            gTableAfter[0] += same, gTableAfter[1] += differ;
+        }
         st.table = std::move(t);
         st.tableKnown.assign(st.table.size(), 1);
     };
@@ -438,9 +442,10 @@ uint32_t captureScene(uint64_t g, uint32_t baseVertex) {
     // The vertex attributes drawIndex is about to generate (else the table holds the last draw's).
     uint64_t fetch = 0;
     std::vector<std::array<uint32_t, 4>> attributes;
-    e.attributes = generatedAttributes(s, baseVertex, fetch, attributes);
-    decodeStage(g, s, 2, at<uint64_t>(s + 0x100), e.vs, e.attributes ? &attributes : nullptr);
-    decodeStage(g, s, 1, at<uint64_t>(s + 0xf0), e.ps);
+    // The feed alone takes the table after drawIndex, attributes and all.
+    e.attributes = !gSceneCheck || generatedAttributes(s, baseVertex, fetch, attributes);
+    decodeStage(g, s, 2, at<uint64_t>(s + 0x100), e.vs, gSceneCheck && e.attributes ? &attributes : nullptr, gSceneCheck);
+    decodeStage(g, s, 1, at<uint64_t>(s + 0xf0), e.ps, nullptr, gSceneCheck);
     std::lock_guard lock(gSceneMutex);
     const uint32_t id = gNextScene++;
     gScenes[id % kScenes] = std::move(e);

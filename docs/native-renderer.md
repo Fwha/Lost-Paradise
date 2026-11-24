@@ -327,3 +327,22 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
 - On by default with the Native Renderer; `LPN_ENGINE_PREPASS=0` turns it off. Fwha's run: no
   glitches, fps as before.
 - The engine docs it rests on: `docs/engine/draw-command-lists.md`, `draw-state.md`, `user-data.md`.
+
+### Engine feed (material and character draws)
+
+- `LPN_ENGINE_FEED=1` (off by default): list draws whose pixel shader the material or character
+  pass claims are analysed from the engine's user data instead of the registers'. Each stage's
+  SGPRs as `decodeStage` reconstructs them, the fetch shader as `drawIndex` installs it (G+0x108,
+  read after the call: the fetch metadata's own pointer is another for ~1.6% of draws), and each
+  table as `drawIndex` copied it from the staging area (read after the call too: the dwords the
+  reconstruction doesn't place are whatever staging held). The pointers go to content-addressed
+  copies at `kFeedBase` (0x7F0000000000), which `readGuest` and the analysis' page cache serve.
+- `LPN_ENGINE_SCENE_CHECK=1` with it checks the engine's SGPRs and whole tables against the
+  registers (0 differ); `LPN_ENGINE_FEED_CHECK=1` analyses each fed draw both ways and compares
+  data, buffers, images and fetch slots (9M stages, 7 differ: pixel-shader constants).
+- Bugs on the way: the fetch shader pointer above, stale table dwords, and (found by Codex) copies
+  reused by their contents from a slot the ring was about to overwrite.
+- Fwha's run: no glitches; fps slightly lower than without it, hence off by default for now. The
+  draws still come from the PM4 stream; the registers still give targets and fixed-function state.
+- The engine prepass now keeps the game's draw when the registers rule the native prepass out
+  (one scene lost ~65 draws to "not one colour target with depth").
