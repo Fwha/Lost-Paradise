@@ -243,6 +243,123 @@ void probeScene(uint64_t g) {
     gProbeCounts.clear();
 }
 
+
+// LPN_ENGINE_SCENE_CHECK (engine_capture.h, docs/engine/user-data.md).
+bool gSceneCheck = false;
+constexpr uint32_t kScenes = 1 << 15;
+std::mutex gSceneMutex;
+std::vector<EngineSceneDraw> gScenes(kScenes);
+std::vector<uint32_t> gSceneIds(kScenes, ~0u);
+uint32_t gNextScene = 0;
+
+template <typename T> bool rd(uint64_t a, T& v) { return probeRead(a, &v, sizeof v); }
+
+// 0xeac01d-0xeac0a2: the physical binding bank of a logical stage.
+uint32_t physicalBank(uint32_t l, uint32_t active) {
+    const bool s3 = active & (1u << 3), s5 = active & (1u << 5);
+    if (!s5 && s3 && l == 4) return 2;
+    if (s5 && l == 6) return 2;
+    if (s5 && !s3 && l == 2) return 4;
+    return l;
+}
+
+// One stage (l: 1 PS, 2 VS) as the engine is about to set it up for this draw.
+void decodeStage(uint64_t g, uint64_t s, uint32_t l, uint64_t record, EngineStage& st) {
+    uint64_t code = 0, prog = 0;
+    uint32_t variant = 0;
+    if (!rd(record, code) || !rd(record + 0x10, prog) || !rd(record + 0x1c, variant)) return;
+    st.code = code;
+    const uint64_t m = prog + 4 * ((variant >> 4) & 0xFFFF);
+    uint16_t n = 0;
+    uint64_t staging = 0;
+    uint32_t active = 0;
+    if (!rd(m, n) || !rd(g + 0x68, staging) || !rd(s + 0xdc, active)) return;
+    const uint32_t b = physicalBank(l, active);
+    st.table.assign(n, 0);
+    st.tableKnown.assign(n, 0);
+    if (n) probeRead(staging + 0x1800 * l, st.table.data(), 4u * n);
+    auto place = [&](uint16_t map, const uint32_t* d, uint32_t words) {
+        if (map == 0xFFFF) return;
+        const uint32_t at = map & 0x3FFF;
+        for (uint32_t k = 0; k < words; ++k) {
+            if (map & 0x8000) {
+                if (at + k < 16) st.sgpr[at + k] = d[k], st.sgprKnown |= uint16_t(1u << (at + k));
+            } else if (at + k < n) {
+                st.table[at + k] = d[k], st.tableKnown[at + k] = 1;
+            }
+        }
+    };
+    auto bits = [](uint64_t mask, auto&& fn) {
+        for (uint32_t i = 0; i < 64; ++i)
+            if (mask >> i & 1) fn(i);
+    };
+    uint32_t cbUse = 0, sampUse = 0, extraUse = 0, extraType = 0;
+    uint64_t resUse = 0, resType = 0;
+    rd(s + 0x170 + 0x20 * l, cbUse), rd(s + 0x160 + 0x20 * l, resUse), rd(s + 0x16c + 0x20 * l, sampUse), rd(s + 0x168 + 0x20 * l, extraUse);
+    rd(s + 0x6a8 + 0x220 * b, resType), rd(s + 0x16c8 + 0x110 * b, extraType);
+    uint32_t d[8];
+    uint16_t map;
+    bits(cbUse, [&](uint32_t i) {
+        if (probeRead(s + 0x1d38 + 0x210 * b + 0x20 * i, d, 16) && rd(m + 0xdc + 2 * i, map)) place(map, d, 4);
+    });
+    bits(resUse, [&](uint32_t i) {
+        uint64_t p = 0;
+        const uint32_t words = (resType >> i & 1) ? 8 : 4;
+        if (rd(s + 0x6c8 + 0x220 * b + 8 * i, p) && probeRead(p, d, 4 * words) && rd(m + 0x1c + 2 * i, map)) place(map, d, words);
+    });
+    bits(sampUse, [&](uint32_t i) {
+        uint64_t p = 0;
+        if (rd(s + 0x1378 + 0x90 * b + 8 * i, p) && probeRead(p, d, 16) && rd(m + 0xbc + 2 * i, map)) place(map, d, 4);
+    });
+    bits(extraUse, [&](uint32_t i) {
+        uint64_t p = 0;
+        const uint32_t words = (extraType >> i & 1) ? 4 : 8;
+        if (rd(s + 0x16d8 + 0x110 * b + 0x10 * i, p) && probeRead(p, d, 4 * words) && rd(m + 0x9c + 2 * i, map)) place(map, d, words);
+    });
+    uint16_t special = 0;
+    if (rd(prog + 4, special) && special && rd(m + 0xfa, map) && probeRead(m + 0x144, d, 16)) place(map, d, 4);
+    // Pointers into the table, and the scalars (e574c0).
+    uint8_t hdr[16];
+    uint16_t offs[5];
+    if (!probeRead(m, hdr, 16) || !probeRead(m + 0x12, offs, 10)) return;
+    auto pointer = [&](uint8_t sgpr, uint32_t dword) {
+        if (sgpr != 0xFF && st.pointerCount < 8) st.pointers[st.pointerCount++] = {sgpr, dword};
+    };
+    auto value = [&](uint8_t sgpr, uint64_t v, uint32_t words) {
+        if (sgpr == 0xFF) return;
+        for (uint32_t k = 0; k < words && sgpr + k < 16; ++k) st.sgpr[sgpr + k] = uint32_t(v >> (32 * k)), st.sgprKnown |= uint16_t(1u << (sgpr + k));
+    };
+    if (hdr[3] & 2) {
+        pointer(hdr[7], offs[0]);   // M+0x12
+        pointer(hdr[8], offs[2]);   // M+0x16
+        pointer(hdr[9], offs[3]);   // M+0x18
+        pointer(hdr[0xa], offs[4]); // M+0x1a
+        pointer(hdr[6], 0);
+        uint64_t v70 = 0;
+        if (rd(g + 0x70, v70)) value(hdr[0xb], v70, 2);
+        uint32_t v94 = 0;
+        if (rd(g + 0x94 + 0x40 * l, v94)) value(hdr[0xd], v94, 1);
+    }
+    if (l == 2) {
+        if (hdr[3] & 4) pointer(hdr[5], offs[1]); // M+0x14 (M+4: the fetch shader, installed inside drawIndex)
+        uint16_t a = 0, c = 0;
+        if (hdr[0xe] != 0xFF && rd(g + 0x2c8, a) && rd(g + 0x2ca, c)) value(hdr[0xe], uint32_t(a) * c, 1);
+    }
+    st.ok = true;
+}
+
+void captureScene(uint64_t g) {
+    const uint64_t s = at<uint64_t>(g + 0x320);
+    EngineSceneDraw e;
+    decodeStage(g, s, 2, at<uint64_t>(s + 0x100), e.vs);
+    decodeStage(g, s, 1, at<uint64_t>(s + 0xf0), e.ps);
+    std::lock_guard lock(gSceneMutex);
+    const uint32_t id = gNextScene++;
+    gScenes[id % kScenes] = std::move(e);
+    gSceneIds[id % kScenes] = id;
+    tEngineCheckId = id + 1;
+}
+
 uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVertex, uint64_t r8, uint64_t r9) {
     const auto* frame = static_cast<const uint64_t*>(LPN_GUEST_FRAME());
     const uint64_t base = reinterpret_cast<uint64_t>(gBase);
@@ -261,6 +378,7 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
     }
     tForcedOrigin = o;
     if (gProbe && site == 0x3700) probeScene(ctx);
+    if (gSceneCheck && site == 0x3700) captureScene(ctx);
     if (engineSite(site)) {
         const uint64_t s = at<uint64_t>(ctx + 0x320);
         EngineDraw d;
@@ -352,6 +470,13 @@ bool takeEngineDraw(EngineDraw& out) {
 }
 
 bool engineCheckOn() { return gOn && !gShadows; }
+bool engineSceneCheckOn() { return gSceneCheck; }
+bool engineScene(uint32_t id, EngineSceneDraw& out) {
+    std::lock_guard lock(gSceneMutex);
+    if (gSceneIds[id % kScenes] != id) return false;
+    out = gScenes[id % kScenes];
+    return true;
+}
 bool engineShadowsOn() { return gShadows; }
 
 bool engineCaster(uint32_t id, EngineCaster& out) {
@@ -372,7 +497,8 @@ bool installEngineCapture(Module& eboot) {
     const bool check = on("LPN_ENGINE_CHECK");
     gShadows = es ? *es && *es != '0' : !check;
     gProbe = on("LPN_ENGINE_PROBE");
-    if (!check && !gShadows && !gProbe) return false;
+    gSceneCheck = on("LPN_ENGINE_SCENE_CHECK");
+    if (!check && !gShadows && !gProbe && !gSceneCheck) return false;
     // push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov eax, ecx
     const Hook hooks[] = {
         {kDrawIndex, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x89, 0xc8}, guestHook<&drawIndex>(),

@@ -31,6 +31,7 @@ GpuRegs gRecordRegs, gAnalysisRegs;
 thread_local GpuRegs* tRegs = &gRecordRegs;
 thread_local bool tDry = false; // the analysis thread: no side effects, analysis hooks only
 thread_local uint32_t tOrigin[3] = {}; // the next draw's origin, from the NOP ahead of it
+thread_local uint32_t tEngineCheck = 0; // the next draw's engine description (id + 1), from a NOP ahead of it
 bool commandProcessorIsAsync();
 // Analysis hooks run inline, just before their counterparts: without the command processor
 // thread, or with LPN_NO_ANALYSIS_THREAD=1 (for comparison).
@@ -52,6 +53,8 @@ void draw(const DrawCall& dc, Pm4Stats* st) {
     if (d.kind < DrawCall::kDispatch) {
         std::memcpy(d.origin, tOrigin, sizeof tOrigin);
         std::memset(tOrigin, 0, sizeof tOrigin);
+        d.engineCheck = tEngineCheck;
+        tEngineCheck = 0;
     }
     if (geometryShaderDraw(d)) {
         if (tDry) return;
@@ -267,7 +270,10 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
             case kOpNop: // a draw's origin, ahead of it (native/draw_origin.h), or an engine draw
                 if (native::isOriginNop(b, count + 1))
                     for (int i = 0; i < 3; ++i) tOrigin[i] = b[i] & ~native::kOriginMask;
-                else if (count + 1 >= 2 && b[0] == native::kEngineTag && !tDry) {
+                else if (count + 1 >= 2 && b[0] == native::kEngineCheckTag) {
+                    tEngineCheck = b[1] + 1;
+                    tOrigin[0] = 0x3700; // the list draws' origin (in place of the origin NOP)
+                } else if (count + 1 >= 2 && b[0] == native::kEngineTag && !tDry) {
                     ++st->draws;
                     for (DrawListener* l : gListeners) l->onEngineDraw(b[1], *tRegs);
                 }

@@ -74,4 +74,30 @@ bool takeEngineDraw(EngineDraw& out);
 
 bool engineCheckOn();
 
+// LPN_ENGINE_SCENE_CHECK: the scene's draw-command-list draws (back at 0x3700) described from the
+// engine's state alone (docs/engine/user-data.md): each stage's code and the user data the engine
+// is about to give it (descriptors in SGPRs, pointers into its descriptor table and that table),
+// checked by the renderer against the draw's registers. A NOP {kEngineCheckTag, id} goes ahead of
+// the draw (in place of its origin NOP); the draw itself still runs.
+constexpr uint32_t kEngineCheckTag = 0x4B43454C; // "LECK"
+inline thread_local uint32_t tEngineCheckId = 0;
+struct EngineStage {
+    uint64_t code = 0;
+    uint32_t sgpr[16] = {};
+    uint16_t sgprKnown = 0;          // bit per SGPR the engine sets with a descriptor or a value
+    struct Pointer {
+        uint8_t sgpr;                // the pair's first SGPR
+        uint32_t dword;              // where it points in the table (dwords)
+    } pointers[8] = {};
+    uint32_t pointerCount = 0;
+    std::vector<uint32_t> table;     // the descriptor table as the engine is about to copy it
+    std::vector<uint8_t> tableKnown; // the dwords placed for this draw (the rest is stale)
+    bool ok = false;
+};
+struct EngineSceneDraw {
+    EngineStage vs, ps;
+};
+bool engineSceneCheckOn();
+bool engineScene(uint32_t id, EngineSceneDraw& out);
+
 } // namespace host::native

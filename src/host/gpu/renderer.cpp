@@ -1098,6 +1098,7 @@ public:
         if (upIn_.on && smaaSeen_ && !upEffect_ && upLastScene_) upscaleEffect(d, r, *held);
         if (passMap_.active()) passMap_.onDraw(d, r, &readGuest);
         if (native::engineCheckOn() && d.kind == DrawCall::kIndexed && native::engineSite(d.origin[0])) engineCheck(d, r, *held);
+        if (d.engineCheck && native::engineSceneCheckOn()) sceneCheck(d, r);
         // A draw a native pass takes is recorded here, in order (see nativeDraw).
         const bool native = nativeOn_ && d.kind != DrawCall::kDispatch && nativeClaimed(*held);
         if (comparePending_) { // LPN_NATIVE_COMPARE: before a recorder thread takes the next draw
@@ -5827,6 +5828,73 @@ void main() {
 
     // LPN_ENGINE_CHECK (native/engine_capture.h): a draw of the stage shadow casters against the
     // engine's own description of it, kept at its drawIndex call.
+    // LPN_ENGINE_SCENE_CHECK (native/engine_capture.h): a list draw's stages as the engine's state
+    // describes them, against the registers its draw packet runs with. Per stage: the code
+    // address, the user-data SGPRs the engine sets, and each table pointer's dwords placed for
+    // this draw (read through the pointer the SGPRs hold). Counted, with the first differences
+    // logged, and reported every 10 s.
+    void sceneCheck(const DrawCall& d, const GpuRegs& r) {
+        native::EngineSceneDraw e;
+        auto& st = sceneStats_;
+        if (!native::engineScene(d.engineCheck - 1, e)) {
+            ++st.lost;
+            return;
+        }
+        auto stage = [&](const native::EngineStage& es, uint32_t pgmLo, uint32_t userData, const char* name, int k) {
+            if (!es.ok) {
+                ++st.undecoded[k];
+                return;
+            }
+            const uint64_t code = shaderAddress(r, pgmLo);
+            if (code != es.code) {
+                if (st.code[k][1]++ < 5)
+                    std::fprintf(stderr, "[native] scene check: %s code 0x%" PRIx64 ", engine 0x%" PRIx64 "\n", name, code, es.code);
+                return;
+            }
+            ++st.code[k][0];
+            for (uint32_t i = 0; i < 16; ++i) {
+                if (!(es.sgprKnown >> i & 1)) continue;
+                const bool same = r.sh[userData + i] == es.sgpr[i];
+                ++st.sgpr[k][same ? 0 : 1];
+                if (!same && st.sgpr[k][1] <= 10)
+                    std::fprintf(stderr, "[native] scene check: %s %s s%u 0x%08x, engine 0x%08x\n", name,
+                                 native::shaderNameAt(code, &readGuest).c_str(), i, r.sh[userData + i], es.sgpr[i]);
+            }
+            for (uint32_t p = 0; p < es.pointerCount; ++p) {
+                const auto& ptr = es.pointers[p];
+                if (ptr.sgpr + 1 >= 16) continue;
+                const uint64_t at = r.sh[userData + ptr.sgpr] | uint64_t(r.sh[userData + ptr.sgpr + 1] & 0xFFFF) << 32;
+                for (uint32_t w = ptr.dword; w < es.table.size(); ++w) {
+                    if (!es.tableKnown[w]) continue;
+                    uint32_t v = 0;
+                    if (!readGuest(at + 4ull * (w - ptr.dword), &v, 4)) {
+                        ++st.table[k][2];
+                        continue;
+                    }
+                    const bool same = v == es.table[w];
+                    ++st.table[k][same ? 0 : 1];
+                    if (!same && st.table[k][1] <= 10)
+                        std::fprintf(stderr, "[native] scene check: %s %s table (s%u) dword %u: 0x%08x, engine 0x%08x\n", name,
+                                     native::shaderNameAt(code, &readGuest).c_str(), ptr.sgpr, w, v, es.table[w]);
+                }
+            }
+        };
+        stage(e.vs, reg::kPgmLoVs, reg::kUserDataVs, "vs", 0);
+        stage(e.ps, reg::kPgmLoPs, reg::kUserDataPs, "ps", 1);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - st.last < std::chrono::seconds(10)) return;
+        st.last = now;
+        for (int k = 0; k < 2; ++k)
+            std::fprintf(stderr, "[native] scene check %s: code %llu same, %llu differ; sgprs %llu same, %llu differ; table dwords %llu same, %llu differ, %llu unreadable; %llu undecoded\n",
+                         k ? "ps" : "vs", (unsigned long long)st.code[k][0], (unsigned long long)st.code[k][1],
+                         (unsigned long long)st.sgpr[k][0], (unsigned long long)st.sgpr[k][1], (unsigned long long)st.table[k][0],
+                         (unsigned long long)st.table[k][1], (unsigned long long)st.table[k][2], (unsigned long long)st.undecoded[k]);
+        if (st.lost) std::fprintf(stderr, "[native] scene check: %llu descriptions lost\n", (unsigned long long)st.lost);
+    }
+    struct SceneStats {
+        uint64_t code[2][2] = {}, sgpr[2][2] = {}, table[2][3] = {}, undecoded[2] = {}, lost = 0;
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    } sceneStats_;
     void engineCheck(const DrawCall& d, const GpuRegs& r, const DrawAnalysis& a) {
         static const std::map<uint64_t, uint32_t> kNone;
         const std::map<uint64_t, uint32_t>& vsLoads = a.vsLoads ? *a.vsLoads : kNone;

@@ -43,6 +43,7 @@ struct DrawCall {
     uint32_t groups[3] = {};         // thread groups for kDispatch
     uint32_t indirectOffset = 0;     // into GpuRegs::indirectBase
     uint32_t origin[3] = {};         // eboot offsets of the engine code that drew it (native/draw_origin.h)
+    uint32_t engineCheck = 0;        // LPN_ENGINE_SCENE_CHECK: the engine's description of it (id + 1), 0: none
 };
 
 class DrawListener {
