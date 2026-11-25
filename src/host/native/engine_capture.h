@@ -101,6 +101,8 @@ struct EngineStage {
 struct EngineSceneDraw {
     EngineStage vs, ps;
     bool attributes = false; // the vertex attributes generated for it are in vs's table
+    uint32_t count = 0;      // the draw: its index count and first index's address, as eac430 computes it
+    uint64_t indexAddr = 0;
 };
 bool engineSceneCheckOn();
 std::shared_ptr<const EngineSceneDraw> engineScene(uint32_t id);
@@ -113,6 +115,15 @@ void engineTableAfter(uint64_t out[2]);
 // feed range, served to the analysis by feedRead). The draws carry the capture's id as the scene
 // check's do (DrawCall::engineCheck); with LPN_ENGINE_SCENE_CHECK too, each is also checked.
 bool engineFeedOn();
+// The fed draws drawn from their captures: the packet helper writes a NOP {kEngineFeedDrawTag, id,
+// count, index address} in place of the draw packet (the arguments for when the capture is gone),
+// and the command processor makes the draw from the capture there. Not with the scene check, which
+// compares the capture with the game's draw.
+constexpr uint32_t kEngineFeedDrawTag = 0x5244464C; // "LFDR"
+inline thread_local uint32_t tEngineFeedDrawId = 0;  // id + 1
+// Command processor: the draws made from captures, and those whose capture disagreed with the
+// NOP's arguments (logged).
+void engineFeedDrawSeen(bool agreed);
 uint64_t engineFeedCaptureNs(); // LPN_PROFILE: game threads' time capturing, in all
 // A capture's tables at addresses of their own: kFeedBase + its ring slot * kFeedCaptureBytes +
 // the stage (0 VS, 1 PS) * kFeedStageBytes, served from the capture itself (no copies: the ring

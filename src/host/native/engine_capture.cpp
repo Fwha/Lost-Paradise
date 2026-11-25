@@ -463,10 +463,17 @@ void fetchInstalled(uint64_t g) {
     gScenes[id % kScenes] = std::move(e);
     gSceneIds[id % kScenes] = id;
 }
-uint32_t captureScene(uint64_t g, uint32_t baseVertex) {
+uint32_t captureScene(uint64_t g, uint32_t count, uint32_t first, uint32_t baseVertex) {
     const uint64_t s = at<uint64_t>(g + 0x320);
     EngineSceneDraw& e = tScene;
     e = {};
+    uint64_t indexBase = 0;
+    uint32_t indexWord = 0;
+    if (rd(s + 0x688, indexBase) && rd(s + 0x690, indexWord)) {
+        // eac430: first << (1 + bit 31 of +0x690), plus its low bits, in 32 bits, onto +0x688.
+        e.count = count;
+        e.indexAddr = indexBase + uint32_t((first << ((indexWord >> 31) + 1)) + (indexWord & 0x7FFFFFFF));
+    }
     // The vertex attributes drawIndex is about to generate (else the table holds the last draw's).
     uint64_t fetch = 0;
     std::vector<std::array<uint32_t, 4>> attributes;
@@ -477,6 +484,7 @@ uint32_t captureScene(uint64_t g, uint32_t baseVertex) {
     const uint32_t id = gNextSceneAtomic.fetch_add(1, std::memory_order_relaxed);
     tSceneId = id + 1;
     tEngineCheckId = id + 1;
+    if (gFeed && !gSceneCheck && e.count) tEngineFeedDrawId = id + 1;
     return id + 1;
 }
 
@@ -791,8 +799,8 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
     // threads ~3 us a draw read by read).
     // (feedClaimed outside it: the shader names take locks, which a fault must not skip.)
     if ((gSceneCheck || (gFeed && feedClaimed(ctx))) && site == 0x3700 &&
-        !guardedAll([&] { scene = captureScene(ctx, uint32_t(baseVertex)); }))
-        scene = 0, tSceneId = 0, tEngineCheckId = 0;
+        !guardedAll([&] { scene = captureScene(ctx, uint32_t(count), uint32_t(first), uint32_t(baseVertex)); }))
+        scene = 0, tSceneId = 0, tEngineCheckId = 0, tEngineFeedDrawId = 0;
     if (prof && scene) gFeedCaptureNs += uint64_t((std::chrono::steady_clock::now() - t0).count());
     if (gPrepass && site == 0x3700 && (displaySettingsNative() || gPrepassCheck)) capturePrepass(ctx, uint32_t(count), uint32_t(first), uint32_t(baseVertex));
     if (engineSite(site)) {
@@ -870,7 +878,7 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
         ++(captured ? gDrawsCaptured : gDrawsGame);
     }
     tForcedOrigin = {}; // not left for another draw when this one wrote none
-    tEngineDrawId = 0, tEnginePrepassId = 0, tEngineCheckId = 0;
+    tEngineDrawId = 0, tEnginePrepassId = 0, tEngineCheckId = 0, tEngineFeedDrawId = 0;
     return r;
 }
 
@@ -906,6 +914,13 @@ std::shared_ptr<const EnginePrepass> enginePrepass(uint32_t id) {
     return gPrepassIds[id % gPrepassIds.size()] == id ? gPrepasses[id % gPrepasses.size()] : nullptr;
 }
 bool engineFeedOn() { return gFeed; }
+void engineFeedDrawSeen(bool agreed) {
+    static std::atomic<uint64_t> seen{0}, differ{0};
+    const uint64_t n = ++seen, d = agreed ? differ.load() : ++differ;
+    if ((n & (n - 1)) == 0 && n >= 1024)
+        std::fprintf(stderr, "[native] engine feed: %llu draws made from the captures, %llu disagreed with the game's arguments\n",
+                     (unsigned long long)n, (unsigned long long)d);
+}
 uint64_t engineFeedCaptureNs() { return gFeedCaptureNs.load(std::memory_order_relaxed); }
 void engineTableAfter(uint64_t out[2]) { out[0] = gTableAfter[0], out[1] = gTableAfter[1]; }
 bool feedRead(uint64_t addr, void* dst, size_t size) {
