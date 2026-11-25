@@ -49,6 +49,46 @@ bool geometryShaderDraw(const DrawCall& d) {
     return d.kind < DrawCall::kDispatch && (tRegs->ctx[ctx::kVgtShaderStagesEn] & (1u << 5));
 }
 
+// LPN_ENGINE_FEED: a draw made from its capture takes the targets and fixed-function state the
+// engine holds for it (docs/engine/fixed-state.md, LPN_ENGINE_FIXED_CHECK: 7.6M draws, 0 differ),
+// over whatever the stream's register writes left. A word that changes is counted and logged: it
+// should not happen while the game's own register writes still run.
+void applyFixed(const native::EngineFixed& f) {
+    using W = native::EngineFixed::Word;
+    bool changed = false;
+    auto set = [&](uint32_t& reg, const W& w) {
+        if (w.known && reg != w.value) reg = w.value, changed = true;
+    };
+    uint32_t* c = tRegs->ctx;
+    for (uint32_t i = 0; i < 8; ++i) {
+        for (uint32_t j = 0; j < 6; ++j) set(c[ctx::kCbColor0Base + i * ctx::kCbColorStride + j], f.color[i][j]);
+        set(c[ctx::kCbBlend0Control + i], f.blend[i]);
+        set(c[ctx::kDbZInfo + i], f.depth[i]);
+    }
+    set(c[ctx::kCbTargetMask], f.targetMask);
+    set(c[ctx::kCbShaderMask], f.shaderMask);
+    set(c[ctx::kCbColorControl], f.colorControl);
+    set(c[ctx::kDbHtileDataBase], f.htileBase);
+    set(c[ctx::kDbDepthControl], f.depthControl);
+    set(c[ctx::kDbStencilControl], f.stencilControl);
+    set(c[ctx::kDbStencilRefMask], f.stencilRefMask);
+    set(c[ctx::kDbStencilRefMaskBf], f.stencilRefMaskBf);
+    set(c[ctx::kDbRenderControl], f.renderControl);
+    set(c[ctx::kPaSuScModeCntl], f.modeCntl);
+    for (uint32_t i = 0; i < 4; ++i) set(c[ctx::kPaSuPolyOffsetFrontScale + i], f.polyOffset[i]);
+    set(c[ctx::kPaSuPolyOffsetClamp], f.polyOffsetClamp);
+    for (uint32_t i = 0; i < 6; ++i) set(c[0x10F + i], f.viewport[i]); // PA_CL_VPORT_XSCALE_0 on
+    set(c[ctx::kPaScVportScissorTl], f.scissor[0]);
+    set(c[ctx::kPaScVportScissorBr], f.scissor[1]);
+    set(tRegs->uconfig[0x242], f.primitive); // VGT_PRIMITIVE_TYPE
+    set(tRegs->indexType, f.indexType);
+    if (!changed) return;
+    ++tRegs->ctxSerial;
+    static std::atomic<uint32_t> n{0};
+    if (const uint32_t k = ++n; k <= 10 || (k & (k - 1)) == 0)
+        std::fprintf(stderr, "[native] engine feed: a draw's fixed state differed from the stream's registers (%u so far)\n", k);
+}
+
 void draw(const DrawCall& dc, Pm4Stats* st) {
     DrawCall d = dc;
     if (d.kind < DrawCall::kDispatch) {
@@ -307,6 +347,7 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
                     if (const auto c = native::engineScene(b[1]); c && c->count) {
                         if (!tDry) native::engineFeedDrawSeen(c->count == d.count && c->indexAddr == d.indexAddr);
                         d.count = c->count, d.indexAddr = c->indexAddr;
+                        applyFixed(c->fixed);
                     }
                     std::memset(tOrigin, 0, sizeof tOrigin);
                     tOrigin[0] = 0x3700; // the list draws' origin (draw() takes it)

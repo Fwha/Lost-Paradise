@@ -39,6 +39,7 @@ Fn gDrawIndex = nullptr;
 uint8_t* gBase = nullptr;
 bool gOn = false;
 bool gFixedCheck = false;
+bool gFeed = false; // LPN_ENGINE_FEED
 thread_local uint64_t tFixedContext = 0;
 
 std::mutex gMutex;
@@ -97,12 +98,12 @@ uint64_t commit(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint
     const uint64_t ret = frame[1] - reinterpret_cast<uint64_t>(gBase);
     if (!gTiming || ret < 0xa51100 || ret >= 0xa51d90) {
         const uint64_t r = gCommit(a, b, c, d, e, f);
-        if (gFixedCheck) tFixedContext = a;
+        if (gFixedCheck || gFeed) tFixedContext = a;
         return r;
     }
     const int64_t t = nowNs();
     const uint64_t r = gCommit(a, b, c, d, e, f);
-    if (gFixedCheck) tFixedContext = a;
+    if (gFixedCheck || gFeed) tFixedContext = a;
     gCommitNs += uint64_t(nowNs() - t);
     ++gCommits;
     return r;
@@ -270,7 +271,6 @@ void probeScene(uint64_t g) {
 
 // LPN_ENGINE_SCENE_CHECK (engine_capture.h, docs/engine/user-data.md).
 bool gSceneCheck = false;
-bool gFeed = false; // LPN_ENGINE_FEED
 bool gPrepass = false; // LPN_ENGINE_PREPASS
 bool gPrepassCheck = false; // LPN_ENGINE_PREPASS_CHECK
 std::mutex gPrepassMutex;
@@ -571,7 +571,7 @@ void fetchInstalled(uint64_t g) {
     if ((gSceneCheck || gFeed) && (!rd(g + 0x108, fetch) || !rd(g + 0x68, staging))) return;
     auto e = std::make_shared<EngineSceneDraw>(std::move(tScene));
     tScene = {};
-    if (gFixedCheck) {
+    if (gFixedCheck || gFeed) {
         const uint64_t p = at<uint64_t>(g + 0xc0); // selected PS, installed lazily by drawIndex
         if (!p) e->fixed.shaderMask = {0, true};
         else if (readable(p)) e->fixed.shaderMask = {at<uint32_t>(p + 0x34), true};
@@ -614,7 +614,7 @@ uint32_t captureScene(uint64_t g, uint32_t count, uint32_t first, uint32_t baseV
         e.count = count;
         e.indexAddr = indexBase + uint32_t((first << ((indexWord >> 31) + 1)) + (indexWord & 0x7FFFFFFF));
     }
-    if (gFixedCheck) captureFixed(g, s, e.fixed);
+    if (gFixedCheck || gFeed) captureFixed(g, s, e.fixed);
     if (gSceneCheck || gFeed) {
         // The vertex attributes drawIndex is about to generate (else the table holds the last draw's).
         uint64_t fetch = 0;
@@ -1132,7 +1132,7 @@ bool installEngineCapture(Module& eboot) {
          reinterpret_cast<void**>(&gDrawIndex)},
     };
     // Share the commit trampoline: installing the same PC twice loses the original.
-    if (gFixedCheck || gTiming)
+    if (gFixedCheck || gFeed || gTiming)
         hooks.push_back({0xe61ae0,
                          {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53},
                          guestHook<&commit>(), reinterpret_cast<void**>(&gCommit)});
