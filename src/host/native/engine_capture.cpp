@@ -958,7 +958,10 @@ bool installEngineCapture(Module& eboot) {
     gPrepass = ep ? *ep && *ep != '0' : !check;
     gPrepassCheck = on("LPN_ENGINE_PREPASS_CHECK");
     gPrepass = gPrepass || gPrepassCheck;
-    gFeed = on("LPN_ENGINE_FEED");
+    // On by default too (fps as without it once its tables were served from the captures);
+    // LPN_ENGINE_FEED=0 turns it off.
+    const char* ef = std::getenv("LPN_ENGINE_FEED");
+    gFeed = ef ? *ef && *ef != '0' : !check;
     if (gPrepassCheck) gSceneCheck = gFeed = false; // its NOP carries the prepass capture's id
     if (!check && !gShadows && !gProbe && !gSceneCheck && !gPrepass && !gFeed) return false;
     // push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov eax, ecx

@@ -346,3 +346,10 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   draws still come from the PM4 stream; the registers still give targets and fixed-function state.
 - The engine prepass now keeps the game's draw when the registers rule the native prepass out
   (one scene lost ~65 draws to "not one colour target with depth").
+- 2026-11-25: LPN_PROFILE showed the feed costing ~550 ms/s on the analysis thread (copying and
+  hashing every table) and ~170 ms/s on the game's threads. The tables are now served from the
+  captures themselves (addresses carry the capture's ring slot and generation) and each capture
+  has one fault guard: the analysis thread's share fell to ~30 ms/s and fps matched a run without
+  it (~84 against ~83 in the same spot). On by default since; `LPN_ENGINE_FEED=0` turns it off.
+  The game threads' ~3 us a draw is mostly the engine state's cache misses, which the engine's
+  own drawIndex then finds warm.
