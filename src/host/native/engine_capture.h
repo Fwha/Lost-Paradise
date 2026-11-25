@@ -103,7 +103,7 @@ struct EngineSceneDraw {
     bool attributes = false; // the vertex attributes generated for it are in vs's table
 };
 bool engineSceneCheckOn();
-bool engineScene(uint32_t id, EngineSceneDraw& out);
+std::shared_ptr<const EngineSceneDraw> engineScene(uint32_t id);
 // The placed table dwords as decodeStage had them before drawIndex: [0] the same after it, [1] not.
 void engineTableAfter(uint64_t out[2]);
 
@@ -113,6 +113,7 @@ void engineTableAfter(uint64_t out[2]);
 // feed range, served to the analysis by feedRead). The draws carry the capture's id as the scene
 // check's do (DrawCall::engineCheck); with LPN_ENGINE_SCENE_CHECK too, each is also checked.
 bool engineFeedOn();
+uint64_t engineFeedCaptureNs(); // LPN_PROFILE: game threads' time capturing, in all
 constexpr uint64_t kFeedBase = 0x7F0000000000ull, kFeedSlotBytes = 0x2000;
 // Frames of draws: a slot is reused long after the analyses and the recorder are done with it
 // (and never between two analyses of one worker, so the analysis' repeat shortcut holds).

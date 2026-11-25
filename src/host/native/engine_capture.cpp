@@ -258,9 +258,10 @@ std::vector<uint32_t> gPrepassIds(1 << 15, ~0u);
 uint32_t gNextPrepass = 0;
 constexpr uint32_t kScenes = 1 << 15;
 std::mutex gSceneMutex;
-std::vector<EngineSceneDraw> gScenes(kScenes);
+std::vector<std::shared_ptr<const EngineSceneDraw>> gScenes(kScenes);
 std::vector<uint32_t> gSceneIds(kScenes, ~0u);
-uint32_t gNextScene = 0;
+std::atomic<uint32_t> gNextSceneAtomic{0};
+std::atomic<uint64_t> gFeedCaptureNs{0}; // LPN_PROFILE: the game threads' time in the feed's captures
 
 template <typename T> bool rd(uint64_t a, T& v) { return probeRead(a, &v, sizeof v); }
 
@@ -409,36 +410,48 @@ bool feedClaimed(uint64_t g) {
 // stage's table as it copied it from the staging area (the dwords decodeStage doesn't place are
 // whatever the staging area held, which the reconstruction only knows from before the call).
 std::atomic<uint64_t> gTableAfter[2]{}; // placed dwords the same after the call, different
-void fetchInstalled(uint64_t g, uint32_t id) {
+// The capture being made on this thread: id + 1, filled in by captureScene, finished and published
+// by fetchInstalled once the original drawIndex returns (the renderer reads it much later).
+thread_local uint32_t tSceneId = 0;
+thread_local EngineSceneDraw tScene;
+void fetchInstalled(uint64_t g) {
+    const uint32_t id = tSceneId - 1;
+    tSceneId = 0;
     uint64_t fetch = 0, staging = 0;
     if (!rd(g + 0x108, fetch) || !rd(g + 0x68, staging)) return;
-    std::lock_guard lock(gSceneMutex);
-    if (gSceneIds[id % kScenes] != id) return;
-    EngineSceneDraw& e = gScenes[id % kScenes];
-    EngineStage& vs = e.vs;
+    auto e = std::make_shared<EngineSceneDraw>(std::move(tScene));
+    tScene = {};
+    EngineStage& vs = e->vs;
     if (vs.fetchSgpr < 15) {
         vs.sgpr[vs.fetchSgpr] = uint32_t(fetch), vs.sgpr[vs.fetchSgpr + 1] = uint32_t(fetch >> 32);
         vs.sgprKnown |= uint16_t(3u << vs.fetchSgpr);
     }
     auto after = [&](EngineStage& st, uint32_t l) {
         if (!st.ok || st.table.empty()) return;
-        std::vector<uint32_t> t(st.table.size());
-        if (!probeRead(staging + 0x1800 * l, t.data(), 4 * t.size())) return;
         if (gSceneCheck) {
+            std::vector<uint32_t> t(st.table.size());
+            if (!probeRead(staging + 0x1800 * l, t.data(), 4 * t.size())) return;
             uint64_t same = 0, differ = 0;
             for (size_t i = 0; i < t.size(); ++i)
                 if (st.tableKnown[i]) ++(t[i] == st.table[i] ? same : differ);
             gTableAfter[0] += same, gTableAfter[1] += differ;
+            st.table = std::move(t);
+        } else if (!probeRead(staging + 0x1800 * l, st.table.data(), 4 * st.table.size())) {
+            st.ok = false;
+            return;
         }
-        st.table = std::move(t);
         st.tableKnown.assign(st.table.size(), 1);
     };
-    after(e.vs, 2);
-    after(e.ps, 1);
+    after(e->vs, 2);
+    after(e->ps, 1);
+    std::lock_guard lock(gSceneMutex);
+    gScenes[id % kScenes] = std::move(e);
+    gSceneIds[id % kScenes] = id;
 }
 uint32_t captureScene(uint64_t g, uint32_t baseVertex) {
     const uint64_t s = at<uint64_t>(g + 0x320);
-    EngineSceneDraw e;
+    EngineSceneDraw& e = tScene;
+    e = {};
     // The vertex attributes drawIndex is about to generate (else the table holds the last draw's).
     uint64_t fetch = 0;
     std::vector<std::array<uint32_t, 4>> attributes;
@@ -446,10 +459,8 @@ uint32_t captureScene(uint64_t g, uint32_t baseVertex) {
     e.attributes = !gSceneCheck || generatedAttributes(s, baseVertex, fetch, attributes);
     decodeStage(g, s, 2, at<uint64_t>(s + 0x100), e.vs, gSceneCheck && e.attributes ? &attributes : nullptr, gSceneCheck);
     decodeStage(g, s, 1, at<uint64_t>(s + 0xf0), e.ps, nullptr, gSceneCheck);
-    std::lock_guard lock(gSceneMutex);
-    const uint32_t id = gNextScene++;
-    gScenes[id % kScenes] = std::move(e);
-    gSceneIds[id % kScenes] = id;
+    const uint32_t id = gNextSceneAtomic.fetch_add(1, std::memory_order_relaxed);
+    tSceneId = id + 1;
     tEngineCheckId = id + 1;
     return id + 1;
 }
@@ -759,7 +770,10 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
     tForcedOrigin = o;
     if (gProbe && site == 0x3700) probeScene(ctx);
     uint32_t scene = 0;
+    static const bool prof = std::getenv("LPN_PROFILE") != nullptr;
+    const auto t0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if ((gSceneCheck || (gFeed && feedClaimed(ctx))) && site == 0x3700) scene = captureScene(ctx, uint32_t(baseVertex));
+    if (prof && scene) gFeedCaptureNs += uint64_t((std::chrono::steady_clock::now() - t0).count());
     if (gPrepass && site == 0x3700 && (displaySettingsNative() || gPrepassCheck)) capturePrepass(ctx, uint32_t(count), uint32_t(first), uint32_t(baseVertex));
     if (engineSite(site)) {
         const uint64_t s = at<uint64_t>(ctx + 0x320);
@@ -826,7 +840,11 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
     const bool captured = tEngineDrawId != 0;
     const int64_t t = timed ? nowNs() : 0;
     const uint64_t r = gDrawIndex(ctx, count, first, baseVertex, r8, r9);
-    if (scene) fetchInstalled(ctx, scene - 1);
+    if (scene) {
+        const auto t1 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        fetchInstalled(ctx);
+        if (prof) gFeedCaptureNs += uint64_t((std::chrono::steady_clock::now() - t1).count());
+    }
     if (timed) {
         gDrawNs += uint64_t(nowNs() - t);
         ++(captured ? gDrawsCaptured : gDrawsGame);
@@ -868,6 +886,7 @@ std::shared_ptr<const EnginePrepass> enginePrepass(uint32_t id) {
     return gPrepassIds[id % gPrepassIds.size()] == id ? gPrepasses[id % gPrepasses.size()] : nullptr;
 }
 bool engineFeedOn() { return gFeed; }
+uint64_t engineFeedCaptureNs() { return gFeedCaptureNs.load(std::memory_order_relaxed); }
 void engineTableAfter(uint64_t out[2]) { out[0] = gTableAfter[0], out[1] = gTableAfter[1]; }
 // The feed range: a ring of table copies, found again by their contents (consecutive draws with
 // the same table get the same address, as the game's own copies repeat, so the analysis' repeat
@@ -917,11 +936,9 @@ bool feedRead(uint64_t addr, void* dst, size_t size) {
     std::memcpy(dst, reinterpret_cast<const uint8_t*>(f.words.data()) + at, size);
     return true;
 }
-bool engineScene(uint32_t id, EngineSceneDraw& out) {
+std::shared_ptr<const EngineSceneDraw> engineScene(uint32_t id) {
     std::lock_guard lock(gSceneMutex);
-    if (gSceneIds[id % kScenes] != id) return false;
-    out = gScenes[id % kScenes];
-    return true;
+    return gSceneIds[id % kScenes] == id ? gScenes[id % kScenes] : nullptr;
 }
 bool engineShadowsOn() { return gShadows; }
 
