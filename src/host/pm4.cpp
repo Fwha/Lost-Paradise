@@ -298,6 +298,20 @@ void execute(const uint32_t* p, const uint32_t* end, Pm4Stats* st, int depth) {
                     } else {
                         std::memset(tOrigin, 0, sizeof tOrigin);
                     }
+                } else if (count + 1 >= 5 && b[0] == native::kEngineFeedDrawTag) {
+                    // LPN_ENGINE_FEED: the draw, from the engine's capture (the NOP's arguments, the
+                    // game's, only when the capture is gone), carrying the capture as the scene check's do.
+                    DrawCall d{DrawCall::kIndexed};
+                    d.count = b[2];
+                    d.indexAddr = address(b[3], b[4]);
+                    if (const auto c = native::engineScene(b[1]); c && c->count) {
+                        if (!tDry) native::engineFeedDrawSeen(c->count == d.count && c->indexAddr == d.indexAddr);
+                        d.count = c->count, d.indexAddr = c->indexAddr;
+                    }
+                    std::memset(tOrigin, 0, sizeof tOrigin);
+                    tOrigin[0] = 0x3700; // the list draws' origin (draw() takes it)
+                    tEngineCheck = b[1] + 1;
+                    draw(d, st);
                 } else if (count + 1 >= 2 && b[0] == native::kEngineTag && !tDry) {
                     ++st->draws;
                     for (DrawListener* l : gListeners) l->onEngineDraw(b[1], *tRegs);
