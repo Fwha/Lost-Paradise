@@ -8238,7 +8238,7 @@ void main() {
         } timed{prof, t0, st.ns};
         int why = 0;
         uint32_t vs[16], ps[16];
-        auto stage = [&](const native::EngineStage& es, const gcn::LaunchState& l, uint32_t* out) {
+        auto stage = [&](const native::EngineStage& es, const gcn::LaunchState& l, uint32_t* out, uint32_t which) {
             if (!es.ok) return 2;
             if (es.code != l.entry) return 3;
             std::memcpy(out, l.userData, sizeof l.userData);
@@ -8248,8 +8248,8 @@ void main() {
             for (uint32_t p = 0; p < es.pointerCount; ++p) {
                 const auto& ptr = es.pointers[p];
                 if (ptr.sgpr + 1 >= 16 || ptr.dword >= es.table.size()) continue;
-                const uint64_t at = native::feedTable(es.table.data() + ptr.dword, uint32_t(es.table.size() - ptr.dword));
-                if (!at) return 4;
+                if (4ull * es.table.size() > native::kFeedStageBytes) return 4;
+                const uint64_t at = native::feedTable(id, which, ptr.dword);
                 out[ptr.sgpr] = uint32_t(at), out[ptr.sgpr + 1] = uint32_t(at >> 32);
                 covered |= 3u << ptr.sgpr;
             }
@@ -8260,7 +8260,7 @@ void main() {
         const auto ep = native::engineScene(id);
         if (!ep) why = 1;
         else if (!ep->attributes) why = 6;
-        else if (!(why = stage(ep->vs, j.vs, vs)) && j.hasPs) why = stage(ep->ps, j.ps, ps);
+        else if (!(why = stage(ep->vs, j.vs, vs, 0)) && j.hasPs) why = stage(ep->ps, j.ps, ps, 1);
         static const bool check = getenv("LPN_ENGINE_FEED_CHECK") != nullptr;
         if (!why && check) j.fedCheck = true, j.regVs = j.vs, j.regPs = j.ps;
         if (!why) {

@@ -21,6 +21,7 @@
 #include <shared_mutex>
 #include <unordered_map>
 #include <string>
+#include <type_traits>
 
 namespace host::native {
 
@@ -194,8 +195,21 @@ std::map<std::string, std::string> gProbeSample;
 int64_t gProbeStart = 0;
 
 // Guarded: a candidate field can hold anything (a fault is caught, as renderer.cpp's readGuest does).
+// Inside a guardedAll() (one fault guard around a whole capture): reads go straight to memory. A
+// fault leaks what the capture had allocated (longjmp skips destructors): rare, and small.
+thread_local bool tDirect = false;
+template <typename F> bool guardedAll(F&& f) {
+    tDirect = true;
+    const bool ok = host::guarded([](void* p) { (*static_cast<std::remove_reference_t<F>*>(p))(); }, &f);
+    tDirect = false;
+    return ok;
+}
 bool probeRead(uint64_t a, void* d, size_t n) {
     if (!readable(a) || !readable(a + n)) return false;
+    if (tDirect) {
+        std::memcpy(d, reinterpret_cast<const void*>(a), n);
+        return true;
+    }
     struct Copy {
         void* dst;
         uint64_t addr;
@@ -256,8 +270,9 @@ std::mutex gPrepassMutex;
 std::vector<std::shared_ptr<const EnginePrepass>> gPrepasses(1 << 15);
 std::vector<uint32_t> gPrepassIds(1 << 15, ~0u);
 uint32_t gNextPrepass = 0;
-constexpr uint32_t kScenes = 1 << 15;
-std::mutex gSceneMutex;
+// Striped by ring slot: the analysis workers read the tables (feedRead) as the game publishes.
+std::mutex gSceneMutexes[64];
+inline std::mutex& sceneMutex(uint32_t slot) { return gSceneMutexes[slot & 63]; }
 std::vector<std::shared_ptr<const EngineSceneDraw>> gScenes(kScenes);
 std::vector<uint32_t> gSceneIds(kScenes, ~0u);
 std::atomic<uint32_t> gNextSceneAtomic{0};
@@ -444,7 +459,7 @@ void fetchInstalled(uint64_t g) {
     };
     after(e->vs, 2);
     after(e->ps, 1);
-    std::lock_guard lock(gSceneMutex);
+    std::lock_guard lock(sceneMutex(id % kScenes));
     gScenes[id % kScenes] = std::move(e);
     gSceneIds[id % kScenes] = id;
 }
@@ -772,7 +787,12 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
     uint32_t scene = 0;
     static const bool prof = std::getenv("LPN_PROFILE") != nullptr;
     const auto t0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    if ((gSceneCheck || (gFeed && feedClaimed(ctx))) && site == 0x3700) scene = captureScene(ctx, uint32_t(baseVertex));
+    // One fault guard for the whole capture, not one per read (the feed's captures cost the game's
+    // threads ~3 us a draw read by read).
+    // (feedClaimed outside it: the shader names take locks, which a fault must not skip.)
+    if ((gSceneCheck || (gFeed && feedClaimed(ctx))) && site == 0x3700 &&
+        !guardedAll([&] { scene = captureScene(ctx, uint32_t(baseVertex)); }))
+        scene = 0, tSceneId = 0, tEngineCheckId = 0;
     if (prof && scene) gFeedCaptureNs += uint64_t((std::chrono::steady_clock::now() - t0).count());
     if (gPrepass && site == 0x3700 && (displaySettingsNative() || gPrepassCheck)) capturePrepass(ctx, uint32_t(count), uint32_t(first), uint32_t(baseVertex));
     if (engineSite(site)) {
@@ -842,7 +862,7 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
     const uint64_t r = gDrawIndex(ctx, count, first, baseVertex, r8, r9);
     if (scene) {
         const auto t1 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        fetchInstalled(ctx);
+        if (!guardedAll([&] { fetchInstalled(ctx); })) tSceneId = 0;
         if (prof) gFeedCaptureNs += uint64_t((std::chrono::steady_clock::now() - t1).count());
     }
     if (timed) {
@@ -888,56 +908,28 @@ std::shared_ptr<const EnginePrepass> enginePrepass(uint32_t id) {
 bool engineFeedOn() { return gFeed; }
 uint64_t engineFeedCaptureNs() { return gFeedCaptureNs.load(std::memory_order_relaxed); }
 void engineTableAfter(uint64_t out[2]) { out[0] = gTableAfter[0], out[1] = gTableAfter[1]; }
-// The feed range: a ring of table copies, found again by their contents (consecutive draws with
-// the same table get the same address, as the game's own copies repeat, so the analysis' repeat
-// shortcut still works). Written by the command processor's analysis pass, read by the workers.
-struct FeedSlot {
-    uint64_t hash = 0;
-    uint32_t made = 0; // gFeedNext when it was written
-    std::vector<uint32_t> words;
-};
-std::shared_mutex gFeedMutex;
-std::vector<FeedSlot> gFeedSlots(kFeedSlots);
-std::unordered_map<uint64_t, uint32_t> gFeedIndex; // hash: slot
-uint32_t gFeedNext = 0;
-uint64_t feedTable(const uint32_t* words, uint32_t n) {
-    if (!n || 4ull * n > kFeedSlotBytes) return 0;
-    uint64_t h = 0xcbf29ce484222325ull ^ n;
-    for (uint32_t i = 0; i < n; ++i) h = (h ^ words[i]) * 0x100000001b3ull;
-    {
-        std::shared_lock lock(gFeedMutex);
-        if (const auto it = gFeedIndex.find(h); it != gFeedIndex.end()) {
-            // Only a slot written in the last half of the ring: an older one may be the next to be
-            // overwritten, under the draw that was just given it (Codex found this: tables that
-            // repeat every frame kept their first slot until the ring came round to it).
-            const FeedSlot& f = gFeedSlots[it->second];
-            if (gFeedNext - f.made < kFeedSlots / 2 && f.words.size() == n && !std::memcmp(f.words.data(), words, 4ull * n))
-                return kFeedBase + it->second * kFeedSlotBytes;
-        }
-    }
-    std::unique_lock lock(gFeedMutex);
-    const uint32_t slot = gFeedNext++ % kFeedSlots;
-    FeedSlot& f = gFeedSlots[slot];
-    if (const auto it = gFeedIndex.find(f.hash); it != gFeedIndex.end() && it->second == slot) gFeedIndex.erase(it);
-    f.hash = h;
-    f.made = gFeedNext;
-    f.words.assign(words, words + n);
-    gFeedIndex[h] = slot;
-    return kFeedBase + uint64_t(slot) * kFeedSlotBytes;
-}
 bool feedRead(uint64_t addr, void* dst, size_t size) {
     const uint64_t off = addr - kFeedBase;
-    const uint32_t slot = uint32_t(off / kFeedSlotBytes);
-    const uint64_t at = off % kFeedSlotBytes;
-    if (slot >= kFeedSlots) return false;
-    std::shared_lock lock(gFeedMutex);
-    const FeedSlot& f = gFeedSlots[slot];
-    if (at + size > 4ull * f.words.size()) return false;
-    std::memcpy(dst, reinterpret_cast<const uint8_t*>(f.words.data()) + at, size);
+    const uint32_t generation = uint32_t(off >> kFeedGenerationShift);
+    const uint64_t in = off & ((1ull << kFeedGenerationShift) - 1);
+    const uint32_t slot = uint32_t(in / kFeedCaptureBytes);
+    const uint32_t stage = uint32_t(in / kFeedStageBytes) & 1;
+    const uint64_t at = in % kFeedStageBytes;
+    if (slot >= kScenes || generation > 0xFF) return false;
+    std::shared_ptr<const EngineSceneDraw> e;
+    {
+        std::lock_guard lock(sceneMutex(slot));
+        if (((gSceneIds[slot] / kScenes) & 0xFF) != generation) return false;
+        e = gScenes[slot];
+    }
+    if (!e) return false;
+    const std::vector<uint32_t>& t = stage ? e->ps.table : e->vs.table;
+    if (at + size > 4ull * t.size()) return false;
+    std::memcpy(dst, reinterpret_cast<const uint8_t*>(t.data()) + at, size);
     return true;
 }
 std::shared_ptr<const EngineSceneDraw> engineScene(uint32_t id) {
-    std::lock_guard lock(gSceneMutex);
+    std::lock_guard lock(sceneMutex(id % kScenes));
     return gSceneIds[id % kScenes] == id ? gScenes[id % kScenes] : nullptr;
 }
 bool engineShadowsOn() { return gShadows; }

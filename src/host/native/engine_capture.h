@@ -114,14 +114,22 @@ void engineTableAfter(uint64_t out[2]);
 // check's do (DrawCall::engineCheck); with LPN_ENGINE_SCENE_CHECK too, each is also checked.
 bool engineFeedOn();
 uint64_t engineFeedCaptureNs(); // LPN_PROFILE: game threads' time capturing, in all
-constexpr uint64_t kFeedBase = 0x7F0000000000ull, kFeedSlotBytes = 0x2000;
-// Frames of draws: a slot is reused long after the analyses and the recorder are done with it
-// (and never between two analyses of one worker, so the analysis' repeat shortcut holds).
-constexpr uint32_t kFeedSlots = 1 << 16;
-inline bool feedAddress(uint64_t a) { return a - kFeedBase < uint64_t(kFeedSlots) * kFeedSlotBytes; }
-// The address a copy of these dwords is served at (the same for the same dwords while they stay
-// in the ring), 0 when it doesn't fit.
-uint64_t feedTable(const uint32_t* words, uint32_t n);
+// A capture's tables at addresses of their own: kFeedBase + its ring slot * kFeedCaptureBytes +
+// the stage (0 VS, 1 PS) * kFeedStageBytes, served from the capture itself (no copies: the ring
+// keeps a capture for ~kScenes draws, seconds of play, long after its analysis).
+constexpr uint64_t kFeedBase = 0x7F0000000000ull, kFeedStageBytes = 0x2000, kFeedCaptureBytes = 2 * kFeedStageBytes;
+constexpr uint32_t kScenes = 1 << 17;
+static_assert(uint64_t(kScenes) * kFeedCaptureBytes == 1ull << 31);
+// Above the slots, 8 bits of the capture's generation (id / kScenes): a read through the address
+// of a capture its slot no longer holds fails rather than reading the newer one, and the analysis'
+// repeat shortcut never sees one address for two captures (Codex's review).
+constexpr uint64_t kFeedGenerationShift = 31; // kScenes * kFeedCaptureBytes = 2^31
+inline bool feedAddress(uint64_t a) { return a - kFeedBase < (256ull << kFeedGenerationShift); }
+// Where a capture's stage table (0 VS, 1 PS) is served, from dword `dword` on.
+inline uint64_t feedTable(uint32_t id, uint32_t stage, uint32_t dword) {
+    return kFeedBase + (uint64_t((id / kScenes) & 0xFF) << kFeedGenerationShift) + uint64_t(id % kScenes) * kFeedCaptureBytes +
+           stage * kFeedStageBytes + 4ull * dword;
+}
 bool feedRead(uint64_t addr, void* dst, size_t size);
 
 // LPN_ENGINE_PREPASS: the list prepass (vs_normal_rigid[_pt] with ps_normal[_pt]) drawn from the
