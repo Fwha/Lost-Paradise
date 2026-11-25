@@ -105,12 +105,17 @@ struct EngineFixed {
         bool known = false;
     };
     Word color[8][6]; // BASE, PITCH, SLICE, VIEW, INFO, ATTRIB
+    Word colorAux[8][3]; // CMASK, CLEAR_WORD0, CLEAR_WORD1
+    Word vs[7], ps[11]; // header+8 setter words: PGM_LO/HI, RSRC1/2, then context words
+    Word psInputCntl[32]; // only the emitted prefix, not the inherited suffix
     Word targetMask, shaderMask, blend[8], colorControl;
     Word depth[8]; // Z_INFO through DEPTH_SLICE, in register order
     Word htileBase, depthControl, stencilControl, stencilRefMask, stencilRefMaskBf, renderControl;
     Word modeCntl, polyOffset[4], polyOffsetClamp; // front scale/offset, back scale/offset
     Word viewport[6], scissor[2]; // register order, viewport zero
-    Word primitive, indexType;
+    Word screenScissor[2], shaderStagesEn;
+    Word clipCntl, vteCntl, vtxCntl, scModeCntl[2], blendColor[4], depthClear, stencilClear;
+    Word primitive, indexType, numInstances;
 };
 struct EngineSceneDraw {
     EngineFixed fixed;

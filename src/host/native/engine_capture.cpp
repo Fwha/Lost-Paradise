@@ -348,9 +348,14 @@ void captureFixed(uint64_t g, uint64_t s, EngineFixed& f) {
             }
         }
         if (!w[0]) f.color[i][4] = {0, true};
-        else if (fixedAddress(w[0]))
+        else if (fixedAddress(w[0])) {
             for (unsigned j = 0; j < 6; ++j)
                 if (prepared || j == 0 || j == 2 || j == 3) f.color[i][j] = {w[j], true};
+            // fa059f-fa05af copies these too. eaa630/fa47d0 leave +0x1c/+0x2c/+0x30
+            // unchanged even in the temporary descriptor; disabled slots write only INFO.
+            const uint32_t offsets[] = {0x1c, 0x2c, 0x30};
+            for (unsigned j = 0; j < 3; ++j) f.colorAux[i][j] = {at<uint32_t>(t + offsets[j]), true};
+        }
     }
     const uint64_t d = at<uint64_t>(s + 0x40);
     if (!d) f.depth[0] = f.depth[1] = Word{0, true};
@@ -407,12 +412,37 @@ void captureFixed(uint64_t g, uint64_t s, EngineFixed& f) {
                    (uint32_t(at<uint16_t>(s + 0x299a) & 0x7fff) << 16) | 0x80000000, true};
     f.scissor[1] = {uint32_t(at<uint16_t>(s + 0x299c) & 0x7fff) |
                    (uint32_t(at<uint16_t>(s + 0x299e) & 0x7fff) << 16), true};
+    // ea9feb-eaa006 -> fa1dae-fa1dbf: screen scissor uses the attachment dimensions.
+    // No source is established for window/generic scissors; leave those alone.
+    f.screenScissor[0] = {0, true};
+    f.screenScissor[1] = {uint32_t(at<uint16_t>(s + 0x4c)) |
+                          (uint32_t(at<uint16_t>(s + 0x4e)) << 16), true};
+    // e627d4/e62838 -> fa1859: only these constructor values emit a register word.
+    const uint32_t stages = at<uint32_t>(s + 0xd8);
+    switch (stages) {
+    case 0: case 0x45: case 0xad: case 0xb0: case 0x145: case 0x1ad: case 0x200:
+        f.shaderStagesEn = {stages, true};
+        break;
+    }
     f.primitive = {at<uint32_t>(c + 0xe74) & 0x3f, true};
     // Ordinary pass/list defaults, not a GPU mirror or S's index-address width bit.
     // Utility draws with temporary bindings are outside captureScene's list site.
     f.colorControl = {0x00cc0010, true};
     f.renderControl = {0, true};
     f.indexType = {0, true};
+    f.clipCntl = {0x80000, true}; // ea9782-ea979a -> fa1fc8-fa1fdc
+    f.vteCntl = {0x43f, true}; // fa2eb0, ea9b5b-ea9b6a -> fa1e25
+    f.vtxCntl = {0x2d, true}; // ea9923-ea9935: (5,2,1) -> fa1b84-fa1b96
+    f.scModeCntl[1] = {0, true}; // ea9e7c-ea9e81 -> fa1ee1
+    // ea9e90 emits 2; eaa601/eab403 override it with 3 for multisampled colour.
+    // eaaf90 retains that condition in S+0x4a bit 0 (eab082-eab0a4), cleared for
+    // depth-only bindings (eab0a9-eab0e2). This follows the ordinary pass ordering.
+    if (at<uint8_t>(s + 0x48) <= 8)
+        f.scModeCntl[0] = {2u | (at<uint8_t>(s + 0x4a) & 1u), true};
+    for (auto& w : f.blendColor) w = {0, true}; // ea9db6-ea9dc9 -> f9ff2c-f9ff3b
+    f.stencilClear = {0, true}; // ea9c82-ea9c97 -> fa0324
+    f.depthClear = {0x3f800000, true}; // same setup -> fa0382 (float 1)
+    f.numInstances = {1, true}; // ea99b6-ea99be -> fa0dd8; eac4ed restores 1
 }
 
 // 0xeac01d-0xeac0a2: the physical binding bank of a logical stage.
@@ -572,9 +602,38 @@ void fetchInstalled(uint64_t g) {
     auto e = std::make_shared<EngineSceneDraw>(std::move(tScene));
     tScene = {};
     if (gFixedCheck || gFeed) {
-        const uint64_t p = at<uint64_t>(g + 0xc0); // selected PS, installed lazily by drawIndex
-        if (!p) e->fixed.shaderMask = {0, true};
-        else if (readable(p)) e->fixed.shaderMask = {at<uint32_t>(p + 0x34), true};
+        auto& f = e->fixed;
+        auto load = [&](EngineFixed::Word& w, uint64_t addr) {
+            uint32_t v = 0;
+            if (rd(addr, v)) w = {v, true};
+        };
+        // e57514/e5751b select G+0xc0/G+0x100; e57589/e575a1 and
+        // e57656/e576cd pass header+8 to the set/update imports. These are not
+        // decodeStage's S+0xf0/S+0x100 records. Read after lazy emission, including
+        // the fetch modifier installed by the original drawIndex.
+        uint64_t v = 0, p = 0;
+        if (rd(g + 0x100, v) && readable(v)) {
+            for (unsigned i = 0; i < 7; ++i) load(f.vs[i], v + 8 + 4 * i);
+            uint32_t modifier = 0;
+            if (!rd(g + 0x110, modifier)) f.vs[2] = {};
+            else if (f.vs[2].known && modifier)
+                f.vs[2].value = (f.vs[2].value & 0xFCFFFC00u) | modifier; // applyModifier
+        } // a null VS setter emits nothing
+        if (rd(g + 0xc0, p)) {
+            if (!p) {
+                // sceGnmSetPsShader350(nullptr) emits only this subset.
+                f.ps[0] = f.ps[1] = f.ps[4] = f.ps[5] = f.shaderMask = {0, true};
+            } else if (readable(p)) {
+                for (unsigned i = 0; i < 11; ++i) load(f.ps[i], p + 8 + 4 * i);
+                load(f.shaderMask, p + 0x34);
+                // e57b51/e57bef: P.byte38 is fa0b60's count; e57b9f-e57bdd
+                // retains the generated controls at G+0x240. fa0b60 writes only
+                // counts 1..32; zero and out-of-range counts establish no words.
+                uint8_t n = 0;
+                if (rd(p + 0x38, n) && n <= 32)
+                    for (unsigned i = 0; i < n; ++i) load(f.psInputCntl[i], g + 0x240 + 4 * i);
+            }
+        }
     }
     EngineStage& vs = e->vs;
     if (vs.fetchSgpr < 15) {

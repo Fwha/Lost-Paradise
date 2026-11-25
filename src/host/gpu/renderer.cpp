@@ -6031,8 +6031,32 @@ void main() {
                 for (unsigned j = 0; j < 6; ++j)
                     ctx(f.color[i][j], ::gpu::ctx::kCbColor0Base + i * ::gpu::ctx::kCbColorStride + j,
                         "CB_COLOR" + std::to_string(i) + "_" + color[j]);
+                const uint32_t offsets[] = {7, 11, 12};
+                const char* aux[] = {"CMASK", "CLEAR_WORD0", "CLEAR_WORD1"};
+                for (unsigned j = 0; j < 3; ++j)
+                    ctx(f.colorAux[i][j], ::gpu::ctx::kCbColor0Base + i * ::gpu::ctx::kCbColorStride + offsets[j],
+                        "CB_COLOR" + std::to_string(i) + "_" + aux[j]);
                 ctx(f.blend[i], ::gpu::ctx::kCbBlend0Control + i, "CB_BLEND" + std::to_string(i) + "_CONTROL");
             }
+            const char* program[] = {"PGM_LO", "PGM_HI", "PGM_RSRC1", "PGM_RSRC2"};
+            const char* blendColor[] = {"CB_BLEND_RED", "CB_BLEND_GREEN", "CB_BLEND_BLUE", "CB_BLEND_ALPHA"};
+            for (unsigned i = 0; i < 4; ++i) {
+                word(f.vs[i], r.sh[::gpu::sh::kSpiShaderPgmLoVs + i], "SPI_SHADER_" + std::string(program[i]) + "_VS");
+                word(f.ps[i], r.sh[::gpu::sh::kSpiShaderPgmLoPs + i], "SPI_SHADER_" + std::string(program[i]) + "_PS");
+                ctx(f.blendColor[i], 0x105 + i, blendColor[i]);
+            }
+            ctx(f.vs[4], ::gpu::ctx::kSpiVsOutConfig, "SPI_VS_OUT_CONFIG");
+            ctx(f.vs[5], ::gpu::ctx::kSpiShaderPosFormat, "SPI_SHADER_POS_FORMAT");
+            ctx(f.vs[6], ::gpu::ctx::kPaClVsOutCntl, "PA_CL_VS_OUT_CNTL");
+            const uint32_t psContext[] = {::gpu::ctx::kSpiShaderZFormat, ::gpu::ctx::kSpiShaderColFormat,
+                                          ::gpu::ctx::kSpiPsInputEna, ::gpu::ctx::kSpiPsInputAddr,
+                                          ::gpu::ctx::kSpiPsInControl, ::gpu::ctx::kSpiBarycCntl,
+                                          ::gpu::ctx::kDbShaderControl};
+            const char* psNames[] = {"SPI_SHADER_Z_FORMAT", "SPI_SHADER_COL_FORMAT", "SPI_PS_INPUT_ENA",
+                                     "SPI_PS_INPUT_ADDR", "SPI_PS_IN_CONTROL", "SPI_BARYC_CNTL", "DB_SHADER_CONTROL"};
+            for (unsigned i = 0; i < 7; ++i) ctx(f.ps[4 + i], psContext[i], psNames[i]);
+            for (unsigned i = 0; i < 32; ++i)
+                ctx(f.psInputCntl[i], ::gpu::ctx::kSpiPsInputCntl0 + i, "SPI_PS_INPUT_CNTL_" + std::to_string(i));
             const char* depth[] = {"DB_Z_INFO", "DB_STENCIL_INFO", "DB_Z_READ_BASE", "DB_STENCIL_READ_BASE",
                                    "DB_Z_WRITE_BASE", "DB_STENCIL_WRITE_BASE", "DB_DEPTH_SIZE", "DB_DEPTH_SLICE"};
             for (unsigned i = 0; i < 8; ++i) ctx(f.depth[i], ::gpu::ctx::kDbZInfo + i, depth[i]);
@@ -6055,8 +6079,19 @@ void main() {
             for (unsigned i = 0; i < 6; ++i) ctx(f.viewport[i], reg::kVportXScale + i, viewport[i]);
             ctx(f.scissor[0], ::gpu::ctx::kPaScVportScissorTl, "PA_SC_VPORT_SCISSOR_0_TL");
             ctx(f.scissor[1], ::gpu::ctx::kPaScVportScissorBr, "PA_SC_VPORT_SCISSOR_0_BR");
+            ctx(f.screenScissor[0], ::gpu::ctx::kPaScScreenScissorTl, "PA_SC_SCREEN_SCISSOR_TL");
+            ctx(f.screenScissor[1], ::gpu::ctx::kPaScScreenScissorTl + 1, "PA_SC_SCREEN_SCISSOR_BR");
+            ctx(f.shaderStagesEn, ::gpu::ctx::kVgtShaderStagesEn, "VGT_SHADER_STAGES_EN");
+            ctx(f.clipCntl, 0x204, "PA_CL_CLIP_CNTL");
+            ctx(f.vteCntl, 0x206, "PA_CL_VTE_CNTL");
+            ctx(f.vtxCntl, 0x2F9, "PA_SU_VTX_CNTL");
+            ctx(f.scModeCntl[0], 0x292, "PA_SC_MODE_CNTL_0");
+            ctx(f.scModeCntl[1], 0x293, "PA_SC_MODE_CNTL_1");
+            ctx(f.stencilClear, 0x00A, "DB_STENCIL_CLEAR");
+            ctx(f.depthClear, 0x00B, "DB_DEPTH_CLEAR");
             word(f.primitive, r.uconfig[reg::kPrimitiveType], "VGT_PRIMITIVE_TYPE");
             word(f.indexType, r.indexType, "INDEX_TYPE");
+            word(f.numInstances, r.numInstances, "NUM_INSTANCES");
         }
         const auto now = std::chrono::steady_clock::now();
         if (now - st.last < std::chrono::seconds(10)) return;
