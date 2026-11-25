@@ -351,5 +351,5 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   captures themselves (addresses carry the capture's ring slot and generation) and each capture
   has one fault guard: the analysis thread's share fell to ~30 ms/s and fps matched a run without
   it (~84 against ~83 in the same spot). On by default since; `LPN_ENGINE_FEED=0` turns it off.
-  The game threads' ~3 us a draw is mostly the engine state's cache misses, which the engine's
+  The game threads' ~3 us a draw is probably mostly the engine state's cache misses (not measured), which the engine's
   own drawIndex then finds warm.
