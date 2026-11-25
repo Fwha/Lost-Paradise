@@ -353,3 +353,8 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   it (~84 against ~83 in the same spot). On by default since; `LPN_ENGINE_FEED=0` turns it off.
   The game threads' ~3 us a draw is probably mostly the engine state's cache misses (not measured), which the engine's
   own drawIndex then finds warm.
+- 2026-11-25: the fed draws are made from their captures: a NOP {kEngineFeedDrawTag, id, count,
+  index address} replaces the game's draw packet (its arguments only for a capture that's gone),
+  and the command processor draws the capture's count and index address (eac430's arithmetic).
+  Fwha's run: 8.4M draws made from captures, 0 disagreeing with the game's own arguments. Targets
+  and fixed-function state still come from the registers.
