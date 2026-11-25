@@ -6006,12 +6006,13 @@ void main() {
     // this draw (read through the pointer the SGPRs hold). Counted, with the first differences
     // logged, and reported every 10 s.
     void sceneCheck(const DrawCall& d, const GpuRegs& r) {
-        native::EngineSceneDraw e;
         auto& st = sceneStats_;
-        if (!native::engineScene(d.engineCheck - 1, e)) {
+        const auto ep = native::engineScene(d.engineCheck - 1);
+        if (!ep) {
             ++st.lost;
             return;
         }
+        const native::EngineSceneDraw& e = *ep;
         auto stage = [&](const native::EngineStage& es, uint32_t pgmLo, uint32_t userData, const char* name, int k) {
             if (!es.ok) {
                 ++st.undecoded[k];
@@ -8227,10 +8228,17 @@ void main() {
     // (its pointers moved to copies of the engine's tables). Both stages or neither.
     void feed(uint32_t id, DrawJob& j) {
         auto& st = feedStats_;
-        native::EngineSceneDraw e;
+        static const bool prof = getenv("LPN_PROFILE") != nullptr;
+        const auto t0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        struct Timed {
+            bool on;
+            std::chrono::steady_clock::time_point t0;
+            uint64_t& ns;
+            ~Timed() { if (on) ns += uint64_t((std::chrono::steady_clock::now() - t0).count()); }
+        } timed{prof, t0, st.ns};
         int why = 0;
         uint32_t vs[16], ps[16];
-        auto stage = [&](const native::EngineStage& es, const gcn::LaunchState& l, uint32_t* out) {
+        auto stage = [&](const native::EngineStage& es, const gcn::LaunchState& l, uint32_t* out, uint32_t which) {
             if (!es.ok) return 2;
             if (es.code != l.entry) return 3;
             std::memcpy(out, l.userData, sizeof l.userData);
@@ -8240,8 +8248,8 @@ void main() {
             for (uint32_t p = 0; p < es.pointerCount; ++p) {
                 const auto& ptr = es.pointers[p];
                 if (ptr.sgpr + 1 >= 16 || ptr.dword >= es.table.size()) continue;
-                const uint64_t at = native::feedTable(es.table.data() + ptr.dword, uint32_t(es.table.size() - ptr.dword));
-                if (!at) return 4;
+                if (4ull * es.table.size() > native::kFeedStageBytes) return 4;
+                const uint64_t at = native::feedTable(id, which, ptr.dword);
                 out[ptr.sgpr] = uint32_t(at), out[ptr.sgpr + 1] = uint32_t(at >> 32);
                 covered |= 3u << ptr.sgpr;
             }
@@ -8249,9 +8257,10 @@ void main() {
             if ((covered & ((1u << n) - 1)) != (1u << n) - 1) return 5;
             return 0;
         };
-        if (!native::engineScene(id, e)) why = 1;
-        else if (!e.attributes) why = 6;
-        else if (!(why = stage(e.vs, j.vs, vs)) && j.hasPs) why = stage(e.ps, j.ps, ps);
+        const auto ep = native::engineScene(id);
+        if (!ep) why = 1;
+        else if (!ep->attributes) why = 6;
+        else if (!(why = stage(ep->vs, j.vs, vs, 0)) && j.hasPs) why = stage(ep->ps, j.ps, ps, 1);
         static const bool check = getenv("LPN_ENGINE_FEED_CHECK") != nullptr;
         if (!why && check) j.fedCheck = true, j.regVs = j.vs, j.regPs = j.ps;
         if (!why) {
@@ -8268,10 +8277,18 @@ void main() {
         for (int i = 0; i < 7; ++i)
             if (st.counts[i]) line += std::string(line.empty() ? "" : ", ") + std::to_string(st.counts[i]) + " " + kWhy[i];
         std::fprintf(stderr, "[native] engine feed: %s\n", line.c_str());
+        if (prof) {
+            const double secs = std::chrono::duration<double>(now - st.profFrom).count();
+            const uint64_t cap = native::engineFeedCaptureNs();
+            std::fprintf(stderr, "[prof] engine feed: capturing %.2f ms/s on the game's threads, feeding %.2f ms/s on the analysis thread\n",
+                         (cap - st.capFrom) / 1e6 / secs, st.ns / 1e6 / secs);
+            st.capFrom = cap, st.ns = 0, st.profFrom = now;
+        }
     }
     struct {
         uint64_t counts[7] = {};
-        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now(), profFrom = last;
+        uint64_t ns = 0, capFrom = 0; // LPN_PROFILE
     } feedStats_;
     // On a worker: analyses one draw or dispatch into its DrawAnalysis.
     void runJob(AnalysisCtx& c, DrawJob& j) {
