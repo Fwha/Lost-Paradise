@@ -1102,6 +1102,7 @@ public:
         if (passMap_.active()) passMap_.onDraw(d, r, &readGuest);
         if (native::engineCheckOn() && d.kind == DrawCall::kIndexed && native::engineSite(d.origin[0])) engineCheck(d, r, *held);
         if (d.engineCheck && native::engineSceneCheckOn()) sceneCheck(d, r);
+        if (d.engineCheck && native::engineFixedCheckOn()) fixedCheck(d, r);
         // A draw a native pass takes is recorded here, in order (see nativeDraw).
         const bool native = nativeOn_ && d.kind != DrawCall::kDispatch && nativeClaimed(*held);
         if (comparePending_) { // LPN_NATIVE_COMPARE: before a recorder thread takes the next draw
@@ -6005,6 +6006,73 @@ void main() {
     // address, the user-data SGPRs the engine sets, and each table pointer's dwords placed for
     // this draw (read through the pointer the SGPRs hold). Counted, with the first differences
     // logged, and reported every 10 s.
+    // LPN_ENGINE_FIXED_CHECK: known CPU words against the game's draw registers.
+    void fixedCheck(const DrawCall& d, const GpuRegs& r) {
+        std::lock_guard lock(fixedCheckMutex_); // recorder threads share the counters
+        auto& st = fixedStats_;
+        const auto ep = native::engineScene(d.engineCheck - 1);
+        if (!ep) ++st.lost;
+        else {
+            const auto& f = ep->fixed;
+            auto word = [&](const native::EngineFixed::Word& w, uint32_t actual, const std::string& name) {
+                if (!w.known) return;
+                const bool same = actual == w.value;
+                ++st.words[name][same ? 0 : 1];
+                if (!same && st.differences++ < 20)
+                    std::fprintf(stderr, "[native] fixed check: %s %s 0x%08x, engine 0x%08x\n",
+                                 native::shaderNameAt(shaderAddress(r, reg::kPgmLoPs), &readGuest).c_str(),
+                                 name.c_str(), actual, w.value);
+            };
+            auto ctx = [&](const native::EngineFixed::Word& w, uint32_t index, const std::string& name) {
+                word(w, r.ctx[index], name);
+            };
+            const char* color[] = {"BASE", "PITCH", "SLICE", "VIEW", "INFO", "ATTRIB"};
+            for (unsigned i = 0; i < 8; ++i) {
+                for (unsigned j = 0; j < 6; ++j)
+                    ctx(f.color[i][j], ::gpu::ctx::kCbColor0Base + i * ::gpu::ctx::kCbColorStride + j,
+                        "CB_COLOR" + std::to_string(i) + "_" + color[j]);
+                ctx(f.blend[i], ::gpu::ctx::kCbBlend0Control + i, "CB_BLEND" + std::to_string(i) + "_CONTROL");
+            }
+            const char* depth[] = {"DB_Z_INFO", "DB_STENCIL_INFO", "DB_Z_READ_BASE", "DB_STENCIL_READ_BASE",
+                                   "DB_Z_WRITE_BASE", "DB_STENCIL_WRITE_BASE", "DB_DEPTH_SIZE", "DB_DEPTH_SLICE"};
+            for (unsigned i = 0; i < 8; ++i) ctx(f.depth[i], ::gpu::ctx::kDbZInfo + i, depth[i]);
+            ctx(f.targetMask, reg::kCbTargetMask, "CB_TARGET_MASK");
+            ctx(f.shaderMask, reg::kCbShaderMask, "CB_SHADER_MASK");
+            ctx(f.colorControl, reg::kCbColorControl, "CB_COLOR_CONTROL");
+            ctx(f.htileBase, reg::kDbHtileDataBase, "DB_HTILE_DATA_BASE");
+            ctx(f.depthControl, reg::kDbDepthControl, "DB_DEPTH_CONTROL");
+            ctx(f.stencilControl, reg::kDbStencilControl, "DB_STENCIL_CONTROL");
+            ctx(f.stencilRefMask, reg::kDbStencilRefMask, "DB_STENCILREFMASK");
+            ctx(f.stencilRefMaskBf, reg::kDbStencilRefMaskBf, "DB_STENCILREFMASK_BF");
+            ctx(f.renderControl, reg::kDbRenderControl, "DB_RENDER_CONTROL");
+            ctx(f.modeCntl, reg::kPaSuScModeCntl, "PA_SU_SC_MODE_CNTL");
+            const char* poly[] = {"PA_SU_POLY_OFFSET_FRONT_SCALE", "PA_SU_POLY_OFFSET_FRONT_OFFSET",
+                                  "PA_SU_POLY_OFFSET_BACK_SCALE", "PA_SU_POLY_OFFSET_BACK_OFFSET"};
+            for (unsigned i = 0; i < 4; ++i) ctx(f.polyOffset[i], ::gpu::ctx::kPaSuPolyOffsetFrontScale + i, poly[i]);
+            ctx(f.polyOffsetClamp, ::gpu::ctx::kPaSuPolyOffsetClamp, "PA_SU_POLY_OFFSET_CLAMP");
+            const char* viewport[] = {"PA_CL_VPORT_XSCALE_0", "PA_CL_VPORT_XOFFSET_0", "PA_CL_VPORT_YSCALE_0",
+                                      "PA_CL_VPORT_YOFFSET_0", "PA_CL_VPORT_ZSCALE_0", "PA_CL_VPORT_ZOFFSET_0"};
+            for (unsigned i = 0; i < 6; ++i) ctx(f.viewport[i], reg::kVportXScale + i, viewport[i]);
+            ctx(f.scissor[0], ::gpu::ctx::kPaScVportScissorTl, "PA_SC_VPORT_SCISSOR_0_TL");
+            ctx(f.scissor[1], ::gpu::ctx::kPaScVportScissorBr, "PA_SC_VPORT_SCISSOR_0_BR");
+            word(f.primitive, r.uconfig[reg::kPrimitiveType], "VGT_PRIMITIVE_TYPE");
+            word(f.indexType, r.indexType, "INDEX_TYPE");
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - st.last < std::chrono::seconds(10)) return;
+        st.last = now;
+        for (const auto& [name, counts] : st.words)
+            std::fprintf(stderr, "[native] fixed check %s: %llu same, %llu differ\n", name.c_str(),
+                         (unsigned long long)counts[0], (unsigned long long)counts[1]);
+        if (st.lost) std::fprintf(stderr, "[native] fixed check: %llu descriptions lost\n", (unsigned long long)st.lost);
+    }
+    struct FixedStats {
+        std::map<std::string, std::array<uint64_t, 2>> words;
+        uint64_t differences = 0, lost = 0;
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    } fixedStats_;
+    std::mutex fixedCheckMutex_;
+
     void sceneCheck(const DrawCall& d, const GpuRegs& r) {
         auto& st = sceneStats_;
         const auto ep = native::engineScene(d.engineCheck - 1);

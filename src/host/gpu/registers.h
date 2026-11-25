@@ -52,6 +52,14 @@ constexpr uint32_t kComputeNumThreadX = 0x207, kComputePgmLo = 0x20C, kComputePg
 } // namespace sh
 
 namespace ctx {
+constexpr uint32_t kDbRenderControl = 0x000, kDbHtileDataBase = 0x005, kDbStencilInfo = 0x011,
+                   kDbStencilReadBase = 0x013, kDbStencilWriteBase = 0x015, kDbDepthSlice = 0x017;
+constexpr uint32_t kCbTargetMask = 0x08E;
+constexpr uint32_t kPaScVportScissorTl = 0x094, kPaScVportScissorBr = 0x095;
+constexpr uint32_t kDbStencilControl = 0x10B, kDbStencilRefMask = 0x10C, kDbStencilRefMaskBf = 0x10D;
+constexpr uint32_t kPaSuPolyOffsetClamp = 0x2DF, kPaSuPolyOffsetFrontScale = 0x2E0,
+                   kPaSuPolyOffsetFrontOffset = 0x2E1, kPaSuPolyOffsetBackScale = 0x2E2,
+                   kPaSuPolyOffsetBackOffset = 0x2E3;
 constexpr uint32_t kDbZInfo = 0x010, kDbZReadBase = 0x012, kDbZWriteBase = 0x014, kDbDepthSize = 0x016;
 constexpr uint32_t kCbShaderMask = 0x08F;
 constexpr uint32_t kPaScScreenScissorTl = 0x00C;

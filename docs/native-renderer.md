@@ -358,3 +358,14 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   and the command processor draws the capture's count and index address (eac430's arithmetic).
   Fwha's run: 8.4M draws made from captures, 0 disagreeing with the game's own arguments. Targets
   and fixed-function state still come from the registers.
+
+### Engine fixed state
+
+- Codex's reading, `docs/engine/fixed-state.md`: where the engine keeps a list draw's colour and
+  depth targets, blending and masks, depth/stencil, raster and polygon offset, viewport and
+  scissor and primitive type, partly in the execution context `C` passed to the state commit
+  `0xe61ae0` (now hooked to record it), partly in `S` and the committed blend/raster objects.
+- `LPN_ENGINE_FIXED_CHECK=1` compares each known word with the draw's registers: 7.6M draws, every
+  register 0 differ (words the engine doesn't hold, such as inactive targets' bases, stay unknown).
+- The draws made from captures now take that state from the engine over the stream's registers
+  (`applyFixed` in pm4.cpp; any word that changes is logged). Fwha's run: none changed.

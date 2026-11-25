@@ -38,6 +38,9 @@ using Fn = uint64_t(LPN_GUEST*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t
 Fn gDrawIndex = nullptr;
 uint8_t* gBase = nullptr;
 bool gOn = false;
+bool gFixedCheck = false;
+bool gFeed = false; // LPN_ENGINE_FEED
+thread_local uint64_t tFixedContext = 0;
 
 std::mutex gMutex;
 std::deque<EngineDraw> gQueue;
@@ -93,9 +96,14 @@ uint64_t casterLoop(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, 
 uint64_t commit(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f) {
     const auto* frame = static_cast<const uint64_t*>(LPN_GUEST_FRAME());
     const uint64_t ret = frame[1] - reinterpret_cast<uint64_t>(gBase);
-    if (ret < 0xa51100 || ret >= 0xa51d90) return gCommit(a, b, c, d, e, f);
+    if (!gTiming || ret < 0xa51100 || ret >= 0xa51d90) {
+        const uint64_t r = gCommit(a, b, c, d, e, f);
+        if (gFixedCheck || gFeed) tFixedContext = a;
+        return r;
+    }
     const int64_t t = nowNs();
     const uint64_t r = gCommit(a, b, c, d, e, f);
+    if (gFixedCheck || gFeed) tFixedContext = a;
     gCommitNs += uint64_t(nowNs() - t);
     ++gCommits;
     return r;
@@ -263,7 +271,6 @@ void probeScene(uint64_t g) {
 
 // LPN_ENGINE_SCENE_CHECK (engine_capture.h, docs/engine/user-data.md).
 bool gSceneCheck = false;
-bool gFeed = false; // LPN_ENGINE_FEED
 bool gPrepass = false; // LPN_ENGINE_PREPASS
 bool gPrepassCheck = false; // LPN_ENGINE_PREPASS_CHECK
 std::mutex gPrepassMutex;
@@ -279,6 +286,134 @@ std::atomic<uint32_t> gNextSceneAtomic{0};
 std::atomic<uint64_t> gFeedCaptureNs{0}; // LPN_PROFILE: the game threads' time in the feed's captures
 
 template <typename T> bool rd(uint64_t a, T& v) { return probeRead(a, &v, sizeof v); }
+
+// Read-only half of e9b590/ec2420. The disassembly takes node for a larger key,
+// node+8 for a smaller key; edges are signed 48-bit pointers, object offsets signed 16-bit.
+uint64_t fixedObject(uint32_t root, uint32_t keyOffset, uint64_t wanted) {
+    uint64_t node = at<uint64_t>(reinterpret_cast<uint64_t>(gBase) + 0x26944c0 + root);
+    for (unsigned n = 0; readable(node) && n < 128; ++n) {
+        const uint64_t object = node + int16_t(at<uint64_t>(node + 8) >> 48);
+        if (!readable(object)) return 0;
+        const uint64_t key = at<uint64_t>(object + keyOffset);
+        if (key == wanted) return object;
+        const uint64_t edge = at<uint64_t>(node + (key > wanted ? 0 : 8));
+        node = uint64_t(int64_t(edge << 16) >> 16);
+    }
+    return 0;
+}
+
+uint32_t fixedBlend(uint32_t p) {
+    if (!(p & 1)) return 0;
+    return (0x60000000 | ((p >> 1) & 31) | (((p >> 11) & 7) << 5) | (((p >> 6) & 31) << 8) |
+            (((p >> 14) & 31) << 16) | (((p >> 24) & 7) << 21) | (((p >> 19) & 31) << 24)) & 0xffff1fff;
+}
+
+uint32_t fixedFloat(float f) {
+    uint32_t v;
+    std::memcpy(&v, &f, sizeof v);
+    return v;
+}
+
+// fa4940/f9f670/f9f9a0 strip layout bits in 3..7: f50c90/f50de0 extract
+// two-bit fields, then the callers clear (1 << (field+1))-1 at bit 3 or 4.
+// A surviving bit proves acceptance; low bits alone require the full layout calculation.
+bool fixedAddress(uint32_t base) { return (base & ~0xf8u) != 0; }
+
+void captureFixed(uint64_t g, uint64_t s, EngineFixed& f) {
+    using Word = EngineFixed::Word;
+    const uint64_t c = tFixedContext;
+    tFixedContext = 0; // one observed commit belongs to the next list draw
+    if (!readable(c) || at<uint64_t>(c + 0x18) != g) return;
+    for (unsigned i = 0; i < 8; ++i) {
+        const uint64_t t = at<uint64_t>(s + 8 * i);
+        if (!t) {
+            f.color[i][4] = {0, true}; // disabled slots inherit their other words
+            continue;
+        }
+        if (!readable(t)) continue;
+        uint32_t w[6];
+        std::memcpy(w, reinterpret_cast<const void*>(t), sizeof w);
+        bool prepared = true;
+        if ((w[4] & 0x2000) && at<uint32_t>(t + 0x1c)) {
+            const uint32_t aux = at<uint32_t>(t + 0x24);
+            if (!aux) {
+                // eaa630's temporary descriptor. fa47d0 changes only +0x24;
+                // the additional +0x28 slice transformation does not affect these six words.
+                w[4] &= ~0x4000u;
+                w[5] = (w[5] & 0xfffffc1f) | ((w[5] & 31) << 5);
+                w[1] = (w[1] & 0x800fffff) | ((w[1] << 20) & 0x7ff00000);
+            } else if ((w[5] & 0x7000) && !fixedAddress(aux)) {
+                // fa4bd0 otherwise returns +0x24 unchanged, or a provably nonzero address.
+                prepared = false;
+            }
+        }
+        if (!w[0]) f.color[i][4] = {0, true};
+        else if (fixedAddress(w[0]))
+            for (unsigned j = 0; j < 6; ++j)
+                if (prepared || j == 0 || j == 2 || j == 3) f.color[i][j] = {w[j], true};
+    }
+    const uint64_t d = at<uint64_t>(s + 0x40);
+    if (!d) f.depth[0] = f.depth[1] = Word{0, true};
+    else if (readable(d)) {
+        const uint32_t z = at<uint32_t>(d + 8), stencil = at<uint32_t>(d + 12);
+        if (fixedAddress(z) || fixedAddress(stencil)) {
+            for (unsigned i = 0; i < 8; ++i) f.depth[i] = {at<uint32_t>(d + 4 * i), true};
+            f.htileBase = {at<uint32_t>(d + 0x24), true};
+        } else if (!z && !stencil) f.depth[0] = f.depth[1] = Word{0, true};
+    }
+    f.depthControl = {at<uint32_t>(s + 0x298c) & 0xc07007ff, true};
+    f.stencilControl = {at<uint32_t>(s + 0x2990) & 0x00ffffff, true};
+    f.blend[0] = {at<uint32_t>(s + 0x2994) & 0xffff1fff, true};
+    const uint64_t e = at<uint64_t>(c + 0xe78);
+    if (readable(e)) {
+        const uint32_t m = (at<uint32_t>(e + 0x18) & 0x00ffff00) |
+                           uint8_t(at<uint32_t>(c + 0xe70)) | 0x01000000;
+        f.stencilRefMask = f.stencilRefMaskBf = Word{m, true};
+    }
+    const uint64_t b = fixedObject(0x38d8, 0x10, at<uint64_t>(c + 0x840));
+    const uint64_t a = readable(b) ? at<uint64_t>(b + 0x18) : 0;
+    if (readable(a)) {
+        const uint32_t count = at<uint32_t>(a + 4);
+        if (count >= 1 && count <= 8) {
+            uint32_t mask = 0;
+            for (unsigned i = 0; i < 8; ++i) {
+                if (count != 1 && i >= count) break; // untouched controls remain unknown
+                const uint32_t p = at<uint32_t>(a + 0x10 + 4 * (count == 1 ? 0 : i));
+                f.blend[i] = {fixedBlend(p), true};
+                mask |= ((p >> 27) & 15) << (4 * i);
+            }
+            f.targetMask = {mask, true};
+        }
+    }
+    const uint64_t raster = fixedObject(0x38d0, 0x28, at<uint64_t>(c + 0x830));
+    if (readable(raster)) {
+        f.modeCntl = {at<uint32_t>(raster + 0x10) & 0x00393fff, true};
+        const uint32_t scale = fixedFloat(16.0f * at<float>(raster + 0x14));
+        f.polyOffset[0] = f.polyOffset[2] = Word{scale, true};
+        f.polyOffset[1] = f.polyOffset[3] = Word{at<uint32_t>(raster + 0x18), true};
+        f.polyOffsetClamp = {at<uint32_t>(raster + 0x1c), true};
+    }
+    const uint32_t viewports = at<uint32_t>(c + 0x1dc8);
+    if (viewports >= 1 && viewports <= 4) {
+        const uint32_t left = at<uint32_t>(c + 0x1dcc), top = at<uint32_t>(c + 0x1dd0);
+        const float x = float(int32_t(at<uint32_t>(c + 0x1dd4) - left)) * 0.5f;
+        const float y = float(int32_t(at<uint32_t>(c + 0x1dd8) - top)) * 0.5f;
+        // eaa010 converts origins as zero-extended dwords, differences as signed dwords.
+        const float v[] = {x, (float(uint64_t(left)) + x) + at<float>(c + 0x1e0c),
+                           -y, (float(uint64_t(top)) + y) + at<float>(c + 0x1e10), 1.0f, 0.0f};
+        for (unsigned i = 0; i < 6; ++i) f.viewport[i] = {fixedFloat(v[i]), true};
+    }
+    f.scissor[0] = {uint32_t(at<uint16_t>(s + 0x2998) & 0x7fff) |
+                   (uint32_t(at<uint16_t>(s + 0x299a) & 0x7fff) << 16) | 0x80000000, true};
+    f.scissor[1] = {uint32_t(at<uint16_t>(s + 0x299c) & 0x7fff) |
+                   (uint32_t(at<uint16_t>(s + 0x299e) & 0x7fff) << 16), true};
+    f.primitive = {at<uint32_t>(c + 0xe74) & 0x3f, true};
+    // Ordinary pass/list defaults, not a GPU mirror or S's index-address width bit.
+    // Utility draws with temporary bindings are outside captureScene's list site.
+    f.colorControl = {0x00cc0010, true};
+    f.renderControl = {0, true};
+    f.indexType = {0, true};
+}
 
 // 0xeac01d-0xeac0a2: the physical binding bank of a logical stage.
 uint32_t physicalBank(uint32_t l, uint32_t active) {
@@ -433,9 +568,14 @@ void fetchInstalled(uint64_t g) {
     const uint32_t id = tSceneId - 1;
     tSceneId = 0;
     uint64_t fetch = 0, staging = 0;
-    if (!rd(g + 0x108, fetch) || !rd(g + 0x68, staging)) return;
+    if ((gSceneCheck || gFeed) && (!rd(g + 0x108, fetch) || !rd(g + 0x68, staging))) return;
     auto e = std::make_shared<EngineSceneDraw>(std::move(tScene));
     tScene = {};
+    if (gFixedCheck || gFeed) {
+        const uint64_t p = at<uint64_t>(g + 0xc0); // selected PS, installed lazily by drawIndex
+        if (!p) e->fixed.shaderMask = {0, true};
+        else if (readable(p)) e->fixed.shaderMask = {at<uint32_t>(p + 0x34), true};
+    }
     EngineStage& vs = e->vs;
     if (vs.fetchSgpr < 15) {
         vs.sgpr[vs.fetchSgpr] = uint32_t(fetch), vs.sgpr[vs.fetchSgpr + 1] = uint32_t(fetch >> 32);
@@ -474,17 +614,20 @@ uint32_t captureScene(uint64_t g, uint32_t count, uint32_t first, uint32_t baseV
         e.count = count;
         e.indexAddr = indexBase + uint32_t((first << ((indexWord >> 31) + 1)) + (indexWord & 0x7FFFFFFF));
     }
-    // The vertex attributes drawIndex is about to generate (else the table holds the last draw's).
-    uint64_t fetch = 0;
-    std::vector<std::array<uint32_t, 4>> attributes;
-    // The feed alone takes the table after drawIndex, attributes and all.
-    e.attributes = !gSceneCheck || generatedAttributes(s, baseVertex, fetch, attributes);
-    decodeStage(g, s, 2, at<uint64_t>(s + 0x100), e.vs, gSceneCheck && e.attributes ? &attributes : nullptr, gSceneCheck);
-    decodeStage(g, s, 1, at<uint64_t>(s + 0xf0), e.ps, nullptr, gSceneCheck);
+    if (gFixedCheck || gFeed) captureFixed(g, s, e.fixed);
+    if (gSceneCheck || gFeed) {
+        // The vertex attributes drawIndex is about to generate (else the table holds the last draw's).
+        uint64_t fetch = 0;
+        std::vector<std::array<uint32_t, 4>> attributes;
+        // The feed alone takes the table after drawIndex, attributes and all.
+        e.attributes = !gSceneCheck || generatedAttributes(s, baseVertex, fetch, attributes);
+        decodeStage(g, s, 2, at<uint64_t>(s + 0x100), e.vs, gSceneCheck && e.attributes ? &attributes : nullptr, gSceneCheck);
+        decodeStage(g, s, 1, at<uint64_t>(s + 0xf0), e.ps, nullptr, gSceneCheck);
+    }
     const uint32_t id = gNextSceneAtomic.fetch_add(1, std::memory_order_relaxed);
     tSceneId = id + 1;
     tEngineCheckId = id + 1;
-    if (gFeed && !gSceneCheck && e.count) tEngineFeedDrawId = id + 1;
+    if (gFeed && !gSceneCheck && !gFixedCheck && e.count) tEngineFeedDrawId = id + 1;
     return id + 1;
 }
 
@@ -798,7 +941,7 @@ uint64_t drawIndex(uint64_t ctx, uint64_t count, uint64_t first, uint64_t baseVe
     // One fault guard for the whole capture, not one per read (the feed's captures cost the game's
     // threads ~3 us a draw read by read).
     // (feedClaimed outside it: the shader names take locks, which a fault must not skip.)
-    if ((gSceneCheck || (gFeed && feedClaimed(ctx))) && site == 0x3700 &&
+    if ((gSceneCheck || gFixedCheck || (gFeed && feedClaimed(ctx))) && site == 0x3700 &&
         !guardedAll([&] { scene = captureScene(ctx, uint32_t(count), uint32_t(first), uint32_t(baseVertex)); }))
         scene = 0, tSceneId = 0, tEngineCheckId = 0, tEngineFeedDrawId = 0;
     if (prof && scene) gFeedCaptureNs += uint64_t((std::chrono::steady_clock::now() - t0).count());
@@ -900,6 +1043,7 @@ bool takeEngineDraw(EngineDraw& out) {
 
 bool engineCheckOn() { return gOn && !gShadows; }
 bool engineSceneCheckOn() { return gSceneCheck; }
+bool engineFixedCheckOn() { return gFixedCheck; }
 bool enginePrepassOn() { return gPrepass; }
 bool enginePrepassCheckOn() { return gPrepassCheck; }
 std::atomic<bool> gPrepassAllowed{false};
@@ -968,6 +1112,7 @@ bool installEngineCapture(Module& eboot) {
     gShadows = es ? *es && *es != '0' : !check;
     gProbe = on("LPN_ENGINE_PROBE");
     gSceneCheck = on("LPN_ENGINE_SCENE_CHECK");
+    gFixedCheck = on("LPN_ENGINE_FIXED_CHECK");
     // On by default too (checked 1.34M draws, 0 differ); LPN_ENGINE_PREPASS=0 turns it off.
     const char* ep = std::getenv("LPN_ENGINE_PREPASS");
     gPrepass = ep ? *ep && *ep != '0' : !check;
@@ -977,28 +1122,32 @@ bool installEngineCapture(Module& eboot) {
     // LPN_ENGINE_FEED=0 turns it off.
     const char* ef = std::getenv("LPN_ENGINE_FEED");
     gFeed = ef ? *ef && *ef != '0' : !check;
+    if (gFixedCheck) gPrepass = gPrepassCheck = false; // retain game draws and scene capture ids
     if (gPrepassCheck) gSceneCheck = gFeed = false; // its NOP carries the prepass capture's id
-    if (!check && !gShadows && !gProbe && !gSceneCheck && !gPrepass && !gFeed) return false;
+    if (!check && !gShadows && !gProbe && !gSceneCheck && !gFixedCheck && !gPrepass && !gFeed) return false;
     // push rbp; mov rbp, rsp; push r15; push r14; push rbx; push rax; mov eax, ecx
-    const Hook hooks[] = {
+    gTiming = on("LPN_ENGINE_TIMING");
+    std::vector<Hook> hooks = {
         {kDrawIndex, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x50, 0x89, 0xc8}, guestHook<&drawIndex>(),
          reinterpret_cast<void**>(&gDrawIndex)},
     };
+    // Share the commit trampoline: installing the same PC twice loses the original.
+    if (gFixedCheck || gFeed || gTiming)
+        hooks.push_back({0xe61ae0,
+                         {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53},
+                         guestHook<&commit>(), reinterpret_cast<void**>(&gCommit)});
+    if (gTiming)
+        hooks.push_back({0xa51d90,
+                         {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53},
+                         guestHook<&casterLoop>(), reinterpret_cast<void**>(&gCasterLoop)});
     gBase = eboot.base();
-    if (!installHooks(gBase, hooks, std::size(hooks), "engine")) return false;
-    gOn = true;
-    if (on("LPN_ENGINE_TIMING")) {
-        // push rbp; mov rbp, rsp; push r15..rbx (13 bytes: the 12-byte jump fits, the trampoline slot too)
-        const Hook timing[] = {
-            {0xa51d90, {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53},
-             guestHook<&casterLoop>(), reinterpret_cast<void**>(&gCasterLoop)},
-            {0xe61ae0,
-             {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53},
-             guestHook<&commit>(), reinterpret_cast<void**>(&gCommit)},
-        };
-        gTiming = installHooks(gBase, timing, std::size(timing), "engine timing");
-        if (gTiming) std::fprintf(stderr, "[native] engine timing: the stage caster loop is timed (LPN_ENGINE_TIMING)\n");
+    if (!installHooks(gBase, hooks.data(), hooks.size(), "engine")) {
+        gFixedCheck = gTiming = false;
+        return false;
     }
+    gOn = true;
+    if (gTiming) std::fprintf(stderr, "[native] engine timing: the stage caster loop is timed (LPN_ENGINE_TIMING)\n");
+    if (gFixedCheck) std::fprintf(stderr, "[native] engine capture: list fixed state is checked against the game's draws (LPN_ENGINE_FIXED_CHECK)\n");
     if (gShadows) std::fprintf(stderr, "[native] engine capture: the stage's opaque shadow casters are drawn from the engine (LPN_ENGINE_SHADOWS)\n");
     if (gFeed) std::fprintf(stderr, "[native] engine capture: the material and character draws are analysed from the engine's user data (LPN_ENGINE_FEED)\n");
     if (gPrepassCheck) std::fprintf(stderr, "[native] engine capture: the prepass captures are checked against the game's draws (LPN_ENGINE_PREPASS_CHECK)\n");

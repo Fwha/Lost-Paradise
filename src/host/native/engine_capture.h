@@ -98,13 +98,29 @@ struct EngineStage {
     std::vector<uint8_t> tableKnown; // the dwords placed for this draw (the rest is stale)
     bool ok = false;
 };
+// CPU sources only (docs/engine/fixed-state.md). Inherited or unresolved words stay unknown.
+struct EngineFixed {
+    struct Word {
+        uint32_t value = 0;
+        bool known = false;
+    };
+    Word color[8][6]; // BASE, PITCH, SLICE, VIEW, INFO, ATTRIB
+    Word targetMask, shaderMask, blend[8], colorControl;
+    Word depth[8]; // Z_INFO through DEPTH_SLICE, in register order
+    Word htileBase, depthControl, stencilControl, stencilRefMask, stencilRefMaskBf, renderControl;
+    Word modeCntl, polyOffset[4], polyOffsetClamp; // front scale/offset, back scale/offset
+    Word viewport[6], scissor[2]; // register order, viewport zero
+    Word primitive, indexType;
+};
 struct EngineSceneDraw {
+    EngineFixed fixed;
     EngineStage vs, ps;
     bool attributes = false; // the vertex attributes generated for it are in vs's table
     uint32_t count = 0;      // the draw: its index count and first index's address, as eac430 computes it
     uint64_t indexAddr = 0;
 };
 bool engineSceneCheckOn();
+bool engineFixedCheckOn();
 std::shared_ptr<const EngineSceneDraw> engineScene(uint32_t id);
 // The placed table dwords as decodeStage had them before drawIndex: [0] the same after it, [1] not.
 void engineTableAfter(uint64_t out[2]);
