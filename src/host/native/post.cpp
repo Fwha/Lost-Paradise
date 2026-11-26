@@ -725,9 +725,10 @@ public:
             const char* e = std::getenv("LPN_NATIVE_COMPARE");
             return e && std::string(e) == "post";
         }();
-        if (!comparing && (role >= kSsao || d.depth.view)) return decline(role, "not yet matched (drawn in compare mode only)");
-        // The SSAO port is wrong (its upsample flashed the screen white indoors in a compare run):
-        // off even in compare mode unless LPN_POST_SSAO=1 asks for it.
+        (void)comparing;
+        if (!d.compareCopy && (role >= kSsao || d.depth.view)) return decline(role, "not yet matched (drawn into compare copies only)");
+        // The SSAO port is wrong (its upsample flashed the screen white indoors when compare mode
+        // still drew unmatched roles into the frame): off unless LPN_POST_SSAO=1 asks for it.
         static const bool ssao = [] {
             const char* e = std::getenv("LPN_POST_SSAO");
             return e && *e && *e != '0';
