@@ -377,3 +377,11 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   setter's constant bits (`0x06020000`, fa1eeb). Applied by default (`LPN_ENGINE_FIXED_SHADERS=0`
   off); Fwha's run: no register changed. Still from the stream: the window and generic scissors
   (no engine source found), and the renderer hashes the whole context to reuse analyses.
+
+### Post-processing: the glow chain
+
+- `native/post.cpp` (Codex's port from the disassembly, `~/lost-paradise-re/dis/post/`):
+  ps_down_sample_2x4 and _4x4, ps_glow_pass0_lumi, ps_glow_pass1_ca (the eight blurs),
+  ps_glow_pass2_5 (the combine), each with the game's vertex shader's outputs.
+- Compare run (`LPN_NATIVE_COMPARE=post`): every role within 1/255, a handful of pixels a frame.
+  The 4x4 downsample drawn with a depth target bound (half of them) stays translated.

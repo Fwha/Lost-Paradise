@@ -42,6 +42,7 @@ add_executable(lpn-host
     native/material.cpp
     native/character.cpp
     native/particle.cpp
+    native/post.cpp
     native/prepass.cpp
     native/shadow.cpp
     window.cpp
