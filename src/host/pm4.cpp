@@ -54,11 +54,12 @@ bool geometryShaderDraw(const DrawCall& d) {
 // over whatever the stream's register writes left. A word that changes is counted and logged: it
 // should not happen while the game's own register writes still run.
 void applyFixed(const native::EngineFixed& f) {
-    // The shader stage registers, pixel inputs and pass defaults (remaining-registers.md) only
-    // with LPN_ENGINE_FIXED_SHADERS=1 until LPN_ENGINE_FIXED_CHECK has them right.
+    // The shader stage registers, pixel inputs and pass defaults (remaining-registers.md; the
+    // fixed check: 6.1M draws, 0 differ once PA_SC_MODE_CNTL_1 took fa1ea0's constant bits).
+    // LPN_ENGINE_FIXED_SHADERS=0 leaves them to the stream's registers.
     static const bool shaders = [] {
         const char* e = std::getenv("LPN_ENGINE_FIXED_SHADERS");
-        return e && *e && *e != '0';
+        return !e || (*e && *e != '0');
     }();
     using W = native::EngineFixed::Word;
     bool changed = false;

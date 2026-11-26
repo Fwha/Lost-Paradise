@@ -433,7 +433,7 @@ void captureFixed(uint64_t g, uint64_t s, EngineFixed& f) {
     f.clipCntl = {0x80000, true}; // ea9782-ea979a -> fa1fc8-fa1fdc
     f.vteCntl = {0x43f, true}; // fa2eb0, ea9b5b-ea9b6a -> fa1e25
     f.vtxCntl = {0x2d, true}; // ea9923-ea9935: (5,2,1) -> fa1b84-fa1b96
-    f.scModeCntl[1] = {0, true}; // ea9e7c-ea9e81 -> fa1ee1
+    f.scModeCntl[1] = {0x06020000, true}; // ea9e7c-ea9e81 supplies 0; fa1eeb ORs in 0x06020000
     // ea9e90 emits 2; eaa601/eab403 override it with 3 for multisampled colour.
     // eaaf90 retains that condition in S+0x4a bit 0 (eab082-eab0a4), cleared for
     // depth-only bindings (eab0a9-eab0e2). This follows the ordinary pass ordering.
