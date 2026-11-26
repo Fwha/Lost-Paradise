@@ -726,6 +726,13 @@ public:
             return e && std::string(e) == "post";
         }();
         if (!comparing && (role >= kSsao || d.depth.view)) return decline(role, "not yet matched (drawn in compare mode only)");
+        // The SSAO port is wrong (its upsample flashed the screen white indoors in a compare run):
+        // off even in compare mode unless LPN_POST_SSAO=1 asks for it.
+        static const bool ssao = [] {
+            const char* e = std::getenv("LPN_POST_SSAO");
+            return e && *e && *e != '0';
+        }();
+        if (role >= kSsao && !ssao) return decline(role, "the SSAO port is off (LPN_POST_SSAO=1 to draw it)");
         if (role==kSsaoBlur || role==kUpsample) {
             // nativeBuild uses shaderNameAt for an unindexed VS: it returns "?".
             // Only these two claimed PSs accept the unnamed vs_fullscreen_53c2a1600.
