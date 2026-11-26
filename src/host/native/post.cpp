@@ -273,15 +273,16 @@ layout(location=0) out vec4 outColour;
 layout(set=0,binding=3) uniform sampler2D tex[TEXTURES];
 #define sampleAt(i,uv) texture(tex[i],(uv)*c[32+(i)].xy)
 float B(uint x) { return uintBitsToFloat(x); }
-float halfRtz(float x) {
-    uint h=packHalf2x16(vec2(x,0.0))&0xffffu;
-    float rounded=unpackHalf2x16(h).x;
-    if (abs(rounded)>abs(x)) --h;
-    return unpackHalf2x16(h).x;
-}
+// Pixel arithmetic follows translator.cpp's pixel fres(): contraction is allowed.
+// Keep kHeader's noncontracting helpers for vertex/glow shaders.
+float ssaoMul(float a, float b) { return a*b; }
+float ssaoMac(float a, float b, float d) { return a*b+d; }
+#define mul ssaoMul
+#define mac ssaoMac
 void put(vec4 v) {
-    // v_cvt_pkrtz_f16_f32 followed by the repeated compressed export.
-    v=vec4(halfRtz(v.x),halfRtz(v.y),halfRtz(v.z),halfRtz(v.w));
+    // Match the current translator's opcode 303 (packHalf2x16, round to nearest).
+    // GCN's RTZ conversion differs; changing that belongs in both paths together.
+    v=vec4(unpackHalf2x16(packHalf2x16(v.xy)),unpackHalf2x16(packHalf2x16(v.zw)));
     outColour=vec4(v[p.swizzle.x],v[p.swizzle.y],v[p.swizzle.z],v[p.swizzle.w]);
 }
 #if ROLE == 9
@@ -295,17 +296,17 @@ const vec4 weights[4]=vec4[4](
 #endif
 void main() {
 #if ROLE == 6
-    precise float v0,v1,v2,v3,v4,v5,v6,v7;
-    precise float v8,v9,v10,v11,v12,v13,v14,v15;
-    precise float v16,v17,v18,v19,v20,v21,v22,v23;
-    precise float v24,v25,v26,v27,v28,v29,v30,v31;
-    precise float v32,v33,v34,v35,v36,v37,v38,v39;
-    precise float v40,v41,v42,v43,v44,v45,v46,v47;
-    precise float s12,s13,s14,s15,s16,s17,s18,s19;
-    precise float s20,s21,s22,s23,s24,s25,s26,s27;
-    precise float s28,s29,s30,s31,s32,s33,s34,s35;
-    precise float s36,s37,s38,s39,s40,s41,s42,s43;
-    precise float s48,s50,s51;
+    float v0,v1,v2,v3,v4,v5,v6,v7;
+    float v8,v9,v10,v11,v12,v13,v14,v15;
+    float v16,v17,v18,v19,v20,v21,v22,v23;
+    float v24,v25,v26,v27,v28,v29,v30,v31;
+    float v32,v33,v34,v35,v36,v37,v38,v39;
+    float v40,v41,v42,v43,v44,v45,v46,v47;
+    float s12,s13,s14,s15,s16,s17,s18,s19;
+    float s20,s21,s22,s23,s24,s25,s26,s27;
+    float s28,s29,s30,s31,s32,s33,s34,s35;
+    float s36,s37,s38,s39,s40,s41,s42,s43;
+    float s48,s50,s51;
     bool b28,b36,b44,b46;
     v2=gl_FragCoord.x; v3=gl_FragCoord.y;
     s48=B(0x3c800000u);
@@ -501,11 +502,11 @@ void main() {
     v0=mac(-0.5,v5,1.0); v0=log2(abs(v0)); v0=mul(s40,v0); v0=exp2(v0); v0=v7+v0; v11=mac(2.0,v0,v11);
     v0=mul(B(0x3e000000u),v11); put(vec4(v45,v0,v45,v0));
 #elif ROLE == 7
-    precise float v0,v1,v2,v3,v4,v5,v6,v7;
-    precise float v8,v9,v10,v11;
-    precise float s0,s1,s2,s3,s4,s5,s6,s7;
-    precise float s8,s9,s10,s11,s12,s24,s25,s26,s27;
-    precise float s28,s29,s30,s31,s40,s41,s42,s43;
+    float v0,v1,v2,v3,v4,v5,v6,v7;
+    float v8,v9,v10,v11;
+    float s0,s1,s2,s3,s4,s5,s6,s7;
+    float s8,s9,s10,s11,s12,s24,s25,s26,s27;
+    float s28,s29,s30,s31,s40,s41,s42,s43;
     v2=a1.x; v3=a1.y;
     // MIMG 0x34: image_sample, dmask 0x1.
     v5=sampleAt(0,vec2(v2,v3)).x;
@@ -568,11 +569,11 @@ void main() {
     v0=mac(s41,v4,v0); v4=v11-v3; v1=mac(v7,v5,v1); v0=mac(s42,v1,v0); v3=mac(v4,v2,v3);
     v0=mac(s43,v3,v0); put(vec4(v0));
 #elif ROLE == 8
-    precise float v0,v1,v2,v3,v4,v5,v6,v7;
-    precise float v8,v9,v10,v11,v12,v13,v14,v15;
-    precise float v16,v17,v18,v19,v20,v21;
-    precise float s20,s21,s22,s23,s24,s25,s26,s27;
-    precise float s32,s33,s34;
+    float v0,v1,v2,v3,v4,v5,v6,v7;
+    float v8,v9,v10,v11,v12,v13,v14,v15;
+    float v16,v17,v18,v19,v20,v21;
+    float s20,s21,s22,s23,s24,s25,s26,s27;
+    float s32,s33,s34;
     v2=gl_FragCoord.x; v3=gl_FragCoord.y;
     s34=B(0x3e218d1du);
     // Scalar load 0x24.
@@ -636,10 +637,10 @@ void main() {
     v5=mul(B(0x3f215716u),v5); v1=mac(v6,v4,v1); v4=mac(v0,B(0x3eb53268u),v7); v5=mac(v3,v5,v1);
     v0=mul(B(0x3eb53268u),v0); v3=1.0+v4; v1=1.0/(v3); v5=mac(v0,v2,v5); v0=mul(v1,v5); put(vec4(v0));
 #elif ROLE == 9
-    precise float v0,v1,v2,v3,v4,v5,v6,v7;
-    precise float v8,v9,v10,v11,v12,v13,v14,v15;
-    precise float v16;
-    precise float s12,s13,s14,s15,s32,s33;
+    float v0,v1,v2,v3,v4,v5,v6,v7;
+    float v8,v9,v10,v11,v12,v13,v14,v15;
+    float v16;
+    float s12,s13,s14,s15,s32,s33;
     bool cc;
     v2=gl_FragCoord.x; v3=gl_FragCoord.y;
     // Scalar load 0x2c.
