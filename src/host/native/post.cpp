@@ -257,12 +257,6 @@ public:
     }
     bool draw(int role,const Draw& d,Gpu& gpu) override {
         if (role<kDown2 || role>kCompose) return false;
-        // Codex's port, unmatched yet: drawn only when LPN_NATIVE_COMPARE=post compares it.
-        static const bool compare = [] {
-            const char* e = std::getenv("LPN_NATIVE_COMPARE");
-            return e && std::string(e) == "post";
-        }();
-        if (!compare) return decline(role,"not yet matched (drawn in compare mode only)");
         if (!d.vsName || (role==kLumi ? *d.vsName!=kRoles[role].vs : !named(*d.vsName,kRoles[role].vs)))
             return decline(role,"another vertex shader");
         if (d.colorCount!=1 || !d.color[0].view || d.color[0].format==VK_FORMAT_UNDEFINED ||
