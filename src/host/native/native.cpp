@@ -8,14 +8,15 @@ Pass* prepassPass(); // prepass.cpp
 Pass* materialPass(); // material.cpp
 Pass* characterPass(); // character.cpp
 Pass* particlePass(); // particle.cpp
+Pass* postPass(); // post.cpp
 
 namespace {
 
 Pass* const* all() {
-    static Pass* const list[] = {aaPass(), shadowPass(), prepassPass(), materialPass(), characterPass(), particlePass()};
+    static Pass* const list[] = {aaPass(), shadowPass(), prepassPass(), materialPass(), characterPass(), particlePass(), postPass()};
     return list;
 }
-constexpr size_t kPasses = 6;
+constexpr size_t kPasses = 7;
 
 } // namespace
 
