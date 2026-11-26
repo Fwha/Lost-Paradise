@@ -1,5 +1,6 @@
-// Bloom/downsampling, from dis/post's shipped GCN programs. Fetch the quad rather than
-// assuming its UVs cover [0,1]: glow_pass1 also remaps each colour into an atlas.
+// Bloom/downsampling and SSAO, from dis/post and dis/ssao's drawn GCN programs.
+// Fetch the quad rather than assuming its UVs cover [0,1]: glow_pass1 and SSAO
+// remap them, and SSAO's named vertex shaders also export view rays.
 // The luminance VS is capture-5's vs-53c2a1500.bin (fx_depth_to_shadow_unuse_map.fxo +8).
 #include "host/native/native.h"
 
@@ -16,7 +17,7 @@
 namespace host::native {
 namespace {
 
-enum Role { kDown2 = 1, kDown4, kLumi, kBlur, kCompose };
+enum Role { kDown2 = 1, kDown4, kLumi, kBlur, kCompose, kSsao, kTemporal, kSsaoBlur, kUpsample };
 struct Variant {
     const char* ps;
     const char* vs;
@@ -31,13 +32,22 @@ constexpr Variant kRoles[] = {
      {0xf8, 0x100, 0x108, 0x110, 0x150, 0x158, 0x160, 0x168, 0x180,
       0x1b8, 0x1c0, 0x1c8, 0x218, 0x220, 0x228, 0x248, 0x250, 0x258}},
     {"ps_glow_pass2_5.pso", "vs_glow_pass2.vso", {0x40, 0x64, 0x84, 0xa4, 0xb8, 0xec}},
+    {"fx_ssao_test[dnrm].fxo", "fx_ssao.fxo +4",
+     {0x50, 0x98, 0x314, 0x3e8, 0x4dc, 0x558, 0x70c, 0x818, 0x96c, 0x994, 0xbec, 0xd1c, 0xda0, 0xde4}},
+    {"fx_ssao_temporal_filter.fxo", "fx_ssao_temporal_filter.fxo",
+     {0x34, 0x1d0, 0x1d8, 0x208, 0x210}},
+    {"ps_ssao_blur.pso", nullptr,
+     {0x88, 0x90, 0x98, 0xa0, 0xac, 0xb4, 0xbc, 0xc4, 0x110, 0x118, 0x120, 0x128, 0x130, 0x138, 0x140, 0x148}},
+    {"ps_ssao_upsampling.pso", nullptr,
+     {0xf4, 0xfc, 0x118, 0x120, 0x128, 0x130, 0x138, 0x140, 0x148}},
 };
 
-// c0: VS position transform; c1..3: VS UV constants; c4..9: PS loads;
-// c10..27: texture scales, one per MIMG instruction, even for the same T#.
+// c0: VS position transform; c1..3: VS constants; c4..31: PS scalar loads;
+// c32..49: texture scales, one per MIMG instruction, even for the same T#.
+// SSAO's scalar-load PCs and destination rows are listed together in draw().
 // Luminance uses c4=0x44, c5..6=0x90 (when enabled), c7.x=0x40 flags.
-using Constants = std::array<std::array<uint32_t, 4>, 28>;
-static_assert(sizeof(Constants) == 28*16);
+using Constants = std::array<std::array<uint32_t, 4>, 50>;
+static_assert(sizeof(Constants) == 50*16);
 struct Push {
     uint32_t fetch[2][4]; // word offset, word stride, stored component count, DST_SEL
     int32_t swizzle[4];
@@ -54,6 +64,7 @@ layout(push_constant) uniform P {
 } p;
 layout(set=0, binding=2, std430) readonly buffer Constants { vec4 c[]; };
 float mul(float a, float b) { precise float r=a*b; return r; }
+float mac(float a, float b, float d) { precise float r=a*b+d; return r; }
 vec2 mac(vec2 a, vec2 b, vec2 d) { precise vec2 r=a*b+d; return r; }
 vec4 mac(vec4 a, vec4 b, vec4 d) { precise vec4 r=a*b+d; return r; }
 )";
@@ -80,7 +91,10 @@ vec4 fetch(int slot) {
 }
 void main() {
     vec4 pos=fetch(0);
-    vec2 uv=fetch(1).xy;
+    vec2 uv=vec2(0.0);
+#if ROLE < 8
+    uv=fetch(1).xy;
+#endif
     gl_Position=vec4(mac(c[0].xy,pos.xy,c[0].zw),pos.zw);
     if (p.flags.x!=0u) gl_Position.z=mul(gl_Position.z+gl_Position.w,0.5);
     a0=a1=a2=vec4(0.0);
@@ -102,6 +116,13 @@ void main() {
     a0=vec4(c[1].xy+uv,c[1].zw+uv);
     a1=vec4(c[2].xy+uv,c[2].zw+uv);
     a2=vec4(c[3].xy+uv,c[3].zw+uv);
+#elif ROLE == 6
+    // 0x50 param1: UV and the normal-map UV; 0x58 param0: view ray.
+    a1=vec4(uv,mac(c[2].xy,uv,c[2].zw));
+    a0=vec4(c[1].xy*gl_Position.xy,c[1].z,0.0);
+#elif ROLE == 7
+    a1=vec4(uv,0.0,0.0);
+    a0=vec4(c[1].xy*gl_Position.xy,c[1].z,0.0);
 #endif
 }
 )";
@@ -146,7 +167,7 @@ layout(location=2) in vec4 a2;
 layout(location=0) out vec4 outColour;
 layout(set=0,binding=3) uniform sampler2D tex[TEXTURES];
 // Literal indices keep this independent of sampled-image array dynamic indexing features.
-#define sampleAt(i,uv) texture(tex[i],(uv)*c[10+(i)].xy)
+#define sampleAt(i,uv) texture(tex[i],(uv)*c[32+(i)].xy)
 void put(vec4 v) {
     // Match the translated compressed export's half conversion before COMP_SWAP.
     v=vec4(unpackHalf2x16(packHalf2x16(v.xy)),unpackHalf2x16(packHalf2x16(v.zw)));
@@ -241,6 +262,447 @@ void main() {
 }
 )";
 
+// The SSAO ports keep the captured register names where interleaved arithmetic matters.
+// Scalar loads and MIMG instructions are identified by PC; samples are separate even
+// when they read the same T#, so each instruction retains the game's sampler and scale.
+constexpr const char* kSsaoFs = R"(
+layout(location=0) in vec4 a0;
+layout(location=1) in vec4 a1;
+layout(location=2) in vec4 a2;
+layout(location=0) out vec4 outColour;
+layout(set=0,binding=3) uniform sampler2D tex[TEXTURES];
+#define sampleAt(i,uv) texture(tex[i],(uv)*c[32+(i)].xy)
+float B(uint x) { return uintBitsToFloat(x); }
+float halfRtz(float x) {
+    uint h=packHalf2x16(vec2(x,0.0))&0xffffu;
+    float rounded=unpackHalf2x16(h).x;
+    if (abs(rounded)>abs(x)) --h;
+    return unpackHalf2x16(h).x;
+}
+void put(vec4 v) {
+    // v_cvt_pkrtz_f16_f32 followed by the repeated compressed export.
+    v=vec4(halfRtz(v.x),halfRtz(v.y),halfRtz(v.z),halfRtz(v.w));
+    outColour=vec4(v[p.swizzle.x],v[p.swizzle.y],v[p.swizzle.z],v[p.swizzle.w]);
+}
+#if ROLE == 9
+// ps_ssao_upsampling.pso's complete literal table (the short code dump cuts it off).
+// The V# starts at PC 0x334; load 0x150 addresses 48 - 16*(xParity+2*yParity).
+const vec4 weights[4]=vec4[4](
+    vec4(0.5625,0.1875,0.1875,0.0625),
+    vec4(0.1875,0.5625,0.0625,0.1875),
+    vec4(0.1875,0.0625,0.5625,0.1875),
+    vec4(0.0625,0.1875,0.1875,0.5625));
+#endif
+void main() {
+#if ROLE == 6
+    precise float v0,v1,v2,v3,v4,v5,v6,v7;
+    precise float v8,v9,v10,v11,v12,v13,v14,v15;
+    precise float v16,v17,v18,v19,v20,v21,v22,v23;
+    precise float v24,v25,v26,v27,v28,v29,v30,v31;
+    precise float v32,v33,v34,v35,v36,v37,v38,v39;
+    precise float v40,v41,v42,v43,v44,v45,v46,v47;
+    precise float s12,s13,s14,s15,s16,s17,s18,s19;
+    precise float s20,s21,s22,s23,s24,s25,s26,s27;
+    precise float s28,s29,s30,s31,s32,s33,s34,s35;
+    precise float s36,s37,s38,s39,s40,s41,s42,s43;
+    precise float s48,s50,s51;
+    bool b28,b36,b44,b46;
+    v2=gl_FragCoord.x; v3=gl_FragCoord.y;
+    s48=B(0x3c800000u);
+    // Scalar load 0x2c.
+    s40=c[13].x; s41=c[13].y; v6=B(0xbe800000u)+v2; v7=B(0xbe800000u)+v3; v4=mul(s40,v6);
+    v5=mul(s41,v7);
+    // MIMG 0x50: image_sample, dmask 0x1.
+    v5=sampleAt(0,vec2(v4,v5)).x;
+    // PS attr0 is VS param1 (the remapped normal-map UV in .zw).
+    // Scalar load 0x58.
+    s12=c[4].x; s13=c[4].y; s14=c[4].z; s15=c[4].w; s16=c[5].x; s17=c[5].y; s18=c[5].z; s19=c[5].w;
+    s20=c[6].x; s21=c[6].y; s22=c[6].z; s23=c[6].w; s24=c[7].x; s25=c[7].y; s26=c[7].z; s27=c[7].w;
+    v0=mac(s41,v7,-0.5); v2=a1.z; v3=a1.w; v1=mac(s40,v6,-0.5); v4=1.0/(s17); v8=mul(v4,-v0);
+    v0=1.0/(s12); v6=mul(v0,-v1);
+    // MIMG 0x98: image_sample, dmask 0x7.
+    { vec4 t=sampleAt(1,vec2(v2,v3));
+      v0=t.x;   v1=t.y;   v2=t.z;
+    }
+    // Scalar load 0xa0.
+    s28=c[8].x; s29=c[8].y; s30=c[8].z; s31=c[8].w; s32=c[9].x; s33=c[9].y; s34=c[9].z; s35=c[9].w;
+    s36=c[10].x; s37=c[10].y; s38=c[10].z; s39=c[10].w; s40=c[11].x; s41=c[11].y; s42=c[11].z;
+    s43=c[11].w; v9=s27;
+    // Scalar load 0xa8.
+    s50=c[12].x; s51=c[12].y; b44=s28>0.5; b28=s29>0.5; v17=s41; v13=s33; b46=s37>0.5; b36=s36>0.5;
+    v3=s22+v5; v3=1.0/(v3); v10=mul(-s23,v3); v11=subgroupQuadBroadcast(v10,2u); v6=mul(v6,v10);
+    v4=subgroupQuadBroadcast(v10,1u); v7=subgroupQuadBroadcast(v10,0u); v18=log2(abs(v5));
+    v5=mul(v8,v10); v4=v4-v7; v7=v11-v7; v11=mul(-2.0,v5); v12=subgroupQuadBroadcast(v11,1u);
+    v8=subgroupQuadBroadcast(v11,0u); v14=subgroupQuadBroadcast(v11,2u); v0=mac(2.0,v0,-1.0);
+    v1=mac(2.0,v1,-1.0); v15=v12-v8; v12=mul(2.0,v6); v16=subgroupQuadBroadcast(v12,1u);
+    v19=subgroupQuadBroadcast(v12,0u); v20=subgroupQuadBroadcast(v12,2u); v14=v14-v8; v8=mul(v4,v14);
+    v16=v16-v19; v19=v20-v19; v8=mac(v7,-v15,v8); v20=mul(v15,v19); v20=mac(v14,-v16,v20);
+    v14=mul(v16,v7); v7=mul(v8,v8); v14=mac(v19,-v4,v14); v7=mac(v14,v14,v7); v7=mac(v20,v20,v7);
+    v15=inversesqrt(v7); v7=mul(v15,v14); v14=mac(2.0,v2,-1.0); v21=b28?0.0:v7; v4=mul(v15,v20);
+    v8=mul(v15,v8); v15=mul(v0,v0); v15=mac(v1,v1,v15); v15=mac(v14,v14,v15); v16=inversesqrt(v15);
+    v15=mul(v16,v14); v14=mul(v16,v0); v16=mul(v16,v1); v1=b44?v15:0.0; v23=b44?v16:0.0;
+    v27=mul(v1,v21); v26=b28?1.0:v4; v24=b28?0.0:v8; v29=b44?v14:0.0; v0=mul(s31,-v10);
+    v28=mul(v1,v24); v1=b44?v2:1.0; v1=mul(s30,v1); v19=max(v1,v0); v1=B(0x3f3504f3u)+v23;
+    v0=B(0x3f3504f3u)+v29; v30=mac(-v26,v0,v28); v38=mul(v21,v0); v0=mac(-v24,v1,v38);
+    v1=mac(v26,v1,-v27); v20=mul(v1,v1); v20=mac(v30,v30,v20); v20=mac(v0,v0,v20);
+    v20=inversesqrt(v20); v22=mul(v1,v20); v36=mac(v22,v19,v12); v1=mul(v30,v20); v35=mac(v1,v19,v11);
+    v0=mul(v0,v20); v20=mul(s12,v36); v25=mac(v0,v19,v10); v20=mac(s13,v35,v20); v20=mac(s14,v25,v20);
+    v33=mac(-v22,v19,v12); v31=mac(-v1,v19,v11); v1=mac(s24,v36,v9); v1=mac(s25,v35,v1);
+    v1=mac(s26,v25,v1); v1=1.0/(v1); v37=mul(s16,v33); v22=mac(-v0,v19,v10); v0=s15+v20;
+    v20=mul(s16,v36); v20=mac(s17,v35,v20); v20=mac(s18,v25,v20); v20=s19+v20; v0=mul(v1,v0);
+    v1=mul(v1,v20); v0=mac(0.5,v0,0.5); v1=mac(-0.5,v1,0.5); v37=mac(s17,v31,v37);
+    v37=mac(s18,v22,v37); v37=s19+v37;
+    // MIMG 0x314: image_sample, dmask 0x1.
+    v34=sampleAt(2,vec2(v0,v1)).x; v0=mul(s35,v18); v1=exp2(v0); v0=mul(s43,v18); v20=mac(s34,v1,v13);
+    v1=exp2(v0); v0=mul(s12,v33); v0=mac(s13,v31,v0); v0=mac(s14,v22,v0); v0=s15+v0;
+    v39=mac(-v8,v20,v33); v39=mac(-2.0,v6,v39); v36=mac(v20,-v8,v36); v13=mul(-v4,v20);
+    v18=mac(-2.0,v6,v36); v35=mac(v20,-v7,v35); v36=mac(2.0,v5,v35); v35=mul(v18,v18); v18=mul(v18,v8);
+    v35=mac(v36,v36,v35); v36=mac(v36,v7,v18); v42=mul(v39,v8); v15=b36?v15:0.0; v14=b36?v14:0.0;
+    v14=B(0x3f3504f3u)+v14; v18=b36?v2:1.0; v18=mul(s38,v18); v2=mac(s42,v1,v17); v1=mac(s24,v33,v9);
+    v1=mac(s25,v31,v1); v1=mac(s26,v22,v1); v1=1.0/(v1); v0=mul(v1,v0); v1=mul(v1,v37);
+    v0=mac(0.5,v0,0.5); v1=mac(-0.5,v1,0.5);
+    // MIMG 0x3e8: image_sample, dmask 0x1.
+    v41=sampleAt(3,vec2(v0,v1)).x; v0=B(0xbf3504f3u)+v23; v1=mac(v26,v0,-v27); v38=mac(v0,-v24,v38);
+    v0=mul(v1,v1); v0=mac(v30,v30,v0); v0=mac(v38,v38,v0); v32=inversesqrt(v0); v37=mul(v1,v32);
+    v0=mac(v37,v19,v12); v1=mul(v30,v32); v17=mul(v38,v32); v40=mac(s24,v0,v9); v30=mac(v17,v19,v10);
+    v33=mac(-v7,v20,v31); v31=mul(s12,v0); v32=mac(-v37,v19,v12); v37=mac(v1,v19,v11);
+    v43=mac(s13,v37,v31); v31=mul(s16,v0); v40=mac(s25,v37,v40); v31=mac(s17,v37,v31);
+    v31=mac(s18,v30,v31); v40=mac(s26,v30,v40); v43=mac(s14,v30,v43); v45=s19+v31; v33=mac(2.0,v5,v33);
+    v17=mac(-v17,v19,v10); v31=mac(-v7,v20,v37); v37=1.0/(v40); v40=mac(-v8,v20,v0);
+    v31=mac(2.0,v5,v31); v38=mul(v39,v39); v39=mac(-2.0,v6,v40); v40=mul(s16,v32);
+    v38=mac(v33,v33,v38); v42=mac(v7,v33,v42); v33=mac(-v1,v19,v11); v1=s15+v43; v1=mul(v37,v1);
+    v37=mul(v37,v45); v0=mac(0.5,v1,0.5); v1=mac(-0.5,v37,0.5);
+    // MIMG 0x4dc: image_sample, dmask 0x1.
+    v37=sampleAt(4,vec2(v0,v1)).x; v1=mul(v39,v8); v0=mac(s24,v32,v9); v43=mac(s25,v33,v0);
+    v40=mac(s17,v33,v40); v40=mac(s18,v17,v40); v43=mac(s26,v17,v43); v0=s19+v40; v43=1.0/(v43);
+    v0=mul(v43,v0); v39=mul(v39,v39); v40=mac(v31,v7,v1); v1=mul(s12,v32); v1=mac(s13,v33,v1);
+    v1=mac(s14,v17,v1); v1=s15+v1; v32=mac(v20,-v8,v32); v32=mac(-2.0,v6,v32); v33=mac(v20,-v7,v33);
+    v39=mac(v31,v31,v39); v31=mul(v43,v1); v1=mac(-0.5,v0,0.5); v0=mac(0.5,v31,0.5);
+    // MIMG 0x558: image_sample, dmask 0x1.
+    v31=sampleAt(5,vec2(v0,v1)).x; v0=1.0+v23; v43=mul(v32,v8); v1=mul(v29,v21); v1=mac(v0,-v24,v1);
+    v0=mac(v26,v0,-v27); v32=mul(v32,v32); v33=mac(2.0,v5,v33); v32=mac(v33,v33,v32);
+    v33=mac(v33,v7,v43); v43=mac(-v29,v26,v28); v29=1.0+v29; v21=mul(v21,v29); v27=mac(v23,v26,-v27);
+    v26=mac(-v26,v29,v28); v29=s22+v34; v29=1.0/(v29); v25=mac(s23,v29,v25); v29=mac(-s23,v29,v13);
+    v25=clamp(mac(-s50,abs(v25),1.0),0.0,1.0); v29=mac(s23,v3,v29); v25=log2(v25);
+    v35=mac(v29,v29,v35); v29=mac(v29,v4,v36); v23=mac(-v23,v24,v21); v21=mul(v0,v0);
+    v21=mac(v43,v43,v21); v21=mac(v1,v1,v21); v24=inversesqrt(v21); v21=mul(v0,v24);
+    v0=mac(v21,v19,v12); v1=mul(v1,v24); v24=mul(v43,v24); v28=mul(s16,v0); v34=s22+v41;
+    v41=inversesqrt(v35); v34=1.0/(v34); v43=mac(-s23,v34,v13); v43=mac(s23,v3,v43);
+    v38=mac(v43,v43,v38); v36=inversesqrt(v38); v35=mac(s23,v34,v22); v42=mac(v4,v43,v42);
+    v45=b46?0.0:v7; v22=clamp(mul(v41,v29),0.0,1.0); v29=mul(s51,v25); v29=exp2(v29);
+    v25=mac(v24,v19,v11); v22=mul(v29,v22); v29=mul(s12,v0); v41=mac(s13,v25,v29);
+    v29=mac(s17,v25,v28); v28=clamp(mac(-s50,abs(v35),1.0),0.0,1.0); v28=log2(v28); v28=mul(s51,v28);
+    v28=exp2(v28); v35=clamp(mul(v36,v42),0.0,1.0); v36=mac(-v21,v19,v12); v42=mac(-v24,v19,v11);
+    v24=mac(v1,v19,v10); v41=mac(s14,v24,v41); v34=s15+v41; v29=mac(s18,v24,v29); v29=s19+v29;
+    v21=mac(-v1,v19,v10); v1=mac(s24,v0,v9); v1=mac(s25,v25,v1); v1=mac(s26,v24,v1); v1=1.0/(v1);
+    v25=mac(v20,-v7,v25); v25=mac(2.0,v5,v25); v22=mac(v35,v28,v22); v35=mac(-v8,v20,v0);
+    v0=mul(v1,v34); v0=mac(0.5,v0,0.5); v1=mul(v1,v29); v1=mac(-0.5,v1,0.5);
+    // MIMG 0x70c: image_sample, dmask 0x1.
+    v29=sampleAt(6,vec2(v0,v1)).x; v34=s22+v37; v37=1.0/(v34); v34=mac(-s23,v37,v13);
+    v37=mac(s23,v37,v30); v0=mac(s24,v36,v9); v34=mac(s23,v3,v34); v0=mac(s25,v42,v0);
+    v38=mac(v34,v34,v39); v0=mac(s26,v21,v0); v39=mac(v34,v4,v40); v1=1.0/(v0); v0=mul(s12,v36);
+    v0=mac(s13,v42,v0); v0=mac(s14,v21,v0); v0=s15+v0; v0=mul(v1,v0); v0=mac(0.5,v0,0.5);
+    v35=mac(-2.0,v6,v35); v34=mul(v35,v35); v34=mac(v25,v25,v34); v41=mul(v35,v8);
+    v30=mac(-v8,v20,v36); v47=s22+v31; v47=1.0/(v47); v36=mul(s16,v36); v17=mac(s23,v47,v17);
+    v47=mac(-s23,v47,v13); v17=clamp(mac(-s50,abs(v17),1.0),0.0,1.0); v40=mac(s17,v42,v36);
+    v36=clamp(mac(-s50,abs(v37),1.0),0.0,1.0); v36=log2(v36); v47=mac(s23,v3,v47);
+    v37=inversesqrt(v38); v36=mul(s51,v36); v17=log2(v17); v32=mac(v47,v47,v32); v40=mac(s18,v21,v40);
+    v37=clamp(mul(v37,v39),0.0,1.0); v36=exp2(v36); v32=inversesqrt(v32); v17=mul(s51,v17);
+    v28=s19+v40; v33=mac(v4,v47,v33); v36=mul(v36,v37); v32=clamp(mul(v32,v33),0.0,1.0); v17=exp2(v17);
+    v1=mul(v1,v28); v33=mul(v27,v27); v1=mac(-0.5,v1,0.5);
+    // MIMG 0x818: image_sample, dmask 0x1.
+    v28=sampleAt(7,vec2(v0,v1)).x; v33=mac(v26,v26,v33); v36=mac(v32,v17,v36); v1=mac(-0.5,v36,1.0);
+    v33=mac(v23,v23,v33); v1=log2(abs(v1)); v33=inversesqrt(v33); v1=mul(s32,v1); v27=mul(v27,v33);
+    v1=exp2(v1); v38=mac(v27,v19,v12); v0=mul(v23,v33); v23=mul(v26,v33); v26=mul(s16,v38);
+    v37=mac(-v27,v19,v12); v27=mul(s16,v37); v36=mac(-v23,v19,v11); v39=mac(s24,v37,v9);
+    v27=mac(s17,v36,v27); v39=mac(s25,v36,v39); v47=b36?v16:0.0; v32=b46?1.0:v4; v40=mul(v45,v14);
+    v42=mac(v20,-v7,v42); v42=mac(2.0,v5,v42); v41=mac(v7,v25,v41); v25=mul(s12,v38);
+    v30=mac(-2.0,v6,v30); v31=mul(v30,v8); v31=mac(v7,v42,v31); v30=mul(v30,v30); v30=mac(v42,v42,v30);
+    v22=mac(-0.5,v22,1.0); v22=log2(abs(v22)); v22=mul(s32,v22); v22=exp2(v22); v22=v22+v1;
+    v1=mac(v23,v19,v11); v23=mac(v0,v19,v10); v35=mac(s13,v1,v25); v35=mac(s14,v23,v35);
+    v25=mac(s17,v1,v26); v25=mac(s18,v23,v25); v25=s19+v25; v26=mul(s12,v37); v19=mac(-v0,v19,v10);
+    v0=s15+v35; v35=mac(s24,v38,v9); v35=mac(s25,v1,v35); v35=mac(s26,v23,v35); v26=mac(s13,v36,v26);
+    v27=mac(s18,v19,v27); v39=mac(s26,v19,v39); v26=mac(s14,v19,v26); v27=s19+v27;
+    v38=mac(v20,-v8,v38); v38=mac(-2.0,v6,v38); v33=mac(-v7,v20,v1); v1=1.0/(v35); v25=mul(v1,v25);
+    v0=mul(v1,v0); v1=mac(-0.5,v25,0.5); v0=mac(0.5,v0,0.5);
+    // MIMG 0x96c: image_sample, dmask 0x1.
+    v25=sampleAt(8,vec2(v0,v1)).x; v1=1.0/(v39); v0=s15+v26; v0=mul(v1,v0); v1=mul(v1,v27);
+    v1=mac(-0.5,v1,0.5); v0=mac(0.5,v0,0.5);
+    // MIMG 0x994: image_sample, dmask 0x1.
+    v27=sampleAt(9,vec2(v0,v1)).x; v1=b46?0.0:v8; v0=s22+v29; v0=1.0/(v0); v35=B(0xbf3504f3u)+v47;
+    v24=mac(s23,v0,v24); v0=mac(-s23,v0,v13); v0=mac(s23,v3,v0); v34=mac(v0,v0,v34);
+    v16=inversesqrt(v34); v41=mac(v4,v0,v41); v0=clamp(mul(v16,v41),0.0,1.0);
+    v24=clamp(mac(-s50,abs(v24),1.0),0.0,1.0); v24=log2(v24); v24=mul(s51,v24); v26=mul(v38,v38);
+    v33=mac(2.0,v5,v33); v16=exp2(v24); v26=mac(v33,v33,v26); v43=mul(v38,v8); v38=mac(-v8,v20,v37);
+    v38=mac(-2.0,v6,v38); v37=mac(-v7,v20,v36); v36=mul(v38,v8); v20=mul(v38,v38); v37=mac(2.0,v5,v37);
+    v29=mac(v37,v37,v20); v20=mul(v15,v1); v15=mul(v15,v45); v20=mac(v14,-v32,v20); v14=mul(s39,-v10);
+    v28=s22+v28; v42=max(v18,v14); v18=mac(v32,v35,-v15); v43=mac(v7,v33,v43); v33=mul(v16,v0);
+    v24=mac(v37,v7,v36); v36=B(0x3f3504f3u)+v47; v39=mac(v32,v36,-v15); v15=mul(v39,v39);
+    v14=mac(-v1,v36,v40); v32=1.0/(v28); v21=mac(s23,v32,v21);
+    v21=clamp(mac(-s50,abs(v21),1.0),0.0,1.0); v36=log2(v21); v36=mul(s51,v36); v36=exp2(v36);
+    v47=mac(-v1,v35,v40); v1=mac(v20,v20,v15); v1=mac(v14,v14,v1); v35=inversesqrt(v1);
+    v34=mul(v39,v35); v21=mac(v34,v42,v12); v15=mul(v20,v35); v38=mac(v15,v42,v11); v28=mul(v14,v35);
+    v35=mac(s24,v21,v9); v37=mul(s12,v21); v14=mac(v28,v42,v10); v35=mac(s25,v38,v35);
+    v37=mac(s13,v38,v37); v1=mac(-s23,v32,v13); v40=mac(s14,v14,v37); v35=mac(s26,v14,v35);
+    v39=1.0/(v35); v0=s15+v40; v1=mac(s23,v3,v1); v0=mul(v39,v0); v31=mac(v4,v1,v31);
+    v0=mac(0.5,v0,0.5); v30=mac(v1,v1,v30); v30=inversesqrt(v30); v30=clamp(mul(v30,v31),0.0,1.0);
+    v31=mul(s16,v21); v31=mac(s17,v38,v31); v31=mac(s18,v14,v31); v46=s19+v31; v1=mul(v39,v46);
+    v1=mac(-0.5,v1,0.5); v33=mac(v30,v36,v33); v30=mac(-0.5,v33,1.0); v30=log2(abs(v30));
+    v30=mul(s32,v30); v36=mac(-v15,v42,v11); v31=mul(v18,v18); v15=mac(-v28,v42,v10);
+    v31=mac(v20,v20,v31); v21=mac(v2,-v8,v21); v31=mac(v47,v47,v31); v44=inversesqrt(v31);
+    v41=exp2(v30); v30=mac(-v34,v42,v12); v28=mul(s16,v30); v28=mac(s17,v36,v28); v28=mac(s18,v15,v28);
+    v37=s19+v28; v33=mul(v18,v44); v22=v22+v41; v18=mac(v33,v42,v12); v31=mul(v20,v44);
+    v47=mul(v47,v44); v12=mac(v42,-v33,v12); v33=mul(s12,v18); v32=mul(s16,v18); v38=mac(v2,-v7,v38);
+    v17=mul(-v4,v2); v34=mac(2.0,v5,v38); v38=mac(-2.0,v6,v21);
+    // MIMG 0xbec: image_sample, dmask 0x1.
+    v21=sampleAt(10,vec2(v0,v1)).x; v0=s22+v25; v0=1.0/(v0); v1=s22+v27; v23=mac(s23,v0,v23);
+    v0=mac(-s23,v0,v13); v0=mac(s23,v3,v0); v26=mac(v0,v0,v26); v20=inversesqrt(v26); v25=mul(s12,v30);
+    v25=mac(s13,v36,v25); v25=mac(s14,v15,v25); v43=mac(v4,v0,v43); v0=clamp(mul(v20,v43),0.0,1.0);
+    v20=1.0/(v1); v1=clamp(mac(-s50,abs(v23),1.0),0.0,1.0); v23=mac(s23,v20,v19);
+    v23=clamp(mac(-s50,abs(v23),1.0),0.0,1.0); v27=mac(-s23,v20,v13); v20=log2(v1); v26=mul(s51,v20);
+    v19=log2(v23); v23=exp2(v26); v19=mul(s51,v19); v27=mac(s23,v3,v27); v19=exp2(v19); v20=s15+v25;
+    v29=mac(v27,v27,v29); v13=inversesqrt(v29); v24=mac(v4,v27,v24); v26=mul(v23,v0);
+    v23=mac(s24,v30,v9); v23=mac(s25,v36,v23); v23=mac(s26,v15,v23); v23=1.0/(v23); v1=mul(v23,v37);
+    v1=mac(-0.5,v1,0.5); v20=mul(v23,v20); v13=clamp(mul(v13,v24),0.0,1.0); v0=mac(0.5,v20,0.5);
+    v27=mac(-v31,v42,v11); v26=mac(v13,v19,v26); v19=mac(v47,v42,v10); v13=mac(-v47,v42,v10);
+    v30=mac(v2,-v8,v30); v24=mul(v38,v38); v35=mac(-v7,v2,v36); v30=mac(-2.0,v6,v30); v20=mul(v30,v30);
+    v24=mac(v34,v34,v24); v35=mac(2.0,v5,v35); v23=mul(v30,v8); v20=mac(v35,v35,v20);
+    v23=mac(v7,v35,v23); v25=mul(v38,v8); v25=mac(v7,v34,v25); v30=mac(-0.5,v26,1.0);
+    // MIMG 0xd1c: image_sample, dmask 0x1.
+    v26=sampleAt(11,vec2(v0,v1)).x; v1=mac(v31,v42,v11); v33=mac(s13,v1,v33); v33=mac(s14,v19,v33);
+    v0=s15+v33; v32=mac(s17,v1,v32); v32=mac(s18,v19,v32); v29=s19+v32; v16=mac(-v7,v2,v1);
+    v16=mac(2.0,v5,v16); v11=log2(abs(v30)); v11=mul(s32,v11); v11=exp2(v11); v11=v22+v11;
+    v22=mac(s24,v18,v9); v22=mac(s25,v1,v22); v22=mac(s26,v19,v22); v1=1.0/(v22); v9=mac(s24,v12,v9);
+    v0=mul(v1,v0); v22=mac(s25,v27,v9); v0=mac(0.5,v0,0.5); v22=mac(s26,v13,v22); v1=mul(v1,v29);
+    v1=mac(-0.5,v1,0.5);
+    // MIMG 0xda0: image_sample, dmask 0x1.
+    v9=sampleAt(12,vec2(v0,v1)).x; v0=mul(s16,v12); v0=mac(s17,v27,v0); v0=mac(s18,v13,v0); v0=s19+v0;
+    v1=1.0/(v22); v22=mul(s12,v12); v22=mac(s13,v27,v22); v22=mac(s14,v13,v22); v22=s15+v22;
+    v0=mul(v1,v0); v22=mul(v1,v22); v1=mac(-0.5,v0,0.5); v0=mac(0.5,v22,0.5);
+    // MIMG 0xde4: image_sample, dmask 0x1.
+    v0=sampleAt(13,vec2(v0,v1)).x; v12=mac(v2,-v8,v12); v12=mac(-2.0,v6,v12); v18=mac(v2,-v8,v18);
+    v18=mac(-2.0,v6,v18); v27=mac(v2,-v7,v27); v6=mul(v18,v8); v1=mul(v12,v12); v27=mac(2.0,v5,v27);
+    v5=mul(v18,v18); v5=mac(v16,v16,v5); v2=mul(v12,v8); v6=mac(v7,v16,v6); v16=mac(v27,v27,v1);
+    v2=mac(v7,v27,v2); v7=s22+v21; v7=1.0/(v7); v14=mac(s23,v7,v14);
+    v8=clamp(mac(-s50,abs(v14),1.0),0.0,1.0); v8=log2(v8); v8=mul(s51,v8); v8=exp2(v8);
+    v7=mac(-s23,v7,v17); v7=mac(s23,v3,v7); v24=mac(v7,v7,v24); v12=inversesqrt(v24);
+    v25=mac(v4,v7,v25); v7=clamp(mul(v12,v25),0.0,1.0); v7=mul(v8,v7);
+    v45=clamp(mac(s48,v10,1.0),0.0,1.0); v8=s22+v26; v8=1.0/(v8); v15=mac(s23,v8,v15);
+    v8=mac(-s23,v8,v17); v8=mac(s23,v3,v8); v20=mac(v8,v8,v20); v14=inversesqrt(v20);
+    v12=clamp(mac(-s50,abs(v15),1.0),0.0,1.0); v23=mac(v4,v8,v23); v8=clamp(mul(v14,v23),0.0,1.0);
+    v12=log2(v12); v12=mul(s51,v12); v12=exp2(v12); v7=mac(v8,v12,v7); v7=mac(-0.5,v7,1.0);
+    v7=log2(abs(v7)); v7=mul(s40,v7); v7=exp2(v7); v8=s22+v9; v8=1.0/(v8); v12=mac(-s23,v8,v17);
+    v19=mac(s23,v8,v19); v9=clamp(mac(-s50,abs(v19),1.0),0.0,1.0); v12=mac(s23,v3,v12); v9=log2(v9);
+    v5=mac(v12,v12,v5); v5=inversesqrt(v5); v9=mul(s51,v9); v6=mac(v4,v12,v6);
+    v5=clamp(mul(v5,v6),0.0,1.0); v8=exp2(v9); v5=mul(v8,v5); v0=s22+v0; v0=1.0/(v0);
+    v17=mac(-s23,v0,v17); v13=mac(s23,v0,v13); v17=mac(s23,v3,v17);
+    v3=clamp(mac(-s50,abs(v13),1.0),0.0,1.0); v1=log2(v3); v16=mac(v17,v17,v16); v3=inversesqrt(v16);
+    v1=mul(s51,v1); v2=mac(v4,v17,v2); v0=clamp(mul(v3,v2),0.0,1.0); v1=exp2(v1); v5=mac(v0,v1,v5);
+    v0=mac(-0.5,v5,1.0); v0=log2(abs(v0)); v0=mul(s40,v0); v0=exp2(v0); v0=v7+v0; v11=mac(2.0,v0,v11);
+    v0=mul(B(0x3e000000u),v11); put(vec4(v45,v0,v45,v0));
+#elif ROLE == 7
+    precise float v0,v1,v2,v3,v4,v5,v6,v7;
+    precise float v8,v9,v10,v11;
+    precise float s0,s1,s2,s3,s4,s5,s6,s7;
+    precise float s8,s9,s10,s11,s12,s24,s25,s26,s27;
+    precise float s28,s29,s30,s31,s40,s41,s42,s43;
+    v2=a1.x; v3=a1.y;
+    // MIMG 0x34: image_sample, dmask 0x1.
+    v5=sampleAt(0,vec2(v2,v3)).x;
+    // Scalar load 0x40.
+    s0=c[4].x; s1=c[4].y; s2=c[4].z; s3=c[4].w; s4=c[5].x; s5=c[5].y; s6=c[5].z; s7=c[5].w;
+    // Scalar load 0x50.
+    s24=c[6].x; s25=c[6].y; s26=c[6].z; s27=c[6].w; s28=c[7].x; s29=c[7].y; s30=c[7].z; s31=c[7].w;
+    v4=a0.x; v2=a0.y; v3=a0.z;
+    // Scalar load 0x68.
+    s40=c[8].x; s41=c[8].y; s42=c[8].z; s43=c[8].w; v0=s0+v5; v0=1.0/(v0); v5=mul(s1,v0);
+    v0=mul(v4,v5); v1=mul(v2,v5); v2=mul(v3,v5); v3=mul(s24,v0); v5=mac(s25,v1,v3); v5=mac(s26,v2,v5);
+    // Scalar load 0x9c.
+    s0=c[9].x; s1=c[9].y; s2=c[9].z; s3=c[9].w; v4=mul(s28,v0); v4=mac(s29,v1,v4); v4=mac(s30,v2,v4);
+    v3=s31+v4; v4=s27+v5;
+    // Scalar load 0xb4.
+    s24=c[10].x; s25=c[10].y; s26=c[10].z; s27=c[10].w; s28=c[11].x; s29=c[11].y; s30=c[11].z;
+    s31=c[11].w; v6=s27; v5=mac(s24,v0,v6); v5=mac(s25,v1,v5); v5=mac(s26,v2,v5); v5=1.0/(v5);
+    v3=mul(v5,v3); v4=mul(v5,v4); v5=mul(s28,v0); v5=mac(s29,v1,v5); v5=mac(s30,v2,v5); v6=s31+v5;
+    // Scalar load 0xec.
+    s24=c[12].x; s25=c[12].y; s26=c[12].z; s27=c[12].w; s28=c[13].x; s29=c[13].y; s30=c[13].z;
+    s31=c[13].w; v5=mul(s0,v0); v7=s27; v7=mac(s24,v0,v7); v7=mac(s25,v1,v7); v7=mac(s26,v2,v7);
+    v7=1.0/(v7); v5=mac(s1,v1,v5); v5=mac(s2,v2,v5); v5=s3+v5;
+    // Scalar load 0x118.
+    s0=c[14].x; s1=c[14].y; s2=c[14].z; s3=c[14].w; v3=mac(-0.5,v3,0.5); v8=mul(s0,v0);
+    v8=mac(s1,v1,v8); v8=mac(s2,v2,v8); v5=mul(v7,v5); v6=mul(v7,v6); v7=mul(s28,v0);
+    v7=mac(s29,v1,v7); v7=mac(s30,v2,v7); v7=s31+v7;
+    // Scalar load 0x14c.
+    s24=c[15].x; s25=c[15].y; s26=c[15].z; s27=c[15].w; s28=c[16].x; s29=c[16].y; s30=c[16].z;
+    s31=c[16].w; v8=s3+v8;
+    // Scalar load 0x154.
+    s0=c[17].x; s1=c[17].y; s2=c[17].z; s3=c[17].w;
+    // Scalar load 0x158.
+    s8=c[18].x; s9=c[18].y; s10=c[18].z; s11=c[18].w; v9=s27; v10=s11; v10=mac(s8,v0,v10);
+    v9=mac(s24,v0,v9); v10=mac(s9,v1,v10); v9=mac(s25,v1,v9); v10=mac(s10,v2,v10); v9=mac(s26,v2,v9);
+    v9=1.0/(v9); v8=mul(v9,v8); v9=mul(v9,v7); v7=mul(s28,v0); v0=mul(s0,v0); v0=mac(s1,v1,v0);
+    v7=mac(s29,v1,v7); v0=mac(s2,v2,v0); v7=mac(s30,v2,v7); v2=1.0/(v10); v1=s3+v0; v7=s31+v7;
+    v0=mac(0.5,v6,0.5); v10=mul(v2,v1); v1=mac(-0.5,v5,0.5); v11=mul(v2,v7); v2=mac(0.5,v4,0.5);
+    // MIMG 0x1d0: image_sample, dmask 0xc.
+    { vec4 t=sampleAt(1,vec2(v2,v3));
+      v6=t.z;   v7=t.w;
+    }
+    // MIMG 0x1d8: image_sample, dmask 0x3.
+    { vec4 t=sampleAt(2,vec2(v0,v1));
+      v4=t.x;   v5=t.y;
+    }
+    v1=mac(-0.5,v8,0.5); v0=mac(0.5,v9,0.5); v3=mac(-0.5,v10,0.5); v2=mac(0.5,v11,0.5);
+    // MIMG 0x208: image_sample, dmask 0xc.
+    { vec4 t=sampleAt(3,vec2(v0,v1));
+      v0=t.z;   v1=t.w;
+    }
+    // MIMG 0x210: image_sample, dmask 0x3.
+    { vec4 t=sampleAt(4,vec2(v2,v3));
+      v2=t.x;   v3=t.y;
+    }
+    s12=B(0x42800000u); v8=mul(s4,v6); v9=mul(s4,v7); v8=mac(s5,v4,v8); v9=mac(s5,v5,v9);
+    v8=mac(s6,v0,v8); v11=mac(s6,v1,v9); v8=mac(s7,v2,v8); v10=v8-v6; v11=mac(s7,v3,v11);
+    v9=clamp(mul(s12,abs(v10)),0.0,1.0); v10=v11-v7; v4=v8-v4; v4=clamp(mul(s12,abs(v4)),0.0,1.0);
+    v7=mac(v10,v9,v7); v9=v11-v5; v10=v8-v0; v0=mul(s40,v7); v4=mac(v4,v9,v5);
+    v5=clamp(mul(s12,abs(v10)),0.0,1.0); v7=v11-v1; v2=v8-v2; v2=clamp(mul(s12,abs(v2)),0.0,1.0);
+    v0=mac(s41,v4,v0); v4=v11-v3; v1=mac(v7,v5,v1); v0=mac(s42,v1,v0); v3=mac(v4,v2,v3);
+    v0=mac(s43,v3,v0); put(vec4(v0));
+#elif ROLE == 8
+    precise float v0,v1,v2,v3,v4,v5,v6,v7;
+    precise float v8,v9,v10,v11,v12,v13,v14,v15;
+    precise float v16,v17,v18,v19,v20,v21;
+    precise float s20,s21,s22,s23,s24,s25,s26,s27;
+    precise float s32,s33,s34;
+    v2=gl_FragCoord.x; v3=gl_FragCoord.y;
+    s34=B(0x3e218d1du);
+    // Scalar load 0x24.
+    s32=c[4].x; s33=c[4].y;
+    // Scalar load 0x28.
+    s20=c[5].x; s21=c[5].y; s22=c[5].z; s23=c[5].w; s24=c[6].x; s25=c[6].y; s26=c[6].z; s27=c[6].w;
+    v11=B(0xbe800000u)+v2; v13=B(0xbe800000u)+v3; v4=mul(s32,v11); v5=mul(s33,v13);
+    v0=mac(-4.0,s22,v4); v1=mac(-4.0,s23,v5); v6=mac(-2.0,s22,v4); v2=s23; v10=s22;
+    v8=mac(v10,B(0xc0400000u),v4); v9=mac(v2,B(0xc0400000u),v5); v7=mac(-2.0,s23,v5);
+    // MIMG 0x88: image_sample, dmask 0x1.
+    v21=sampleAt(0,vec2(v0,v1)).x;
+    // MIMG 0x90: image_sample, dmask 0x1.
+    v20=sampleAt(1,vec2(v4,v5)).x;
+    // MIMG 0x98: image_sample, dmask 0x1.
+    v18=sampleAt(2,vec2(v8,v9)).x;
+    // MIMG 0xa0: image_sample, dmask 0x1.
+    v15=sampleAt(3,vec2(v6,v7)).x; v2=s23;
+    // MIMG 0xac: image_sample, dmask 0x8.
+    v12=sampleAt(4,vec2(v6,v7)).w;
+    // MIMG 0xb4: image_sample, dmask 0x8.
+    v16=sampleAt(5,vec2(v0,v1)).w;
+    // MIMG 0xbc: image_sample, dmask 0xa.
+    { vec4 t=sampleAt(6,vec2(v4,v5));
+      v0=t.y;   v1=t.w;
+    }
+    // MIMG 0xc4: image_sample, dmask 0x8.
+    v14=sampleAt(7,vec2(v8,v9)).w; v6=s22; v6=mac(s32,v11,-v6); v7=mac(s33,v13,-v2);
+    v8=mac(s32,v11,v10); v9=mac(s33,v13,v2); v3=mac(2.0,s23,v5); v10=mac(v10,B(0x40400000u),v4);
+    v11=mac(v2,B(0x40400000u),v5); v2=mac(2.0,s22,v4);
+    // MIMG 0x110: image_sample, dmask 0x1.
+    v19=sampleAt(8,vec2(v6,v7)).x;
+    // MIMG 0x118: image_sample, dmask 0x1.
+    v13=sampleAt(9,vec2(v8,v9)).x;
+    // MIMG 0x120: image_sample, dmask 0x1.
+    v17=sampleAt(10,vec2(v2,v3)).x;
+    // MIMG 0x128: image_sample, dmask 0x1.
+    v5=sampleAt(11,vec2(v10,v11)).x;
+    // MIMG 0x130: image_sample, dmask 0x8.
+    v6=sampleAt(12,vec2(v6,v7)).w;
+    // MIMG 0x138: image_sample, dmask 0x8.
+    v4=sampleAt(13,vec2(v8,v9)).w;
+    // MIMG 0x140: image_sample, dmask 0x8.
+    v3=sampleAt(14,vec2(v2,v3)).w;
+    // MIMG 0x148: image_sample, dmask 0x8.
+    v2=sampleAt(15,vec2(v10,v11)).w; v7=s20+v21; v8=1.0/(v7); v7=s20+v20; v7=1.0/(v7); v7=mul(s21,v7);
+    v8=mac(s21,v8,-v7); v8=clamp(mac(-s24,abs(v8),1.0),0.0,1.0); v8=log2(v8); v8=mul(s25,v8);
+    v10=exp2(v8); v8=s20+v18; v8=1.0/(v8); v8=mac(s21,v8,-v7); v11=s20+v19; v11=1.0/(v11);
+    v8=clamp(mac(-s24,abs(v8),1.0),0.0,1.0); v11=mac(s21,v11,-v7); v8=log2(v8);
+    v11=clamp(mac(-s24,abs(v11),1.0),0.0,1.0); v8=mul(s25,v8); v11=log2(v11); v8=exp2(v8);
+    v18=mul(s25,v11); v5=s20+v5; v9=mul(B(0x3e218d1du),v10); v10=mac(s34,v10,1.0);
+    v10=mac(v8,B(0x3eb53268u),v10); v5=1.0/(v5); v9=mac(v16,v9,v0); v0=s20+v15; v0=1.0/(v0);
+    v0=mac(s21,v0,-v7); v0=clamp(mac(-s24,abs(v0),1.0),0.0,1.0); v0=log2(v0); v0=mul(s25,v0);
+    v11=mul(B(0x3eb53268u),v8); v8=exp2(v18); v15=exp2(v0); v16=mac(v14,v11,v9);
+    v11=mul(B(0x3f215716u),v15); v0=mac(v15,B(0x3f215716u),v10); v10=s20+v17; v10=1.0/(v10);
+    v10=mac(s21,v10,-v7); v10=clamp(mac(-s24,abs(v10),1.0),0.0,1.0); v14=log2(v10); v9=mul(s25,v14);
+    v0=mac(v8,B(0x3f64184du),v0); v16=mac(v11,v12,v16); v12=s20+v13; v11=mul(B(0x3f64184du),v8);
+    v8=1.0/(v12); v8=mac(s21,v8,-v7); v8=clamp(mac(-s24,abs(v8),1.0),0.0,1.0); v8=log2(v8);
+    v7=mac(s21,v5,-v7); v8=mul(s25,v8); v5=clamp(mac(-s24,abs(v7),1.0),0.0,1.0); v8=exp2(v8);
+    v7=log2(v5); v5=exp2(v9); v7=mul(s25,v7); v9=mac(v8,B(0x3f64184du),v0); v16=mac(v11,v6,v16);
+    v1=v16+v1; v6=mul(B(0x3f64184du),v8); v0=exp2(v7); v7=mac(v5,B(0x3f215716u),v9);
+    v5=mul(B(0x3f215716u),v5); v1=mac(v6,v4,v1); v4=mac(v0,B(0x3eb53268u),v7); v5=mac(v3,v5,v1);
+    v0=mul(B(0x3eb53268u),v0); v3=1.0+v4; v1=1.0/(v3); v5=mac(v0,v2,v5); v0=mul(v1,v5); put(vec4(v0));
+#elif ROLE == 9
+    precise float v0,v1,v2,v3,v4,v5,v6,v7;
+    precise float v8,v9,v10,v11,v12,v13,v14,v15;
+    precise float v16;
+    precise float s12,s13,s14,s15,s32,s33;
+    bool cc;
+    v2=gl_FragCoord.x; v3=gl_FragCoord.y;
+    // Scalar load 0x2c.
+    s32=c[4].x; s33=c[4].y; v0=B(0xbe800000u)+v2; v1=floor(v0);
+    v6=B(0xbe800000u)+v3; v5=intBitsToFloat(int(v1));
+    v1=uintBitsToFloat(0xffffffffu+floatBitsToUint(v5)); v4=uintBitsToFloat(1u&floatBitsToUint(v1));
+    v5=uintBitsToFloat(1u&floatBitsToUint(v5));
+    v4=uintBitsToFloat(floatBitsToUint(v1)-floatBitsToUint(v4)); v9=mul(0.5,s32); v0=mul(0.5,s33);
+    v2=-0.5+v2; v1=-0.5+v3; v3=floor(v6); v3=intBitsToFloat(int(v3));
+    v6=uintBitsToFloat(0xffffffffu+floatBitsToUint(v3)); v3=uintBitsToFloat(1u&floatBitsToUint(v3));
+    v3=uintBitsToFloat((floatBitsToUint(v3)&0xffffffu)*2u+floatBitsToUint(v5));
+    v5=uintBitsToFloat(1u&floatBitsToUint(v6));
+    v7=uintBitsToFloat(floatBitsToUint(v6)-floatBitsToUint(v5));
+    v5=uintBitsToFloat(2u+floatBitsToUint(v4)); v6=float(floatBitsToInt(v5));
+    v5=uintBitsToFloat(2u+floatBitsToUint(v7)); v7=float(floatBitsToInt(v7)); v7=mac(v7,s33,v0);
+    v8=float(floatBitsToInt(v4)); v4=uintBitsToFloat(0u-floatBitsToUint(v3)); v6=mac(v6,s32,v9);
+    v3=float(floatBitsToInt(v5)); v5=mac(s33,v1,v0); v1=mac(v3,s33,v0); v3=v1;
+    v13=uintBitsToFloat(floatBitsToUint(v4)<<4u); v4=mac(s32,v2,v9);
+    // MIMG 0xf4: image_sample, dmask 0x1.
+    v11=sampleAt(0,vec2(v4,v5)).x;
+    // MIMG 0xfc: image_sample, dmask 0x1.
+    v14=sampleAt(1,vec2(v6,v7)).x; v4=mac(v8,s32,v9); v5=v7; v0=v4; v2=v6;
+    // MIMG 0x118: image_sample, dmask 0x1.
+    v12=sampleAt(2,vec2(v4,v5)).x;
+    // MIMG 0x120: image_sample, dmask 0x1.
+    v10=sampleAt(3,vec2(v0,v1)).x;
+    // MIMG 0x128: image_sample, dmask 0x1.
+    v9=sampleAt(4,vec2(v2,v3)).x;
+    // MIMG 0x130: image_sample, dmask 0x8.
+    v6=sampleAt(5,vec2(v6,v7)).w;
+    // MIMG 0x138: image_sample, dmask 0x8.
+    v7=sampleAt(6,vec2(v2,v3)).w;
+    // MIMG 0x140: image_sample, dmask 0x8.
+    v8=sampleAt(7,vec2(v0,v1)).w;
+    // MIMG 0x148: image_sample, dmask 0x8.
+    v4=sampleAt(8,vec2(v4,v5)).w;
+    // 0x150: shader-local float4 table at PC 0x334, byte offset 48 - 16*parity.
+    { vec4 t=weights[int((floatBitsToUint(v13)+48u)>>4u)];
+      v0=t.x; v1=t.y; v2=t.z; v3=t.w; }
+    // Scalar load 0x158.
+    s12=c[5].x; s13=c[5].y; s14=c[5].z; s15=c[5].w; v5=s12+v11; v5=1.0/(v5); v11=mul(-s13,v5);
+    v5=s12+v14; v5=1.0/(v5); v12=s12+v12; v12=1.0/(v12); v10=s12+v10; v5=mac(s13,v5,v11);
+    v14=1.0/(v10); v13=s12+v9; v9=mac(s13,v12,v11); v12=abs(v9)+abs(v5); v13=1.0/(v13);
+    v10=mac(s13,v13,v11); v11=mac(s13,v14,v11); v12=v12+abs(v11); cc=v12<=-abs(v10); v14=v12+abs(v10);
+    v13=abs(v5); v12=abs(v9);
+    if (cc) {
+        v0=mul(v0,v4); v0=mac(v6,v1,v0); v0=mac(v8,v2,v0); v0=mac(v7,v3,v0);
+    } else {
+        v15=mul(v0,abs(v9)); v14=1.0/(v14); v16=mul(abs(v5),v1); v0=mac(v14,-v15,v0); v15=mac(-v16,v14,v1);
+        v1=mul(abs(v11),v2); v16=mul(v0,v4); v1=mac(-v1,v14,v2); v2=mul(abs(v10),v3); v0=v0+v15; v0=v0+v1;
+        v16=mac(v6,v15,v16); v3=mac(v14,-v2,v3); v0=v0+v3; v16=mac(v8,v1,v16); v0=1.0/(v0);
+        v16=mac(v7,v3,v16); v0=mul(v0,v16);
+    }
+    cc=abs(v9)>abs(v5);
+    if (cc) {
+        v12=v13; v4=v6;
+    }
+    cc=abs(v11)>abs(v10); v1=min(abs(v11),abs(v10)); v2=cc?v7:v8; cc=v12>v1; v1=cc?v2:v4; v0=v0-v1;
+    v1=mac(s14,v0,v1); put(vec4(v1));
+#endif
+}
+)";
+
 bool named(const std::string& name,const char* wanted) {
     if (name==wanted) return true;
     const std::string prefix=std::string(wanted)+" +";
@@ -252,32 +714,47 @@ class Post final : public Pass {
 public:
     const char* name() const override { return "post"; }
     int claims(const std::string& ps) const override {
-        for (int i=1;i<=kCompose;++i) if (named(ps,kRoles[i].ps)) return i;
+        for (int i=1;i<=kUpsample;++i) if (named(ps,kRoles[i].ps)) return i;
         return 0;
     }
     bool draw(int role,const Draw& d,Gpu& gpu) override {
-        if (role<kDown2 || role>kCompose) return false;
-        if (!d.vsName || (role==kLumi ? *d.vsName!=kRoles[role].vs : !named(*d.vsName,kRoles[role].vs)))
+        if (role<kDown2 || role>kUpsample) return false;
+        // The SSAO chain and depth-bound draws: Codex's port, unmatched yet, drawn only when
+        // LPN_NATIVE_COMPARE=post compares it (the glow chain matched within 1/255).
+        static const bool comparing = [] {
+            const char* e = std::getenv("LPN_NATIVE_COMPARE");
+            return e && std::string(e) == "post";
+        }();
+        if (!comparing && (role >= kSsao || d.depth.view)) return decline(role, "not yet matched (drawn in compare mode only)");
+        if (role==kSsaoBlur || role==kUpsample) {
+            // nativeBuild uses shaderNameAt for an unindexed VS: it returns "?".
+            // Only these two claimed PSs accept the unnamed vs_fullscreen_53c2a1600.
+            if (d.vsName && !d.vsName->empty() && *d.vsName!="?")
+                return decline(role,"another vertex shader");
+        } else if (!d.vsName || ((role==kLumi || role==kSsao) ?
+                   *d.vsName!=kRoles[role].vs : !named(*d.vsName,kRoles[role].vs)))
             return decline(role,"another vertex shader");
         if (d.colorCount!=1 || !d.color[0].view || d.color[0].format==VK_FORMAT_UNDEFINED ||
-            !d.color[0].width || !d.color[0].height || d.color[0].comps!=4)
-            return decline(role,"not one four-component colour target");
-        if (d.color[0].format!=VK_FORMAT_R8G8B8A8_UNORM)
+            !d.color[0].width || !d.color[0].height || !d.color[0].comps || d.color[0].comps>4 ||
+            (role<kSsao && d.color[0].comps!=4))
+            return decline(role,"not one supported colour target");
+        if (role<kSsao && d.color[0].format!=VK_FORMAT_R8G8B8A8_UNORM)
             return decline(role,"unexpected colour format (expected RGBA8 UNORM)");
         if ((d.writeMask&~0xfu) || !(d.writeMask&0xfu))
             return decline(role,"unexpected target write mask");
         const auto& blend=d.blendState[0];
         const bool additive=blend.blendEnable;
         // Capture-5's composition adds RGB and alpha (0x61010101); other roles replace.
-        if (additive) {
+        if (additive && role<kSsao) {
             if (role!=kCompose || blend.srcColorBlendFactor!=VK_BLEND_FACTOR_ONE ||
                 blend.dstColorBlendFactor!=VK_BLEND_FACTOR_ONE || blend.colorBlendOp!=VK_BLEND_OP_ADD ||
                 blend.srcAlphaBlendFactor!=VK_BLEND_FACTOR_ONE || blend.dstAlphaBlendFactor!=VK_BLEND_FACTOR_ONE ||
                 blend.alphaBlendOp!=VK_BLEND_OP_ADD) return decline(role,"unexpected blending");
-        } else if (d.blend) return decline(role,"inconsistent blend state");
-        if (d.depthTest || d.depthWrite || d.stencil || d.depthStencil.depthTestEnable ||
-            d.depthStencil.depthWriteEnable || d.depthStencil.stencilTestEnable ||
-            d.depthStencil.depthBoundsTestEnable) return decline(role,"depth or stencil");
+        } else if (!additive && d.blend) return decline(role,"inconsistent blend state");
+        const auto& z=d.depthStencil;
+        if ((d.depthTest || d.depthWrite || d.stencil || z.depthTestEnable ||
+             z.depthWriteEnable || z.stencilTestEnable || z.depthBoundsTestEnable) && !d.depth.view)
+            return decline(role,"depth/stencil state without an attachment");
         if (d.pixelPositions || d.depthBias || d.cull!=VK_CULL_MODE_NONE)
             return decline(role,"pixel positions, polygon offset or culling");
         if (d.primitive!=17 || d.count!=3 || d.instances!=1 || d.indexed)
@@ -297,7 +774,8 @@ public:
             if (slots[v.slot]) return decline(role,"duplicate fetch slot");
             slots[v.slot]=&v;
         }
-        for (int i=0;i<2;++i) {
+        const int fetches=role>=kSsaoBlur?1:2;
+        for (int i=0;i<fetches;++i) {
             const VertexBuffer* v=slots[i];
             // Capture-5 uses float3 position with DST_SEL_W=1 and float2 UV.
             if (!v || !v->data.buffer || v->nfmt!=7 || v->indexVgpr ||
@@ -322,6 +800,8 @@ public:
             buffers[i]={v->data.buffer,v->data.offset,v->data.range};
         }
 
+        if (fetches==1) buffers[1]=buffers[0]; // unused descriptor remains valid
+
         Constants constants{};
         auto load=[&](bool vs,uint32_t pc,uint32_t n,int at) {
             uint32_t words[16]{};
@@ -330,9 +810,27 @@ public:
             std::memcpy(reinterpret_cast<unsigned char*>(constants.data())+at*16,words,n*4);
             return true;
         };
-        if (!load(true,role==kLumi?0x10:0xc,4,0)) return decline(role,"missing VS position scalar load");
+        const uint32_t positionPc=role==kTemporal?0x14:(role==kLumi || role>=kSsao?0x10:0xc);
+        if (!load(true,positionPc,4,0)) return decline(role,"missing VS position scalar load");
         uint32_t wantedTextures=0;
-        if (role==kLumi) {
+        if (role>=kSsao) {
+            if (role==kSsao && !load(true,0x14,8,1))
+                return decline(role,"missing SSAO VS ray/UV load");
+            if (role==kTemporal && !load(true,0x10,4,1))
+                return decline(role,"missing temporal VS ray load");
+            struct Scalar { uint32_t pc,n; int at; };
+            // PCs in the drawn programs, not the other programs in the FXO archives.
+            static constexpr Scalar term[]={{0x2c,2,13},{0x58,16,4},{0xa0,16,8},{0xa8,2,12}};
+            static constexpr Scalar temporal[]={{0x40,8,4},{0x50,8,6},{0x68,4,8},{0x9c,4,9},
+                {0xb4,8,10},{0xec,8,12},{0x118,4,14},{0x14c,8,15},{0x154,4,17},{0x158,4,18}};
+            static constexpr Scalar blur[]={{0x24,2,4},{0x28,8,5}};
+            static constexpr Scalar upsample[]={{0x2c,2,4},{0x158,4,5}};
+            const std::span<const Scalar> loads=role==kSsao?std::span<const Scalar>(term):
+                role==kTemporal?std::span<const Scalar>(temporal):
+                role==kSsaoBlur?std::span<const Scalar>(blur):std::span<const Scalar>(upsample);
+            for (const Scalar& s:loads)
+                if (!load(false,s.pc,s.n,s.at)) return decline(role,"missing SSAO scalar load");
+        } else if (role==kLumi) {
             if (!load(false,0x40,1,7) || !load(false,0x44,4,4))
                 return decline(role,"missing luminance flags or scale load");
             wantedTextures=(constants[7][0]&8)?2:1;
@@ -359,10 +857,10 @@ public:
             if (!t || !t->view || !t->sampler) return decline(role,"missing texture or sampler at MIMG PC");
             if (t->address==d.color[0].address) return decline(role,"texture aliases colour target");
             images[n]={t->sampler,t->view,VK_IMAGE_LAYOUT_GENERAL};
-            std::memcpy(constants[10+n].data(),t->scale,sizeof t->scale);
+            std::memcpy(constants[32+n].data(),t->scale,sizeof t->scale);
             ++n;
         }
-        VkPipeline pipe=pipeline(gpu,role,d.color[0].format,d.writeMask&0xf,n,additive);
+        VkPipeline pipe=pipeline(gpu,role,d,n);
         if (!pipe) return decline(role,"pipeline creation failed");
         Buffer cb;
         if (!gpu.upload(constants.data(),sizeof constants,cb)) return decline(role,"constant upload failed");
@@ -372,18 +870,23 @@ public:
         if (kCompare) {
             char b[256];
             std::snprintf(b,sizeof b,"vs %s; target %ux%u format %d mask 0x%x; %u MIMG samples; clipZHalf %u",
-                          d.vsName->c_str(),d.color[0].width,d.color[0].height,int(d.color[0].format),
+                          d.vsName?d.vsName->c_str():"?",d.color[0].width,d.color[0].height,int(d.color[0].format),
                           d.writeMask,n,push.clipZHalf);
             info_=b;
-            for (int i=0;i<10;++i) {
+            for (int i=0;i<(role>=kSsao?20:10);++i) {
                 float f[4]; std::memcpy(f,constants[i].data(),sizeof f);
                 std::snprintf(b,sizeof b,"\n    c%d: %g %g %g %g",i,f[0],f[1],f[2],f[3]);
                 info_+=b;
             }
         }
         const VkRect2D sc{{d.scissor[0],d.scissor[1]},{uint32_t(d.scissor[2]),uint32_t(d.scissor[3])}};
-        gpu.beginRendering(d.color,1,Target{},false);
+        std::array<uint32_t,6> st{};
+        for (int i=0;i<2;++i)
+            st[i*3]=d.stencilRef[i],st[i*3+1]=d.stencilCompare[i],st[i*3+2]=d.stencilWrite[i];
+        gpu.beginRendering(d.color,1,d.depth,d.hasStencil);
         gpu.record([pipe,layout=layouts_[role],push,buffers,images,n,vp=d.vkViewport,sc,
+                    st,bc=std::to_array(d.blendConstants),bounds=z.depthBoundsTestEnable,
+                    minBounds=z.minDepthBounds,maxBounds=z.maxDepthBounds,
                     pushSet=gpu.pushDescriptorSet()](VkCommandBuffer cmd) {
             VkWriteDescriptorSet w[4]{};
             for (uint32_t i=0;i<3;++i) {
@@ -397,6 +900,14 @@ public:
             w[3].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             w[3].pImageInfo=images.data();
             vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipe);
+            vkCmdSetBlendConstants(cmd,bc.data());
+            for (int i=0;i<2;++i) {
+                const VkStencilFaceFlags face=i?VK_STENCIL_FACE_BACK_BIT:VK_STENCIL_FACE_FRONT_BIT;
+                vkCmdSetStencilReference(cmd,face,st[i*3]);
+                vkCmdSetStencilCompareMask(cmd,face,st[i*3+1]);
+                vkCmdSetStencilWriteMask(cmd,face,st[i*3+2]);
+            }
+            if (bounds) vkCmdSetDepthBounds(cmd,minBounds,maxBounds);
             vkCmdSetViewport(cmd,0,1,&vp);
             vkCmdSetScissor(cmd,0,1,&sc);
             pushSet(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,layout,0,4,w);
@@ -415,9 +926,26 @@ private:
             std::fprintf(stderr,"[native] post: %s left to the translated renderer (%s)\n",kRoles[role].ps,why);
         return false;
     }
-    VkPipeline pipeline(Gpu& gpu,int role,VkFormat format,uint32_t mask,uint32_t textures,bool additive) {
+    VkPipeline pipeline(Gpu& gpu,int role,const Draw& d,uint32_t textures) {
         std::lock_guard lock(m_);
-        const auto key=std::make_tuple(role,int(format),mask,textures,additive);
+        const VkFormat format=d.color[0].format;
+        const uint32_t mask=d.writeMask&0xf;
+        const auto& z=d.depthStencil;
+        const auto& b=d.blendState[0];
+        const uint64_t blendKey=uint64_t(b.blendEnable) | uint64_t(b.srcColorBlendFactor)<<1 |
+            uint64_t(b.dstColorBlendFactor)<<6 | uint64_t(b.colorBlendOp)<<11 |
+            uint64_t(b.srcAlphaBlendFactor)<<14 | uint64_t(b.dstAlphaBlendFactor)<<19 |
+            uint64_t(b.alphaBlendOp)<<24;
+        const bool stencil=d.stencil && d.hasStencil && z.stencilTestEnable;
+        uint64_t stencilKey=uint64_t(stencil)<<40;
+        if (stencil)
+            for (int i=0;i<2;++i) {
+                const VkStencilOpState& o=i?z.back:z.front;
+                stencilKey|=uint64_t(o.failOp | o.passOp<<3 | o.depthFailOp<<6 | o.compareOp<<9)<<(16*i);
+            }
+        const auto key=std::make_tuple(role,int(format),mask,textures,blendKey,
+            int(d.depth.view?d.depth.format:VK_FORMAT_UNDEFINED),bool(d.hasStencil),
+            z.depthTestEnable,z.depthWriteEnable,int(z.depthCompareOp),z.depthBoundsTestEnable,int(d.frontFace),stencilKey);
         if (auto it=pipes_.find(key);it!=pipes_.end()) return it->second;
         VkPipeline& out=pipes_[key];
         if (!layouts_[role]) {
@@ -439,7 +967,12 @@ private:
         const std::string header=std::string(kHeader)+"\n#define ROLE "+std::to_string(role)+
                                  "\n#define TEXTURES "+std::to_string(textures)+"\n";
         const VkShaderModule vs=gpu.shader(header+kVs,Gpu::Stage::Vertex);
-        const VkShaderModule fs=gpu.shader(header+kFs,Gpu::Stage::Fragment);
+        std::string fsHeader=header;
+        if (role==kSsao)
+            fsHeader.insert(fsHeader.find('\n')+1,
+                "#extension GL_KHR_shader_subgroup_basic : require\n"
+                "#extension GL_KHR_shader_subgroup_quad : require\n");
+        const VkShaderModule fs=gpu.shader(fsHeader+(role>=kSsao?kSsaoFs:kFs),Gpu::Stage::Fragment);
         const VkShaderModule gs=gpu.shader(kGs,Gpu::Stage::Geometry);
         if (!vs || !fs || !gs) return out;
         VkPipelineShaderStageCreateInfo stages[3]{
@@ -453,23 +986,27 @@ private:
         VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
         vp.viewportCount=vp.scissorCount=1;
         VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-        rs.polygonMode=VK_POLYGON_MODE_FILL; rs.lineWidth=1;
+        rs.polygonMode=VK_POLYGON_MODE_FILL; rs.frontFace=d.frontFace; rs.lineWidth=1;
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         ms.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
-        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-        VkPipelineColorBlendAttachmentState attachment{};
+        VkPipelineDepthStencilStateCreateInfo ds=z;
+        ds.pNext=nullptr;
+        ds.stencilTestEnable=stencil;
+        VkPipelineColorBlendAttachmentState attachment=b;
         attachment.colorWriteMask=mask;
-        attachment.blendEnable=additive;
-        attachment.srcColorBlendFactor=attachment.dstColorBlendFactor=VK_BLEND_FACTOR_ONE;
-        attachment.srcAlphaBlendFactor=attachment.dstAlphaBlendFactor=VK_BLEND_FACTOR_ONE;
-        attachment.colorBlendOp=attachment.alphaBlendOp=VK_BLEND_OP_ADD;
         VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         cb.attachmentCount=1; cb.pAttachments=&attachment;
-        const VkDynamicState states[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};
+        const VkDynamicState states[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_BLEND_CONSTANTS,VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+            VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,VK_DYNAMIC_STATE_DEPTH_BOUNDS};
         VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dy.dynamicStateCount=2; dy.pDynamicStates=states;
+        dy.dynamicStateCount=std::size(states); dy.pDynamicStates=states;
         VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
         rendering.colorAttachmentCount=1; rendering.pColorAttachmentFormats=&format;
+        if (d.depth.view) {
+            rendering.depthAttachmentFormat=d.depth.format;
+            if (d.hasStencil) rendering.stencilAttachmentFormat=d.depth.format;
+        }
         VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         pi.pNext=&rendering; pi.stageCount=3; pi.pStages=stages;
         pi.pVertexInputState=&vi; pi.pInputAssemblyState=&ia; pi.pViewportState=&vp;
@@ -479,10 +1016,12 @@ private:
         return out;
     }
     std::mutex m_;
-    std::map<std::tuple<int,int,uint32_t,uint32_t,bool>,VkPipeline> pipes_;
-    VkDescriptorSetLayout sets_[6]{};
-    VkPipelineLayout layouts_[6]{};
-    std::set<std::string> declined_[6];
+    using PipelineKey=std::tuple<int,int,uint32_t,uint32_t,uint64_t,int,bool,
+                                 VkBool32,VkBool32,int,VkBool32,int,uint64_t>;
+    std::map<PipelineKey,VkPipeline> pipes_;
+    VkDescriptorSetLayout sets_[kUpsample+1]{};
+    VkPipelineLayout layouts_[kUpsample+1]{};
+    std::set<std::string> declined_[kUpsample+1];
     static inline const bool kCompare=std::getenv("LPN_NATIVE_COMPARE")!=nullptr;
     static inline thread_local std::string info_;
 };

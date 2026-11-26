@@ -6557,17 +6557,24 @@ void main() {
             if (!img) return false;
             barrier(); // after a new copy's clear
             const VkImageAspectFlags aspect = depth ? img->aspect : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
-            VkImageCopy rg{};
-            rg.srcSubresource = rg.dstSubresource = {aspect, 0, 0, 1};
-            rg.extent = {t.width, t.height, 1};
-            rec([c = R().cmd_, src = t.image, dst = img->image, rg] {
-                vkCmdCopyImage(c, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+            // Depth and stencil need separate copy regions. Both must survive the native
+            // comparison draw, including the stencil values it tests and updates.
+            std::array<VkImageCopy, 2> regions{};
+            uint32_t count = 0;
+            for (VkImageAspectFlags bit : {VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT}) {
+                if (!(aspect & bit)) continue;
+                VkImageCopy& rg = regions[count++];
+                rg.srcSubresource = rg.dstSubresource = {bit, 0, 0, 1};
+                rg.extent = {t.width, t.height, 1};
+            }
+            rec([c = R().cmd_, src = t.image, dst = img->image, regions, count] {
+                vkCmdCopyImage(c, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, count, regions.data());
             });
             const VkImageAspectFlags sampled = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
             pc.a[index] = t.view ? (depth ? view(*img, t.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, sampled) : t.view) : VK_NULL_HANDLE;
             pc.b[index] = view(*img, t.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, sampled);
             t.image = img->image;
-            t.view = view(*img, t.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, depth ? img->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+            t.view = view(*img, t.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, depth ? img->aspect : 0);
             return true;
         };
         for (uint32_t i = 0; i < cd.colorCount; ++i)
