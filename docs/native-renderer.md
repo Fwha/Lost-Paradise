@@ -369,3 +369,11 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   register 0 differ (words the engine doesn't hold, such as inactive targets' bases, stay unknown).
 - The draws made from captures now take that state from the engine over the stream's registers
   (`applyFixed` in pm4.cpp; any word that changes is logged). Fwha's run: none changed.
+- 2026-11-26: the rest of the registers the renderer reads for these draws (Codex's inventory,
+  `docs/engine/remaining-registers.md`): the VS/PS stage registers from the selected shader
+  headers (`G+0x100`, `G+0xc0`, +8) read after drawIndex, the pixel inputs from `G+0x240` for the
+  emitted count, the screen scissor, VGT_SHADER_STAGES_EN (`S+0xd8`), colour CMASK/clear words and
+  the pass defaults. The fixed check: 6.1M draws, 0 differ once PA_SC_MODE_CNTL_1 took the
+  setter's constant bits (`0x06020000`, fa1eeb). Applied by default (`LPN_ENGINE_FIXED_SHADERS=0`
+  off); Fwha's run: no register changed. Still from the stream: the window and generic scissors
+  (no engine source found), and the renderer hashes the whole context to reuse analyses.

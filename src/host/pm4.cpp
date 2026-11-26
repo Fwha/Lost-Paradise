@@ -54,6 +54,13 @@ bool geometryShaderDraw(const DrawCall& d) {
 // over whatever the stream's register writes left. A word that changes is counted and logged: it
 // should not happen while the game's own register writes still run.
 void applyFixed(const native::EngineFixed& f) {
+    // The shader stage registers, pixel inputs and pass defaults (remaining-registers.md; the
+    // fixed check: 6.1M draws, 0 differ once PA_SC_MODE_CNTL_1 took fa1ea0's constant bits).
+    // LPN_ENGINE_FIXED_SHADERS=0 leaves them to the stream's registers.
+    static const bool shaders = [] {
+        const char* e = std::getenv("LPN_ENGINE_FIXED_SHADERS");
+        return !e || (*e && *e != '0');
+    }();
     using W = native::EngineFixed::Word;
     bool changed = false;
     auto set = [&](uint32_t& reg, const W& w) {
@@ -62,8 +69,27 @@ void applyFixed(const native::EngineFixed& f) {
     uint32_t* c = tRegs->ctx;
     for (uint32_t i = 0; i < 8; ++i) {
         for (uint32_t j = 0; j < 6; ++j) set(c[ctx::kCbColor0Base + i * ctx::kCbColorStride + j], f.color[i][j]);
+        const uint32_t offsets[] = {7, 11, 12}; // CMASK, CLEAR_WORD0/1
+        if (shaders)
+            for (uint32_t j = 0; j < 3; ++j)
+                set(c[ctx::kCbColor0Base + i * ctx::kCbColorStride + offsets[j]], f.colorAux[i][j]);
         set(c[ctx::kCbBlend0Control + i], f.blend[i]);
         set(c[ctx::kDbZInfo + i], f.depth[i]);
+    }
+    if (shaders) {
+        for (uint32_t i = 0; i < 4; ++i) {
+            set(tRegs->sh[sh::kSpiShaderPgmLoVs + i], f.vs[i]);
+            set(tRegs->sh[sh::kSpiShaderPgmLoPs + i], f.ps[i]);
+            set(c[0x105 + i], f.blendColor[i]); // CB_BLEND_RED through ALPHA
+        }
+        set(c[ctx::kSpiVsOutConfig], f.vs[4]);
+        set(c[ctx::kSpiShaderPosFormat], f.vs[5]);
+        set(c[ctx::kPaClVsOutCntl], f.vs[6]);
+        const uint32_t psContext[] = {ctx::kSpiShaderZFormat, ctx::kSpiShaderColFormat,
+                                      ctx::kSpiPsInputEna, ctx::kSpiPsInputAddr, ctx::kSpiPsInControl,
+                                      ctx::kSpiBarycCntl, ctx::kDbShaderControl};
+        for (uint32_t i = 0; i < 7; ++i) set(c[psContext[i]], f.ps[4 + i]);
+        for (uint32_t i = 0; i < 32; ++i) set(c[ctx::kSpiPsInputCntl0 + i], f.psInputCntl[i]);
     }
     set(c[ctx::kCbTargetMask], f.targetMask);
     set(c[ctx::kCbShaderMask], f.shaderMask);
@@ -80,8 +106,21 @@ void applyFixed(const native::EngineFixed& f) {
     for (uint32_t i = 0; i < 6; ++i) set(c[0x10F + i], f.viewport[i]); // PA_CL_VPORT_XSCALE_0 on
     set(c[ctx::kPaScVportScissorTl], f.scissor[0]);
     set(c[ctx::kPaScVportScissorBr], f.scissor[1]);
+    if (shaders) {
+        for (uint32_t i = 0; i < 2; ++i) {
+            set(c[ctx::kPaScScreenScissorTl + i], f.screenScissor[i]);
+            set(c[0x292 + i], f.scModeCntl[i]); // PA_SC_MODE_CNTL_0/1
+        }
+        set(c[ctx::kVgtShaderStagesEn], f.shaderStagesEn);
+        set(c[0x204], f.clipCntl); // PA_CL_CLIP_CNTL
+        set(c[0x206], f.vteCntl); // PA_CL_VTE_CNTL
+        set(c[0x2F9], f.vtxCntl); // PA_SU_VTX_CNTL
+        set(c[0x00A], f.stencilClear); // DB_STENCIL_CLEAR
+        set(c[0x00B], f.depthClear); // DB_DEPTH_CLEAR
+    }
     set(tRegs->uconfig[0x242], f.primitive); // VGT_PRIMITIVE_TYPE
     set(tRegs->indexType, f.indexType);
+    if (shaders) set(tRegs->numInstances, f.numInstances);
     if (!changed) return;
     ++tRegs->ctxSerial;
     static std::atomic<uint32_t> n{0};
