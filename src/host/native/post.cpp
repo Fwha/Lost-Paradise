@@ -734,12 +734,25 @@ public:
             const char* e = std::getenv("LPN_POST_SSAO");
             return e && *e && *e != '0';
         }();
-        (void)ssao;
-        // Off entirely, compare mode included: compare runs with these roles and the depth-bound
-        // draws flashed the screen (title, indoors, glowing objects). Glow without depth compared
-        // cleanly; nothing else here may run until compare mode is proven not to touch the frame.
-        if (role >= kSsao) return decline(role, "the SSAO port is off");
-        if (d.depth.view) return decline(role, "depth-bound draws are off");
+        // Compare runs with these roles and the depth-bound draws flashed the screen (title,
+        // indoors, glowing objects): only into compare copies, only with LPN_POST_SSAO=1, and only
+        // the roles LPN_POST_ROLES lists (comma separated; all of 6-9 by default), to find which
+        // one disturbs the frame with the flash guard's log (hle_videoout.cpp) in a headless run.
+        static const uint32_t roles = [] {
+            const char* e = std::getenv("LPN_POST_ROLES");
+            if (!e || !*e) return (1u << kSsao) | (1u << kTemporal) | (1u << kSsaoBlur) | (1u << kUpsample) | 1u;
+            uint32_t m = 0;
+            for (const char* p = e; *p;) {
+                char* end = nullptr;
+                const long v = std::strtol(p, &end, 10);
+                if (end == p) break;
+                if (v >= 0 && v < 32) m |= 1u << v;
+                p = *end ? end + 1 : end;
+            }
+            return m; // bit 0: the depth-bound glow draws
+        }();
+        if (role >= kSsao && (!ssao || !d.compareCopy || !(roles >> role & 1))) return decline(role, "the SSAO port is off");
+        if (role < kSsao && d.depth.view && (!ssao || !d.compareCopy || !(roles & 1))) return decline(role, "depth-bound draws are off");
         if (role==kSsaoBlur || role==kUpsample) {
             // nativeBuild uses shaderNameAt for an unindexed VS: it returns "?".
             // Only these two claimed PSs accept the unnamed vs_fullscreen_53c2a1600.

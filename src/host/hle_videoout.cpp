@@ -149,6 +149,41 @@ void showFrame(Shown& s) {
         frame.tilingMode = 1;
     }
     const uint64_t n = s.flip;
+    // Flash guard (on with LPN_NATIVE_COMPARE, or LPN_FLASH_GUARD=1): a frame much brighter or
+    // darker than the one before is logged and not shown (the last one is shown again). A native
+    // port under test flashed the screen white; this catches it without anyone seeing it.
+    static const bool guard = getenv("LPN_FLASH_GUARD") ? *getenv("LPN_FLASH_GUARD") != '0' : getenv("LPN_NATIVE_COMPARE") != nullptr;
+    static std::vector<uint32_t> lastShown;
+    static Frame lastFrame{};
+    static double lastLuma = -1;
+    static uint64_t flashes = 0;
+    if (guard && s.rendered && frame.pixels && frame.width && frame.height) {
+        double sum = 0;
+        uint64_t count = 0;
+        for (uint32_t y = 0; y < frame.height; y += 16)
+            for (uint32_t x = 0; x < frame.width; x += 16) {
+                const uint32_t p = rendered[uint64_t(y) * frame.width + x];
+                sum += double((p & 0xFF) + ((p >> 8) & 0xFF) + ((p >> 16) & 0xFF)) / (3 * 255.0);
+                ++count;
+            }
+        const double luma = count ? sum / double(count) : 0;
+        // Up to 8 frames in a row are held back; a change that lasts longer is a real one (a cut).
+        static int held = 0;
+        if (lastLuma >= 0 && std::abs(luma - lastLuma) > 0.2 && !lastShown.empty() && held < 8) {
+            ++held;
+            if (++flashes <= 50 || (flashes & (flashes - 1)) == 0)
+                std::fprintf(stderr, "[flash] flip %" PRIu64 ": brightness %.2f after %.2f, not shown (%" PRIu64 " so far)\n", n, luma, lastLuma,
+                             flashes);
+            frame = lastFrame;
+            frame.pixels = lastShown.data();
+            presentFrame(frame);
+            return;
+        }
+        held = 0;
+        lastLuma = luma;
+        lastShown = rendered;
+        lastFrame = frame;
+    }
     if (frame.pixels && gScreenshotFlip && n == gScreenshotFlip) writeScreenshot(frame, gScreenshotPath);
     static const uint64_t captureAt = getenv("LPN_CAPTURE_AT") ? std::strtoull(getenv("LPN_CAPTURE_AT"), nullptr, 0) : 0;
     if (n == captureAt) gCaptureRequested = true; // a capture without pressing F12
