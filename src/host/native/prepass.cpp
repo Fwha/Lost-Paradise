@@ -944,7 +944,10 @@ private:
     }
 
     bool drawLongtail(int role, const Draw& d, Gpu& gpu) {
-        if (!d.compareCopy) return decline(role, "not yet matched (drawn into compare copies only)");
+        // Matched in Fwha's compare run (shadow receivers 0 px and within 1/255, skinned depth 0 px over
+        // ~15,000 draws): drawn by default; LPN_PREPASS_LONGTAIL=0 leaves them to the translated renderer.
+        static const bool on = [] { const char* e = std::getenv("LPN_PREPASS_LONGTAIL"); return !e || *e != '0'; }();
+        if (!on && !d.compareCopy) return decline(role, "off (LPN_PREPASS_LONGTAIL=0)");
         const bool depthOnly=role==kSkinDepth, alpha=role!=kShadowReceiver;
         const bool skin=depthOnly || (d.vsName && *d.vsName=="vs_sdw_cas3_skin_pt.vso");
         const char* vs=depthOnly?"lin_depth_skin_pt.vso +1":
