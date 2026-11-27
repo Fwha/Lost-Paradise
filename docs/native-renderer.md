@@ -441,3 +441,14 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   translated arithmetic operation by operation, so the last step's cause is still open. Drawn by
   default (the outline pass's standard); LPN_POST_SHADOW=0 leaves it to the translated renderer.
   A normal run with the flash guard was clean.
+
+### Long tail: the skinned character prepass
+
+- `native/prepass.cpp` roles 3-4 (Codex's port, `~/lost-paradise-re/dis/prepass-skin/`): vs_normal_skin_n
+  with ps_normal_mask_n (opaque skin) and vs_normal_skin_n_pt with ps_normal_mask_n_hair_pt (alpha-tested
+  hair). Each fetch slot is bound on its own; any depth state and target size.
+- Compare: the opaque role matched across ~20,000 draws (depth exact, ~40 px at 1/255) and is drawn by
+  default (LPN_PREPASS_SKIN=0 leaves it to the translated renderer); a normal run was clean. The hair's
+  depth matches but its normals differ on many pixels (up to 175/255); an op-by-op check of the
+  normal math and constants found nothing, and the remaining candidate is the translated renderer's
+  export routing and input defaults (D[20..22]). Compare copies only.

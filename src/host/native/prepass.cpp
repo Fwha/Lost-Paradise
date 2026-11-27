@@ -660,7 +660,7 @@ private:
         const VkPipeline pipe = pipeline(gpu, role, d);
         if (!pipe) return decline(role, "no pipeline");
         if (!logged_[role].exchange(true))
-            std::fprintf(stderr, "[native] prepass: drawing %s into compare copies only\n", roleName(role));
+            std::fprintf(stderr, "[native] prepass: drawing %s natively (or into compare copies)\n", roleName(role));
         gpu.beginRendering(d.color, 1, d.depth, d.hasStencil);
         const VkRect2D sc{{d.scissor[0], d.scissor[1]}, {uint32_t(d.scissor[2]), uint32_t(d.scissor[3])}};
         gpu.record([pipe, layout = layouts_[role], push, buffers, images, textures, vp = d.vkViewport, sc,
