@@ -1468,7 +1468,15 @@ public:
         // The SSAO term (role 6) is still off on scattered pixels: compare copies only. The temporal
         // filter, blurs and upsampling matched exactly in three compare runs (0 px, ~200 draws a
         // run each) and are drawn; depth or stencil in use stays to compare copies for the glow roles.
-        if (!d.compareCopy && role == kSsao) return decline(role, "not yet matched (drawn into compare copies only)");
+        // The SSAO term differs on ~0.1% of pixels (single samples tipping across a threshold from
+        // rounding the normal reconstruction amplifies; no semantic mismatch found). Fwha judged it on
+        // screen and saw nothing wrong (normal run with the flash guard: clean). Drawn by default;
+        // LPN_POST_SSAO_DRAW=0 leaves it to the translated renderer.
+        static const bool ssaoDraw = [] {
+            const char* e = std::getenv("LPN_POST_SSAO_DRAW");
+            return !e || *e != '0';
+        }();
+        if (!d.compareCopy && role == kSsao && !ssaoDraw) return decline(role, "not yet matched (drawn into compare copies only)");
         // The SSAO port is wrong (its upsample flashed the screen white indoors when compare mode
         // still drew unmatched roles into the frame): off unless LPN_POST_SSAO=1 asks for it.
         static const bool ssao = [] {
@@ -1493,7 +1501,7 @@ public:
             return m; // bit 0: the depth-bound glow draws
         }();
         if (role >= kSsao && role <= kUpsample && !(roles >> role & 1)) return decline(role, "the SSAO port is off (LPN_POST_ROLES)");
-        if (role == kSsao && !ssao) return decline(role, "the SSAO term is off (LPN_POST_SSAO=1 compares it)");
+        if (role == kSsao && !ssao && !ssaoDraw) return decline(role, "the SSAO term is off (LPN_POST_SSAO=1 compares it)");
         // As the merged glow pass: a depth buffer bound but neither tested nor written is drawn
         // (the 2x4 downsample always has one); depth or stencil in use only into compare copies.
         const bool usesDepth = d.depthTest || d.depthWrite || d.stencil || d.depthStencil.depthTestEnable ||
