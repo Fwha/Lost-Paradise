@@ -400,3 +400,11 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   mode or with LPN_FLASH_GUARD=1) logs and holds back frames whose brightness jumps (fades too).
   Two compare-mode rewrites (a depth+stencil copy, preparing the real draw first) made compare
   runs flash and were dropped; compare mode is as before but for compareCopy.
+
+### Post-processing: hand-drawn outlines
+
+- `native/post.cpp` roles 10-12 (Codex's port of the drawn programs, `~/lost-paradise-re/dis/outline/`):
+  ps_hand_draw_2 (the outline term), fx_hand_draw_finalize (onto the scene with stencil and alpha
+  blending) and ps_toon_edge_fxaa.
+- Compare run: finalize and the edge FXAA at 0 px, the outline pass within 1/255 (about 4% of its
+  pixels a step off); drawn by default.
