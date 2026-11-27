@@ -964,10 +964,8 @@ private:
             (d.indexType != VK_INDEX_TYPE_UINT16 && d.indexType != VK_INDEX_TYPE_UINT32))
             return decline(role, "not an indexed triangle list");
         if ((!depthOnly && (d.color[0].format!=VK_FORMAT_R8G8B8A8_UNORM ||
-                d.color[0].swap!=1 || d.color[0].comps!=4 || d.writeMask!=0xf ||
-                d.color[0].width!=2560 || d.color[0].height!=1472)) ||
-            d.depth.format!=VK_FORMAT_D32_SFLOAT_S8_UINT || !d.hasStencil ||
-            d.depth.width!=2560 || d.depth.height!=1472)
+                d.color[0].swap!=1 || d.color[0].comps!=4 || d.writeMask!=0xf)) ||
+            d.depth.format!=VK_FORMAT_D32_SFLOAT_S8_UINT || !d.hasStencil)
             return decline(role,"another target or depth format");
         // DB_DEPTH_CONTROL 0x732: depth test, LEQUAL, no writes or stencil.
         // 0x736 adds depth writes; the disabled stencil functions are ALWAYS.
