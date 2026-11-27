@@ -18,6 +18,7 @@
 // where the second texture's w times the first's z is below a threshold (0xa0 of the buffer at
 // 0x30 of the table in s[12:13]).
 #include "host/native/native.h"
+#include "host/native/skin_fetch.h"
 
 #include <cinttypes>
 #include <cstdio>
@@ -33,7 +34,19 @@ namespace host::native {
 
 namespace {
 
-enum Role { kOpaque = 1, kAlphaTest = 2 };
+enum Role { kOpaque = 1, kAlphaTest = 2, kSkinOpaque = 3, kSkinHair = 4, kRoleCount };
+
+bool skinRole(int role) { return role == kSkinOpaque || role == kSkinHair; }
+bool alphaRole(int role) { return role == kAlphaTest || role == kSkinHair; }
+const char* roleName(int role) {
+    switch (role) {
+    case kOpaque: return "ps_normal.pso";
+    case kAlphaTest: return "ps_normal_pt.pso";
+    case kSkinOpaque: return "ps_normal_mask_n.pso";
+    case kSkinHair: return "ps_normal_mask_n_hair_pt.pso";
+    default: return "unknown";
+    }
+}
 
 // 240 bytes: more than the 128 every device has, so the pass needs a device with 256.
 struct Push {
@@ -158,6 +171,206 @@ void main() {
 }
 )";
 
+// The skin VSs share fetch decoding with the character material passes, but
+// have their own translation order and exports. The two hair PS binaries
+// (0x53c41d400 and 0x53c41c800) and their translated GLSL are identical.
+constexpr const char* kSkinVs = R"(
+// v4/v8/v12/v16/v20/v24, followed by the palette and compact fetch constants.
+layout(set = 0, binding = 0, std430) readonly buffer V0 { uint w[]; } v0;
+layout(set = 0, binding = 1, std430) readonly buffer V1 { uint w[]; } v1;
+layout(set = 0, binding = 2, std430) readonly buffer V2 { uint w[]; } v2;
+layout(set = 0, binding = 3, std430) readonly buffer V3 { uint w[]; } v3;
+layout(set = 0, binding = 4, std430) readonly buffer V4 { uint w[]; } v4;
+layout(set = 0, binding = 5, std430) readonly buffer V5 { uint w[]; } v5;
+layout(set = 0, binding = 6, std430) readonly buffer Palette { uint w[]; } palette;
+layout(set = 0, binding = 7, std430) readonly buffer Fetch { uvec4 c[]; } cb;
+layout(location = 0) out vec4 n;
+layout(location = 1) out vec4 t;
+layout(location = 2) out vec4 tangent;
+// Every floating VS instruction in these translations is precise. Pixel arithmetic
+// deliberately has separate helpers below: it permits contraction.
+float add(float a, float b) { precise float r = a + b; return r; }
+float sub(float a, float b) { precise float r = a - b; return r; }
+float mul(float a, float b) { precise float r = a * b; return r; }
+float mac(float a, float b, float c) { precise float r = a * b + c; return r; }
+float dot3(vec4 a, vec3 b) {
+    return mac(a.z, b.z, mac(a.y, b.y, mul(a.x, b.x)));
+}
+)";
+
+constexpr const char* kSkinMain = R"(
+void main() {
+    vec3 x = fetch(0u).xyz;
+    vec4 fw = fetch(1u);
+    uvec4 indices = fetchBits(2u);
+    vec3 en = fetch(3u).xyz;
+    vec4 et = fetch(4u);
+    vec2 uv = fetch(5u).xy;
+    float sum = add(fw.y, fw.z);
+    sum = add(sum, fw.w);
+    vec4 weights = vec4(sub(1.0, sum), fw.yzw);
+    vec4 bone[12];
+    for (int k = 0; k < 4; ++k)
+        for (int r = 0; r < 3; ++r)
+            bone[3*k+r] = boneRow(indices[k], uint(r));
+    vec3 M[3];
+    vec3 w;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            float a = mul(bone[r][c], weights.x);
+            // These MADs have the palette component first in both VSs.
+            if ((r == 2 && c == 0) || (r == 1 && c == 1)) a = mac(bone[3+r][c], weights.y, a);
+            else a = mac(weights.y, bone[3+r][c], a);
+#ifdef ALPHA_TEST
+            if (r == 1 && c == 1) a = mac(bone[6+r][c], weights.z, a);
+            else
+#endif
+            a = mac(weights.z, bone[6+r][c], a);
+#ifdef ALPHA_TEST
+            if (r == 0 && c == 2) M[r][c] = mac(bone[9+r][c], weights.w, a);
+            else
+#endif
+            if (r == 1 && c == 2) M[r][c] = mac(bone[9+r][c], weights.w, a);
+            else M[r][c] = mac(weights.w, bone[9+r][c], a);
+        }
+        precise float anchor = floor(bone[r].w);
+        float a = sub(bone[r].w, anchor);
+        // Unlike the material VS, the offset is added BEFORE the weighted
+        // fractional translation. Moving it after skinning changes depths.
+        float s = add(p.off[r], anchor);
+        s = mac(weights.x, a, s);
+        s = mac(weights.y, sub(bone[3+r].w, anchor), s);
+        s = mac(weights.z, sub(bone[6+r].w, anchor), s);
+        s = mac(weights.w, sub(bone[9+r].w, anchor), s);
+        s = mac(M[r].x, x.x, s);
+        s = mac(M[r].y, x.y, s);
+        w[r] = mac(M[r].z, x.z, s);
+        if (p.cam.w != 0.0) w[r] = sub(w[r], p.cam[r]);
+    }
+    vec3 e = vec3(dot3(p.rot[0], w), dot3(p.rot[1], w), dot3(p.rot[2], w));
+    vec4 clip;
+    for (int r = 0; r < 4; ++r)
+        clip[r] = mac(p.proj[r].z, e.z,
+                      mac(p.proj[r].y, e.y, mac(p.proj[r].x, e.x, p.proj[r].w)));
+#ifdef ALPHA_TEST
+    // s_buffer_load at 0x2dc, added to clip z at 0x3f4 (before clip conversion).
+    clip.z = add(p.world[0].x, clip.z);
+#endif
+    vec4 pos = clip;
+    // Export adjustment is NOT precise in the translator.
+    if (p.nrm.w != 0u) pos.z = (pos.z + pos.w) * 0.5;
+    gl_Position = pos;
+    const float k = uintBitsToFloat(0x40008102u);
+    vec3 on, ot;
+    for (int c = 0; c < 3; ++c) {
+        on[c] = mac(k, en[c], -1.0);
+        ot[c] = mac(k, et[c], -1.0);
+    }
+    vec3 normal, tan;
+    for (int r = 0; r < 3; ++r) {
+        float a = mul(M[r].x, on.x);
+        // The opaque r2 normal MAD has M.y first; hair's MAC has on.y first.
+#ifndef ALPHA_TEST
+        if (r == 2) a = mac(M[r].y, on.y, a);
+        else
+#endif
+        a = mac(on.y, M[r].y, a);
+#ifdef ALPHA_TEST
+        if (r == 0) normal[r] = mac(M[r].z, on.z, a);
+        else
+#endif
+#ifndef ALPHA_TEST
+        if (r == 1) normal[r] = mac(M[r].z, on.z, a);
+        else
+#endif
+        normal[r] = mac(on.z, M[r].z, a);
+        a = mul(M[r].x, ot.x);
+#ifdef ALPHA_TEST
+        if (r == 1) a = mac(M[r].y, ot.y, a);
+        else
+#endif
+        a = mac(ot.y, M[r].y, a);
+        tan[r] = mac(ot.z, M[r].z, a);
+    }
+    vec3 vn, vt;
+    for (int r = 0; r < 3; ++r) {
+        // The shader's last multiply is rotation.z * input.z, not a dot builtin.
+        vn[r] = dot3(p.rot[r], normal);
+        vt[r] = dot3(p.rot[r], tan);
+    }
+    n = vec4(vn, clip.w);
+    t = vec4(uv, 0.0, 0.0);
+    tangent = vec4(vt, mac(k, et.w, -1.0));
+}
+)";
+
+constexpr const char* kSkinFs = R"(
+layout(location = 0) in vec4 n;
+layout(location = 1) in vec4 t;
+layout(location = 2) in vec4 tangent;
+layout(set = 0, binding = 8) uniform sampler2D normalMap;
+#ifdef ALPHA_TEST
+layout(set = 0, binding = 9) uniform sampler2D mask0;
+layout(set = 0, binding = 10) uniform sampler2D mask1;
+#endif
+layout(location = 0) out vec4 color;
+float F(uint x) { return uintBitsToFloat(x); }
+uint U(float x) { return floatBitsToUint(x); }
+uint sat(float x, bool c) { return U(c ? clamp(x, 0.0, 1.0) : x); }
+void main() {
+#ifdef ALPHA_TEST
+    // No precise here: like every arithmetic instruction in these PS translations.
+    uint alpha = sat(texture(mask1, t.xy).w * texture(mask0, t.xy).z + (-p.off.w), false);
+    if (F(0u) > F(alpha)) discard;
+#endif
+    vec2 sampleRG = texture(normalMap, t.xy).xy;
+    uint v0, v1, v2 = U(sampleRG.x), v3 = U(sampleRG.y);
+    uint v4 = U(n.z), v5 = U(n.y), v6 = U(tangent.z);
+    uint v7 = U(tangent.y), v8 = U(n.x), v9 = U(tangent.x);
+    uint v10, v11, v12 = U(tangent.w), v13;
+v10 = sat(F(v5) * F(v6), false);
+v1 = sat(F(v4) * F(v9), false);
+v10 = sat(F(v7) * (-F(v4)) + F(v10), false);
+v11 = sat(F(v12) * F(v10), false);
+v0 = sat(F(v8) * F(v7), false);
+v1 = sat(F(v6) * (-F(v8)) + F(v1), false);
+v10 = sat(F(v12) * F(v1), false);
+v0 = sat(F(v9) * (-F(v5)) + F(v0), false);
+v1 = sat(F(v12) * F(v0), false);
+v0 = 0x3efefeffu;
+v12 = sat(2.0 * F(v2) + -1.0, false);
+v13 = sat(F(v12) * F(v12), false);
+v2 = sat(2.0 * F(v3) + -1.0, false);
+v13 = sat(F(v2) * F(v2) + F(v13), false);
+v3 = sat(1.0 - F(v13), true);
+v9 = sat(F(v9) * F(v12), false);
+v3 = sat(sqrt(F(v3)), false);
+v13 = sat(F(v11) * F(v2) + F(v9), false);
+v7 = sat(F(v7) * F(v12), false);
+v13 = sat(F(v3) * F(v8) + F(v13), false);
+v8 = sat(F(v6) * F(v12), false);
+v7 = sat(F(v2) * F(v10) + F(v7), false);
+v6 = sat(F(v13) * F(v13), false);
+v7 = sat(F(v3) * F(v5) + F(v7), false);
+v8 = sat(F(v2) * F(v1) + F(v8), false);
+v6 = sat(F(v7) * F(v7) + F(v6), false);
+v8 = sat(F(v3) * F(v4) + F(v8), false);
+v6 = sat(F(v8) * F(v8) + F(v6), false);
+v2 = sat(inversesqrt(F(v6)), false);
+v3 = sat(F(v2) * F(v13), false);
+v4 = sat(F(v2) * F(v7), false);
+v1 = sat(F(v2) * F(v8), false);
+v2 = sat(F(v0) * F(v3) + F(0x3efefeffu), false);
+v3 = sat(F(v0) * F(v4) + F(0x3efefeffu), false);
+v0 = sat(F(v0) * F(v1) + F(0x3efefeffu), false);
+v1 = packHalf2x16(vec2(F(v2), F(v3)));
+v0 = packHalf2x16(vec2(F(v0), 1.0));
+    vec4 v = vec4(unpackHalf2x16(v1), unpackHalf2x16(v0));
+    uint s = p.pos.w;
+    color = vec4(v[s & 3u], v[(s >> 2) & 3u], v[(s >> 4) & 3u], v[(s >> 6) & 3u]);
+}
+)";
+
 // Where the shaders' scalar loads are (offsets from the vertex shader's start).
 struct Loads {
     uint32_t offset, world, world2, flags, camera, rotation, rotation2, projection;
@@ -180,12 +393,17 @@ public:
     int claims(const std::string& psName) const override {
         if (psName == "ps_normal.pso") return kOpaque;
         if (psName == "ps_normal_pt.pso") return kAlphaTest;
+        // Name aliases (+1 in capture-5) identify the same program role.
+        if (psName == "ps_normal_mask_n.pso" || psName == "ps_normal_mask_n.pso +1") return kSkinOpaque;
+        if (psName == "ps_normal_mask_n_hair_pt.pso" || psName == "ps_normal_mask_n_hair_pt.pso +1") return kSkinHair;
         return 0;
     }
 
     bool draw(int role, const Draw& d, Gpu& gpu) override {
-        const bool alpha = role == kAlphaTest;
-        const char* vs = alpha ? "vs_normal_rigid_pt.vso" : "vs_normal_rigid.vso";
+        const bool skin = skinRole(role), alpha = alphaRole(role);
+        if (skin && !d.compareCopy) return decline(role, "not yet matched (drawn into compare copies only)");
+        const char* vs = skin ? (alpha ? "vs_normal_skin_n_pt.vso" : "vs_normal_skin_n.vso") :
+                               (alpha ? "vs_normal_rigid_pt.vso" : "vs_normal_rigid.vso");
         if (!d.vsName || *d.vsName != vs) return decline(role, "another vertex shader");
         // The depths must be the translated ones: with an upscaler the scene's draws are jittered
         // and the camera read from the first of them, which stays with the translated renderer.
@@ -197,6 +415,7 @@ public:
         if (d.blend || d.stencil) return decline(role, "blending or stencil");
         if (d.instances != 1) return decline(role, "instanced");
         if (d.primitive != 4) return decline(role, "not a triangle list");
+        if (skin) return drawSkin(role, d, gpu);
         // Fetch slots: the position (v4: x, y, z), the normal (v8: x, y, z), the coordinates (v12: x, y).
         const VertexBuffer* slot[3] = {};
         for (const VertexBuffer& v : d.vertex)
@@ -304,12 +523,153 @@ public:
     }
 
 private:
+
+    bool drawSkin(int role, const Draw& d, Gpu& gpu) {
+        const bool alpha = role == kSkinHair;
+        const auto& z = d.depthStencil;
+        // DB_DEPTH_CONTROL 0x736: depth test/write, LEQUAL, stencil disabled.
+        // The stencil ASPECT is still attached, exactly as for the rigid roles.
+        if (!d.indexed || !d.index.buffer ||
+            (d.indexType != VK_INDEX_TYPE_UINT16 && d.indexType != VK_INDEX_TYPE_UINT32))
+            return decline(role, "not an indexed triangle list");
+        if (d.color[0].format != VK_FORMAT_R8G8B8A8_UNORM || d.color[0].width != 2560 || d.color[0].height != 1472 ||
+            d.color[0].swap != 1 || d.color[0].comps != 4 || d.writeMask != 0xf ||
+            d.depth.format != VK_FORMAT_D32_SFLOAT_S8_UINT || !d.hasStencil)
+            return decline(role, "another target or depth format/shape");
+        if (!d.depthTest || !d.depthWrite || !z.depthTestEnable || !z.depthWriteEnable ||
+            z.depthCompareOp != VK_COMPARE_OP_LESS_OR_EQUAL || z.depthBoundsTestEnable || z.stencilTestEnable)
+            return decline(role, "another depth state");
+        const VertexBuffer* slot[6] = {};
+        const VertexBuffer* palette = nullptr;
+        constexpr uint32_t palettePc[] = {0x3c, 0x44, 0x4c, 0x84, 0x8c, 0x94, 0x9c, 0xc4, 0xcc, 0xe8, 0xf0, 0xfc};
+        uint32_t seen = 0;
+        for (const VertexBuffer& v : d.vertex) {
+            if (v.slot >= 0 && v.slot < 6 && v.components) {
+                if (slot[v.slot]) return decline(role, "duplicate vertex input");
+                slot[v.slot] = &v;
+                continue;
+            }
+            if (v.slot >= 0) return decline(role, "another fetch slot");
+            int at = -1;
+            for (int i = 0; i < 12; ++i) if (v.pc == palettePc[i]) at = i;
+            if (at < 0 || (seen & (1u << at))) return decline(role, "another palette load");
+            seen |= 1u << at;
+            if (v.stride != 16 || v.records != 2097152 || v.offset || v.data.byteOffset % 4 ||
+                v.dfmt != 14 || v.nfmt != 7 || v.dstSel != 0xfac || !v.data.buffer ||
+                v.data.byteOffset > v.data.range || v.data.range - v.data.byteOffset < 256 * 48)
+                return decline(role, "another palette layout");
+            if (palette && (palette->data.buffer != v.data.buffer || palette->data.offset != v.data.offset ||
+                            palette->data.byteOffset != v.data.byteOffset || palette->data.range != v.data.range))
+                return decline(role, "palette loads disagree");
+            palette = &v;
+        }
+        if (seen != 0xfff || !palette) return decline(role, "a palette load missing");
+        constexpr uint32_t dfmt[] = {13, 10, 10, 10, 10, 5};
+        constexpr uint32_t nfmt[] = {7, 0, 4, 0, 0, 7};
+        constexpr uint32_t components[] = {3, 4, 4, 3, 4, 2};
+        constexpr uint32_t select[] = {0x3ac, 0xfac, 0xfac, 0xfac, 0xfac, 0x22c};
+        constexpr uint32_t displacement[] = {0, 12, 16, 20, 24, 28};
+        constexpr uint32_t bytes[] = {12, 4, 4, 4, 4, 4};
+        uint32_t constants[7][4]{};
+        VkDescriptorBufferInfo buffers[8]{};
+        for (int i = 0; i < 6; ++i) {
+            const VertexBuffer* v = slot[i];
+            if (!v || !v->data.buffer || v->stride != 32 || v->indexVgpr || v->offset ||
+                v->dfmt != dfmt[i] || v->nfmt != nfmt[i] || v->components != components[i] ||
+                v->dstSel != select[i] || !v->records || v->data.byteOffset % 4)
+                return decline(role, "another stride-32 skin fetch format");
+            const auto& base = slot[0]->data;
+            if (v->data.buffer != base.buffer || v->records != slot[0]->records ||
+                v->data.offset + v->data.byteOffset != base.offset + base.byteOffset + displacement[i] ||
+                v->data.byteOffset > v->data.range ||
+                uint64_t(v->records - 1) * 32 + bytes[i] > v->data.range - v->data.byteOffset)
+                return decline(role, "not one interleaved skin stream");
+            constants[i][0] = v->data.byteOffset / 4;
+            constants[i][1] = 8;
+            constants[i][2] = v->dfmt | v->nfmt << 4;
+            constants[i][3] = v->records;
+            buffers[i] = {v->data.buffer, v->data.offset, v->data.range};
+        }
+        constants[6][0] = palette->data.byteOffset / 4;
+        buffers[6] = {palette->data.buffer, palette->data.offset, palette->data.range};
+        Push push{};
+        auto get = [&](uint32_t pc, float* out, uint32_t n) {
+            return d.vsLoad && d.vsLoad(pc, reinterpret_cast<uint32_t*>(out), n);
+        };
+        uint32_t flags;
+        if (!get(alpha ? 0x104 : 0x108, push.off, 4) || !d.vsLoad || !d.vsLoad(0x11c, &flags, 1) ||
+            !get(alpha ? 0x354 : 0x340, push.rot, 8) || !get(alpha ? 0x35c : 0x348, push.rot + 8, 4) ||
+            !get(alpha ? 0x358 : 0x344, push.proj, 16))
+            return decline(role, "the skin vertex constants are missing");
+        const bool subtract = !((flags & 0x80000) && !(flags & 0x100000));
+        if (subtract && !get(alpha ? 0x2c4 : 0x2bc, push.cam, 4)) return decline(role, "no skin camera constants");
+        push.cam[3] = subtract ? 1.0f : 0.0f;
+        if (alpha && !get(0x2dc, push.world, 1)) return decline(role, "no hair depth offset");
+        VkDescriptorImageInfo images[3]{};
+        const uint32_t texturePc[] = {alpha ? 0x70u : 0x24u, 0x34, 0x3c};
+        const uint32_t textures = alpha ? 3 : 1;
+        for (uint32_t i = 0; i < textures; ++i) {
+            const Texture* t = nullptr;
+            for (const Texture& candidate : d.textures) if (candidate.pc == texturePc[i]) {
+                if (t) return decline(role, "duplicate skin texture");
+                t = &candidate;
+            }
+            if (!t || !t->view || !t->sampler) return decline(role, "no skin texture");
+            if (t->scale[0] != 1.0f || t->scale[1] != 1.0f) return decline(role, "a scaled skin texture");
+            images[i] = {t->sampler, t->view, VK_IMAGE_LAYOUT_GENERAL};
+        }
+        if (alpha) {
+            uint32_t threshold;
+            if (!d.load || !d.load(0x44, &threshold, 1)) return decline(role, "no hair alpha threshold");
+            std::memcpy(&push.off[3], &threshold, sizeof threshold);
+        }
+        int32_t sw[4];
+        swizzle(d.color[0], sw);
+        push.pos[3] = uint32_t(sw[0] | sw[1] << 2 | sw[2] << 4 | sw[3] << 6);
+        push.nrm[3] = d.clipZHalf ? 1 : 0;
+        Buffer uploaded;
+        if (!gpu.upload(constants, sizeof constants, uploaded)) return decline(role, "no room for skin fetch constants");
+        buffers[7] = {uploaded.buffer, uploaded.offset, uploaded.range};
+        const VkPipeline pipe = pipeline(gpu, role, d);
+        if (!pipe) return decline(role, "no pipeline");
+        if (!logged_[role].exchange(true))
+            std::fprintf(stderr, "[native] prepass: drawing %s into compare copies only\n", roleName(role));
+        gpu.beginRendering(d.color, 1, d.depth, d.hasStencil);
+        const VkRect2D sc{{d.scissor[0], d.scissor[1]}, {uint32_t(d.scissor[2]), uint32_t(d.scissor[3])}};
+        gpu.record([pipe, layout = layouts_[role], push, buffers, images, textures, vp = d.vkViewport, sc,
+                    index = d.index, indexType = d.indexType, first = d.firstIndex, count = d.count,
+                    pushSet = gpu.pushDescriptorSet()](VkCommandBuffer c) {
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            vkCmdSetViewport(c, 0, 1, &vp);
+            vkCmdSetScissor(c, 0, 1, &sc);
+            VkWriteDescriptorSet writes[11]{};
+            for (uint32_t i = 0; i < 8 + textures; ++i) {
+                auto& w = writes[i];
+                w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w.dstBinding = i;
+                w.descriptorCount = 1;
+                if (i < 8) {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    w.pBufferInfo = &buffers[i];
+                } else {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                    w.pImageInfo = &images[i - 8];
+                }
+            }
+            pushSet(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 8 + textures, writes);
+            vkCmdPushConstants(c, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, &push);
+            vkCmdBindIndexBuffer(c, index.buffer, index.offset + index.byteOffset, indexType);
+            vkCmdDrawIndexed(c, count, 1, first, 0, 0);
+        });
+        return true;
+    }
+
     // Logs each reason once.
     bool decline(int role, const char* why) {
         std::lock_guard lock(m_);
         if (declined_[role].insert(why).second && declined_[role].size() <= 16)
             std::fprintf(stderr, "[native] prepass: a %s draw left to the translated renderer (%s)\n",
-                         role == kAlphaTest ? "ps_normal_pt" : "ps_normal", why);
+                         roleName(role), why);
         return false;
     }
 
@@ -322,9 +682,9 @@ private:
         if (auto it = pipes_.find(key); it != pipes_.end()) return it->second;
         VkPipeline& out = pipes_[key];
         const VkDevice dev = gpu.device();
-        const bool alpha = role == kAlphaTest;
+        const bool skin = skinRole(role), alpha = alphaRole(role);
         if (!layouts_[role]) {
-            const VkDescriptorSetLayoutBinding b[5] = {
+            VkDescriptorSetLayoutBinding b[11] = {
                 {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
                 {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
                 {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
@@ -333,7 +693,13 @@ private:
             };
             VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
             dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-            dl.bindingCount = alpha ? 5 : 2;
+            if (skin) {
+                for (uint32_t i = 0; i < 8; ++i)
+                    b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+                for (uint32_t i = 8; i < (alpha ? 11u : 9u); ++i)
+                    b[i] = {i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+            }
+            dl.bindingCount = skin ? (alpha ? 11 : 9) : (alpha ? 5 : 2);
             dl.pBindings = b;
             if (vkCreateDescriptorSetLayout(dev, &dl, nullptr, &setLayouts_[role]) != VK_SUCCESS) return out = VK_NULL_HANDLE;
             const VkPushConstantRange pr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, uint32_t(sizeof(Push))};
@@ -347,9 +713,10 @@ private:
                 return out = VK_NULL_HANDLE;
             }
         }
-        const std::string defs = alpha ? "#define ALPHA_TEST\n" : "";
-        const VkShaderModule vsm = gpu.shader(std::string(kHeader) + defs + kVs, Gpu::Stage::Vertex);
-        const VkShaderModule fsm = gpu.shader(std::string(kHeader) + defs + kFs, Gpu::Stage::Fragment);
+        const std::string defs = std::string(alpha ? "#define ALPHA_TEST\n" : "") + (skin ? "#define PREPASS_SKIN\n" : "");
+        const std::string vertex = skin ? std::string(kSkinVs) + kSkinFetch + kSkinMain : std::string(kVs);
+        const VkShaderModule vsm = gpu.shader(std::string(kHeader) + defs + vertex, Gpu::Stage::Vertex);
+        const VkShaderModule fsm = gpu.shader(std::string(kHeader) + defs + (skin ? kSkinFs : kFs), Gpu::Stage::Fragment);
         if (!vsm || !fsm) return out = VK_NULL_HANDLE;
         VkPipelineShaderStageCreateInfo st[2]{};
         st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vsm, "main", nullptr};
@@ -403,12 +770,12 @@ private:
     }
 
     std::map<std::tuple<int, int, int, int, bool, VkBool32, VkBool32, int, int, int>, VkPipeline> pipes_;
-    VkDescriptorSetLayout setLayouts_[3] = {};
-    VkPipelineLayout layouts_[3] = {};
-    std::atomic<bool> logged_[3] = {};
+    VkDescriptorSetLayout setLayouts_[kRoleCount] = {};
+    VkPipelineLayout layouts_[kRoleCount] = {};
+    std::atomic<bool> logged_[kRoleCount] = {};
     // Recorder threads draw concurrently: the pipelines and logs are guarded.
     std::mutex m_;
-    std::set<std::string> declined_[3];
+    std::set<std::string> declined_[kRoleCount];
 };
 
 } // namespace
