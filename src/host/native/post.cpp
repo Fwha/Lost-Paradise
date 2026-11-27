@@ -1270,6 +1270,9 @@ layout(set=0, binding=1, std430) readonly buffer V1 { uint w[]; } v1;
 layout(location=0) out vec4 a0;
 layout(location=1) out vec4 a1;
 layout(location=2) out vec4 a2;
+float F(uint x) { return uintBitsToFloat(x); }
+uint U(float x) { return floatBitsToUint(x); }
+uint sat(float x,bool c) { return U(c?clamp(x,0.0,1.0):x); }
 vec4 fetch(int slot) {
     uvec4 f=p.fetch[slot];
     uint index=uint(gl_VertexIndex);
@@ -1286,12 +1289,16 @@ vec4 fetch(int slot) {
 }
 void main() {
     vec4 pos=fetch(0);
-    vec2 xy=mac(c[0].xy,pos.xy,c[0].zw);
-    gl_Position=vec4(xy,pos.zw);
-    if (p.flags.x!=0u) gl_Position.z=mul(gl_Position.z+gl_Position.w,0.5);
+    uint x,y,rx,ry;
+    { precise float r=c[0].x*pos.x+c[0].z; x=sat(r,false); }
+    { precise float r=c[0].y*pos.y+c[0].w; y=sat(r,false); }
+    gl_Position=vec4(F(x),F(y),pos.zw);
+    if (p.flags.x!=0u) gl_Position.z=(gl_Position.z+gl_Position.w)*0.5;
     // param0 is UV; param1 is the view ray, using the unadjusted position.
+    { precise float r=c[1].x*F(x); rx=sat(r,false); }
+    { precise float r=c[1].y*F(y); ry=sat(r,false); }
+    a1=vec4(F(rx),F(ry),c[1].z,0.0);
     a0=vec4(fetch(1).xy,0.0,0.0);
-    a1=vec4(mul(c[1].x,xy.x),mul(c[1].y,xy.y),c[1].z,0.0);
     a2=vec4(0.0);
 }
 )";
@@ -1303,89 +1310,101 @@ layout(location=0) out vec4 outColour;
 layout(set=0,binding=3) uniform sampler2D sceneDepth;
 layout(set=0,binding=4) uniform sampler2DShadow shadowTex[16];
 // resolveImage(im) supplies sampler(im.s,im.compare) and a depth-aspect view.
-// Pixel fres() permits contraction; do not use kHeader's precise helpers.
-vec3 shadowProject(int row,vec3 q) {
-    float w=c[row+3].w;
-    float x=c[row].x*q.x;
-    float y=c[row+1].x*q.x;
-    w=c[row+3].x*q.x+w;
-    y=c[row+1].y*q.y+y;
-    x=c[row].y*q.y+x;
-    w=c[row+3].y*q.y+w;
-    x=c[row].z*q.z+x;
-    w=c[row+3].z*q.z+w;
-    y=c[row+1].z*q.z+y;
-    x=c[row].w+x;
-    float r=1.0/w;
-    y=c[row+1].w+y;
-    return vec3(r*x,r*y,r);
+// Match the translated register boundaries; PS expressions may contract.
+float F(uint x) { return uintBitsToFloat(x); }
+uint U(float x) { return floatBitsToUint(x); }
+uint sat(float x,bool c) { return U(c?clamp(x,0.0,1.0):x); }
+uvec3 shadowProject(int row,uvec3 q) {
+    uint w=U(c[row+3].w);
+    uint x=sat(c[row].x*F(q.x),false);
+    uint y=sat(c[row+1].x*F(q.x),false);
+    w=sat(c[row+3].x*F(q.x)+F(w),false);
+    y=sat(c[row+1].y*F(q.y)+F(y),false);
+    x=sat(c[row].y*F(q.y)+F(x),false);
+    w=sat(c[row+3].y*F(q.y)+F(w),false);
+    x=sat(c[row].z*F(q.z)+F(x),false);
+    w=sat(c[row+3].z*F(q.z)+F(w),false);
+    y=sat(c[row+1].z*F(q.z)+F(y),false);
+    x=sat(c[row].w+F(x),false);
+    uint r=sat(1.0/F(w),false);
+    y=sat(c[row+1].w+F(y),false);
+    x=sat(F(r)*F(x),false);
+    y=sat(F(r)*F(y),false);
+    return uvec3(x,y,r);
 }
-float shadowReference(int row,vec3 q,float r) {
-    float z=c[row+2].x*q.x;
-    z=c[row+2].y*q.y+z;
-    z=c[row+2].z*q.z+z;
-    z=c[row+2].w+z;
-    return min(1.0,r*z);
+uint shadowReference(int row,uvec3 q,uint r) {
+    uint z=sat(c[row+2].x*F(q.x),false);
+    z=sat(c[row+2].y*F(q.y)+F(z),false);
+    z=sat(c[row+2].z*F(q.z)+F(z),false);
+    z=sat(c[row+2].w+F(z),false);
+    z=sat(F(r)*F(z),false);
+    return sat(min(1.0,F(z)),false);
 }
-bool shadowInside(vec2 uv) {
+bool shadowInside(uvec2 uv) {
     // Preserve the translated max+clamp+equality checks, including NaNs.
-    return uv.y==clamp(max(0.0,uv.y),0.0,1.0) &&
-           uv.x==clamp(max(0.0,uv.x),0.0,1.0);
+    uint y=sat(max(F(0u),F(uv.y)),true);
+    uint x=sat(max(F(0u),F(uv.x)),true);
+    return F(uv.y)==F(y) && F(uv.x)==F(x);
 }
 // Literal sampler indices avoid sampled-image dynamic indexing requirements.
-#define SHADOW_TAP(i,uv,z) texture(shadowTex[i],vec3((uv)*c[33+(i)].xy,z))
+#define SHADOW_TAP(i,uv,z) U(texture(shadowTex[i],vec3((uv)*c[33+(i)].xy,F(z))))
 #define SHADOW_GROUP(name,base,row,offset,firstLeft) \
-float name(vec3 q) { \
-    vec3 uv=shadowProject(row,q); \
-    if (!shadowInside(uv.xy)) return 1.0; \
-    float z=shadowReference(row,q,uv.z); \
-    float e=c[offset].x; \
-    float yp=e+uv.y, xm=uv.x-e, xp=e+uv.x, ym=uv.y-e; \
-    float t0=SHADOW_TAP(base,vec2(firstLeft?xm:xp,yp),z); \
-    float t1=SHADOW_TAP(base+1,vec2(firstLeft?xp:xm,yp),z); \
-    float t2=SHADOW_TAP(base+2,vec2(xp,ym),z); \
-    float t3=SHADOW_TAP(base+3,vec2(xm,ym),z); \
-    float sum=firstLeft?t1+t0:t0+t1; \
-    sum=sum+t2; \
-    float last=0.25*t3; \
-    return sum*0.25+last; \
+uint name(uvec3 q) { \
+    uvec3 uv=shadowProject(row,q); \
+    if (!shadowInside(uv.xy)) return U(1.0); \
+    uint z=shadowReference(row,q,uv.z); \
+    uint e=U(c[offset].x); \
+    uint yp=sat(F(e)+F(uv.y),false); \
+    uint xm=sat(F(uv.x)-F(e),false); \
+    uint xp=sat(F(e)+F(uv.x),false); \
+    uint ym=sat(F(uv.y)-F(e),false); \
+    uint t0=SHADOW_TAP(base,vec2(F(firstLeft?xm:xp),F(yp)),z); \
+    uint t1=SHADOW_TAP(base+1,vec2(F(firstLeft?xp:xm),F(yp)),z); \
+    uint t2=SHADOW_TAP(base+2,vec2(F(xp),F(ym)),z); \
+    uint t3=SHADOW_TAP(base+3,vec2(F(xm),F(ym)),z); \
+    uint sum=sat(firstLeft?F(t1)+F(t0):F(t0)+F(t1),false); \
+    sum=sat(F(sum)+F(t2),false); \
+    uint last=sat(F(0x3e800000u)*F(t3),false); \
+    return sat(F(sum)*F(0x3e800000u)+F(last),false); \
 }
 SHADOW_GROUP(shadowNear,0,8,24,true)
 SHADOW_GROUP(shadowMiddle,4,12,25,false)
 SHADOW_GROUP(shadowFar,8,16,26,false)
 SHADOW_GROUP(shadowCharacter,12,20,27,false)
 void main() {
-    float depth=texture(sceneDepth,a0.xy*c[32].xy).x;
+    uint depth=U(texture(sceneDepth,a0.xy*c[32].xy).x);
     if ((floatBitsToUint(c[4].x)&32u)==0u) {
-        float r=c[5].x+depth;
-        r=1.0/r;
-        depth=c[5].y*r;
+        uint r=sat(c[5].x+F(depth),false);
+        r=sat(1.0/F(r),false);
+        depth=sat(c[5].y*F(r),false);
     }
-    float nearWeight=c[6].x*c[6].y;
-    nearWeight=clamp(c[6].y*(-depth)+nearWeight,0.0,1.0);
-    vec3 q=vec3(depth*a1.x,depth*a1.y,depth*a1.z);
-    float nearShadow=1.0;
-    if (0.0<nearWeight) nearShadow=shadowNear(q);
-    float farWeight=c[6].w*depth;
-    float remainder=1.0-nearWeight;
-    farWeight=clamp((-c[6].z)*c[6].w+farWeight,0.0,1.0);
-    float middleWeight=remainder-farWeight;
-    float middleShadow=1.0;
-    if (remainder>farWeight) middleShadow=shadowMiddle(q);
-    float farShadow=1.0;
-    if (0.0<farWeight) farShadow=shadowFar(q);
-    float character=shadowCharacter(q);
-    float v=middleWeight+nearWeight;
-    v=v+farWeight;
-    v=nearWeight*(-nearShadow)+v;
-    v=middleShadow*(-middleWeight)+v;
-    float fade=clamp(uintBitsToFloat(0x3c800000u)*(-depth)+1.0,0.0,1.0);
-    v=farWeight*(-farShadow)+v;
-    fade=fade*fade;
-    character=v*(-character)+character;
+    uint nearWeight=sat(c[6].x*c[6].y,false);
+    nearWeight=sat(c[6].y*(-F(depth))+F(nearWeight),true);
+    uvec3 q=uvec3(sat(F(depth)*a1.x,false),
+                  sat(F(depth)*a1.y,false),
+                  sat(F(depth)*a1.z,false));
+    uint nearShadow=U(1.0);
+    if (F(0u)<F(nearWeight)) nearShadow=shadowNear(q);
+    uint farWeight=sat(c[6].w*F(depth),false);
+    uint remainder=sat(1.0-F(nearWeight),false);
+    farWeight=sat((-c[6].z)*c[6].w+F(farWeight),true);
+    uint middleWeight=sat(F(remainder)-F(farWeight),false);
+    uint middleShadow=U(1.0);
+    if (F(remainder)>F(farWeight)) middleShadow=shadowMiddle(q);
+    uint farShadow=U(1.0);
+    if (F(0u)<F(farWeight)) farShadow=shadowFar(q);
+    uint character=shadowCharacter(q);
+    uint v=sat(F(middleWeight)+F(nearWeight),false);
+    v=sat(F(v)+F(farWeight),false);
+    v=sat(F(nearWeight)*(-F(nearShadow))+F(v),false);
+    v=sat(F(middleShadow)*(-F(middleWeight))+F(v),false);
+    uint fade=sat(F(0x3c800000u)*(-F(depth))+1.0,true);
+    v=sat(F(farWeight)*(-F(farShadow))+F(v),false);
+    fade=sat(F(fade)*F(fade),false);
+    character=sat(F(v)*(-F(character))+F(character),false);
     // Opcode 303 currently uses nearest-half rounding, despite the RTZ mnemonic.
-    vec4 colour=vec4(unpackHalf2x16(packHalf2x16(vec2(character,1.0))),
-                     unpackHalf2x16(packHalf2x16(vec2(fade,1.0))));
+    vec4 colour=vec4(unpackHalf2x16(packHalf2x16(vec2(F(character),1.0))),
+                     unpackHalf2x16(packHalf2x16(vec2(F(fade),1.0))));
     outColour=vec4(colour[p.swizzle.x],colour[p.swizzle.y],colour[p.swizzle.z],colour[p.swizzle.w]);
 }
 )";
