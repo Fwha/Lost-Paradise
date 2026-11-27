@@ -452,3 +452,17 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   depth matches but its normals differ on many pixels (up to 175/255); an op-by-op check of the
   normal math and constants found nothing, and the remaining candidate is the translated renderer's
   export routing and input defaults (D[20..22]). Compare copies only.
+
+### Long tail: character shadow receivers and skinned alpha-tested depth
+
+- `native/prepass.cpp` roles 5-7 (Codex's port, `~/lost-paradise-re/dis/longtail2/`):
+  - Roles 5-6, the character shadow receivers: vs_sdw_cas3_normal[_pt] / vs_sdw_cas3_skin_pt with
+    ps_sdw_cas3_char1[_pt]. Characters are drawn mesh by mesh into the screen-space shadow target,
+    with three-cascade plus character-map PCF; the _pt variants alpha-test.
+  - Role 7, skinned alpha-tested depth: lin_depth_skin_pt +1 with ps_depth_pt. Depth only, with no
+    colour attachment.
+- The first compare run turned every draw down: the port expected a 2560x1472 depth buffer, and the
+  scene's is 2560x1536.
+- Compare after that fix: role 5 at 0 px (~340 draws), role 6 within 1/255, role 7 at 0 px (~15,000
+  draws). Drawn by default; LPN_PREPASS_LONGTAIL=0 leaves them to the translated renderer.
+  A normal run was clean.
