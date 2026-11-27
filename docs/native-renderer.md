@@ -427,3 +427,14 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
     imageGen_; that was what flickered (found with LPN_COMPARE_STOP=1/2/3, which stops a compared
     draw after routing, building or copying). Frequent imageGen_ moves disturbing translated
     rendering is worth a look if such flicker ever shows outside compare mode.
+
+### Post-processing: screen-space shadows
+
+- `native/post.cpp` role 14 (Codex's port, `~/lost-paradise-re/dis/shadow/`): fx_depth_to_shadow_cas3_char1
+  with fx_depth_to_shadow +50, one full-screen draw a frame. It reads the scene depth and takes 16
+  depth-compare samples (four-tap PCF on each of the three cascades and the character shadow map),
+  blends the cascades by depth and writes the shadow term and a distance fade.
+- Compare runs: within 1/255 on ~0.7% of pixels, never more. That held after the GLSL mirrored the
+  translated arithmetic operation by operation, so the last step's cause is still open. Drawn by
+  default (the outline pass's standard); LPN_POST_SHADOW=0 leaves it to the translated renderer.
+  A normal run with the flash guard was clean.
