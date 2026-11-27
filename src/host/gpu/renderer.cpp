@@ -1105,13 +1105,20 @@ public:
         if (d.engineCheck && native::engineFixedCheckOn()) fixedCheck(d, r);
         // A draw a native pass takes is recorded here, in order (see nativeDraw).
         const bool native = nativeOn_ && d.kind != DrawCall::kDispatch && nativeClaimed(*held);
+        // Compare mode records a native draw here, in order. Of the compared pass's draws, only the
+        // few compareChoose picks: sending all of them here (thousands of haze draws a frame, each
+        // draining the recorder threads' segments) made glows and outlines flicker on screen.
+        bool here = native && !compareWith_.empty();
+        held->compareChosen = false;
+        if (here && compareWith_ == held->psm->nativePass->name())
+            here = held->compareChosen = held->nativeLoads && compareChoose(held->psm->nativeRole);
         if (comparePending_) { // LPN_NATIVE_COMPARE: before a recorder thread takes the next draw
             std::lock_guard lock(m_);
             runCompare();
         }
         if (recordThreads_) {
             // Native draws go to the recorder threads too (but for LPN_NATIVE_COMPARE's, recorded here).
-            if ((!native || compareWith_.empty()) && segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
+            if (!here && segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
                 addToSegment(d, r, held);
                 return;
             }
@@ -6537,12 +6544,18 @@ void main() {
         return &img;
     }
     // Before the translated draw: the copies, and the native pass's draw into them.
-    void nativeCompare(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
+    // Whether the compared pass's next draw is compared (before it is routed: see onDraw).
+    bool compareChoose(int role) {
         if (compareFrame_ != frame_) compareFrame_ = frame_, std::fill(std::begin(compareCount_), std::end(compareCount_), 0u);
         // A budget per role: a role drawn late in the frame is compared too.
-        uint32_t& budget = compareCount_[std::min<uint32_t>(a.psm->nativeRole, kCompareRoles - 1)];
+        uint32_t& budget = compareCount_[std::min<uint32_t>(role, kCompareRoles - 1)];
         // Spread over the frame's draws: every fourth, starting at a different one each frame.
-        if (budget >= kComparePerFrame || (compareSeq_++ + frame_) % 4) return;
+        // Counted once the draw is built (nativeCompare): a chosen draw is compared before the next is chosen.
+        return budget < kComparePerFrame && (compareSeq_++ + frame_) % 4 == 0;
+    }
+    void nativeCompare(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
+        if (!a.compareChosen) return;
+        uint32_t& budget = compareCount_[std::min<uint32_t>(a.psm->nativeRole, kCompareRoles - 1)];
         native::Draw nd;
         Surface* written[8]{};
         Surface* depthWritten = nullptr;
@@ -7973,6 +7986,7 @@ void main() {
         std::vector<BufRes> vsRes, psRes;
         uint64_t resEpoch = 0;
         bool nativeLoads = false; // psLoads and vsLoads are set (a native pass claims the draw)
+        bool compareChosen = false; // LPN_NATIVE_COMPARE: this draw is compared (compareChoose)
         std::shared_ptr<const std::map<uint64_t, uint32_t>> psLoads, vsLoads; // pc -> data offset
     };
     // A draw's launches as the registers give them, for a worker to analyse.

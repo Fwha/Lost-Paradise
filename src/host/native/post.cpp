@@ -1271,7 +1271,14 @@ class Post final : public Pass {
 public:
     const char* name() const override { return "post"; }
     int claims(const std::string& ps) const override {
-        if (ps==kRoles[kHaze].ps) return kHaze;
+        // The haze: compare copies only, and only claimed when LPN_POST_HAZE=1 asks for it (its
+        // compare run flickered on screen before compare mode stopped routing every claimed draw
+        // to the main recorder). Unclaimed, the build draws as it did before the haze port.
+        static const bool haze = [] {
+            const char* e = std::getenv("LPN_POST_HAZE");
+            return e && *e && *e != '0';
+        }();
+        if (ps==kRoles[kHaze].ps) return haze ? kHaze : 0;
         for (int i=1;i<=kToonEdgeFxaa;++i) if (named(ps,kRoles[i].ps)) return i;
         return 0;
     }
