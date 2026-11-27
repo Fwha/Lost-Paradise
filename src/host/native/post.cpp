@@ -727,7 +727,10 @@ public:
             return e && std::string(e) == "post";
         }();
         (void)comparing;
-        if (!d.compareCopy && (role >= kSsao || d.depth.view)) return decline(role, "not yet matched (drawn into compare copies only)");
+        // The SSAO term (role 6) is still off on scattered pixels: compare copies only. The temporal
+        // filter, blurs and upsampling matched exactly in three compare runs (0 px, ~200 draws a
+        // run each) and are drawn; depth or stencil in use stays to compare copies for the glow roles.
+        if (!d.compareCopy && role == kSsao) return decline(role, "not yet matched (drawn into compare copies only)");
         // The SSAO port is wrong (its upsample flashed the screen white indoors when compare mode
         // still drew unmatched roles into the frame): off unless LPN_POST_SSAO=1 asks for it.
         static const bool ssao = [] {
@@ -751,7 +754,8 @@ public:
             }
             return m; // bit 0: the depth-bound glow draws
         }();
-        if (role >= kSsao && (!ssao || !d.compareCopy || !(roles >> role & 1))) return decline(role, "the SSAO port is off");
+        if (role >= kSsao && !(roles >> role & 1)) return decline(role, "the SSAO port is off (LPN_POST_ROLES)");
+        if (role == kSsao && !ssao) return decline(role, "the SSAO term is off (LPN_POST_SSAO=1 compares it)");
         // As the merged glow pass: a depth buffer bound but neither tested nor written is drawn
         // (the 2x4 downsample always has one); depth or stencil in use only into compare copies.
         const bool usesDepth = d.depthTest || d.depthWrite || d.stencil || d.depthStencil.depthTestEnable ||
