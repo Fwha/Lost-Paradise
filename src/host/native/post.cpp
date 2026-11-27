@@ -752,7 +752,12 @@ public:
             return m; // bit 0: the depth-bound glow draws
         }();
         if (role >= kSsao && (!ssao || !d.compareCopy || !(roles >> role & 1))) return decline(role, "the SSAO port is off");
-        if (role < kSsao && d.depth.view && (!ssao || !d.compareCopy || !(roles & 1))) return decline(role, "depth-bound draws are off");
+        // As the merged glow pass: a depth buffer bound but neither tested nor written is drawn
+        // (the 2x4 downsample always has one); depth or stencil in use only into compare copies.
+        const bool usesDepth = d.depthTest || d.depthWrite || d.stencil || d.depthStencil.depthTestEnable ||
+                               d.depthStencil.depthWriteEnable || d.depthStencil.stencilTestEnable ||
+                               d.depthStencil.depthBoundsTestEnable;
+        if (role < kSsao && usesDepth && (!ssao || !d.compareCopy || !(roles & 1))) return decline(role, "depth or stencil");
         if (role==kSsaoBlur || role==kUpsample) {
             // nativeBuild uses shaderNameAt for an unindexed VS: it returns "?".
             // Only these two claimed PSs accept the unnamed vs_fullscreen_53c2a1600.
