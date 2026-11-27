@@ -6555,11 +6555,16 @@ void main() {
     }
     void nativeCompare(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
         if (!a.compareChosen) return;
+        // LPN_COMPARE_STOP (a bisection of compare mode's side effects on the frame): 1 stops after
+        // routing the chosen draw here, 2 after building it, 3 after the copies (no native draw).
+        static const int stop = [] { const char* e = std::getenv("LPN_COMPARE_STOP"); return e ? std::atoi(e) : 0; }();
+        if (stop == 1) return;
         uint32_t& budget = compareCount_[std::min<uint32_t>(a.psm->nativeRole, kCompareRoles - 1)];
         native::Draw nd;
         Surface* written[8]{};
         Surface* depthWritten = nullptr;
         if (!nativeBuild(d, r, a, nd, written, depthWritten) || !comparePipeline()) return;
+        if (stop == 2) return;
         if (!ringFits(1 << 12)) flush();
         begin();
         fullBarrier();
@@ -6593,6 +6598,10 @@ void main() {
             pc.a[8] = view(ds->img, nd.depth.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, VK_IMAGE_ASPECT_DEPTH_BIT);
         }
         barrier();
+        if (stop == 3) {
+            nativeDrawn(nullptr, nullptr);
+            return;
+        }
         NativeGpu gpu(*this);
         const int role = a.psm->nativeRole;
         cd.compareCopy = true;
