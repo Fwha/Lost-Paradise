@@ -1438,8 +1438,10 @@ public:
         // outline pass within 1/255 (~4% of pixels a step off). Drawn by default.
         if (role<kDown2 || role>kShadow) return false;
         if (role==kShadow) {
-            if (!d.compareCopy)
-                return decline(role,"not yet matched (drawn into compare copies only)");
+            // Two compare runs: within 1/255 on ~0.7% of pixels, never more (as the outline pass
+            // was enabled at). Drawn by default; LPN_POST_SHADOW=0 leaves it to the translated renderer.
+            static const bool on = [] { const char* e = std::getenv("LPN_POST_SHADOW"); return !e || *e != '0'; }();
+            if (!on) return decline(role,"off (LPN_POST_SHADOW=0)");
             if (!d.vsName || *d.vsName!=kRoles[kShadow].vs)
                 return decline(role,"another vertex shader");
             if (d.colorCount!=1 || d.color[0].format!=VK_FORMAT_R8G8B8A8_UNORM ||
