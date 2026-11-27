@@ -408,3 +408,22 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   blending) and ps_toon_edge_fxaa.
 - Compare run: finalize and the edge FXAA at 0 px, the outline pass within 1/255 (about 4% of its
   pixels a step off); drawn by default.
+
+### Post-processing: haze
+
+- `native/post.cpp` role 13 (Codex's port, `~/lost-paradise-re/dis/haze/`): fx_haze_pass0 +3 with
+  its two vertex shaders (screen rectangles, and p_dvtx_modulate meshes with their fetch formats
+  decoded in the shader). Other vertex shaders, primitives, pixel positions, polygon offset and
+  culling are left to the translated renderer.
+- Compare run: 0 px on ~850 compared draws; drawn by default (LPN_POST_HAZE=0 leaves it to the
+  translated renderer). A normal run with the flash guard was clean.
+- Compare-mode fixes found on the way (the haze's first compare runs flickered glows and outlines
+  on screen, though the haze itself matched):
+  - The compared draws are chosen before they are routed (compareChoose in onDraw): only those are
+    recorded on the main recorder; every claimed draw used to be, draining the recorder threads'
+    segments thousands of times a frame.
+  - A compare copy is kept for each target index, format and size. Replacing it when the size
+    changed (the haze draws to three sizes) created images many times a frame, each moving
+    imageGen_; that was what flickered (found with LPN_COMPARE_STOP=1/2/3, which stops a compared
+    draw after routing, building or copying). Frequent imageGen_ moves disturbing translated
+    rendering is worth a look if such flicker ever shows outside compare mode.
