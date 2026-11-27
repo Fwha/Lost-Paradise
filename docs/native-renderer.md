@@ -393,8 +393,11 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   upsampling into the scene target with the depth buffer (ps_ssao_upsampling).
 - Compare runs: the temporal filter, blurs and upsampling at 0 px in three runs (~200 draws each)
   once their arithmetic matched the translated shaders' (contraction, round-to-nearest export);
-  drawn by default. The SSAO term still differs on ~0.1% of pixels by up to 100/255 (no cause
-  found): compare copies only, with LPN_POST_SSAO=1.
+  drawn by default. The SSAO term still differs on ~0.1% of pixels by up to 100/255. A
+  step-by-step check against the translated shader (math, sampling, quad handling) found no
+  semantic mismatch. The differences are single occlusion samples tipping across a threshold from
+  rounding, which the normal reconstruction amplifies. Fwha ran it on screen and saw nothing
+  wrong, so it is drawn by default; LPN_POST_SSAO_DRAW=0 leaves it to the translated renderer.
 - Safety, after a compare run flashed the screen white indoors: unmatched roles draw only into
   compare copies (native::Draw::compareCopy), and a flash guard (hle_videoout.cpp; on in compare
   mode or with LPN_FLASH_GUARD=1) logs and holds back frames whose brightness jumps (fades too).
