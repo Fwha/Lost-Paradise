@@ -734,7 +734,12 @@ public:
             const char* e = std::getenv("LPN_POST_SSAO");
             return e && *e && *e != '0';
         }();
-        if (role >= kSsao && !ssao) return decline(role, "the SSAO port is off (LPN_POST_SSAO=1 to draw it)");
+        (void)ssao;
+        // Off entirely, compare mode included: compare runs with these roles and the depth-bound
+        // draws flashed the screen (title, indoors, glowing objects). Glow without depth compared
+        // cleanly; nothing else here may run until compare mode is proven not to touch the frame.
+        if (role >= kSsao) return decline(role, "the SSAO port is off");
+        if (d.depth.view) return decline(role, "depth-bound draws are off");
         if (role==kSsaoBlur || role==kUpsample) {
             // nativeBuild uses shaderNameAt for an unindexed VS: it returns "?".
             // Only these two claimed PSs accept the unnamed vs_fullscreen_53c2a1600.

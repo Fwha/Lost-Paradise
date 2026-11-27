@@ -5495,7 +5495,7 @@ void main() {
     }
     // The draw as a native pass sees it. False when the renderer cannot describe it.
     bool nativeBuild(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a, native::Draw& nd, Surface** written,
-                     Surface*& depthWritten, bool cachedOnly = false) {
+                     Surface*& depthWritten) {
         // Analysed before the claim: without its scalar loads (the next draws have them).
         if (!a.nativeLoads) return false;
         nd.psName = a.psm->gameName;
@@ -5552,7 +5552,7 @@ void main() {
         // The vertex shader's buffers, as bindBuffer resolves them (without the per-draw words).
         auto buffer = [&](uint64_t base, uint64_t size, native::Buffer& out) {
             VkDeviceSize off = 0;
-            if (!vramBuffer(base, size, out.buffer, off, cachedOnly) && !guestBuffer(base, size, out.buffer, off)) return false;
+            if (!vramBuffer(base, size, out.buffer, off) && !guestBuffer(base, size, out.buffer, off)) return false;
             out.offset = off & ~(storageAlign_ - 1);
             out.byteOffset = uint32_t(off - out.offset);
             out.range = std::min<VkDeviceSize>(size + out.byteOffset, vk_.props.limits.maxStorageBufferRange);
@@ -6546,25 +6546,8 @@ void main() {
         native::Draw nd;
         Surface* written[8]{};
         Surface* depthWritten = nullptr;
-        // Called after translated resource preparation. Never flush here: its descriptors
-        // already reference uploads in the current batch's ring.
-        if (!ringFits(1 << 12)) return;
-        struct RestoreSamples {
-            Rec& rec;
-            std::vector<VkImage> samples;
-            ~RestoreSamples() { rec.sampledSurfaces_ = std::move(samples); }
-        } restoreSamples{R(), R().sampledSurfaces_};
-        // Probe existing resources only, even on the main recorder (which holds m_).
-        // A miss declines comparison instead of creating/replacing a game surface, resolving
-        // CPU ownership, or promoting a guest buffer merely for this diagnostic draw.
-        const bool oldShared = R().lockShared_, oldAbort = R().abort_;
-        R().lockShared_ = true;
-        R().abort_ = false;
-        const bool built = nativeBuild(d, r, a, nd, written, depthWritten, true);
-        const bool missed = R().abort_;
-        R().lockShared_ = oldShared;
-        R().abort_ = oldAbort;
-        if (!built || missed || !comparePipeline()) return;
+        if (!nativeBuild(d, r, a, nd, written, depthWritten) || !comparePipeline()) return;
+        if (!ringFits(1 << 12)) flush();
         begin();
         fullBarrier();
         native::Draw cd = nd;
@@ -6574,44 +6557,36 @@ void main() {
             if (!img) return false;
             barrier(); // after a new copy's clear
             const VkImageAspectFlags aspect = depth ? img->aspect : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
-            // Depth and stencil need separate copy regions. Both must survive the native
-            // comparison draw, including the stencil values it tests and updates.
-            std::array<VkImageCopy, 2> regions{};
-            uint32_t count = 0;
-            for (VkImageAspectFlags bit : {VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT}) {
-                if (!(aspect & bit)) continue;
-                VkImageCopy& rg = regions[count++];
-                rg.srcSubresource = rg.dstSubresource = {bit, 0, 0, 1};
-                rg.extent = {t.width, t.height, 1};
-            }
-            rec([c = R().cmd_, src = t.image, dst = img->image, regions, count] {
-                vkCmdCopyImage(c, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, count, regions.data());
+            VkImageCopy rg{};
+            rg.srcSubresource = rg.dstSubresource = {aspect, 0, 0, 1};
+            rg.extent = {t.width, t.height, 1};
+            rec([c = R().cmd_, src = t.image, dst = img->image, rg] {
+                vkCmdCopyImage(c, src, VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
             });
             const VkImageAspectFlags sampled = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-            pc.a[index] = depth ? VK_NULL_HANDLE : t.view;
+            pc.a[index] = t.view ? (depth ? view(*img, t.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, sampled) : t.view) : VK_NULL_HANDLE;
             pc.b[index] = view(*img, t.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, sampled);
             t.image = img->image;
-            t.view = view(*img, t.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, depth ? img->aspect : 0);
+            t.view = view(*img, t.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, depth ? img->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT : 0);
             return true;
         };
         for (uint32_t i = 0; i < cd.colorCount; ++i)
             if (cd.color[i].view && !copy(i, cd.color[i], false)) return;
         if (cd.depth.view) {
             // The real depth buffer, sampled: its depth aspect.
-            auto ds = depths_.find(nd.depth.address);
-            if (ds == depths_.end() || ds->second.img.image != nd.depth.image) return;
+            Surface* ds = depthSurface(nd.depth.address, nd.depth.width, nd.depth.height, nd.depth.format);
+            if (!ds) return;
             if (!copy(8, cd.depth, true)) return;
-            pc.a[8] = view(ds->second.img, nd.depth.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, VK_IMAGE_ASPECT_DEPTH_BIT);
+            pc.a[8] = view(ds->img, nd.depth.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, VK_IMAGE_ASPECT_DEPTH_BIT);
         }
         barrier();
         NativeGpu gpu(*this);
         const int role = a.psm->nativeRole;
         cd.compareCopy = true;
         const bool drawn = a.psm->nativePass->draw(role, cd, gpu);
-        // Account for the copy pass before the barrier retires its reads and writes.
-        nativeDrawn(nullptr, nullptr);
         endPass();
         barrier();
+        nativeDrawn(nullptr, nullptr);
         ++budget;
         if (!drawn) {
             ++compareDeclined_[std::min<uint32_t>(role, kCompareRoles - 1)];
@@ -8825,18 +8800,18 @@ void main() {
         if (!a.ok) return;
         if (d.engineCheck && native::enginePrepassCheckOn()) prepassCheck(d, r, a);
         if (upOn_ && a.psm && a.psm->smaa && upscaleSmaa(r, a.psm->smaa, a)) return;
-        const bool compare = nativeOn_ && !R().worker_ && a.psm && a.psm->nativePass &&
-                             !compareWith_.empty() && compareWith_ == a.psm->nativePass->name();
         if (nativeOn_ && !R().worker_) {
             runCompare(); // the last compared draw's: its translated draw is recorded by now
-            // Compare runs keep every real draw translated, including other native passes.
-            if (compareWith_.empty() && a.psm && a.psm->nativePass && nativeDraw(d, r, a)) return;
+            if (a.psm && a.psm->nativePass) {
+                if (!compareWith_.empty() && compareWith_ == a.psm->nativePass->name()) nativeCompare(d, r, a); // and drawn as usual
+                else if (nativeDraw(d, r, a)) return;
+            }
         } else if (nativeOn_ && compareWith_.empty() && a.psm && a.psm->nativePass && nativeDraw(d, r, a)) {
             return; // on a recorder thread, in its segment
         }
         const bool wasMergeable = R().lastMergeable_;
         R().lastMergeable_ = false;
-        if (!compare && (fastDraw(d, r, a, wasMergeable) || switchDraw(d, r, a))) return;
+        if (fastDraw(d, r, a, wasMergeable) || switchDraw(d, r, a)) return;
         stashFast();
         // A recorder thread looks the caches up holding m_ shared first: almost every full draw
         // only finds what it needs. One that would change a cache (sharedMiss) starts over here
@@ -9073,10 +9048,6 @@ void main() {
         // overlook, holding m_ to the end of each full draw left the threads waiting for it half
         // their time.
         wl.unlock();
-
-        // Resolve the real draw first, including gpuWrote/CPU ownership and texture memos.
-        // Snapshot before it renders, with its prepared descriptors and targets unchanged.
-        if (compare) nativeCompare(d, r, a);
 
         // Consecutive draws into the same targets share a render pass. A new pass starts behind a
         // full barrier, as before every draw, so earlier passes, copies and dispatches are visible.
