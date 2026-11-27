@@ -407,7 +407,12 @@ public:
 
     bool draw(int role, const Draw& d, Gpu& gpu) override {
         const bool skin = skinRole(role), alpha = alphaRole(role);
-        if (skin && !d.compareCopy) return decline(role, "not yet matched (drawn into compare copies only)");
+        // The skinned opaque role matched in Fwha's compare run (~20,000 draws: depth exact, ~40 px at
+        // 1/255) and is drawn (LPN_PREPASS_SKIN=0 leaves it to the translated renderer); the hair's
+        // normals still differ: compare copies only.
+        static const bool skinOn = [] { const char* e = std::getenv("LPN_PREPASS_SKIN"); return !e || *e != '0'; }();
+        if (role == kSkinOpaque && !skinOn && !d.compareCopy) return decline(role, "off (LPN_PREPASS_SKIN=0)");
+        if (role == kSkinHair && !d.compareCopy) return decline(role, "not yet matched (drawn into compare copies only)");
         const char* vs = skin ? (alpha ? "vs_normal_skin_n_pt.vso" : "vs_normal_skin_n.vso") :
                                (alpha ? "vs_normal_rigid_pt.vso" : "vs_normal_rigid.vso");
         if (!d.vsName || *d.vsName != vs) return decline(role, "another vertex shader");
