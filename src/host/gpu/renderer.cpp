@@ -1105,13 +1105,20 @@ public:
         if (d.engineCheck && native::engineFixedCheckOn()) fixedCheck(d, r);
         // A draw a native pass takes is recorded here, in order (see nativeDraw).
         const bool native = nativeOn_ && d.kind != DrawCall::kDispatch && nativeClaimed(*held);
+        // Compare mode records a native draw here, in order. Of the compared pass's draws, only the
+        // few compareChoose picks: sending all of them here (thousands of haze draws a frame, each
+        // draining the recorder threads' segments) made glows and outlines flicker on screen.
+        bool here = native && !compareWith_.empty();
+        held->compareChosen = false;
+        if (here && compareWith_ == held->psm->nativePass->name())
+            here = held->compareChosen = held->nativeLoads && compareChoose(held->psm->nativeRole);
         if (comparePending_) { // LPN_NATIVE_COMPARE: before a recorder thread takes the next draw
             std::lock_guard lock(m_);
             runCompare();
         }
         if (recordThreads_) {
             // Native draws go to the recorder threads too (but for LPN_NATIVE_COMPARE's, recorded here).
-            if ((!native || compareWith_.empty()) && segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
+            if (!here && segmentable(d, *held) && !upscaleTouches(d, r, *held)) {
                 addToSegment(d, r, held);
                 return;
             }
@@ -6522,31 +6529,43 @@ void main() {
     }
     // A copy of a target's size and format (one for each target index: a draw writes up to 8).
     Image* compareImage(uint32_t index, const native::Target& t, bool depth) {
-        Image& img = compareImages_[index];
-        if (img.image && img.format == t.format && img.width == t.width && img.height == t.height) return &img;
-        if (img.image) {
-            fullBarrier();
-            destroyImage(img);
-        }
+        // Kept for each size and format: replacing one moved imageGen_ (createImage), and the haze's
+        // targets of three sizes did that many times a frame, which made glows and outlines flicker
+        // on screen (the copies were the step that did it: LPN_COMPARE_STOP=3).
+        const auto key = std::make_tuple(index, int(t.format), t.width, t.height);
+        if (auto it = compareImages_.find(key); it != compareImages_.end()) return &it->second;
+        if (compareImages_.size() >= 64) return nullptr; // enough sizes: the rest are not compared
+        Image& img = compareImages_[key];
         const VkImageUsageFlags usage = (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
                                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (!createImage(img, t.format, t.width, t.height, usage, depth)) {
-            img = Image{};
+            compareImages_.erase(key);
             return nullptr;
         }
         return &img;
     }
     // Before the translated draw: the copies, and the native pass's draw into them.
-    void nativeCompare(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
+    // Whether the compared pass's next draw is compared (before it is routed: see onDraw).
+    bool compareChoose(int role) {
         if (compareFrame_ != frame_) compareFrame_ = frame_, std::fill(std::begin(compareCount_), std::end(compareCount_), 0u);
         // A budget per role: a role drawn late in the frame is compared too.
-        uint32_t& budget = compareCount_[std::min<uint32_t>(a.psm->nativeRole, kCompareRoles - 1)];
+        uint32_t& budget = compareCount_[std::min<uint32_t>(role, kCompareRoles - 1)];
         // Spread over the frame's draws: every fourth, starting at a different one each frame.
-        if (budget >= kComparePerFrame || (compareSeq_++ + frame_) % 4) return;
+        // Counted once the draw is built (nativeCompare): a chosen draw is compared before the next is chosen.
+        return budget < kComparePerFrame && (compareSeq_++ + frame_) % 4 == 0;
+    }
+    void nativeCompare(const DrawCall& d, const DrawRegs& r, DrawAnalysis& a) {
+        if (!a.compareChosen) return;
+        // LPN_COMPARE_STOP (a bisection of compare mode's side effects on the frame): 1 stops after
+        // routing the chosen draw here, 2 after building it, 3 after the copies (no native draw).
+        static const int stop = [] { const char* e = std::getenv("LPN_COMPARE_STOP"); return e ? std::atoi(e) : 0; }();
+        if (stop == 1) return;
+        uint32_t& budget = compareCount_[std::min<uint32_t>(a.psm->nativeRole, kCompareRoles - 1)];
         native::Draw nd;
         Surface* written[8]{};
         Surface* depthWritten = nullptr;
         if (!nativeBuild(d, r, a, nd, written, depthWritten) || !comparePipeline()) return;
+        if (stop == 2) return;
         if (!ringFits(1 << 12)) flush();
         begin();
         fullBarrier();
@@ -6580,6 +6599,10 @@ void main() {
             pc.a[8] = view(ds->img, nd.depth.format, VK_IMAGE_VIEW_TYPE_2D, kIdentity, VK_IMAGE_ASPECT_DEPTH_BIT);
         }
         barrier();
+        if (stop == 3) {
+            nativeDrawn(nullptr, nullptr);
+            return;
+        }
         NativeGpu gpu(*this);
         const int role = a.psm->nativeRole;
         cd.compareCopy = true;
@@ -6693,7 +6716,7 @@ void main() {
     VkDeviceMemory compareMem_ = VK_NULL_HANDLE;
     void* compareMap_ = nullptr;
     bool compareFailed_ = false, compareAwaiting_ = false, comparePending_ = false, compareRunning_ = false;
-    Image compareImages_[9];
+    std::map<std::tuple<uint32_t, int, uint32_t, uint32_t>, Image> compareImages_; // index, format, size
     PendingCompare pendingCompare_;
     uint64_t compareFrame_ = ~0ull, compareSeq_ = 0;
     uint32_t compareCount_[kCompareRoles] = {};
@@ -7973,6 +7996,7 @@ void main() {
         std::vector<BufRes> vsRes, psRes;
         uint64_t resEpoch = 0;
         bool nativeLoads = false; // psLoads and vsLoads are set (a native pass claims the draw)
+        bool compareChosen = false; // LPN_NATIVE_COMPARE: this draw is compared (compareChoose)
         std::shared_ptr<const std::map<uint64_t, uint32_t>> psLoads, vsLoads; // pc -> data offset
     };
     // A draw's launches as the registers give them, for a worker to analyse.

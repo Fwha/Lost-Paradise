@@ -19,8 +19,8 @@ namespace host::native {
 namespace {
 
 enum Role { kDown2 = 1, kDown4, kLumi, kBlur, kCompose, kSsao, kTemporal, kSsaoBlur, kUpsample,
-            kHandDraw2, kHandDrawFinalize, kToonEdgeFxaa };
-static_assert(kToonEdgeFxaa<24); // renderer.cpp's kCompareRoles; roles 10..12 compare separately.
+            kHandDraw2, kHandDrawFinalize, kToonEdgeFxaa, kHaze };
+static_assert(kHaze<24); // renderer.cpp's kCompareRoles.
 struct Variant {
     const char* ps;
     const char* vs;
@@ -46,6 +46,7 @@ constexpr Variant kRoles[] = {
     {"ps_hand_draw_2.pso", "fx_depth_to_shadow_unuse_map.fxo +8", {0x28}},
     {"fx_hand_draw_finalize.fxo", "fx_hand_draw_finalize.fxo", {0x3c, 0x50}},
     {"ps_toon_edge_fxaa.pso", nullptr, {0x50, 0x58, 0x60, 0x6c, 0x74, 0x110, 0x128, 0x140, 0x158}},
+    {"fx_haze_pass0.fxo +3", nullptr, {0x24}},
 };
 
 // All 49 MIMG instructions in hand_draw_2 read s[0:7], s[8:11].
@@ -1153,6 +1154,112 @@ void main() {
 }
 )";
 
+// capture-5's two haze PS dumps have identical executable bytes [0,0x78).
+// In the first 0x100 bytes only the footer word at 0xa0 differs:
+// 0xbce8ebd5 versus 0x9ce2dbd5. Later differences belong to following programs.
+// Both are shader_names' "fx_haze_pass0.fxo +3"; select the VS per draw.
+constexpr const char* kHazeVs = R"(
+layout(set=0,binding=0,std430) readonly buffer HazeVertex { uint w[]; } hv[3];
+layout(location=0) out vec4 a0;
+layout(location=1) out vec4 a1;
+layout(location=2) out vec4 a2;
+uint hazeWord(int slot,uint i) {
+    if (slot==0) return hv[0].w[i];
+    if (slot==1) return hv[1].w[i];
+    return hv[2].w[i];
+}
+float hazeDecode(uint raw,uint bits,uint nfmt) {
+    if (nfmt==7u) return unpackHalf2x16(raw).x;
+    if (nfmt==0u) return float(raw)/float((1u<<bits)-1u);
+    return max(float(bitfieldExtract(int(raw),0,int(bits)))/
+               float((1u<<(bits-1u))-1u),-1.0);
+}
+vec4 hazeFetch(int slot) {
+    uvec4 f=floatBitsToUint(c[20+slot]);
+    uvec4 control=floatBitsToUint(c[23+slot]);
+    uint index=control.y==0u?uint(gl_VertexIndex):uint(gl_InstanceIndex);
+    if (index>=f.w) return vec4(0.0);
+    uint base=f.x+index*f.y, dfmt=f.z&15u, nfmt=(f.z>>4u)&7u;
+    vec4 r=vec4(0.0,0.0,0.0,1.0);
+    if (dfmt==4u || dfmt==11u || dfmt==13u || dfmt==14u) {
+        uint n=dfmt==4u?1u:dfmt==11u?2u:dfmt==13u?3u:4u;
+        for (uint j=0u;j<n;++j) r[j]=uintBitsToFloat(hazeWord(slot,base+j));
+    } else {
+        bool halfWidth=dfmt==2u || dfmt==5u || dfmt==12u;
+        uint bits=halfWidth?16u:8u;
+        uint n=(dfmt==1u || dfmt==2u)?1u:(dfmt==3u || dfmt==5u)?2u:4u;
+        for (uint j=0u;j<n;++j) {
+            uint raw=(hazeWord(slot,base+(j*bits)/32u)>>((j*bits)%32u))&((1u<<bits)-1u);
+            r[j]=hazeDecode(raw,bits,nfmt);
+        }
+    }
+    if (control.x==0u) return r; // implicit identity selection, as decodeFormat()
+    vec4 result;
+    for (uint j=0u;j<4u;++j) {
+        uint s=(control.x>>(3u*j))&7u;
+        result[j]=s>=4u?r[s-4u]:(s==1u?1.0:0.0);
+    }
+    return result;
+}
+float hazeAdd(float a,float b) { precise float r=a+b; return r; }
+float hazeSub(float a,float b) { precise float r=a-b; return r; }
+float hazeObjectRow(vec4 row,float shift,vec3 v) {
+    float r=mac(row.x,v.x,hazeAdd(shift,row.w));
+    r=mac(row.y,v.y,r);
+    return mac(row.z,v.z,r);
+}
+float hazeViewRow(vec4 row,vec3 v) {
+    float r=mul(row.x,v.x);
+    r=mac(row.y,v.y,r);
+    return mac(row.z,v.z,r);
+}
+float hazeProjectRow(vec4 row,vec3 v) {
+    float r=mac(row.x,v.x,row.w);
+    r=mac(row.y,v.y,r);
+    return mac(row.z,v.z,r);
+}
+void main() {
+    vec4 pos=hazeFetch(0), colour=hazeFetch(1), uv=hazeFetch(2);
+    a1=vec4(uv.xy,0.0,0.0);
+    a2=vec4(0.0);
+#if HAZE_MESH
+    vec3 world=vec3(hazeObjectRow(c[3],c[2].x,pos.xyz),
+                    hazeObjectRow(c[4],c[2].y,pos.xyz),
+                    hazeObjectRow(c[5],c[2].z,pos.xyz));
+    // 0x9c branches over the camera-origin subtraction only for this flag pair.
+    if ((floatBitsToUint(c[1].x)&0x180000u)!=0x80000u)
+        world=vec3(hazeSub(world.x,c[6].x),hazeSub(world.y,c[6].y),hazeSub(world.z,c[6].z));
+    vec3 view=vec3(hazeViewRow(c[7],world),hazeViewRow(c[8],world),hazeViewRow(c[13],world));
+    gl_Position=vec4(hazeProjectRow(c[9],view),hazeProjectRow(c[10],view),
+                     hazeProjectRow(c[11],view),hazeProjectRow(c[12],view));
+    // Preserve the distinct multiplication order for red and alpha.
+    a0.r=mul(c[16].r,mul(c[14].r,colour.r));
+    a0.g=mul(mul(c[14].g,c[16].g),colour.g);
+    a0.b=mul(mul(c[14].b,c[16].b),colour.b);
+    a0.a=mul(mul(c[16].a,mul(c[14].a,c[15].x)),colour.a);
+#else
+    gl_Position=vec4(mac(c[0].xy,pos.xy,c[0].zw),pos.zw);
+    a0=colour;
+#endif
+    if (p.flags.x!=0u) gl_Position.z=mul(gl_Position.z+gl_Position.w,0.5);
+}
+)";
+
+constexpr const char* kHazeFs = R"(
+layout(location=0) in vec4 a0;
+layout(location=1) in vec4 a1;
+layout(location=0) out vec4 outColour;
+layout(set=0,binding=3) uniform sampler2D hazeImage;
+void main() {
+    // Pixel fres() permits contraction, as in SSAO and outlines. Do not use
+    // kHeader's precise vertex helpers here. Opcode 303 currently exports
+    // round-to-nearest halves in the translator, despite GCN's RTZ mnemonic.
+    vec4 v=texture(hazeImage,a1.xy*c[32].xy)*a0;
+    v=vec4(unpackHalf2x16(packHalf2x16(v.xy)),unpackHalf2x16(packHalf2x16(v.zw)));
+    outColour=vec4(v[p.swizzle.x],v[p.swizzle.y],v[p.swizzle.z],v[p.swizzle.w]);
+}
+)";
+
 bool named(const std::string& name,const char* wanted) {
     if (name==wanted) return true;
     const std::string prefix=std::string(wanted)+" +";
@@ -1164,10 +1271,19 @@ class Post final : public Pass {
 public:
     const char* name() const override { return "post"; }
     int claims(const std::string& ps) const override {
+        // The haze matched in Fwha's compare run (0 px on ~850 compared draws) once compare mode
+        // stopped replacing its copies many times a frame (that, not the haze, flickered the
+        // screen). Drawn by default; LPN_POST_HAZE=0 leaves it to the translated renderer.
+        static const bool haze = [] {
+            const char* e = std::getenv("LPN_POST_HAZE");
+            return !e || *e != '0';
+        }();
+        if (ps==kRoles[kHaze].ps) return haze ? kHaze : 0;
         for (int i=1;i<=kToonEdgeFxaa;++i) if (named(ps,kRoles[i].ps)) return i;
         return 0;
     }
     bool draw(int role,const Draw& d,Gpu& gpu) override {
+        if (role==kHaze) return drawHaze(d,gpu);
         // The outline chain matched in Fwha's compare run: finalize and the edge FXAA at 0 px, the
         // outline pass within 1/255 (~4% of pixels a step off). Drawn by default.
         if (role<kDown2 || role>kToonEdgeFxaa) return false;
@@ -1435,6 +1551,174 @@ public:
     std::string lastDrawInfo() const override { return info_; }
 
 private:
+    bool drawHaze(const Draw& d,Gpu& gpu) {
+        const int role=kHaze;
+        const bool mesh=d.vsName && *d.vsName=="p_dvtx_modulate.fxo";
+        if (!mesh && d.vsName && *d.vsName!="?")
+            return decline(role,"another haze vertex shader");
+        if (d.colorCount!=1 || !d.color[0].view || d.color[0].format==VK_FORMAT_UNDEFINED ||
+            !d.color[0].width || !d.color[0].height || !d.color[0].comps || d.color[0].comps>4)
+            return decline(role,"not one supported colour target");
+        if ((d.writeMask&~0xfu) || !(d.writeMask&0xfu))
+            return decline(role,"unexpected target write mask");
+        const auto& z=d.depthStencil;
+        if ((d.depthTest || d.depthWrite || d.stencil || z.depthTestEnable ||
+             z.depthWriteEnable || z.stencilTestEnable || z.depthBoundsTestEnable) && !d.depth.view)
+            return decline(role,"depth/stencil state without an attachment");
+        if (d.pixelPositions || d.depthBias || d.cull!=VK_CULL_MODE_NONE)
+            return decline(role,"pixel positions, polygon offset or culling");
+        if (d.instances!=1 || (mesh ? (d.primitive!=4 || !d.indexed || !d.count || d.count%3) :
+                                     (d.primitive!=17 || d.indexed || d.count!=3)))
+            return decline(role,"unsupported haze primitive");
+        if (d.scissor[2]<0 || d.scissor[3]<0 || !(d.vkViewport.width>0) || d.vkViewport.height==0)
+            return decline(role,"invalid viewport or scissor");
+        if (gpu.maxPushConstants()<sizeof(Push)) return decline(role,"push constant limit");
+        if (mesh) {
+            const uint32_t bytes=d.indexType==VK_INDEX_TYPE_UINT16?2:
+                                 d.indexType==VK_INDEX_TYPE_UINT32?4:0;
+            const uint64_t end=uint64_t(d.index.byteOffset)+(uint64_t(d.firstIndex)+d.count)*bytes;
+            if (!bytes || !d.index.buffer || d.index.byteOffset%bytes ||
+                !d.index.range || d.index.range==VK_WHOLE_SIZE || end>d.index.range)
+                return decline(role,"unsupported haze index buffer");
+        }
+
+        Constants constants{};
+        Push push{};
+        push.clipZHalf=d.clipZHalf;
+        swizzle(d.color[0],push.swizzle);
+        std::array<VkDescriptorBufferInfo,5> buffers{};
+        const VertexBuffer* slots[3]{};
+        for (const VertexBuffer& v:d.vertex) {
+            if (!v.components) continue;
+            if (v.slot<0 || v.slot>2) return decline(role,"unexpected haze vertex buffer");
+            if (slots[v.slot]) return decline(role,"duplicate haze fetch slot");
+            slots[v.slot]=&v;
+        }
+        // v4: position, v8: colour, v12: UV. Decode float32, half, UNORM
+        // and SNORM with DST_SEL, including the quad's constant position W.
+        const uint32_t used[3]={mesh?3u:4u,4,2};
+        for (uint32_t i=0;i<3;++i) {
+            const VertexBuffer* v=slots[i];
+            if (!v || !v->data.buffer || v->components<used[i] || v->components>4 ||
+                v->indexVgpr>3 || !v->stride || v->stride%4)
+                return decline(role,"unsupported haze fetch input");
+            uint32_t bytes=0;
+            bool wide=false,half=false;
+            switch (v->dfmt) {
+            case 1: bytes=1; break;
+            case 2: bytes=2; half=true; break;
+            case 3: bytes=2; break;
+            case 4: bytes=4; wide=true; break;
+            case 5: bytes=4; half=true; break;
+            case 10: bytes=4; break;
+            case 11: bytes=8; wide=true; break;
+            case 12: bytes=8; half=true; break;
+            case 13: bytes=12; wide=true; break;
+            case 14: bytes=16; wide=true; break;
+            default: return decline(role,"unsupported haze fetch format");
+            }
+            if (wide ? v->nfmt!=7 : !(v->nfmt==0 || v->nfmt==1 || (half && v->nfmt==7)))
+                return decline(role,"unsupported haze fetch number format");
+            for (uint32_t j=0;j<used[i];++j) {
+                const uint32_t s=(v->dstSel>>(3*j))&7;
+                if (s==2 || s==3) return decline(role,"reserved haze fetch selection");
+            }
+            const uint64_t first=uint64_t(v->data.byteOffset)+v->offset;
+            const uint64_t end=first+(v->records?uint64_t(v->records-1)*v->stride+((bytes+3u)&~3u):0);
+            if (!v->records || (!mesh && !v->indexVgpr && v->records<3) || first%4 ||
+                end>uint64_t(UINT32_MAX)*4 || !v->data.range ||
+                v->data.range==VK_WHOLE_SIZE || end>v->data.range)
+                return decline(role,"haze fetch outside buffer or unaligned");
+            constants[20+i]={uint32_t(first/4),v->stride/4,v->dfmt|(v->nfmt<<4),v->records};
+            constants[23+i]={v->dstSel,v->indexVgpr,0,0};
+            buffers[i]={v->data.buffer,v->data.offset,v->data.range};
+        }
+        buffers[3]=buffers[0]; // unused binding 1 remains valid
+        auto load=[&](uint32_t pc,uint32_t n,int at) {
+            uint32_t words[16]{};
+            if (!d.vsLoad || !d.vsLoad(pc,words,n)) return false;
+            std::memcpy(constants[at].data(),words,n*4);
+            return true;
+        };
+        if (mesh) {
+            // Load PCs of drawn_vs_p_dvtx_modulate.s, not offsets in the FXO.
+            if (!load(0x1c,1,1) || !load(0x20,4,2) || !load(0x24,8,3) ||
+                !load(0x28,4,5) || !load(0xc8,1,15) || !load(0xcc,4,16) ||
+                !load(0xd4,8,7) || !load(0xd8,16,9) || !load(0xdc,4,13) ||
+                !load(0xe0,4,14))
+                return decline(role,"missing haze mesh VS scalar load");
+            if ((constants[1][0]&0x180000)!=0x80000 && !load(0xa8,4,6))
+                return decline(role,"missing haze camera-origin load");
+        } else if (!load(0x10,4,0)) {
+            return decline(role,"missing haze rectangle transform");
+        }
+        const Texture* texture=nullptr;
+        for (const Texture& t:d.textures) if (t.pc==kRoles[role].samples[0]) {
+            if (texture) return decline(role,"duplicate haze MIMG PC");
+            texture=&t;
+        }
+        if (!texture || !texture->view || !texture->sampler)
+            return decline(role,"missing haze texture or sampler at MIMG PC");
+        if (texture->address==d.color[0].address)
+            return decline(role,"texture aliases colour target");
+        std::memcpy(constants[32].data(),texture->scale,sizeof texture->scale);
+        const VkDescriptorImageInfo image{texture->sampler,texture->view,VK_IMAGE_LAYOUT_GENERAL};
+        const VkPipeline pipe=hazePipeline(gpu,d,mesh);
+        if (!pipe) return decline(role,"haze pipeline creation failed");
+        Buffer cb;
+        if (!gpu.upload(constants.data(),sizeof constants,cb) || cb.byteOffset)
+            return decline(role,"haze constant upload failed or nonzero byte offset");
+        buffers[4]={cb.buffer,cb.offset,cb.range};
+        if (kCompare) {
+            char b[256];
+            std::snprintf(b,sizeof b,"haze %s; target %ux%u format %d mask 0x%x; %u indices; blend %u; clipZHalf %u",
+                          mesh?"p_dvtx_modulate.fxo":"?",d.color[0].width,d.color[0].height,
+                          int(d.color[0].format),d.writeMask,mesh?d.count:0,
+                          d.blendState[0].blendEnable,push.clipZHalf);
+            info_=b;
+        }
+        const VkRect2D sc{{d.scissor[0],d.scissor[1]},{uint32_t(d.scissor[2]),uint32_t(d.scissor[3])}};
+        std::array<uint32_t,6> st{};
+        for (int i=0;i<2;++i)
+            st[i*3]=d.stencilRef[i],st[i*3+1]=d.stencilCompare[i],st[i*3+2]=d.stencilWrite[i];
+        gpu.beginRendering(d.color,1,d.depth,d.hasStencil);
+        gpu.record([pipe,layout=hazeLayouts_[mesh],push,buffers,image,mesh,
+                    count=d.count,index=d.index,indexType=d.indexType,firstIndex=d.firstIndex,
+                    vp=d.vkViewport,sc,st,bc=std::to_array(d.blendConstants),
+                    bounds=z.depthBoundsTestEnable,minBounds=z.minDepthBounds,maxBounds=z.maxDepthBounds,
+                    pushSet=gpu.pushDescriptorSet()](VkCommandBuffer cmd) {
+            VkWriteDescriptorSet w[4]{};
+            for (uint32_t i=0;i<3;++i) {
+                w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w[i].dstBinding=i; w[i].descriptorCount=i==0?3:1;
+                w[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                w[i].pBufferInfo=&buffers[i==0?0:i+2];
+            }
+            w[3].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[3].dstBinding=3; w[3].descriptorCount=1;
+            w[3].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w[3].pImageInfo=&image;
+            vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipe);
+            vkCmdSetBlendConstants(cmd,bc.data());
+            for (int i=0;i<2;++i) {
+                const VkStencilFaceFlags face=i?VK_STENCIL_FACE_BACK_BIT:VK_STENCIL_FACE_FRONT_BIT;
+                vkCmdSetStencilReference(cmd,face,st[i*3]);
+                vkCmdSetStencilCompareMask(cmd,face,st[i*3+1]);
+                vkCmdSetStencilWriteMask(cmd,face,st[i*3+2]);
+            }
+            if (bounds) vkCmdSetDepthBounds(cmd,minBounds,maxBounds);
+            vkCmdSetViewport(cmd,0,1,&vp);
+            vkCmdSetScissor(cmd,0,1,&sc);
+            pushSet(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,layout,0,4,w);
+            vkCmdPushConstants(cmd,layout,kStages,0,sizeof push,&push);
+            if (mesh) {
+                vkCmdBindIndexBuffer(cmd,index.buffer,index.offset+index.byteOffset,indexType);
+                vkCmdDrawIndexed(cmd,count,1,firstIndex,0,0);
+            } else vkCmdDraw(cmd,3,1,0,0);
+        });
+        return true;
+    }
+
     bool decline(int role,const char* why) {
         std::lock_guard lock(m_);
         if (declined_[role].insert(why).second)
@@ -1530,13 +1814,101 @@ private:
         if (vkCreateGraphicsPipelines(gpu.device(),VK_NULL_HANDLE,1,&pi,nullptr,&out)!=VK_SUCCESS) out=VK_NULL_HANDLE;
         return out;
     }
+    VkPipeline hazePipeline(Gpu& gpu,const Draw& d,bool mesh) {
+        const int role=mesh?1:0;
+        const uint32_t textures=1;
+        std::lock_guard lock(m_);
+        const VkFormat format=d.color[0].format;
+        const uint32_t mask=d.writeMask&0xf;
+        const auto& z=d.depthStencil;
+        const auto& b=d.blendState[0];
+        const uint64_t blendKey=uint64_t(b.blendEnable) | uint64_t(b.srcColorBlendFactor)<<1 |
+            uint64_t(b.dstColorBlendFactor)<<6 | uint64_t(b.colorBlendOp)<<11 |
+            uint64_t(b.srcAlphaBlendFactor)<<14 | uint64_t(b.dstAlphaBlendFactor)<<19 |
+            uint64_t(b.alphaBlendOp)<<24;
+        const bool stencil=d.stencil && d.hasStencil && z.stencilTestEnable;
+        uint64_t stencilKey=uint64_t(stencil)<<40;
+        if (stencil)
+            for (int i=0;i<2;++i) {
+                const VkStencilOpState& o=i?z.back:z.front;
+                stencilKey|=uint64_t(o.failOp | o.passOp<<3 | o.depthFailOp<<6 | o.compareOp<<9)<<(16*i);
+            }
+        const auto key=std::make_tuple(role,int(format),mask,textures,blendKey,
+            int(d.depth.view?d.depth.format:VK_FORMAT_UNDEFINED),bool(d.hasStencil),
+            z.depthTestEnable,z.depthWriteEnable,int(z.depthCompareOp),z.depthBoundsTestEnable,int(d.frontFace),stencilKey);
+        if (auto it=hazePipes_.find(key);it!=hazePipes_.end()) return it->second;
+        VkPipeline& out=hazePipes_[key];
+        if (!hazeLayouts_[role]) {
+            VkDescriptorSetLayoutBinding bindings[4]{};
+            for (uint32_t i=0;i<3;++i)
+                bindings[i]={i,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,i==2?kStages:VkShaderStageFlags(VK_SHADER_STAGE_VERTEX_BIT),nullptr};
+            bindings[0].descriptorCount=3;
+            bindings[3]={3,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
+            VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            dl.flags=VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+            dl.bindingCount=4; dl.pBindings=bindings;
+            if (vkCreateDescriptorSetLayout(gpu.device(),&dl,nullptr,&hazeSets_[role])!=VK_SUCCESS) return out;
+            const VkPushConstantRange range{kStages,0,sizeof(Push)};
+            VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            pl.setLayoutCount=1; pl.pSetLayouts=&hazeSets_[role];
+            pl.pushConstantRangeCount=1; pl.pPushConstantRanges=&range;
+            if (vkCreatePipelineLayout(gpu.device(),&pl,nullptr,&hazeLayouts_[role])!=VK_SUCCESS) return out;
+        }
+        const std::string header=std::string(kHeader)+"\n#define HAZE_MESH "+std::to_string(mesh?1:0)+"\n";
+        const VkShaderModule vs=gpu.shader(header+kHazeVs,Gpu::Stage::Vertex);
+        const VkShaderModule fs=gpu.shader(header+kHazeFs,Gpu::Stage::Fragment);
+        const VkShaderModule gs=mesh?VK_NULL_HANDLE:gpu.shader(kGs,Gpu::Stage::Geometry);
+        if (!vs || !fs || (!mesh && !gs)) return out;
+        VkPipelineShaderStageCreateInfo stages[3]{
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_VERTEX_BIT,vs,"main",nullptr},
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_FRAGMENT_BIT,fs,"main",nullptr},
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_GEOMETRY_BIT,gs,"main",nullptr},
+        };
+        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount=vp.scissorCount=1;
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode=VK_POLYGON_MODE_FILL; rs.frontFace=d.frontFace; rs.lineWidth=1;
+        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineDepthStencilStateCreateInfo ds=z;
+        ds.pNext=nullptr;
+        ds.stencilTestEnable=stencil;
+        VkPipelineColorBlendAttachmentState attachment=b;
+        attachment.colorWriteMask=mask;
+        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        cb.attachmentCount=1; cb.pAttachments=&attachment;
+        const VkDynamicState states[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_BLEND_CONSTANTS,VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+            VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,VK_DYNAMIC_STATE_DEPTH_BOUNDS};
+        VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dy.dynamicStateCount=std::size(states); dy.pDynamicStates=states;
+        VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        rendering.colorAttachmentCount=1; rendering.pColorAttachmentFormats=&format;
+        if (d.depth.view) {
+            rendering.depthAttachmentFormat=d.depth.format;
+            if (d.hasStencil) rendering.stencilAttachmentFormat=d.depth.format;
+        }
+        VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        pi.pNext=&rendering; pi.stageCount=mesh?2:3; pi.pStages=stages;
+        pi.pVertexInputState=&vi; pi.pInputAssemblyState=&ia; pi.pViewportState=&vp;
+        pi.pRasterizationState=&rs; pi.pMultisampleState=&ms; pi.pDepthStencilState=&ds;
+        pi.pColorBlendState=&cb; pi.pDynamicState=&dy; pi.layout=hazeLayouts_[role];
+        if (vkCreateGraphicsPipelines(gpu.device(),VK_NULL_HANDLE,1,&pi,nullptr,&out)!=VK_SUCCESS) out=VK_NULL_HANDLE;
+        return out;
+    }
     std::mutex m_;
     using PipelineKey=std::tuple<int,int,uint32_t,uint32_t,uint64_t,int,bool,
                                  VkBool32,VkBool32,int,VkBool32,int,uint64_t>;
     std::map<PipelineKey,VkPipeline> pipes_;
     VkDescriptorSetLayout sets_[kToonEdgeFxaa+1]{};
     VkPipelineLayout layouts_[kToonEdgeFxaa+1]{};
-    std::set<std::string> declined_[kToonEdgeFxaa+1];
+    std::map<PipelineKey,VkPipeline> hazePipes_;
+    VkDescriptorSetLayout hazeSets_[2]{};
+    VkPipelineLayout hazeLayouts_[2]{};
+    std::set<std::string> declined_[kHaze+1];
     static inline const bool kCompare=std::getenv("LPN_NATIVE_COMPARE")!=nullptr;
     static inline thread_local std::string info_;
 };
