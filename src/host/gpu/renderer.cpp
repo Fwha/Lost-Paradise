@@ -6582,6 +6582,7 @@ void main() {
         barrier();
         NativeGpu gpu(*this);
         const int role = a.psm->nativeRole;
+        cd.compareCopy = true;
         const bool drawn = a.psm->nativePass->draw(role, cd, gpu);
         endPass();
         barrier();

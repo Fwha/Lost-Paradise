@@ -2076,7 +2076,7 @@ public:
         if (role < 1 || role > kVariantCount) return false;
         // r_o1dut_b(vr)2dut[ref] still differs from the game's shader (darker, up to ~60/255): drawn
         // only in compare mode, where it is checked, until it matches.
-        if (role == kUnmatchedRole && !kCompareOn) return decline(role, "not yet matched (drawn in compare mode only)");
+        if (role == kUnmatchedRole && !d.compareCopy) return decline(role, "not yet matched (drawn into compare copies only)");
         const Variant& var = kVariants[role - 1];
         const VertexShaderInfo& vsi = kVertexShaders[var.vs];
         const char* vsWanted = vsi.name;

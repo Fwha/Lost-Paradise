@@ -385,3 +385,18 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   ps_glow_pass2_5 (the combine), each with the game's vertex shader's outputs.
 - Compare run (`LPN_NATIVE_COMPARE=post`): every role within 1/255, a handful of pixels a frame.
   The 4x4 downsample drawn with a depth target bound (half of them) stays translated.
+
+### Post-processing: SSAO
+
+- `native/post.cpp` roles 6-9 (Codex's port of the drawn programs, `~/lost-paradise-re/dis/ssao/`):
+  the SSAO term (fx_ssao_test[dnrm]), its temporal filter, the four blurs (ps_ssao_blur) and the
+  upsampling into the scene target with the depth buffer (ps_ssao_upsampling).
+- Compare runs: the temporal filter, blurs and upsampling at 0 px in three runs (~200 draws each)
+  once their arithmetic matched the translated shaders' (contraction, round-to-nearest export);
+  drawn by default. The SSAO term still differs on ~0.1% of pixels by up to 100/255 (no cause
+  found): compare copies only, with LPN_POST_SSAO=1.
+- Safety, after a compare run flashed the screen white indoors: unmatched roles draw only into
+  compare copies (native::Draw::compareCopy), and a flash guard (hle_videoout.cpp; on in compare
+  mode or with LPN_FLASH_GUARD=1) logs and holds back frames whose brightness jumps (fades too).
+  Two compare-mode rewrites (a depth+stencil copy, preparing the real draw first) made compare
+  runs flash and were dropped; compare mode is as before but for compareCopy.

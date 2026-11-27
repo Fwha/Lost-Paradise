@@ -102,6 +102,9 @@ struct Draw {
     bool clipZHalf = false, pixelPositions = false;
     // An upscaler is on: scene draws are jittered and the camera is read from them.
     bool upscaler = false;
+    // LPN_NATIVE_COMPARE: drawn into copies of the targets to be compared, not the frame. A pass's
+    // unmatched roles draw only then (anything else would show an unchecked port on screen).
+    bool compareCopy = false;
     bool depthBias = false; // polygon offset on (PA_SU_SC_MODE_CNTL)
     VkCullModeFlags cull = VK_CULL_MODE_NONE;
     VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
