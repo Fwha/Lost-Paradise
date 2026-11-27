@@ -6529,16 +6529,17 @@ void main() {
     }
     // A copy of a target's size and format (one for each target index: a draw writes up to 8).
     Image* compareImage(uint32_t index, const native::Target& t, bool depth) {
-        Image& img = compareImages_[index];
-        if (img.image && img.format == t.format && img.width == t.width && img.height == t.height) return &img;
-        if (img.image) {
-            fullBarrier();
-            destroyImage(img);
-        }
+        // Kept for each size and format: replacing one moved imageGen_ (createImage), and the haze's
+        // targets of three sizes did that many times a frame, which made glows and outlines flicker
+        // on screen (the copies were the step that did it: LPN_COMPARE_STOP=3).
+        const auto key = std::make_tuple(index, int(t.format), t.width, t.height);
+        if (auto it = compareImages_.find(key); it != compareImages_.end()) return &it->second;
+        if (compareImages_.size() >= 64) return nullptr; // enough sizes: the rest are not compared
+        Image& img = compareImages_[key];
         const VkImageUsageFlags usage = (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
                                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (!createImage(img, t.format, t.width, t.height, usage, depth)) {
-            img = Image{};
+            compareImages_.erase(key);
             return nullptr;
         }
         return &img;
@@ -6715,7 +6716,7 @@ void main() {
     VkDeviceMemory compareMem_ = VK_NULL_HANDLE;
     void* compareMap_ = nullptr;
     bool compareFailed_ = false, compareAwaiting_ = false, comparePending_ = false, compareRunning_ = false;
-    Image compareImages_[9];
+    std::map<std::tuple<uint32_t, int, uint32_t, uint32_t>, Image> compareImages_; // index, format, size
     PendingCompare pendingCompare_;
     uint64_t compareFrame_ = ~0ull, compareSeq_ = 0;
     uint32_t compareCount_[kCompareRoles] = {};
