@@ -1168,8 +1168,8 @@ public:
         return 0;
     }
     bool draw(int role,const Draw& d,Gpu& gpu) override {
-        if (role>=kHandDraw2 && role<=kToonEdgeFxaa && !d.compareCopy)
-            return decline(role, "not yet matched (drawn into compare copies only)");
+        // The outline chain matched in Fwha's compare run: finalize and the edge FXAA at 0 px, the
+        // outline pass within 1/255 (~4% of pixels a step off). Drawn by default.
         if (role<kDown2 || role>kToonEdgeFxaa) return false;
         // The SSAO chain and depth-bound draws: Codex's port, unmatched yet, drawn only when
         // LPN_NATIVE_COMPARE=post compares it (the glow chain matched within 1/255).
