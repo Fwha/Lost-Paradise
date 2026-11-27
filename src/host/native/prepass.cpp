@@ -321,9 +321,15 @@ void main() {
 #ifdef ALPHA_TEST
     // No precise here: like every arithmetic instruction in these PS translations.
     uint alpha = sat(texture(mask1, t.xy).w * texture(mask0, t.xy).z + (-p.off.w), false);
+    // PS 0x68 restores WQM for the normal-map sample at 0x70. Capture
+    // gradients before killing alpha-failing lanes: their UVs still take
+    // part in the surviving lanes' implicit LOD in the translated shader.
+    vec2 dx = dFdx(t.xy), dy = dFdy(t.xy);
+    vec2 sampleRG = textureGrad(normalMap, t.xy, dx, dy).xy;
     if (F(0u) > F(alpha)) discard;
-#endif
+#else
     vec2 sampleRG = texture(normalMap, t.xy).xy;
+#endif
     uint v0, v1, v2 = U(sampleRG.x), v3 = U(sampleRG.y);
     uint v4 = U(n.z), v5 = U(n.y), v6 = U(tangent.z);
     uint v7 = U(tangent.y), v8 = U(n.x), v9 = U(tangent.x);
@@ -527,17 +533,16 @@ private:
     bool drawSkin(int role, const Draw& d, Gpu& gpu) {
         const bool alpha = role == kSkinHair;
         const auto& z = d.depthStencil;
-        // DB_DEPTH_CONTROL 0x736: depth test/write, LEQUAL, stencil disabled.
-        // The stencil ASPECT is still attached, exactly as for the rigid roles.
+        // Test/write enables and compare op are copied into the pipeline and
+        // included in its key, just as for the rigid roles.
         if (!d.indexed || !d.index.buffer ||
             (d.indexType != VK_INDEX_TYPE_UINT16 && d.indexType != VK_INDEX_TYPE_UINT32))
             return decline(role, "not an indexed triangle list");
-        if (d.color[0].format != VK_FORMAT_R8G8B8A8_UNORM || d.color[0].width != 2560 || d.color[0].height != 1472 ||
+        if (d.color[0].format != VK_FORMAT_R8G8B8A8_UNORM ||
             d.color[0].swap != 1 || d.color[0].comps != 4 || d.writeMask != 0xf ||
             d.depth.format != VK_FORMAT_D32_SFLOAT_S8_UINT || !d.hasStencil)
-            return decline(role, "another target or depth format/shape");
-        if (!d.depthTest || !d.depthWrite || !z.depthTestEnable || !z.depthWriteEnable ||
-            z.depthCompareOp != VK_COMPARE_OP_LESS_OR_EQUAL || z.depthBoundsTestEnable || z.stencilTestEnable)
+            return decline(role, "another target or depth format");
+        if (z.depthBoundsTestEnable || z.stencilTestEnable)
             return decline(role, "another depth state");
         const VertexBuffer* slot[6] = {};
         const VertexBuffer* palette = nullptr;
@@ -564,28 +569,45 @@ private:
             palette = &v;
         }
         if (seen != 0xfff || !palette) return decline(role, "a palette load missing");
-        constexpr uint32_t dfmt[] = {13, 10, 10, 10, 10, 5};
-        constexpr uint32_t nfmt[] = {7, 0, 4, 0, 0, 7};
-        constexpr uint32_t components[] = {3, 4, 4, 3, 4, 2};
-        constexpr uint32_t select[] = {0x3ac, 0xfac, 0xfac, 0xfac, 0xfac, 0x22c};
-        constexpr uint32_t displacement[] = {0, 12, 16, 20, 24, 28};
-        constexpr uint32_t bytes[] = {12, 4, 4, 4, 4, 4};
+        // Only components consumed by these VSs must have an identity DST_SEL.
+        // In particular the stored weight x is ignored (reconstructed from yzw),
+        // and normal.w is unused.
+        constexpr uint32_t used[] = {3, 4, 4, 3, 4, 2};
         uint32_t constants[7][4]{};
         VkDescriptorBufferInfo buffers[8]{};
         for (int i = 0; i < 6; ++i) {
             const VertexBuffer* v = slot[i];
-            if (!v || !v->data.buffer || v->stride != 32 || v->indexVgpr || v->offset ||
-                v->dfmt != dfmt[i] || v->nfmt != nfmt[i] || v->components != components[i] ||
-                v->dstSel != select[i] || !v->records || v->data.byteOffset % 4)
-                return decline(role, "another stride-32 skin fetch format");
-            const auto& base = slot[0]->data;
-            if (v->data.buffer != base.buffer || v->records != slot[0]->records ||
-                v->data.offset + v->data.byteOffset != base.offset + base.byteOffset + displacement[i] ||
-                v->data.byteOffset > v->data.range ||
-                uint64_t(v->records - 1) * 32 + bytes[i] > v->data.range - v->data.byteOffset)
-                return decline(role, "not one interleaved skin stream");
-            constants[i][0] = v->data.byteOffset / 4;
-            constants[i][1] = 8;
+            if (!v) return decline(role, "a skin vertex input missing");
+            uint32_t channels = 0, bytes = 0;
+            switch (v->dfmt) {
+            case 1: channels = 1; bytes = 4; break;
+            case 2: channels = 1; bytes = 4; break;
+            case 3: channels = 2; bytes = 4; break;
+            case 4: channels = 1; bytes = 4; break;
+            case 5: channels = 2; bytes = 4; break;
+            case 10: channels = 4; bytes = 4; break;
+            case 11: channels = 2; bytes = 8; break;
+            case 12: channels = 4; bytes = 8; break;
+            case 13: channels = 3; bytes = 12; break;
+            case 14: channels = 4; bytes = 16; break;
+            }
+            const bool wide = v->dfmt == 4 || v->dfmt == 11 || v->dfmt == 13 || v->dfmt == 14;
+            const bool half = v->dfmt == 2 || v->dfmt == 5 || v->dfmt == 12;
+            const bool format = i == 2 ? (v->nfmt == 4 || v->nfmt == 5) :
+                (wide ? v->nfmt == 7 : (v->nfmt == 0 || v->nfmt == 1 || (half && v->nfmt == 7)));
+            bool plain = v->components >= used[i] && channels >= used[i];
+            for (uint32_t c = i == 1 ? 1 : 0; c < used[i]; ++c)
+                plain = plain && ((v->dstSel >> (3 * c)) & 7) == 4 + c;
+            const uint64_t offset = uint64_t(v->data.byteOffset) + v->offset;
+            if (!v->data.buffer || v->indexVgpr || v->stride % 4 || offset % 4 ||
+                offset > UINT32_MAX || !format || !plain || !v->records)
+                return decline(role, "a skin fetch format it does not read exactly");
+            // The renderer may cap the descriptor range independently of
+            // NUM_RECORDS; do not require the entire declared stream to fit.
+            if (offset > v->data.range || bytes > v->data.range - offset)
+                return decline(role, "a skin fetch outside its buffer");
+            constants[i][0] = uint32_t(offset / 4);
+            constants[i][1] = v->stride / 4;
             constants[i][2] = v->dfmt | v->nfmt << 4;
             constants[i][3] = v->records;
             buffers[i] = {v->data.buffer, v->data.offset, v->data.range};
