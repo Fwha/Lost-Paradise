@@ -1271,20 +1271,18 @@ class Post final : public Pass {
 public:
     const char* name() const override { return "post"; }
     int claims(const std::string& ps) const override {
-        // The haze: compare copies only, and only claimed when LPN_POST_HAZE=1 asks for it (its
-        // compare run flickered on screen before compare mode stopped routing every claimed draw
-        // to the main recorder). Unclaimed, the build draws as it did before the haze port.
+        // The haze matched in Fwha's compare run (0 px on ~850 compared draws) once compare mode
+        // stopped replacing its copies many times a frame (that, not the haze, flickered the
+        // screen). Drawn by default; LPN_POST_HAZE=0 leaves it to the translated renderer.
         static const bool haze = [] {
             const char* e = std::getenv("LPN_POST_HAZE");
-            return e && *e && *e != '0';
+            return !e || *e != '0';
         }();
         if (ps==kRoles[kHaze].ps) return haze ? kHaze : 0;
         for (int i=1;i<=kToonEdgeFxaa;++i) if (named(ps,kRoles[i].ps)) return i;
         return 0;
     }
     bool draw(int role,const Draw& d,Gpu& gpu) override {
-        if (role==kHaze && !d.compareCopy)
-            return decline(role,"not yet matched (drawn into compare copies only)");
         if (role==kHaze) return drawHaze(d,gpu);
         // The outline chain matched in Fwha's compare run: finalize and the edge FXAA at 0 px, the
         // outline pass within 1/255 (~4% of pixels a step off). Drawn by default.
