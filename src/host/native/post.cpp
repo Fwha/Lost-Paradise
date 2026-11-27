@@ -1,4 +1,5 @@
-// Bloom/downsampling and SSAO, from dis/post and dis/ssao's drawn GCN programs.
+// Bloom/downsampling, SSAO and outlines, from the drawn GCN programs in
+// dis/post, dis/ssao and dis/outline.
 // Fetch the quad rather than assuming its UVs cover [0,1]: glow_pass1 and SSAO
 // remap them, and SSAO's named vertex shaders also export view rays.
 // The luminance VS is capture-5's vs-53c2a1500.bin (fx_depth_to_shadow_unuse_map.fxo +8).
@@ -17,7 +18,9 @@
 namespace host::native {
 namespace {
 
-enum Role { kDown2 = 1, kDown4, kLumi, kBlur, kCompose, kSsao, kTemporal, kSsaoBlur, kUpsample };
+enum Role { kDown2 = 1, kDown4, kLumi, kBlur, kCompose, kSsao, kTemporal, kSsaoBlur, kUpsample,
+            kHandDraw2, kHandDrawFinalize, kToonEdgeFxaa };
+static_assert(kToonEdgeFxaa<24); // renderer.cpp's kCompareRoles; roles 10..12 compare separately.
 struct Variant {
     const char* ps;
     const char* vs;
@@ -40,6 +43,20 @@ constexpr Variant kRoles[] = {
      {0x88, 0x90, 0x98, 0xa0, 0xac, 0xb4, 0xbc, 0xc4, 0x110, 0x118, 0x120, 0x128, 0x130, 0x138, 0x140, 0x148}},
     {"ps_ssao_upsampling.pso", nullptr,
      {0xf4, 0xfc, 0x118, 0x120, 0x128, 0x130, 0x138, 0x140, 0x148}},
+    {"ps_hand_draw_2.pso", "fx_depth_to_shadow_unuse_map.fxo +8", {0x28}},
+    {"fx_hand_draw_finalize.fxo", "fx_hand_draw_finalize.fxo", {0x3c, 0x50}},
+    {"ps_toon_edge_fxaa.pso", nullptr, {0x50, 0x58, 0x60, 0x6c, 0x74, 0x110, 0x128, 0x140, 0x158}},
+};
+
+// All 49 MIMG instructions in hand_draw_2 read s[0:7], s[8:11].
+// Validate that binding at every PC before sharing its descriptor and scale.
+constexpr uint32_t kHandDrawSamples[] = {
+    0x28, 0x74, 0x7c, 0x140, 0x148, 0x210, 0x218, 0x2cc, 0x2d4,
+    0x394, 0x39c, 0x458, 0x460, 0x50c, 0x514, 0x5cc, 0x5d4, 0x6d0,
+    0x6d8, 0x6e0, 0x6f0, 0x700, 0x79c, 0x7cc, 0x7d4, 0x890, 0x898,
+    0x8a8, 0x8b0, 0x8b8, 0x968, 0x998, 0x9a0, 0xa4c, 0xa54, 0xb14,
+    0xb1c, 0xbdc, 0xbe4, 0xca0, 0xca8, 0xd84, 0xda8, 0xdb0, 0xdc0,
+    0xdcc, 0xde0, 0xde8, 0xebc,
 };
 
 // c0: VS position transform; c1..3: VS constants; c4..31: PS scalar loads;
@@ -704,6 +721,438 @@ void main() {
 }
 )";
 
+constexpr const char* kOutlineVs = R"(
+layout(set=0, binding=0, std430) readonly buffer V0 { uint w[]; } v0;
+layout(set=0, binding=1, std430) readonly buffer V1 { uint w[]; } v1;
+layout(location=0) out vec4 a0;
+layout(location=1) out vec4 a1;
+layout(location=2) out vec4 a2;
+vec4 fetch(int slot) {
+    uvec4 f=p.fetch[slot];
+    uint index=uint(gl_VertexIndex);
+    vec4 r=vec4(0.0,0.0,0.0,1.0);
+    uint base=f.x+index*f.y;
+    for (uint j=0u;j<f.z;++j)
+        r[j]=uintBitsToFloat(slot==0?v0.w[base+j]:v1.w[base+j]);
+    vec4 result;
+    for (uint j=0u;j<4u;++j) {
+        uint s=(f.w>>(3u*j))&7u;
+        result[j]=s>=4u?r[s-4u]:(s==1u?1.0:0.0);
+    }
+    return result;
+}
+void main() {
+    vec4 pos=fetch(0);
+    gl_Position=vec4(mac(c[0].xy,pos.xy,c[0].zw),pos.zw);
+    if (p.flags.x!=0u) gl_Position.z=mul(gl_Position.z+gl_Position.w,0.5);
+    a0=a1=a2=vec4(0.0);
+#if ROLE == 10
+    a0=vec4(fetch(1).xy,0.0,0.0);
+#elif ROLE == 11
+    vec2 uv=fetch(1).xy;
+    a0=vec4(uv,c[1].xy*uv);
+#endif
+}
+)";
+
+// Capture-5's drawn outline programs. Preserve register reuse and operation order,
+// including both branches of hand_draw_2; these are not interchangeable blur kernels.
+constexpr const char* kOutlineFs = R"(
+layout(location=0) in vec4 a0;
+layout(location=0) out vec4 outColour;
+layout(set=0,binding=3) uniform sampler2D tex[TEXTURES];
+#define sampleAt(i,uv) texture(tex[i],(uv)*c[32+(i)].xy)
+float B(uint x) { return uintBitsToFloat(x); }
+// As kSsaoFs and the translated pixel shaders: allow contraction, export half RNE.
+float omul(float a,float b) { return a*b; }
+float omad(float a,float b,float d) { return a*b+d; }
+void put(vec4 v) {
+    v=vec4(unpackHalf2x16(packHalf2x16(v.xy)),unpackHalf2x16(packHalf2x16(v.zw)));
+    outColour=vec4(v[p.swizzle.x],v[p.swizzle.y],v[p.swizzle.z],v[p.swizzle.w]);
+}
+void main() {
+#if ROLE == 10
+    float v0,v1,v2,v3,v4,v5,v6,v7;
+    float v8,v9,v10,v11,v12,v13,v14,v15;
+    float v16,v17,v18,v19,v20,v21,v22,v23;
+    float v24,v25,v26,v27,v28,v29,v30,v31;
+    float v32,v33,v34,v35;
+    float s13=c[4].y,s14=c[4].z,s15=c[4].w;
+    bool enabled=s13>0.0,cc;
+    v21=a0.x; v22=a0.y;
+    // MIMG 0x28.
+    { vec4 t=sampleAt(0,vec2(v21,v22));
+      v0=t.x; v1=t.y; v2=t.z; v3=t.w; }
+    v4=s13; v33=omul(-2.0,s14); v32=omul(-2.0,s15); v31=omad(v4,B(0x3a4d9a68u),v3);
+    if (enabled) {
+        v19=v21+v33; v20=v22+v32; v15=v21-v33; v16=v22-v32;
+        // MIMG 0x74.
+        { vec4 t=sampleAt(0,vec2(v19,v20));
+          v3=t.x; v4=t.y; v5=t.z; v6=t.w; }
+        // MIMG 0x7c.
+        { vec4 t=sampleAt(0,vec2(v15,v16));
+          v7=t.x; v8=t.y; v9=t.z; v10=t.w; }
+        v17=v15; v18=v20; v11=v19; v12=v16; v13=v19; v24=v5-v2; v14=v3-v0; v23=v4-v1; v25=omul(v14,v14); v14=v8-v1;
+        v25=omad(v23,v23,v25); v25=omad(v24,v24,v25); v24=v7-v0; v23=omul(v24,v24); v24=v9-v2; v23=omad(v14,v14,v23);
+        v23=omad(v24,v24,v23); cc=v25<v23;
+        if (cc) {
+            cc=v10>=v31; v6=cc?1.0:0.0; v14=omad(v7,v6,v3); v23=omad(v8,v6,v4); v24=omad(v9,v6,v5); v25=cc?2.0:1.0;
+        } else {
+            cc=v6>=v31; v6=cc?1.0:0.0; v14=omad(v3,v6,v7); v23=omad(v4,v6,v8); v24=omad(v5,v6,v9); v25=cc?2.0:1.0;
+        }
+        // MIMG 0x140.
+        { vec4 t=sampleAt(0,vec2(v17,v18));
+          v3=t.x; v4=t.y; v5=t.z; v6=t.w; }
+        // MIMG 0x148.
+        { vec4 t=sampleAt(0,vec2(v11,v12));
+          v7=t.x; v8=t.y; v9=t.z; v10=t.w; }
+        v17=v5-v2; v11=v3-v0; v12=v4-v1; v18=omul(v11,v11); v11=v8-v1; v18=omad(v12,v12,v18); v18=omad(v17,v17,v18);
+        v17=v7-v0; v12=omul(v17,v17); v17=v9-v2; v12=omad(v11,v11,v12); v12=omad(v17,v17,v12); cc=v18<v12;
+        if (cc) {
+            cc=v10>=v31; v6=cc?1.0:0.0; v10=v25+v6; v3=v3+v14; v25=v23+v4; v26=v24+v5; v23=1.0+v10; v24=omad(v7,v6,v3);
+            v25=omad(v6,v8,v25); v26=omad(v6,v9,v26);
+        } else {
+            cc=v6>=v31; v6=cc?1.0:0.0; v10=v25+v6; v7=v7+v14; v25=v23+v8; v26=v24+v9; v23=1.0+v10; v24=omad(v3,v6,v7);
+            v25=omad(v6,v4,v25); v26=omad(v6,v5,v26);
+        }
+        v3=s14+v33; v11=v21+v3; v12=v20; v17=v21-v3; v18=v16;
+        // MIMG 0x210.
+        { vec4 t=sampleAt(0,vec2(v11,v12));
+          v3=t.x; v4=t.y; v5=t.z; v6=t.w; }
+        // MIMG 0x218.
+        { vec4 t=sampleAt(0,vec2(v17,v18));
+          v7=t.x; v8=t.y; v9=t.z; v10=t.w; }
+        v18=v20; v12=v16; v20=v5-v2; v14=v3-v0; v16=v4-v1; v27=omul(v14,v14); v14=v8-v1; v27=omad(v16,v16,v27);
+        v27=omad(v20,v20,v27); v20=v7-v0; v16=omul(v20,v20); v20=v9-v2; v16=omad(v14,v14,v16); v16=omad(v20,v20,v16);
+        cc=v27<v16;
+        if (cc) {
+            cc=v10>=v31; v6=cc?1.0:0.0; v16=omad(v7,v6,v3); v20=omad(v8,v6,v4); v27=omad(v9,v6,v5); v14=cc?2.0:1.0;
+        } else {
+            cc=v6>=v31; v6=cc?1.0:0.0; v16=omad(v3,v6,v7); v20=omad(v4,v6,v8); v27=omad(v5,v6,v9); v14=cc?2.0:1.0;
+        }
+        // MIMG 0x2cc.
+        { vec4 t=sampleAt(0,vec2(v17,v18));
+          v3=t.x; v4=t.y; v5=t.z; v6=t.w; }
+        // MIMG 0x2d4.
+        { vec4 t=sampleAt(0,vec2(v11,v12));
+          v7=t.x; v8=t.y; v9=t.z; v10=t.w; }
+        v28=v5-v2; v12=v3-v0; v18=v4-v1; v29=omul(v12,v12); v12=v8-v1; v29=omad(v18,v18,v29); v29=omad(v28,v28,v29);
+        v28=v7-v0; v18=omul(v28,v28); v28=v9-v2; v18=omad(v12,v12,v18); v18=omad(v28,v28,v18); cc=v29<v18;
+        if (cc) {
+            cc=v10>=v31; v6=cc?1.0:0.0; v10=v3+v16; v29=v20+v4; v30=v27+v5; v5=v14+v6; v28=1.0+v5; v27=omad(v7,v6,v10);
+            v29=omad(v6,v8,v29); v30=omad(v6,v9,v30);
+        } else {
+            cc=v6>=v31; v6=cc?1.0:0.0; v10=v7+v16; v29=v20+v8; v30=v27+v9; v27=omad(v3,v6,v10); v3=v14+v6; v28=1.0+v3;
+            v29=omad(v6,v4,v29); v30=omad(v6,v5,v30);
+        }
+        v3=s15+v32; v20=v22+v3; v16=v22-v3;
+        // MIMG 0x394.
+        { vec4 t=sampleAt(0,vec2(v19,v20));
+          v3=t.x; v4=t.y; v5=t.z; v6=t.w; }
+        // MIMG 0x39c.
+        { vec4 t=sampleAt(0,vec2(v15,v16));
+          v7=t.x; v8=t.y; v9=t.z; v10=t.w; }
+        v14=v16; v12=v20; v18=v16; v16=v20; v34=v5-v2; v19=v3-v0; v20=v4-v1; v35=omul(v19,v19); v19=v8-v1;
+        v35=omad(v20,v20,v35); v35=omad(v34,v34,v35); v34=v7-v0; v20=omul(v34,v34); v34=v9-v2; v20=omad(v19,v19,v20);
+        v20=omad(v34,v34,v20); cc=v35<v20;
+        if (cc) {
+            cc=v10>=v31; v6=cc?1.0:0.0; v20=omad(v7,v6,v3); v19=omad(v8,v6,v4); v34=omad(v9,v6,v5); v35=cc?2.0:1.0;
+        } else {
+            cc=v6>=v31; v6=cc?1.0:0.0; v20=omad(v3,v6,v7); v19=omad(v4,v6,v8); v34=omad(v5,v6,v9); v35=cc?2.0:1.0;
+        }
+        // MIMG 0x458.
+        { vec4 t=sampleAt(0,vec2(v15,v16));
+          v3=t.x; v4=t.y; v5=t.z; v6=t.w; }
+        // MIMG 0x460.
+        { vec4 t=sampleAt(0,vec2(v13,v14));
+          v7=t.x; v8=t.y; v9=t.z; v10=t.w; }
+        v15=v5-v2; v13=v3-v0; v14=v4-v1; v16=omul(v13,v13); v13=v8-v1; v16=omad(v14,v14,v16); v16=omad(v15,v15,v16);
+        v15=v7-v0; v14=omul(v15,v15); v15=v9-v2; v14=omad(v13,v13,v14); v14=omad(v15,v15,v14); cc=v16<v14;
+        if (cc) {
+            cc=v10>=v31; v6=cc?1.0:0.0; v10=v35+v6; v16=v3+v20; v19=v19+v4; v20=v34+v5; v15=1.0+v10; v16=omad(v6,v7,v16);
+            v19=omad(v6,v8,v19); v20=omad(v6,v9,v20);
+        } else {
+            cc=v6>=v31; v6=cc?1.0:0.0; v16=v7+v20; v19=v19+v8; v20=v34+v9; v16=omad(v6,v3,v16); v3=v35+v6; v15=1.0+v3;
+            v19=omad(v6,v4,v19); v20=omad(v6,v5,v20);
+        }
+        // MIMG 0x50c.
+        { vec4 t=sampleAt(0,vec2(v11,v12));
+          v3=t.x; v4=t.y; v5=t.z; v6=t.w; }
+        // MIMG 0x514.
+        { vec4 t=sampleAt(0,vec2(v17,v18));
+          v7=t.x; v8=t.y; v9=t.z; v10=t.w; }
+        v13=v17; v14=v12; v12=v18; v34=v5-v2; v17=v3-v0; v18=v4-v1; v35=omul(v17,v17); v17=v8-v1;
+        v35=omad(v18,v18,v35); v35=omad(v34,v34,v35); v34=v7-v0; v18=omul(v34,v34); v34=v9-v2; v18=omad(v17,v17,v18);
+        v18=omad(v34,v34,v18); cc=v35<v18;
+        if (cc) {
+            cc=v10>=v31; v6=cc?1.0:0.0; v18=omad(v7,v6,v3); v34=omad(v8,v6,v4); v35=omad(v9,v6,v5); v17=cc?2.0:1.0;
+        } else {
+            cc=v6>=v31; v6=cc?1.0:0.0; v18=omad(v3,v6,v7); v34=omad(v4,v6,v8); v35=omad(v5,v6,v9); v17=cc?2.0:1.0;
+        }
+        // MIMG 0x5cc.
+        { vec4 t=sampleAt(0,vec2(v13,v14));
+          v3=t.x; v4=t.y; v5=t.z; v6=t.w; }
+        // MIMG 0x5d4.
+        { vec4 t=sampleAt(0,vec2(v11,v12));
+          v7=t.x; v8=t.y; v9=t.z; v10=t.w; }
+        v13=v5-v2; v11=v3-v0; v12=v4-v1; v14=omul(v11,v11); v11=v8-v1; v14=omad(v12,v12,v14); v14=omad(v13,v13,v14);
+        v13=v7-v0; v12=omul(v13,v13); v13=v9-v2; v12=omad(v11,v11,v12); v12=omad(v13,v13,v12); cc=v14<v12;
+        if (cc) {
+            cc=v10>=v31; v6=cc?1.0:0.0; v11=v3+v18; v12=v34+v4; v13=v35+v5; v11=omad(v6,v7,v11); v12=omad(v6,v8,v12);
+            v13=omad(v6,v9,v13); v6=v17+v6; v6=1.0+v6;
+        } else {
+            cc=v6>=v31; v6=cc?1.0:0.0; v11=v7+v18; v12=v34+v8; v13=v35+v9; v11=omad(v6,v3,v11); v12=omad(v6,v4,v12);
+            v13=omad(v6,v5,v13); v6=v17+v6; v6=1.0+v6;
+        }
+        v7=v24+v27; v8=v25+v29; v9=v26+v30; v10=v23+v28; v7=v16+v7; v8=v19+v8; v9=v20+v9; v10=v15+v10; v26=v11+v7;
+        v27=v12+v8; v28=v13+v9; v35=v6+v10;
+    } else {
+        v3=s14+v33; v19=v22+v32; v23=v21-v3; v18=v21+v3; v3=v23; v4=v19; v24=v22-v32;
+        // MIMG 0x6d0.
+        { vec4 t=sampleAt(0,vec2(v18,v19));
+          v12=t.x; v13=t.y; v14=t.z; }
+        // MIMG 0x6d8.
+        { vec4 t=sampleAt(0,vec2(v3,v4));
+          v6=t.x; v7=t.y; v8=t.z; }
+        // MIMG 0x6e0.
+        { vec4 t=sampleAt(0,vec2(v23,v24));
+          v15=t.x; v16=t.y; v17=t.z; }
+        v3=v18; v4=v24;
+        // MIMG 0x6f0.
+        { vec4 t=sampleAt(0,vec2(v3,v4));
+          v9=t.x; v10=t.y; v11=t.z; }
+        v25=v21+v33; v26=v19;
+        // MIMG 0x700.
+        { vec4 t=sampleAt(0,vec2(v25,v26));
+          v3=t.x; v4=t.y; v5=t.z; }
+        v28=v24; v27=v21-v33; v26=v24; v20=s15+v32; v29=v25; v34=v14-v2; v24=v12-v0; v30=v13-v1; v35=omul(v24,v24);
+        v24=v16-v1; v35=omad(v30,v30,v35); v35=omad(v34,v34,v35); v34=v15-v0; v30=omul(v34,v34); v34=v17-v2;
+        v30=omad(v24,v24,v30); v30=omad(v34,v34,v30); cc=v35<v30; v24=cc?v14:v17; v14=v10-v1; v15=cc?v12:v15;
+        v12=v6-v0; v12=omul(v12,v12); v16=cc?v13:v16; v13=v7-v1; v12=omad(v13,v13,v12); v13=v8-v2;
+        v12=omad(v13,v13,v12); v13=v9-v0; v13=omul(v13,v13); v13=omad(v14,v14,v13); v14=v11-v2;
+        v13=omad(v14,v14,v13); cc=v12<v13;
+        // MIMG 0x79c.
+        { vec4 t=sampleAt(0,vec2(v27,v28));
+          v12=t.x; v13=t.y; v14=t.z; }
+        v28=v19; v10=cc?v7:v10; v6=cc?v6:v9; v9=cc?v8:v11; v8=v3-v0; v19=omul(v8,v8); v17=v6+v15; v16=v10+v16;
+        v15=v9+v24;
+        // MIMG 0x7cc.
+        { vec4 t=sampleAt(0,vec2(v27,v28));
+          v9=t.x; v10=t.y; v11=t.z; }
+        // MIMG 0x7d4.
+        { vec4 t=sampleAt(0,vec2(v25,v26));
+          v6=t.x; v7=t.y; v8=t.z; }
+        v26=v22+v20; v28=v22-v20; v20=v4-v1; v19=omad(v20,v20,v19); v20=v5-v2; v19=omad(v20,v20,v19); v30=v28;
+        v35=8.0; v20=v12-v0; v20=omul(v20,v20); v24=v13-v1; v20=omad(v24,v24,v20); v24=v14-v2; v20=omad(v24,v24,v20);
+        cc=v19<v20; v12=cc?v3:v12; v3=cc?v4:v13; v4=cc?v5:v14; v14=v9-v0; v13=v10-v1; v19=omul(v14,v14); v14=v11-v2;
+        v5=v7-v1; v19=omad(v13,v13,v19); v19=omad(v14,v14,v19); v14=v6-v0; v13=omul(v14,v14); v14=v8-v2;
+        v13=omad(v5,v5,v13); v13=omad(v14,v14,v13); cc=v19<v13; v5=cc?v9:v6; v6=v5+v12; v5=cc?v11:v8; v19=v26;
+        v5=v5+v4; v4=cc?v10:v7; v3=v4+v3; v4=v26; v24=v28; v20=v5+v15; v34=v6+v17;
+        // MIMG 0x890.
+        { vec4 t=sampleAt(0,vec2(v25,v26));
+          v12=t.x; v13=t.y; v14=t.z; }
+        // MIMG 0x898.
+        { vec4 t=sampleAt(0,vec2(v29,v30));
+          v6=t.x; v7=t.y; v8=t.z; }
+        v29=v3+v16; v3=v27;
+        // MIMG 0x8a8.
+        { vec4 t=sampleAt(0,vec2(v27,v28));
+          v15=t.x; v16=t.y; v17=t.z; }
+        // MIMG 0x8b0.
+        { vec4 t=sampleAt(0,vec2(v3,v4));
+          v9=t.x; v10=t.y; v11=t.z; }
+        // MIMG 0x8b8.
+        { vec4 t=sampleAt(0,vec2(v18,v19));
+          v3=t.x; v4=t.y; v5=t.z; }
+        v27=v12-v0; v30=omul(v27,v27); v19=v13-v1; v27=v14-v2; v30=omad(v19,v19,v30); v19=omad(v27,v27,v30);
+        v27=v15-v0; v27=omul(v27,v27); v30=v16-v1; v27=omad(v30,v30,v27); v30=v17-v2; v27=omad(v30,v30,v27);
+        cc=v19<v27; v16=cc?v13:v16; v13=v10-v1; v15=cc?v12:v15; v12=cc?v14:v17; v17=v9-v0; v19=omul(v17,v17);
+        v17=v11-v2; v14=v7-v1; v19=omad(v13,v13,v19); v19=omad(v17,v17,v19); v17=v6-v0; v13=omul(v17,v17); v17=v8-v2;
+        v13=omad(v14,v14,v13); v13=omad(v17,v17,v13); cc=v19<v13; v7=cc?v10:v7; v6=cc?v9:v6; v9=v6+v15; v6=cc?v11:v8;
+        v8=v7+v16; v7=v4-v1; v19=v28; v6=v6+v12;
+        // MIMG 0x968.
+        { vec4 t=sampleAt(0,vec2(v23,v24));
+          v12=t.x; v13=t.y; v14=t.z; }
+        v24=v26; v15=v34+v9; v16=v29+v8; v8=v3-v0; v9=omul(v8,v8); v8=v5-v2; v9=omad(v7,v7,v9); v26=omad(v8,v8,v9);
+        v17=v20+v6;
+        // MIMG 0x998.
+        { vec4 t=sampleAt(0,vec2(v23,v24));
+          v6=t.x; v7=t.y; v8=t.z; }
+        // MIMG 0x9a0.
+        { vec4 t=sampleAt(0,vec2(v18,v19));
+          v9=t.x; v10=t.y; v11=t.z; }
+        v19=v12-v0; v20=omul(v19,v19); v18=v13-v1; v19=v14-v2; v20=omad(v18,v18,v20); v20=omad(v19,v19,v20);
+        cc=v26<v20; v12=cc?v3:v12; v3=cc?v4:v13; v4=cc?v5:v14; v13=v6-v0; v5=v9-v0; v14=omul(v13,v13); v18=v7-v1;
+        v5=omul(v5,v5); v13=v10-v1; v14=omad(v18,v18,v14); v18=v8-v2; v5=omad(v13,v13,v5); v13=v11-v2;
+        v14=omad(v18,v18,v14); v5=omad(v13,v13,v5); cc=v14<v5; v5=cc?v6:v9; v5=v5+v12; v6=cc?v8:v11; v4=v6+v4;
+        v26=v15+v5; v5=cc?v7:v10; v3=v5+v3; v27=v16+v3; v28=v17+v4;
+    }
+    if (enabled) {
+        v3=v21+v33; v4=v22; v7=v21-v33; v8=v22;
+        // MIMG 0xa4c.
+        { vec4 t=sampleAt(0,vec2(v3,v4));
+          v3=t.x; v4=t.y; v5=t.z; v6=t.w; }
+        // MIMG 0xa54.
+        { vec4 t=sampleAt(0,vec2(v7,v8));
+          v7=t.x; v8=t.y; v9=t.z; v10=t.w; }
+        v14=v22+v32; v13=v21; v12=v22-v32; v11=v21; v17=v5-v2; v15=v3-v0; v16=v4-v1; v18=omul(v15,v15); v15=v8-v1;
+        v18=omad(v16,v16,v18); v18=omad(v17,v17,v18); v17=v7-v0; v16=omul(v17,v17); v17=v9-v2; v16=omad(v15,v15,v16);
+        v16=omad(v17,v17,v16); cc=v18<v16;
+        if (cc) {
+            cc=v10>=v31; v6=cc?1.0:0.0; v15=omad(v7,v6,v3); v16=omad(v8,v6,v4); v17=omad(v9,v6,v5); v18=cc?2.0:1.0;
+        } else {
+            cc=v6>=v31; v6=cc?1.0:0.0; v15=omad(v3,v6,v7); v16=omad(v4,v6,v8); v17=omad(v5,v6,v9); v18=cc?2.0:1.0;
+        }
+        // MIMG 0xb14.
+        { vec4 t=sampleAt(0,vec2(v13,v14));
+          v3=t.x; v4=t.y; v5=t.z; v6=t.w; }
+        // MIMG 0xb1c.
+        { vec4 t=sampleAt(0,vec2(v11,v12));
+          v7=t.x; v8=t.y; v9=t.z; v10=t.w; }
+        v13=v5-v2; v11=v3-v0; v12=v4-v1; v14=omul(v11,v11); v11=v8-v1; v14=omad(v12,v12,v14); v14=omad(v13,v13,v14);
+        v13=v7-v0; v12=omul(v13,v13); v13=v9-v2; v12=omad(v11,v11,v12); v12=omad(v13,v13,v12); cc=v14<v12;
+        if (cc) {
+            cc=v10>=v31; v6=cc?1.0:0.0; v10=v18+v6; v14=v3+v15; v15=v16+v4; v16=v17+v5; v13=1.0+v10; v14=omad(v6,v7,v14);
+            v15=omad(v6,v8,v15); v16=omad(v6,v9,v16);
+        } else {
+            cc=v6>=v31; v6=cc?1.0:0.0; v10=v18+v6; v14=v7+v15; v15=v16+v8; v16=v17+v9; v13=1.0+v10; v14=omad(v6,v3,v14);
+            v15=omad(v6,v4,v15); v16=omad(v6,v5,v16);
+        }
+        v5=s14+v33; v3=v21+v5; v4=v22; v7=v21-v5; v8=v22;
+        // MIMG 0xbdc.
+        { vec4 t=sampleAt(0,vec2(v3,v4));
+          v3=t.x; v4=t.y; v5=t.z; v6=t.w; }
+        // MIMG 0xbe4.
+        { vec4 t=sampleAt(0,vec2(v7,v8));
+          v7=t.x; v8=t.y; v9=t.z; v10=t.w; }
+        v11=s15+v32; v12=v22+v11; v22=v22-v11; v11=v21; v19=v5-v2; v17=v3-v0; v18=v4-v1; v20=omul(v17,v17);
+        v17=v8-v1; v20=omad(v18,v18,v20); v20=omad(v19,v19,v20); v19=v7-v0; v18=omul(v19,v19); v19=v9-v2;
+        v18=omad(v17,v17,v18); v18=omad(v19,v19,v18); cc=v20<v18;
+        if (cc) {
+            cc=v10>=v31; v6=cc?1.0:0.0; v17=omad(v7,v6,v3); v18=omad(v8,v6,v4); v19=omad(v9,v6,v5); v20=cc?2.0:1.0;
+        } else {
+            cc=v6>=v31; v6=cc?1.0:0.0; v17=omad(v3,v6,v7); v18=omad(v4,v6,v8); v19=omad(v5,v6,v9); v20=cc?2.0:1.0;
+        }
+        // MIMG 0xca0.
+        { vec4 t=sampleAt(0,vec2(v11,v12));
+          v3=t.x; v4=t.y; v5=t.z; v6=t.w; }
+        // MIMG 0xca8.
+        { vec4 t=sampleAt(0,vec2(v21,v22));
+          v7=t.x; v8=t.y; v9=t.z; v10=t.w; }
+        v21=v5-v2; v11=v3-v0; v12=v4-v1; v22=omul(v11,v11); v11=v8-v1; v22=omad(v12,v12,v22); v22=omad(v21,v21,v22);
+        v21=v7-v0; v12=omul(v21,v21); v21=v9-v2; v12=omad(v11,v11,v12); v12=omad(v21,v21,v12); cc=v22<v12;
+        if (cc) {
+            cc=v10>=v31; v10=cc?1.0:0.0; v6=v20+v10; v11=v3+v17; v12=v18+v4; v17=v19+v5; v6=1.0+v6; v11=omad(v10,v7,v11);
+            v12=omad(v10,v8,v12); v17=omad(v10,v9,v17);
+        } else {
+            cc=v6>=v31; v10=cc?1.0:0.0; v6=v20+v10; v11=v7+v17; v12=v18+v8; v17=v19+v9; v6=1.0+v6; v11=omad(v10,v3,v11);
+            v12=omad(v10,v4,v12); v17=omad(v10,v5,v17);
+        }
+        v7=v14+v26; v8=v15+v27; v9=v16+v28; v10=v13+v35; v3=v11+v7; v4=v12+v8; v5=v17+v9; v25=v6+v10;
+    } else {
+        v3=v21+v33; v4=v22;
+        // MIMG 0xd84.
+        { vec4 t=sampleAt(0,vec2(v3,v4));
+          v15=t.x; v16=t.y; v17=t.z; }
+        v3=v21-v33; v6=s14+v33; v29=s15+v32; v7=v22; v24=v22+v29; v23=v21; v25=4.0+v35;
+        // MIMG 0xda8.
+        { vec4 t=sampleAt(0,vec2(v3,v4));
+          v18=t.x; v19=t.y; v20=t.z; }
+        // MIMG 0xdb0.
+        { vec4 t=sampleAt(0,vec2(v23,v24));
+          v33=t.x; v34=t.y; v35=t.z; }
+        v4=v22+v32; v3=v21;
+        // MIMG 0xdc0.
+        { vec4 t=sampleAt(0,vec2(v3,v4));
+          v9=t.x; v10=t.y; v11=t.z; }
+        v4=v22-v32;
+        // MIMG 0xdcc.
+        { vec4 t=sampleAt(0,vec2(v3,v4));
+          v12=t.x; v13=t.y; v14=t.z; }
+        v3=v21+v6; v4=v22; v6=v21-v6;
+        // MIMG 0xde0.
+        { vec4 t=sampleAt(0,vec2(v3,v4));
+          v3=t.x; v4=t.y; v5=t.z; }
+        // MIMG 0xde8.
+        { vec4 t=sampleAt(0,vec2(v6,v7));
+          v6=t.x; v7=t.y; v8=t.z; }
+        v22=v22-v29; v31=v17-v2; v29=v15-v0; v30=v16-v1; v32=omul(v29,v29); v32=omad(v30,v30,v32);
+        v32=omad(v31,v31,v32); v31=v18-v0; v30=omul(v31,v31); v29=v19-v1; v31=v20-v2; v30=omad(v29,v29,v30);
+        v30=omad(v31,v31,v30); cc=v32<v30; v15=cc?v15:v18; v18=v10-v1; v16=cc?v16:v19; v19=v9-v0; v29=omul(v19,v19);
+        v19=v11-v2; v29=omad(v18,v18,v29); v29=omad(v19,v19,v29); v19=v12-v0; v19=omul(v19,v19); v17=cc?v17:v20;
+        v20=v13-v1; v19=omad(v20,v20,v19); v20=v14-v2; v19=omad(v20,v20,v19); cc=v29<v19; v9=cc?v9:v12;
+        v11=cc?v11:v14; v9=v9+v15; v20=v4-v1; v19=v7-v1; v13=cc?v10:v13; v13=v13+v16; v12=v11+v17; v11=v3-v0;
+        v18=omul(v11,v11); v18=omad(v20,v20,v18); v20=v5-v2; v18=omad(v20,v20,v18); v20=v6-v0; v15=v26+v9;
+        // MIMG 0xebc.
+        { vec4 t=sampleAt(0,vec2(v21,v22));
+          v9=t.x; v10=t.y; v11=t.z; }
+        v21=omul(v20,v20); v20=v8-v2; v21=omad(v19,v19,v21); v21=omad(v20,v20,v21); cc=v18<v21; v3=cc?v3:v6;
+        v4=cc?v4:v7; v7=v34-v1; v5=cc?v5:v8; v8=v33-v0; v18=omul(v8,v8); v8=v35-v2; v18=omad(v7,v7,v18);
+        v18=omad(v8,v8,v18); v16=v27+v13; v17=v28+v12; v8=v9-v0; v7=omul(v8,v8); v6=v10-v1; v8=v11-v2;
+        v7=omad(v6,v6,v7); v7=omad(v8,v8,v7); cc=v18<v7; v6=cc?v33:v9; v7=cc?v34:v10; v8=cc?v35:v11; v3=v6+v3;
+        v4=v7+v4; v5=v8+v5; v3=v15+v3; v4=v16+v4; v5=v17+v5;
+    }
+    v6=omad(2.0,v25,1.0); v6=1.0/(v6); v0=omad(2.0,v3,v0); v1=omad(2.0,v4,v1); v2=omad(2.0,v5,v2);
+    v0=omul(v6,v0); v1=omul(v6,v1); v2=omul(v6,v2);
+    put(vec4(v0,v1,v2,1.0));
+#elif ROLE == 11
+    // Scalar loads 0x58 (s0..7), 0x5c (s16..19), 0x60 (s8).
+    vec3 rgb=sampleAt(0,a0.zw).rgb; // MIMG 0x3c
+    float depth=sampleAt(1,a0.xy).x; // MIMG 0x50, distinct sampler
+    float v3=c[5].w,v4=c[6].y,v5,v6;
+    v6=clamp(rgb.r-c[4].z,0.0,1.0); rgb.r=omad(c[4].w,v6,rgb.r);
+    v6=clamp(rgb.g-c[4].z,0.0,1.0); rgb.g=omad(c[4].w,v6,rgb.g);
+    v5=c[4].x+depth; v5=1.0/v5; v5=omul(c[4].y,v5);
+    v4=clamp(omad(c[6].x,v5,v4),0.0,1.0); v4=omul(c[6].z,v4);
+    v3=clamp(omad(c[5].z,v5,v3),0.0,1.0);
+    v5=clamp(rgb.b-c[4].z,0.0,1.0); v3=max(v3,v4);
+    rgb.b=omad(c[4].w,v5,rgb.b);
+    rgb.r=omul(v3,rgb.r); rgb.g=omul(v3,rgb.g); rgb.b=omul(v3,rgb.b);
+    if ((floatBitsToUint(c[7].x)&8u)!=0u) {
+        // Conditional scalar load 0xdc (s0..3).
+        v4=-1.0+c[8].z; v4=omad(v3,v4,1.0);
+        rgb.r=omul(c[8].x,rgb.r); rgb.g=omul(c[8].x,rgb.g); rgb.b=omul(c[8].x,rgb.b);
+        rgb.r=omul(rgb.r,v4); rgb.g=omul(rgb.g,v4); rgb.b=omul(rgb.b,v4);
+        v3=omul(c[8].x,v3);
+    }
+    put(vec4(rgb,v3));
+#elif ROLE == 12
+    float v0,v1,v2,v3,v4,v5,v6,v7;
+    float v8,v9,v10,v11,v12;
+    float s12=c[4].x,s13=c[4].y;
+    bool cc;
+    v2=gl_FragCoord.x; v3=gl_FragCoord.y;
+    v1=omul(s13,v3); v4=B(0x3f400000u); v0=omul(s12,v2); v3=omad(v4,-s13,v1); v4=omad(v4,-s12,v0); v7=s13+v3;
+    v6=s12+v4; v5=v7; v2=v6;
+    // MIMG 0x50.
+    v7=sampleAt(0,vec2(v6,v7)).x;
+    // MIMG 0x58.
+    v8=sampleAt(1,vec2(v4,v5)).x;
+    // MIMG 0x60.
+    v10=sampleAt(2,vec2(v0,v1)).x; v5=v3;
+    // MIMG 0x6c.
+    v6=sampleAt(3,vec2(v2,v3)).x;
+    // MIMG 0x74.
+    v4=sampleAt(4,vec2(v4,v5)).x; v2=-8.0; v9=v7+v8; v5=min(min(v8,v10),v7); v3=v7+v6; v11=v8+v4; v3=v3-v11;
+    v7=max(max(v8,v10),v7); v10=v6+v4; v12=v9+v10; v12=omul(B(0x3d000000u),v12); v8=v9-v10;
+    v9=max(B(0x3c000000u),v12); v10=min(abs(v8),abs(v3)); v9=v9+v10; v9=1.0/(v9); v8=omul(v9,v8);
+    v3=omul(-v3,v9); v8=min(max(v2,v8),8.0); v2=min(max(v2,v3),8.0); v9=omul(s12,v8); v10=omul(s13,v2);
+    v2=omad(v9,B(0x3e2aaaacu),v0); v3=omad(v10,B(0x3e2aaaacu),v1);
+    // MIMG 0x110.
+    v8=sampleAt(5,vec2(v2,v3)).x; v2=omad(v9,B(0xbe2aaaaau),v0); v3=omad(v10,B(0xbe2aaaaau),v1);
+    // MIMG 0x128.
+    v11=sampleAt(6,vec2(v2,v3)).x; v2=omad(0.5,v9,v0); v3=omad(0.5,v10,v1);
+    // MIMG 0x140.
+    v12=sampleAt(7,vec2(v2,v3)).x; v2=omad(-0.5,v9,v0); v3=omad(-0.5,v10,v1);
+    // MIMG 0x158.
+    v1=sampleAt(8,vec2(v2,v3)).x; v0=min(min(v4,v5),v6); v2=max(max(v4,v7),v6); v4=v8+v11; v3=omul(0.5,v4);
+    v1=v12+v1; v1=v4+v1; v1=omul(B(0x3e800000u),v1); cc=v1>=v0; v0=cc?1.0:0.0; cc=v1>=v2; v2=cc?1.0:0.0;
+    v0=v0-v2; v3=omad(v3,-v0,v3); v3=omad(v1,v0,v3);
+    put(vec4(v3,v3,v3,1.0));
+#endif
+}
+)";
+
 bool named(const std::string& name,const char* wanted) {
     if (name==wanted) return true;
     const std::string prefix=std::string(wanted)+" +";
@@ -715,11 +1164,13 @@ class Post final : public Pass {
 public:
     const char* name() const override { return "post"; }
     int claims(const std::string& ps) const override {
-        for (int i=1;i<=kUpsample;++i) if (named(ps,kRoles[i].ps)) return i;
+        for (int i=1;i<=kToonEdgeFxaa;++i) if (named(ps,kRoles[i].ps)) return i;
         return 0;
     }
     bool draw(int role,const Draw& d,Gpu& gpu) override {
-        if (role<kDown2 || role>kUpsample) return false;
+        if (role>=kHandDraw2 && role<=kToonEdgeFxaa && !d.compareCopy)
+            return decline(role, "not yet matched (drawn into compare copies only)");
+        if (role<kDown2 || role>kToonEdgeFxaa) return false;
         // The SSAO chain and depth-bound draws: Codex's port, unmatched yet, drawn only when
         // LPN_NATIVE_COMPARE=post compares it (the glow chain matched within 1/255).
         static const bool comparing = [] {
@@ -754,7 +1205,7 @@ public:
             }
             return m; // bit 0: the depth-bound glow draws
         }();
-        if (role >= kSsao && !(roles >> role & 1)) return decline(role, "the SSAO port is off (LPN_POST_ROLES)");
+        if (role >= kSsao && role <= kUpsample && !(roles >> role & 1)) return decline(role, "the SSAO port is off (LPN_POST_ROLES)");
         if (role == kSsao && !ssao) return decline(role, "the SSAO term is off (LPN_POST_SSAO=1 compares it)");
         // As the merged glow pass: a depth buffer bound but neither tested nor written is drawn
         // (the 2x4 downsample always has one); depth or stencil in use only into compare copies.
@@ -762,12 +1213,12 @@ public:
                                d.depthStencil.depthWriteEnable || d.depthStencil.stencilTestEnable ||
                                d.depthStencil.depthBoundsTestEnable;
         if (role < kSsao && usesDepth && (!ssao || !d.compareCopy || !(roles & 1))) return decline(role, "depth or stencil");
-        if (role==kSsaoBlur || role==kUpsample) {
+        if (role==kSsaoBlur || role==kUpsample || role==kToonEdgeFxaa) {
             // nativeBuild uses shaderNameAt for an unindexed VS: it returns "?".
-            // Only these two claimed PSs accept the unnamed vs_fullscreen_53c2a1600.
+            // These claimed PSs accept the unnamed vs_fullscreen_53c2a1600.
             if (d.vsName && !d.vsName->empty() && *d.vsName!="?")
                 return decline(role,"another vertex shader");
-        } else if (!d.vsName || ((role==kLumi || role==kSsao) ?
+        } else if (!d.vsName || ((role==kLumi || role==kSsao || role==kHandDraw2) ?
                    *d.vsName!=kRoles[role].vs : !named(*d.vsName,kRoles[role].vs)))
             return decline(role,"another vertex shader");
         if (d.colorCount!=1 || !d.color[0].view || d.color[0].format==VK_FORMAT_UNDEFINED ||
@@ -776,6 +1227,9 @@ public:
             return decline(role,"not one supported colour target");
         if (role<kSsao && d.color[0].format!=VK_FORMAT_R8G8B8A8_UNORM)
             return decline(role,"unexpected colour format (expected RGBA8 UNORM)");
+        if ((role==kHandDraw2 || role==kToonEdgeFxaa) &&
+            (d.color[0].format!=VK_FORMAT_R8G8B8A8_UNORM || d.color[0].comps!=4))
+            return decline(role,"unexpected outline colour format (expected RGBA8 UNORM)");
         if ((d.writeMask&~0xfu) || !(d.writeMask&0xfu))
             return decline(role,"unexpected target write mask");
         const auto& blend=d.blendState[0];
@@ -810,7 +1264,7 @@ public:
             if (slots[v.slot]) return decline(role,"duplicate fetch slot");
             slots[v.slot]=&v;
         }
-        const int fetches=role>=kSsaoBlur?1:2;
+        const int fetches=(role==kHandDraw2 || role==kHandDrawFinalize)?2:(role>=kSsaoBlur?1:2);
         for (int i=0;i<fetches;++i) {
             const VertexBuffer* v=slots[i];
             // Capture-5 uses float3 position with DST_SEL_W=1 and float2 UV.
@@ -846,10 +1300,35 @@ public:
             std::memcpy(reinterpret_cast<unsigned char*>(constants.data())+at*16,words,n*4);
             return true;
         };
-        const uint32_t positionPc=role==kTemporal?0x14:(role==kLumi || role>=kSsao?0x10:0xc);
+        const uint32_t positionPc=role==kHandDrawFinalize?0xc:role==kTemporal?0x14:(role==kLumi || role>=kSsao?0x10:0xc);
         if (!load(true,positionPc,4,0)) return decline(role,"missing VS position scalar load");
         uint32_t wantedTextures=0;
-        if (role>=kSsao) {
+        if (role>=kHandDraw2) {
+            if (role==kHandDraw2) {
+                if (!load(false,0xc,4,4)) return decline(role,"missing hand-draw scalar load");
+                const Texture* first=nullptr;
+                for (uint32_t pc:kHandDrawSamples) {
+                    const Texture* t=nullptr;
+                    for (const Texture& x:d.textures) if (x.pc==pc) {
+                        if (t) return decline(role,"duplicate hand-draw MIMG PC");
+                        t=&x;
+                    }
+                    if (!t || !t->view || !t->sampler)
+                        return decline(role,"missing hand-draw texture or sampler at MIMG PC");
+                    if (first && (t->view!=first->view || t->sampler!=first->sampler ||
+                        t->address!=first->address || std::memcmp(t->scale,first->scale,sizeof t->scale)))
+                        return decline(role,"hand-draw MIMG bindings differ");
+                    first=t;
+                }
+            } else if (role==kHandDrawFinalize) {
+                if (!load(true,0x10,2,1) || !load(false,0x58,8,4) ||
+                    !load(false,0x5c,4,6) || !load(false,0x60,1,7))
+                    return decline(role,"missing hand-draw finalize scalar load");
+                if ((constants[7][0]&8) && !load(false,0xdc,4,8))
+                    return decline(role,"missing hand-draw finalize conditional scalar load");
+            } else if (!load(false,0x8,2,4))
+                return decline(role,"missing toon-edge FXAA scalar load");
+        } else if (role>=kSsao) {
             if (role==kSsao && !load(true,0x14,8,1))
                 return decline(role,"missing SSAO VS ray/UV load");
             if (role==kTemporal && !load(true,0x10,4,1))
@@ -1002,13 +1481,13 @@ private:
         }
         const std::string header=std::string(kHeader)+"\n#define ROLE "+std::to_string(role)+
                                  "\n#define TEXTURES "+std::to_string(textures)+"\n";
-        const VkShaderModule vs=gpu.shader(header+kVs,Gpu::Stage::Vertex);
+        const VkShaderModule vs=gpu.shader(header+(role>=kHandDraw2?kOutlineVs:kVs),Gpu::Stage::Vertex);
         std::string fsHeader=header;
         if (role==kSsao)
             fsHeader.insert(fsHeader.find('\n')+1,
                 "#extension GL_KHR_shader_subgroup_basic : require\n"
                 "#extension GL_KHR_shader_subgroup_quad : require\n");
-        const VkShaderModule fs=gpu.shader(fsHeader+(role>=kSsao?kSsaoFs:kFs),Gpu::Stage::Fragment);
+        const VkShaderModule fs=gpu.shader(fsHeader+(role>=kHandDraw2?kOutlineFs:role>=kSsao?kSsaoFs:kFs),Gpu::Stage::Fragment);
         const VkShaderModule gs=gpu.shader(kGs,Gpu::Stage::Geometry);
         if (!vs || !fs || !gs) return out;
         VkPipelineShaderStageCreateInfo stages[3]{
@@ -1055,9 +1534,9 @@ private:
     using PipelineKey=std::tuple<int,int,uint32_t,uint32_t,uint64_t,int,bool,
                                  VkBool32,VkBool32,int,VkBool32,int,uint64_t>;
     std::map<PipelineKey,VkPipeline> pipes_;
-    VkDescriptorSetLayout sets_[kUpsample+1]{};
-    VkPipelineLayout layouts_[kUpsample+1]{};
-    std::set<std::string> declined_[kUpsample+1];
+    VkDescriptorSetLayout sets_[kToonEdgeFxaa+1]{};
+    VkPipelineLayout layouts_[kToonEdgeFxaa+1]{};
+    std::set<std::string> declined_[kToonEdgeFxaa+1];
     static inline const bool kCompare=std::getenv("LPN_NATIVE_COMPARE")!=nullptr;
     static inline thread_local std::string info_;
 };
