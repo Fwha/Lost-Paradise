@@ -35,7 +35,7 @@ namespace host::native {
 namespace {
 
 enum Role { kOpaque = 1, kAlphaTest = 2, kSkinOpaque = 3, kSkinHair = 4,
-            kShadowReceiver = 5, kShadowReceiverPt = 6, kSkinDepth = 7, kRoleCount };
+            kShadowReceiver = 5, kShadowReceiverPt = 6, kSkinDepth = 7, kTreePt = 8, kRoleCount };
 
 bool skinRole(int role) { return role == kSkinOpaque || role == kSkinHair; }
 bool alphaRole(int role) { return role == kAlphaTest || role == kSkinHair; }
@@ -48,6 +48,7 @@ const char* roleName(int role) {
     case kShadowReceiver: return "ps_sdw_cas3_char1.pso";
     case kShadowReceiverPt: return "ps_sdw_cas3_char1_pt.pso";
     case kSkinDepth: return "ps_depth_pt.pso";
+    case kTreePt: return "ps_normal_tree_pt.pso";
     default: return "unknown";
     }
 }
@@ -625,6 +626,85 @@ void main() {
 }
 )";
 
+// Tree prepass (VS 0x53c3cb400, PS 0x53c41da00). Its indexed float4
+// wind load uses c[6] in bytes; the four fetch descriptors use c[0..3].
+constexpr const char* kTreeVs = R"(
+layout(set=0,binding=0,std430) readonly buffer V0 { uint w[]; } v0;
+layout(set=0,binding=1,std430) readonly buffer V1 { uint w[]; } v1;
+layout(set=0,binding=2,std430) readonly buffer V2 { uint w[]; } v2;
+layout(set=0,binding=3,std430) readonly buffer V3 { uint w[]; } v3;
+layout(set=0,binding=4,std430) readonly buffer V4 { uint w[]; } v4;
+layout(set=0,binding=5,std430) readonly buffer V5 { uint w[]; } v5;
+layout(set=0,binding=6,std430) readonly buffer Wind { uint w[]; } palette;
+layout(set=0,binding=7,std430) readonly buffer Fetch { uvec4 c[]; } cb;
+layout(location=0) out vec4 a0;
+float mul(float a,float b) { precise float r=a*b; return r; }
+float mac(float a,float b,float c) { precise float r=a*b+c; return r; }
+)";
+constexpr const char* kTreeMain = R"(
+uvec4 treeFetch(uint slot) {
+    uvec4 r=fetchBits(slot);
+    uint count=(cb.c[slot].z>>8)&7u;
+    for (uint i=count;i<4u;++i) r[i]=0u;
+    return r;
+}
+void main() {
+    vec4 x=uintBitsToFloat(treeFetch(0u));
+    uint index=treeFetch(1u).x;
+    vec2 uv=uintBitsToFloat(treeFetch(2u)).xy;
+    vec4 b=uintBitsToFloat(treeFetch(3u));
+    uvec4 wi=cb.c[6];
+    uint a=wi.x+index*wi.y;
+    vec4 wind=vec4(0.0);
+    if ((wi.y!=0u?index<wi.z:wi.z!=0u) && a<wi.w) {
+        uint i=a>>2;
+        wind=uintBitsToFloat(uvec4(palette.w[i],palette.w[i+1u],palette.w[i+2u],palette.w[i+3u]));
+    }
+    vec3 axis=vec3(mac(2.0,b.y,-1.0),mac(2.0,b.z,-1.0),mac(2.0,b.w,-1.0));
+    vec3 world;
+    for (int i=0;i<3;++i)
+        world[i]=mac(p.world[i].w,x.w,mac(p.world[i].z,x.z,mac(p.world[i].y,x.y,mul(p.world[i].x,x.x))));
+    float along=mul(wind.x,axis.x);
+    along=mac(wind.y,axis.y,along);
+    along=mac(axis.z,wind.z,along);
+    vec3 perpendicular;
+    perpendicular.x=mac(-axis.x,along,wind.x);
+    perpendicular.y=mac(along,-axis.y,wind.y);
+    perpendicular.z=mac(-axis.z,along,wind.z);
+    float length2=mul(perpendicular.x,perpendicular.x);
+    length2=mac(perpendicular.y,perpendicular.y,length2);
+    length2=mac(perpendicular.z,perpendicular.z,length2);
+    length2=mac(wind.w,wind.w,length2);
+    precise float length_=sqrt(length2);
+    float bend=mul(uintBitsToFloat(0x3e4ccccdu),length_);
+    perpendicular.x=mac(bend,axis.x,perpendicular.x);
+    perpendicular.y=mac(axis.y,bend,perpendicular.y);
+    world.x=mac(perpendicular.x,b.x,world.x);
+    world.y=mac(perpendicular.y,b.x,world.y);
+    perpendicular.z=mac(bend,axis.z,perpendicular.z);
+    world.z=mac(perpendicular.z,b.x,world.z);
+    float homogeneous=mac(b.x,wind.w,x.w);
+    vec4 clip;
+    for (int i=0;i<4;++i)
+        clip[i]=mac(p.proj[i].w,homogeneous,mac(p.proj[i].z,world.z,mac(p.proj[i].y,world.y,mul(p.proj[i].x,world.x))));
+    gl_Position=clip;
+    if (p.nrm.w!=0u) gl_Position.z=(gl_Position.z+gl_Position.w)*0.5;
+    a0=vec4(uv,clip.w,0.0);
+}
+)";
+constexpr const char* kTreeFs = R"(
+layout(location=0) in vec4 a0;
+layout(set=0,binding=8) uniform sampler2D mask0;
+layout(location=0) out vec4 color;
+void main() {
+    float alpha=texture(mask0,a0.xy).w;
+    if (p.off.w>alpha) discard;
+    vec4 v=vec4(unpackHalf2x16(0x38003800u),unpackHalf2x16(packHalf2x16(vec2(0.0,alpha))));
+    uint s=p.pos.w;
+    color=vec4(v[s&3u],v[(s>>2)&3u],v[(s>>4)&3u],v[(s>>6)&3u]);
+}
+)";
+
 // Where the shaders' scalar loads are (offsets from the vertex shader's start).
 struct Loads {
     uint32_t offset, world, world2, flags, camera, rotation, rotation2, projection;
@@ -653,6 +733,7 @@ public:
         if (psName == "ps_sdw_cas3_char1.pso") return kShadowReceiver;
         if (psName == "ps_sdw_cas3_char1_pt.pso") return kShadowReceiverPt;
         if (psName == "ps_depth_pt.pso") return kSkinDepth;
+        if (psName == "ps_normal_tree_pt.pso") return kTreePt;
         return 0;
     }
 
@@ -944,13 +1025,16 @@ private:
     }
 
     bool drawLongtail(int role, const Draw& d, Gpu& gpu) {
+        const bool tree=role==kTreePt;
+        if (tree && !d.compareCopy)
+            return decline(role,"not yet matched (drawn into compare copies only)");
         // Matched in Fwha's compare run (shadow receivers 0 px and within 1/255, skinned depth 0 px over
         // ~15,000 draws): drawn by default; LPN_PREPASS_LONGTAIL=0 leaves them to the translated renderer.
         static const bool on = [] { const char* e = std::getenv("LPN_PREPASS_LONGTAIL"); return !e || *e != '0'; }();
         if (!on && !d.compareCopy) return decline(role, "off (LPN_PREPASS_LONGTAIL=0)");
         const bool depthOnly=role==kSkinDepth, alpha=role!=kShadowReceiver;
         const bool skin=depthOnly || (d.vsName && *d.vsName=="vs_sdw_cas3_skin_pt.vso");
-        const char* vs=depthOnly?"lin_depth_skin_pt.vso +1":
+        const char* vs=tree?"lin_depth_rigid_tree_pt.vso +1":depthOnly?"lin_depth_skin_pt.vso +1":
             skin?"vs_sdw_cas3_skin_pt.vso":alpha?"vs_sdw_cas3_normal_pt.vso":"vs_sdw_cas3_normal.vso";
         if (!d.vsName || *d.vsName!=vs || (skin && !alpha))
             return decline(role,"another vertex shader");
@@ -967,12 +1051,12 @@ private:
             (d.indexType != VK_INDEX_TYPE_UINT16 && d.indexType != VK_INDEX_TYPE_UINT32))
             return decline(role, "not an indexed triangle list");
         if ((!depthOnly && (d.color[0].format!=VK_FORMAT_R8G8B8A8_UNORM ||
-                d.color[0].swap!=1 || d.color[0].comps!=4 || d.writeMask!=0xf)) ||
+                d.color[0].swap!=1 || d.color[0].comps!=4 || d.writeMask!=(tree?0x7u:0xfu))) ||
             d.depth.format!=VK_FORMAT_D32_SFLOAT_S8_UINT || !d.hasStencil)
             return decline(role,"another target or depth format");
         // DB_DEPTH_CONTROL 0x732: depth test, LEQUAL, no writes or stencil.
         // 0x736 adds depth writes; the disabled stencil functions are ALWAYS.
-        if (!z.depthTestEnable || z.depthWriteEnable!=VkBool32(depthOnly) ||
+        if (!z.depthTestEnable || z.depthWriteEnable!=VkBool32(depthOnly || tree) ||
             z.depthCompareOp!=VK_COMPARE_OP_LESS_OR_EQUAL || z.depthBoundsTestEnable || z.stencilTestEnable)
             return decline(role,"another depth state");
         const VertexBuffer* slot[6] = {};
@@ -980,13 +1064,24 @@ private:
         constexpr uint32_t depthPalettePc[]={0x3c,0x44,0x4c,0x84,0x8c,0x94,0x9c,0xc4,0xcc,0xe8,0xf0,0xfc};
         constexpr uint32_t receiverPalettePc[]={0x74,0x7c,0x84,0x8c,0x94,0x9c,0xa4,0xc0,0xc8,0xe4,0xec,0xf8};
         const uint32_t* palettePc=depthOnly?depthPalettePc:receiverPalettePc;
-        const int slots=skin?4:alpha?2:1;
+        const int slots=(skin || tree)?4:alpha?2:1;
         uint32_t seen = 0;
         for (const VertexBuffer& v : d.vertex) {
             if (v.slot>=0 && !v.components) continue;
             if (v.slot >= 0 && v.slot < slots && v.components) {
                 if (slot[v.slot]) return decline(role, "duplicate vertex input");
                 slot[v.slot] = &v;
+                continue;
+            }
+            if (tree && v.slot<0) {
+                if (palette || v.pc!=0xc || v.offset ||
+                    v.stride!=16 || v.dfmt!=14 || v.nfmt!=7 || v.dstSel!=0xfac ||
+                    !v.data.buffer || v.data.byteOffset%4 || !v.records ||
+                    v.data.range==VK_WHOLE_SIZE || v.data.range>UINT32_MAX ||
+                    v.data.byteOffset>v.data.range || v.data.range-v.data.byteOffset<16 ||
+                    (v.data.range-v.data.byteOffset)%16)
+                    return decline(role,"another wind buffer layout");
+                palette=&v;
                 continue;
             }
             if (v.slot >= 0 || !skin) return decline(role, "another fetch slot or palette");
@@ -1004,7 +1099,8 @@ private:
             palette = &v;
         }
         if (skin && (seen != 0xfff || !palette)) return decline(role, "a palette load missing");
-        const uint32_t used[]={3,skin?4u:2u,4,2};
+        if (tree && !palette) return decline(role,"missing tree wind buffer");
+        const uint32_t used[]={3,tree?1u:skin?4u:2u,tree?2u:4u,tree?4u:2u};
         uint32_t constants[26][4]{};
         VkDescriptorBufferInfo buffers[8]{};
         for (int i = 0; i < slots; ++i) {
@@ -1025,9 +1121,15 @@ private:
             }
             const bool wide = v->dfmt == 4 || v->dfmt == 11 || v->dfmt == 13 || v->dfmt == 14;
             const bool half = v->dfmt == 2 || v->dfmt == 5 || v->dfmt == 12;
-            const bool format = skin && i == 2 ? (v->dfmt == 10 && v->nfmt == 4) :
+            const bool format = tree && i == 1 ?
+                (wide ? (v->nfmt==4 || v->nfmt==5 || v->nfmt==7) :
+                    (v->nfmt==4 || v->nfmt==5)) : skin && i == 2 ? (v->dfmt == 10 && v->nfmt == 4) :
                 (wide ? v->nfmt == 7 : (v->nfmt == 0 || v->nfmt == 1 || (half && v->nfmt == 7)));
             bool plain = v->components >= used[i] && channels >= used[i];
+            if (tree) {
+                plain = plain && v->components<=4 && v->stride!=0;
+                if (i==0 && v->components==4) plain = plain && ((v->dstSel>>9)&7)==7;
+            }
             for (uint32_t c = skin && i == 1 ? 1 : 0; c < used[i]; ++c)
                 plain = plain && ((v->dstSel >> (3 * c)) & 7) == 4 + c;
             const uint64_t offset = uint64_t(v->data.byteOffset) + v->offset;
@@ -1041,6 +1143,7 @@ private:
             constants[i][0] = uint32_t(offset / 4);
             constants[i][1] = v->stride / 4;
             constants[i][2] = v->dfmt | v->nfmt << 4;
+            if (tree) constants[i][2] |= v->components << 8;
             constants[i][3] = v->records;
             buffers[i] = {v->data.buffer, v->data.offset, v->data.range};
         }
@@ -1048,6 +1151,13 @@ private:
         for (int i=slots;i<7;++i) buffers[i]=buffers[0];
         if (skin) {
             constants[6][0]=palette->data.byteOffset/4;
+            buffers[6]={palette->data.buffer,palette->data.offset,palette->data.range};
+        }
+        if (tree) {
+            constants[6][0]=palette->data.byteOffset;
+            constants[6][1]=palette->stride;
+            constants[6][2]=palette->records;
+            constants[6][3]=uint32_t(palette->data.range);
             buffers[6]={palette->data.buffer,palette->data.offset,palette->data.range};
         }
         Push push{};
@@ -1058,37 +1168,43 @@ private:
             return d.load && d.load(pc,out,n);
         };
         uint32_t flags=0;
-        if (!get(skin?0x104:0x10,push.off,4) ||
-            !d.vsLoad || !d.vsLoad(skin?(depthOnly?0x11c:0x118):0x24,&flags,1) ||
-            !get(skin?(depthOnly?0x2e0:0x32c):0x11c,push.rot,8) ||
-            !get(skin?(depthOnly?0x2e8:0x334):0x124,push.rot+8,4) ||
-            !get(skin?(depthOnly?0x2e4:0x330):0x120,push.proj,16))
-            return decline(role,"missing longtail vertex constants");
-        const bool subtract=!((flags&0x80000) && !(flags&0x100000));
-        if (subtract && !get(skin?(depthOnly?0x2bc:0x2c0):0xb4,push.cam,4))
-            return decline(role,"missing longtail camera");
-        push.cam[3]=subtract?1.0f:0.0f;
-        if (skin) {
-            if (!get(depthOnly?0x2d8:0x2f8,push.world,1)) return decline(role,"missing object depth offset");
-        } else if (!get(0x1c,push.world,8) || !get(0x20,push.world+8,4))
-            return decline(role,"missing rigid world matrix");
-        if (!depthOnly) {
-            for (int i=0;i<3;++i)
-                if (!d.vsLoad(skin?0x2fc+4*i:0xec+4*i,constants[7+4*i],16))
-                    return decline(role,"missing receiver cascade matrix");
-            if ((flags&0x80000) && !d.vsLoad(skin?0x2dc:0xd0,constants[19],4))
-                return decline(role,"missing receiver secondary offset");
-            if (!load(0x14,constants[20],4) ||
-                !load(0x94,&constants[21][0],1) || !load(0x180,&constants[21][1],1) ||
-                !load(0x254,&constants[21][2],1) ||
-                !load(alpha?0x370:0x364,&constants[21][3],1) ||
-                !load(0x2dc,constants[22],8) || !load(alpha?0x36c:0x360,constants[24],4) ||
-                !load(alpha?0x44c:0x3f4,constants[25],1))
-                return decline(role,"missing receiver pixel constants");
+        if (tree) {
+            if (!get(0x2c,push.world,8) || !get(0x30,push.world+8,4) ||
+                !get(0x34,push.proj,16))
+                return decline(role,"missing tree vertex constants");
+        } else {
+            if (!get(skin?0x104:0x10,push.off,4) ||
+                !d.vsLoad || !d.vsLoad(skin?(depthOnly?0x11c:0x118):0x24,&flags,1) ||
+                !get(skin?(depthOnly?0x2e0:0x32c):0x11c,push.rot,8) ||
+                !get(skin?(depthOnly?0x2e8:0x334):0x124,push.rot+8,4) ||
+                !get(skin?(depthOnly?0x2e4:0x330):0x120,push.proj,16))
+                return decline(role,"missing longtail vertex constants");
+            const bool subtract=!((flags&0x80000) && !(flags&0x100000));
+            if (subtract && !get(skin?(depthOnly?0x2bc:0x2c0):0xb4,push.cam,4))
+                return decline(role,"missing longtail camera");
+            push.cam[3]=subtract?1.0f:0.0f;
+            if (skin) {
+                if (!get(depthOnly?0x2d8:0x2f8,push.world,1)) return decline(role,"missing object depth offset");
+            } else if (!get(0x1c,push.world,8) || !get(0x20,push.world+8,4))
+                return decline(role,"missing rigid world matrix");
+            if (!depthOnly) {
+                for (int i=0;i<3;++i)
+                    if (!d.vsLoad(skin?0x2fc+4*i:0xec+4*i,constants[7+4*i],16))
+                        return decline(role,"missing receiver cascade matrix");
+                if ((flags&0x80000) && !d.vsLoad(skin?0x2dc:0xd0,constants[19],4))
+                    return decline(role,"missing receiver secondary offset");
+                if (!load(0x14,constants[20],4) ||
+                    !load(0x94,&constants[21][0],1) || !load(0x180,&constants[21][1],1) ||
+                    !load(0x254,&constants[21][2],1) ||
+                    !load(alpha?0x370:0x364,&constants[21][3],1) ||
+                    !load(0x2dc,constants[22],8) || !load(alpha?0x36c:0x360,constants[24],4) ||
+                    !load(alpha?0x44c:0x3f4,constants[25],1))
+                    return decline(role,"missing receiver pixel constants");
+            }
         }
         if (alpha) {
             uint32_t threshold;
-            if (!load(depthOnly?0x44:0x424,&threshold,1)) return decline(role,"missing alpha threshold");
+            if (!load(tree?0xc:depthOnly?0x44:0x424,&threshold,1)) return decline(role,"missing alpha threshold");
             std::memcpy(&push.off[3],&threshold,4);
         }
         if (!depthOnly) {
@@ -1099,7 +1215,7 @@ private:
         push.nrm[3]=d.clipZHalf?1:0;
         push.uv[3]=(flags&0x80000)?1:0;
         VkDescriptorImageInfo images[6]{};
-        const uint32_t textures=depthOnly?2:alpha?6:4;
+        const uint32_t textures=tree?1:depthOnly?2:alpha?6:4;
         auto texture=[&](uint32_t pc)->const Texture* {
             const Texture* result=nullptr;
             for (const Texture& t:d.textures) if (t.pc==pc) {
@@ -1112,16 +1228,16 @@ private:
             {0xc0,0xc8,0xd4,0xe0},{0x1ac,0x1b4,0x1c0,0x1cc},{0x280,0x288,0x294,0x2a0},
             {alpha?0x3a0u:0x394u,alpha?0x3a8u:0x39cu,alpha?0x3b4u:0x3a8u,alpha?0x3c0u:0x3b4u}
         };
-        if (d.textures.size()!=(depthOnly?2u:alpha?18u:16u))
+        if (d.textures.size()!=(tree?1u:depthOnly?2u:alpha?18u:16u))
             return decline(role,"another texture instruction shape");
         for (uint32_t i=0;i<textures;++i) {
-            const uint32_t pc=depthOnly?(i==0?0x34:0x3c):
+            const uint32_t pc=tree?0x28:depthOnly?(i==0?0x34:0x3c):
                 i<4?groups[i][0]:i==4?0x414:0x41c;
             const Texture* t=texture(pc);
             if (!t || !t->view || !t->sampler || t->scale[0]!=1 || t->scale[1]!=1 ||
                 t->address==d.depth.address || (!depthOnly && t->address==d.color[0].address))
                 return decline(role,"missing, scaled or aliased texture");
-            if (!depthOnly && i<4) {
+            if (!tree && !depthOnly && i<4) {
                 if (t->width!=1024 || t->height!=1024) return decline(role,"another shadow map size");
                 for (int j=1;j<4;++j) {
                     const Texture* other=texture(groups[i][j]);
@@ -1216,11 +1332,11 @@ private:
                 for (uint32_t i=0;i<8;++i)
                     b[i]={i,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,
                           VkShaderStageFlags(i==7?VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT:VK_SHADER_STAGE_VERTEX_BIT),nullptr};
-                const uint32_t images=role==kSkinDepth?2:role==kShadowReceiverPt?6:4;
+                const uint32_t images=role==kTreePt?1:role==kSkinDepth?2:role==kShadowReceiverPt?6:4;
                 for (uint32_t i=8;i<8+images;++i)
                     b[i]={i,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
             }
-            dl.bindingCount = family ? (role==kSkinDepth?10:role==kShadowReceiverPt?14:12) :
+            dl.bindingCount = family ? (role==kTreePt?9:role==kSkinDepth?10:role==kShadowReceiverPt?14:12) :
                 skin ? (alpha ? 11 : 9) : (alpha ? 5 : 2);
             dl.pBindings = b;
             if (vkCreateDescriptorSetLayout(dev, &dl, nullptr, &setLayouts_[role]) != VK_SUCCESS) return out = VK_NULL_HANDLE;
@@ -1241,11 +1357,11 @@ private:
             (familySkin ? "#define FAMILY_SKIN\n" : "") +
             (role==kSkinDepth ? "#define DEPTH_ONLY\n" : "") :
             std::string(alpha ? "#define ALPHA_TEST\n" : "") + (skin ? "#define PREPASS_SKIN\n" : "");
-        const std::string vertex = family ? std::string(kLongtailVs) + kSkinFetch + kLongtailMain :
+        const std::string vertex = role==kTreePt ? std::string(kTreeVs) + kSkinFetch + kTreeMain : family ? std::string(kLongtailVs) + kSkinFetch + kLongtailMain :
             skin ? std::string(kSkinVs) + kSkinFetch + kSkinMain : std::string(kVs);
         const VkShaderModule vsm = gpu.shader(std::string(kHeader) + defs + vertex, Gpu::Stage::Vertex);
         const VkShaderModule fsm = gpu.shader(std::string(kHeader) + defs +
-            (family ? kLongtailFs : skin ? kSkinFs : kFs), Gpu::Stage::Fragment);
+            (role==kTreePt ? kTreeFs : family ? kLongtailFs : skin ? kSkinFs : kFs), Gpu::Stage::Fragment);
         if (!vsm || !fsm) return out = VK_NULL_HANDLE;
         VkPipelineShaderStageCreateInfo st[2]{};
         st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vsm, "main", nullptr};
