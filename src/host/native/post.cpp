@@ -19,8 +19,8 @@ namespace host::native {
 namespace {
 
 enum Role { kDown2 = 1, kDown4, kLumi, kBlur, kCompose, kSsao, kTemporal, kSsaoBlur, kUpsample,
-            kHandDraw2, kHandDrawFinalize, kToonEdgeFxaa, kHaze, kShadow };
-static_assert(kShadow<48); // renderer.cpp's kCompareRoles.
+            kHandDraw2, kHandDrawFinalize, kToonEdgeFxaa, kHaze, kShadow, kStarGlare };
+static_assert(kStarGlare<48); // renderer.cpp's kCompareRoles.
 struct Variant {
     const char* ps;
     const char* vs;
@@ -50,6 +50,8 @@ constexpr Variant kRoles[] = {
     {"fx_depth_to_shadow_cas3_char1.fxo", "fx_depth_to_shadow.fxo +50",
      {0x34, 0x174, 0x17c, 0x188, 0x194, 0x2a8, 0x2b0, 0x2bc, 0x2c8,
       0x3c4, 0x3cc, 0x3d8, 0x3e4, 0x4d4, 0x4dc, 0x4e8, 0x4f4}},
+    {"fx_star_glare.fxo", "fx_star_glare.fxo",
+     {0x58, 0x60, 0x68, 0x9c, 0xa4, 0xbc, 0x108, 0x110}},
 };
 
 // All 49 MIMG instructions in hand_draw_2 read s[0:7], s[8:11].
@@ -280,6 +282,110 @@ void main() {
     rgb=clamp(c[4].yzw*rgb+vec3(alpha),0.0,1.0);
     put(vec4(rgb,max(max(rgb.b,rgb.r),rgb.g)));
 #endif
+}
+)";
+
+constexpr const char* kStarGlareVs = R"(
+layout(set=0, binding=0, std430) readonly buffer V0 { uint w[]; } v0;
+layout(set=0, binding=1, std430) readonly buffer V1 { uint w[]; } v1;
+layout(location=0) out vec4 a0;
+layout(location=1) out vec4 a1;
+layout(location=2) out vec4 a2;
+layout(location=3) out vec4 a3;
+vec4 fetch(int slot) {
+    uvec4 f=p.fetch[slot];
+    uint index=uint(gl_VertexIndex);
+    vec4 r=vec4(0.0,0.0,0.0,1.0);
+    uint base=f.x+index*f.y;
+    for (uint j=0u;j<f.z;++j)
+        r[j]=uintBitsToFloat(slot==0?v0.w[base+j]:v1.w[base+j]);
+    vec4 result;
+    for (uint j=0u;j<4u;++j) {
+        uint s=(f.w>>(3u*j))&7u;
+        result[j]=s>=4u?r[s-4u]:(s==1u?1.0:0.0);
+    }
+    return result;
+}
+void main() {
+    vec4 pos=fetch(0);
+    vec2 uv=fetch(1).xy;
+    gl_Position=vec4(mac(c[0].xy,pos.xy,c[0].zw),pos.zw);
+    if (p.flags.x!=0u) gl_Position.z=mul(gl_Position.z+gl_Position.w,0.5);
+    // vs-53c2e1300: param0..3 carry offsets 0..7; madmk literals multiply.
+    a0=vec4(uv,c[1].xy+uv);
+    a1=vec4(mac(vec2(2.0),c[1].xy,uv),mac(c[1].xy,vec2(3.0),uv));
+    a2=vec4(mac(vec2(4.0),c[1].xy,uv),mac(c[1].xy,vec2(5.0),uv));
+    a3=vec4(mac(c[1].xy,vec2(6.0),uv),mac(c[1].xy,vec2(7.0),uv));
+}
+)";
+
+// The glare rectangle has a fourth parameter; retain the shared GS's corner arithmetic.
+constexpr const char* kStarGlareGs = R"(#version 450
+layout(triangles) in;
+layout(triangle_strip,max_vertices=4) out;
+in gl_PerVertex { vec4 gl_Position; } gl_in[];
+out gl_PerVertex { vec4 gl_Position; };
+layout(location=0) in vec4 a0[];
+layout(location=1) in vec4 a1[];
+layout(location=2) in vec4 a2[];
+layout(location=3) in vec4 a3[];
+layout(location=0) out vec4 b0;
+layout(location=1) out vec4 b1;
+layout(location=2) out vec4 b2;
+layout(location=3) out vec4 b3;
+void emit(int i) {
+    gl_Position=gl_in[i].gl_Position;
+    b0=a0[i]; b1=a1[i]; b2=a2[i]; b3=a3[i];
+    EmitVertex();
+}
+void main() {
+    vec2 p0=gl_in[0].gl_Position.xy/gl_in[0].gl_Position.w;
+    vec2 p1=gl_in[1].gl_Position.xy/gl_in[1].gl_Position.w;
+    vec2 p2=gl_in[2].gl_Position.xy/gl_in[2].gl_Position.w;
+    float d0=abs(dot(p1-p0,p2-p0)),d1=abs(dot(p0-p1,p2-p1)),d2=abs(dot(p0-p2,p1-p2));
+    int c=(d0<=d1 && d0<=d2)?0:(d1<=d2?1:2);
+    int a=(c+1)%3,b=(c+2)%3;
+    emit(c); emit(a); emit(b);
+    gl_Position=gl_in[a].gl_Position+gl_in[b].gl_Position-gl_in[c].gl_Position;
+    b0=a0[a]+a0[b]-a0[c];
+    b1=a1[a]+a1[b]-a1[c];
+    b2=a2[a]+a2[b]-a2[c];
+    b3=a3[a]+a3[b]-a3[c];
+    EmitVertex(); EndPrimitive();
+}
+)";
+
+// ps-53c2e1500: contraction is allowed, as in the translated pixel shader.
+constexpr const char* kStarGlareFs = R"(
+layout(location=0) in vec4 a0;
+layout(location=1) in vec4 a1;
+layout(location=2) in vec4 a2;
+layout(location=3) in vec4 a3;
+layout(location=0) out vec4 outColour;
+layout(set=0,binding=3) uniform sampler2D tex[TEXTURES];
+#define sampleAt(i,uv) texture(tex[i],(uv)*c[32+(i)].xy)
+void main() {
+    vec3 t0=sampleAt(0,a0.zw).rgb; // 0x58: offset 1
+    vec3 t1=sampleAt(1,a0.xy).rgb; // 0x60: offset 0
+    vec3 t2=sampleAt(2,a2.zw).rgb; // 0x68: offset 5
+    vec3 v=c[4].rgb*t1;
+    v=c[5].rgb*t0+v;
+    vec3 t3=sampleAt(3,a1.xy).rgb; // 0x9c: offset 2
+    vec3 t4=sampleAt(4,a2.xy).rgb; // 0xa4: offset 4
+    vec3 t5=sampleAt(5,a1.zw).rgb; // 0xbc: offset 3
+    v=c[6].rgb*t3+v;
+    v=c[7].rgb*t5+v;
+    vec3 t6=sampleAt(6,a3.xy).rgb; // 0x108: offset 6
+    vec3 t7=sampleAt(7,a3.zw).rgb; // 0x110: offset 7
+    v=c[8].rgb*t4+v;
+    v=c[9].rgb*t2+v;
+    v=c[10].rgb*t6+v;
+    v=c[11].rgb*t7+v;
+    // Match the translator's packHalf2x16 (including alpha=1), then COMP_SWAP.
+    vec4 packed=vec4(unpackHalf2x16(packHalf2x16(v.xy)),
+                     unpackHalf2x16(packHalf2x16(vec2(v.z,1.0))));
+    outColour=vec4(packed[p.swizzle.x],packed[p.swizzle.y],
+                   packed[p.swizzle.z],packed[p.swizzle.w]);
 }
 )";
 
@@ -1427,6 +1533,7 @@ public:
             const char* e = std::getenv("LPN_POST_HAZE");
             return !e || *e != '0';
         }();
+        if (ps==kRoles[kStarGlare].ps) return kStarGlare;
         if (ps==kRoles[kShadow].ps) return kShadow;
         if (ps==kRoles[kHaze].ps) return haze ? kHaze : 0;
         for (int i=1;i<=kToonEdgeFxaa;++i) if (named(ps,kRoles[i].ps)) return i;
@@ -1436,7 +1543,24 @@ public:
         if (role==kHaze) return drawHaze(d,gpu);
         // The outline chain matched in Fwha's compare run: finalize and the edge FXAA at 0 px, the
         // outline pass within 1/255 (~4% of pixels a step off). Drawn by default.
-        if (role<kDown2 || role>kShadow) return false;
+        if (role<kDown2 || role>kStarGlare) return false;
+        if (role==kStarGlare) {
+            // Compare: 0 px (30 draws). Drawn by default; LPN_POST_GLARE=0 leaves it to the translated renderer.
+            static const bool glare = [] { const char* e = std::getenv("LPN_POST_GLARE"); return !e || *e != '0'; }();
+            if (!glare && !d.compareCopy) return decline(role,"off (LPN_POST_GLARE=0)");
+            if (!d.vsName || *d.vsName!=kRoles[role].vs)
+                return decline(role,"another vertex shader");
+            if (d.colorCount!=1 || d.color[0].format!=VK_FORMAT_R8G8B8A8_UNORM ||
+                d.color[0].comps!=4 || d.color[0].swap!=1 || d.writeMask!=0xf ||
+                d.blend || d.blendState[0].blendEnable)
+                return decline(role,"unexpected star-glare colour target or blend state");
+            const auto& z=d.depthStencil;
+            if (d.depthTest || d.depthWrite || d.stencil || z.depthTestEnable ||
+                z.depthWriteEnable || z.stencilTestEnable || z.depthBoundsTestEnable)
+                return decline(role,"unexpected star-glare depth/stencil state");
+            if (d.textures.size()!=8)
+                return decline(role,"unexpected star-glare MIMG count");
+        }
         if (role==kShadow) {
             // Two compare runs: within 1/255 on ~0.7% of pixels, never more (as the outline pass
             // was enabled at). Drawn by default; LPN_POST_SHADOW=0 leaves it to the translated renderer.
@@ -1513,7 +1637,7 @@ public:
             // These claimed PSs accept the unnamed vs_fullscreen_53c2a1600.
             if (d.vsName && !d.vsName->empty() && *d.vsName!="?")
                 return decline(role,"another vertex shader");
-        } else if (!d.vsName || ((role==kShadow || role==kLumi || role==kSsao || role==kHandDraw2) ?
+        } else if (!d.vsName || ((role==kStarGlare || role==kShadow || role==kLumi || role==kSsao || role==kHandDraw2) ?
                    *d.vsName!=kRoles[role].vs : !named(*d.vsName,kRoles[role].vs)))
             return decline(role,"another vertex shader");
         if (d.colorCount!=1 || !d.color[0].view || d.color[0].format==VK_FORMAT_UNDEFINED ||
@@ -1559,7 +1683,7 @@ public:
             if (slots[v.slot]) return decline(role,"duplicate fetch slot");
             slots[v.slot]=&v;
         }
-        const int fetches=(role==kShadow)?2:(role==kHandDraw2 || role==kHandDrawFinalize)?2:(role>=kSsaoBlur?1:2);
+        const int fetches=(role==kStarGlare || role==kShadow)?2:(role==kHandDraw2 || role==kHandDrawFinalize)?2:(role>=kSsaoBlur?1:2);
         for (int i=0;i<fetches;++i) {
             const VertexBuffer* v=slots[i];
             // Capture-5 uses float3 position with DST_SEL_W=1 and float2 UV.
@@ -1595,10 +1719,14 @@ public:
             std::memcpy(reinterpret_cast<unsigned char*>(constants.data())+at*16,words,n*4);
             return true;
         };
-        const uint32_t positionPc=role==kShadow?0x14:role==kHandDrawFinalize?0xc:role==kTemporal?0x14:(role==kLumi || role>=kSsao?0x10:0xc);
+        const uint32_t positionPc=role==kStarGlare?0xc:role==kShadow?0x14:role==kHandDrawFinalize?0xc:role==kTemporal?0x14:(role==kLumi || role>=kSsao?0x10:0xc);
         if (!load(true,positionPc,4,0)) return decline(role,"missing VS position scalar load");
         uint32_t wantedTextures=0;
-        if (role==kShadow) {
+        if (role==kStarGlare) {
+            // VS 0x10: streak step. PS 0xc/0xe4: eight RGBA tap weights.
+            if (!load(true,0x10,2,1) || !load(false,0xc,16,4) || !load(false,0xe4,16,8))
+                return decline(role,"missing star-glare scalar load");
+        } else if (role==kShadow) {
             // c4 flags, c5 depth conversion, c6 cascade weights; four XYZW matrices
             // in c8..23 and one PC-specific PCF radius in each of c24..27.
             struct Scalar { uint32_t pc,n; int at; };
@@ -1973,14 +2101,14 @@ private:
         }
         const std::string header=std::string(kHeader)+"\n#define ROLE "+std::to_string(role)+
                                  "\n#define TEXTURES "+std::to_string(textures)+"\n";
-        const VkShaderModule vs=gpu.shader(header+(role==kShadow?kShadowVs:role>=kHandDraw2?kOutlineVs:kVs),Gpu::Stage::Vertex);
+        const VkShaderModule vs=gpu.shader(header+(role==kStarGlare?kStarGlareVs:role==kShadow?kShadowVs:role>=kHandDraw2?kOutlineVs:kVs),Gpu::Stage::Vertex);
         std::string fsHeader=header;
         if (role==kSsao)
             fsHeader.insert(fsHeader.find('\n')+1,
                 "#extension GL_KHR_shader_subgroup_basic : require\n"
                 "#extension GL_KHR_shader_subgroup_quad : require\n");
-        const VkShaderModule fs=gpu.shader(fsHeader+(role==kShadow?kShadowFs:role>=kHandDraw2?kOutlineFs:role>=kSsao?kSsaoFs:kFs),Gpu::Stage::Fragment);
-        const VkShaderModule gs=gpu.shader(kGs,Gpu::Stage::Geometry);
+        const VkShaderModule fs=gpu.shader(fsHeader+(role==kStarGlare?kStarGlareFs:role==kShadow?kShadowFs:role>=kHandDraw2?kOutlineFs:role>=kSsao?kSsaoFs:kFs),Gpu::Stage::Fragment);
+        const VkShaderModule gs=gpu.shader(role==kStarGlare?kStarGlareGs:kGs,Gpu::Stage::Geometry);
         if (!vs || !fs || !gs) return out;
         VkPipelineShaderStageCreateInfo stages[3]{
             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_VERTEX_BIT,vs,"main",nullptr},
@@ -2111,12 +2239,12 @@ private:
     using PipelineKey=std::tuple<int,int,uint32_t,uint32_t,uint64_t,int,bool,
                                  VkBool32,VkBool32,int,VkBool32,int,uint64_t>;
     std::map<PipelineKey,VkPipeline> pipes_;
-    VkDescriptorSetLayout sets_[kShadow+1]{};
-    VkPipelineLayout layouts_[kShadow+1]{};
+    VkDescriptorSetLayout sets_[kStarGlare+1]{};
+    VkPipelineLayout layouts_[kStarGlare+1]{};
     std::map<PipelineKey,VkPipeline> hazePipes_;
     VkDescriptorSetLayout hazeSets_[2]{};
     VkPipelineLayout hazeLayouts_[2]{};
-    std::set<std::string> declined_[kShadow+1];
+    std::set<std::string> declined_[kStarGlare+1];
     static inline const bool kCompare=std::getenv("LPN_NATIVE_COMPARE")!=nullptr;
     static inline thread_local std::string info_;
 };
