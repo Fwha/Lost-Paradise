@@ -1132,7 +1132,7 @@ private:
             bool plain = v->components >= used[i] && channels >= used[i];
             if (tree) {
                 plain = plain && v->components<=4 && v->stride!=0;
-                if (i==0 && v->components==4) plain = plain && ((v->dstSel>>9)&7)==7;
+                if (i==0 && v->components==4) plain = plain && (((v->dstSel>>9)&7)==7 || ((v->dstSel>>9)&7)==1); // W (absent in a 3-channel format: 1) or the constant 1
             }
             for (uint32_t c = skin && i == 1 ? 1 : 0; c < used[i]; ++c)
                 plain = plain && ((v->dstSel >> (3 * c)) & 7) == 4 + c;
