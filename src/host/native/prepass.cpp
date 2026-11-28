@@ -1029,9 +1029,7 @@ private:
     }
 
     bool drawLongtail(int role, const Draw& d, Gpu& gpu) {
-        const bool tree=role==kTreePt;
-        if (tree && !d.compareCopy)
-            return decline(role,"not yet matched (drawn into compare copies only)");
+        const bool tree=role==kTreePt; // the tree prepass matched too (0 px over ~900 draws)
         // Matched in Fwha's compare run (shadow receivers 0 px and within 1/255, skinned depth 0 px over
         // ~15,000 draws): drawn by default; LPN_PREPASS_LONGTAIL=0 leaves them to the translated renderer.
         static const bool on = [] { const char* e = std::getenv("LPN_PREPASS_LONGTAIL"); return !e || *e != '0'; }();
