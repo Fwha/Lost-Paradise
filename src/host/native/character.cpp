@@ -785,7 +785,7 @@ const Variant kVariants[] = {
     {"s_o1dzt.fxo", "s_b1dst.fxo", "",
      kVsRigid, kPsO1dzt,
      {0x150,0x158,0x2b0,0,0xbc0,0xb4c,0,0,0,0x1178,0x1330,0x1348,0x1180,0x1218,0x1230},
-     0, true, "s_o1dzt[mouth].fxo", kVsMouth},
+     0, false, "s_o1dzt[mouth].fxo", kVsMouth}, // compare: 0 px (~6,500 draws)
 };
 constexpr int kVariantCount = std::size(kVariants);
 constexpr int kO1dztRole = 10;
