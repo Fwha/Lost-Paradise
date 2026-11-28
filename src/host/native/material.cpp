@@ -1400,7 +1400,7 @@ const Variant kVariants[] = {
     {"r_o1dut_m(vr)2du[ref].fxo", "#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define KEEP_PRIMARY_NORMAL\n#define MULTIPLY_DETAIL_REF\n", kPsLoadsM2duRef, count(kPsLoadsM2duRef), {0x54, 0x160, 0x6bc, 0x8ac, 0x8dc, 0x6fc, 0x604, 0xcd8, 0xce0, 0}, 4, 0x6b4},
     {"r_o1d.fxo", "#define SIMPLE_MATERIAL\n#define GEOMETRIC_NORMAL\n#define BARE_MATERIAL\n", kPsLoadsO1d, count(kPsLoadsO1d), {0, 0xa0, 0, 0x664, 0x6b0, 0, 0, 0xa94, 0xa9c, 0}, 5},
     {"r_o1dut_a(vr)2d.fxo", "#define KEEP_PRIMARY_NORMAL\n#define SPECULAR_GREEN\n#define AMBIENT_DETAIL_ADD\n", kPsLoadsA2d, count(kPsLoadsA2d), {0x4c, 0x178, 0x818, 0x74c, 0x7a0, 0x7c8, 0, 0xbd8, 0xbe0, 0}, 0},
-    {"r_o1d2u[ref].fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define GEOMETRIC_NORMAL\n", kPsLoadsD2uRef, count(kPsLoadsD2uRef), {0, 0x94, 0, 0x5e0, 0x6a4, 0x65c, 0, 0xba4, 0xbac, 0}, 6, 0x750, true},
+    {"r_o1d2u[ref].fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define GEOMETRIC_NORMAL\n", kPsLoadsD2uRef, count(kPsLoadsD2uRef), {0, 0x94, 0, 0x5e0, 0x6a4, 0x65c, 0, 0xba4, 0xbac, 0}, 6, 0x750}, // compare: within 1/255 (~560 draws)
 };
 
 constexpr int kVariantCount = 23;
