@@ -485,3 +485,12 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
 - `native/character.cpp` role 10 (Codex's port, `~/lost-paradise-re/dis/longtail4/`): s_o1dzt.fxo with s_b1dst +43
   (the body) and s_o1dzt[mouth] +2 (with its shifted loads). It has a per-variant unmatched flag.
 - Compare: 0 px over ~6,500 draws. Drawn by default, and a normal run was clean.
+
+### Long tail: the tree prepass
+
+- `native/prepass.cpp` role 8 (Codex's port, `~/lost-paradise-re/dis/longtail5/`): lin_depth_rigid_tree_pt +1 with
+  ps_normal_tree_pt. It has a wind buffer and an alpha test.
+- The first run turned every draw down. The position's W came as DST_SEL 1 (the constant 1), and the check only
+  allowed 7. The fetch-format decline now names the slot, format and selects, so a guess like that shows up in one run.
+- Compare: 0 px over ~900 draws. Drawn by default with the other long-tail roles (LPN_PREPASS_LONGTAIL=0 turns
+  them off). A normal run was clean.
