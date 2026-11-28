@@ -1288,6 +1288,75 @@ constexpr Load kPsLoadsA2d[] = {
     {false, 0xfe0, 1, cPsFlags, 3},
 };
 
+constexpr Load kVsLoadsD2uRef[] = {
+    {true, 0x01c,  4, cOffset,          0},
+    {true, 0x020,  8, cWorld,           0},
+    {true, 0x024,  4, cWorld + 2,       0},
+    {true, 0x028,  1, cVsMisc,          2},
+    {true, 0x0b8,  4, cCamera,          0},
+    {true, 0x0dc,  4, cOffset2,         0},
+    {true, 0x118, 16, cProj + 3,        0},
+    {true, 0x168, 16, cFog,             0},
+    {true, 0x16c,  4, cFogDir,          0},
+    {true, 0x174,  4, cCamera,          0},
+    {true, 0x2e0,  8, cProj,            0},
+    {true, 0x2e4,  4, cProj + 2,        0},
+    {true, 0x2e8,  4, cCamera,          0},
+    {true, 0x2ec,  1, cVsMisc,          1},
+    {true, 0x2f0,  4, cUvOffset,        0},
+    {true, 0x2f4,  1, cReflectVs,       0},
+};
+constexpr Load kPsLoadsD2uRef[] = {
+    {false, 0x024,  1, cPsFlags,         0},
+    {false, 0x030,  2, cPsFlags,         1},
+    {false, 0x0ac,  4, cShadowMap,       0},
+    {false, 0x0ec,  4, cShadowMap,       0},
+    {false, 0x114,  4, cTintBase,        0},
+    {false, 0x16c,  4, cTint,            0},
+    {false, 0x1d8,  4, cPointPos,        0},
+    {false, 0x240,  4, cPointColor,      0},
+    {false, 0x290,  4, cPointPos + 1,    0},
+    {false, 0x2f8,  4, cPointColor + 1,  0},
+    {false, 0x348,  4, cPointPos + 2,    0},
+    {false, 0x3b0,  4, cPointColor + 2,  0},
+    {false, 0x400,  4, cPointPos + 3,    0},
+    {false, 0x468,  4, cPointColor + 3,  0},
+    {false, 0x50c,  4, cPsCamera,        0},
+    {false, 0x510,  8, cDir,             0},
+    {false, 0x514,  8, cMul,             0},
+    {false, 0x518,  2, cUvScale,         0},
+    {false, 0x51c,  1, cMisc,            0},
+    {false, 0x520,  2, cReflectPs,       0},
+    {false, 0x5e8,  4, cAmbientTint,     0},
+    {false, 0x5f0,  8, cMaterial,        0},
+    {false, 0x648,  4, cExposure,        0},
+    {false, 0x64c,  4, cAmbient,         0},
+    {false, 0x6ac,  8, cLight,           0},
+    {false, 0xa98,  8, cDistFog,         0},
+    {false, 0xb08,  1, cMisc,            2},
+    {false, 0xb0c,  1, cMisc,            3},
+    {false, 0xb10,  1, cMisc2,           2},
+    {false, 0xb14,  1, cPsFlags,         0},
+    {false, 0xb18,  4, cOutScale,        0},
+    {false, 0xb80,  2, cPsFlags,         1},
+    {false, 0xb84,  1, cMask0,           0},
+    {false, 0xb88,  4, cMask1,           0},
+    {false, 0xb8c,  1, cMask0,           1},
+    {false, 0xb90,  1, cMask0,           2},
+    {false, 0xb94,  1, cMisc2,           3},
+    {false, 0xcd8,  2, cMask2,           0},
+    {false, 0xd34,  2, cMask2,           2},
+    {false, 0xd38,  1, cMask0,           3},
+    {false, 0xe0c,  4, cMask3,           0},
+    {false, 0xe10,  2, cMask4,           0},
+    {false, 0xe14,  1, cMask4,           2},
+    {false, 0xecc,  2, cMask5,           0},
+    {false, 0xed0,  1, cMask4,           3},
+    {false, 0xf1c,  1, cPsFlags,         0},
+    {false, 0xf38,  4, cBlend,           0},
+    {false, 0xfb0,  1, cPsFlags,         3},
+};
+
 struct VertexShaderInfo {
     const char* name;
     const char* defines;
@@ -1305,6 +1374,7 @@ struct Variant {
     uint32_t texturePc[kTextures]; // 0: not read (bound to another of the draw's textures)
     uint8_t vs = 0;                // its vertex shader (kVertexShaders); 1 and up: SIMPLE_MATERIAL
     uint32_t cubePc = 0;           // the environment cube map's sample ([ref])
+    bool unmatched = false;       // restricted to comparison copies until image-matched
 };
 template <size_t N> constexpr size_t count(const Load (&)[N]) { return N; }
 const Variant kVariants[] = {
@@ -1326,21 +1396,22 @@ const Variant kVariants[] = {
     {"r_o1d[ag].fxo", "#define SIMPLE_MATERIAL\n#define GEOMETRIC_NORMAL\n#define DIFFUSE_MATERIAL\n", kPsLoadsD, count(kPsLoadsD), {0, 0xd8, 0, 0x610, 0x590, 0, 0, 0x964, 0x96c, 0}, 5},
     {"r_b1dst.fxo", "#define SIMPLE_MATERIAL\n#define MODULATED_ALPHA_TEST\n#define RASTER_DEPTH_MASK\n#define BLEND_ALPHA_BOTH\n", kPsLoadsB1dst, count(kPsLoadsB1dst), {0x4c, 0x178, 0, 0x710, 0x754, 0x810, 0, 0, 0xba8, 0}, 1},
     {"r_o1dst_b(vr)2dst[nte].fxo", "#define DETAIL_NORMAL\n#define DETAIL_BLEND\n#define NO_EDGE_MASK\n", kPsLoadsNte, count(kPsLoadsNte), {0x7c, 0x1c8, 0x84, 0x7e0, 0x6c4, 0x834, 0x890, 0, 0, 0x74}, 0},
-    {"r_o1dut_b(vr)2dut[ref].fxo", "#define DETAIL_NORMAL\n#define DETAIL_BLEND\n#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define REFLECT_DETAIL_BLEND\n", kPsLoadsB2dutRef, count(kPsLoadsB2dutRef), {0x7c, 0x1b4, 0x84, 0x884, 0x8c4, 0x6e8, 0x6e0, 0xce4, 0xcec, 0x74}, 4, 0x6d0},
+    {"r_o1dut_b(vr)2dut[ref].fxo", "#define DETAIL_NORMAL\n#define DETAIL_BLEND\n#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define REFLECT_DETAIL_BLEND\n", kPsLoadsB2dutRef, count(kPsLoadsB2dutRef), {0x7c, 0x1b4, 0x84, 0x884, 0x8c4, 0x6e8, 0x6e0, 0xce4, 0xcec, 0x74}, 4, 0x6d0, true},
     {"r_o1dut_m(vr)2du[ref].fxo", "#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define KEEP_PRIMARY_NORMAL\n#define MULTIPLY_DETAIL_REF\n", kPsLoadsM2duRef, count(kPsLoadsM2duRef), {0x54, 0x160, 0x6bc, 0x8ac, 0x8dc, 0x6fc, 0x604, 0xcd8, 0xce0, 0}, 4, 0x6b4},
     {"r_o1d.fxo", "#define SIMPLE_MATERIAL\n#define GEOMETRIC_NORMAL\n#define BARE_MATERIAL\n", kPsLoadsO1d, count(kPsLoadsO1d), {0, 0xa0, 0, 0x664, 0x6b0, 0, 0, 0xa94, 0xa9c, 0}, 5},
     {"r_o1dut_a(vr)2d.fxo", "#define KEEP_PRIMARY_NORMAL\n#define SPECULAR_GREEN\n#define AMBIENT_DETAIL_ADD\n", kPsLoadsA2d, count(kPsLoadsA2d), {0x4c, 0x178, 0x818, 0x74c, 0x7a0, 0x7c8, 0, 0xbd8, 0xbe0, 0}, 0},
+    {"r_o1d2u[ref].fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define GEOMETRIC_NORMAL\n", kPsLoadsD2uRef, count(kPsLoadsD2uRef), {0, 0x94, 0, 0x5e0, 0x6a4, 0x65c, 0, 0xba4, 0xbac, 0}, 6, 0x750, true},
 };
 
-constexpr int kVariantCount = 22;
-constexpr int kUnmatchedRole = 19; // r_o1dut_b(vr)2dut[ref]
-constexpr VertexShaderInfo kVertexShaders[6] = {
+constexpr int kVariantCount = 23;
+constexpr VertexShaderInfo kVertexShaders[7] = {
     {"r_b1dst_a(vr)2d.fxo", "", kVsLoads, count(kVsLoads), {3, 4, 4, 4, 2, 2, 4}, 7},
     {"r_b1dst.fxo", "#define SIMPLE_MATERIAL\n", kVsLoadsSimple, count(kVsLoadsSimple), {3, 3, 4, 4, 2, 4, 0}, 6},
     {"r_b1dst[ref].fxo", "#define SIMPLE_MATERIAL\n#define REFLECT_MATERIAL\n", kVsLoadsRefSt, count(kVsLoadsRefSt), {3, 3, 4, 4, 2, 4, 0}, 6},
     {"r_b1dut[ref].fxo", "#define SIMPLE_MATERIAL\n#define REFLECT_MATERIAL\n#define REFLECT_VERTEX_U\n", kVsLoadsRefUt, count(kVsLoadsRefUt), {3, 4, 4, 4, 2, 4, 0}, 6},
     {"r_o1dut_a(vr)2d[ref].fxo", "#define REFLECT_MATERIAL\n#define REFLECT_VERTEX_U\n", kVsLoadsRefM2d, count(kVsLoadsRefM2d), {3, 4, 4, 4, 2, 2, 4}, 7},
     {"r_b1d.fxo", "#define SIMPLE_MATERIAL\n#define DIFFUSE_MATERIAL\n", kVsLoadsD, count(kVsLoadsD), {3, 3, 4, 2, 4, 0, 0}, 5},
+    {"r_o1d2u[ref].fxo", "#define SIMPLE_MATERIAL\n#define DIFFUSE_MATERIAL\n#define REFLECT_MATERIAL\n", kVsLoadsD2uRef, count(kVsLoadsD2uRef), {3, 3, 4, 2, 2, 4, 0}, 6},
 };
 
 constexpr const char* kHeader = R"(#version 450
@@ -2051,6 +2122,418 @@ void main() {
 }
 )";
 
+// r_o1d2u[ref], ps 0x53c570c00. The register names and forward block labels
+// retain the translated GLSL's operation boundaries and contraction opportunities.
+// No material alpha test occurs in this program: the translator's final discard
+// only restores the raster execution mask. Alpha is exported, without a demote.
+// Samples: shadow, screen light, UV1 specular RG, UV0 base, cube, then edge samples.
+constexpr const char* kFsD2uRefMain = R"(
+float F(uint x) { return uintBitsToFloat(x); }
+// v_cube*: face id, face s/t and 2x the major axis of a direction (GCN face order +x -x +y -y +z -z).
+float cubeId(vec3 d) {
+    vec3 a = abs(d);
+    if (a.z >= a.x && a.z >= a.y) return d.z < 0.0 ? 5.0 : 4.0;
+    if (a.y >= a.x) return d.y < 0.0 ? 3.0 : 2.0;
+    return d.x < 0.0 ? 1.0 : 0.0;
+}
+float cubeSc(vec3 d) {
+    vec3 a = abs(d);
+    if (a.z >= a.x && a.z >= a.y) return d.z < 0.0 ? -d.x : d.x;
+    if (a.y >= a.x) return d.x;
+    return d.x < 0.0 ? d.z : -d.z;
+}
+float cubeTc(vec3 d) {
+    vec3 a = abs(d);
+    if (a.z >= a.x && a.z >= a.y) return -d.y;
+    if (a.y >= a.x) return d.y < 0.0 ? -d.z : d.z;
+    return -d.y;
+}
+float cubeMa(vec3 d) {
+    vec3 a = abs(d);
+    if (a.z >= a.x && a.z >= a.y) return 2.0 * d.z;
+    if (a.y >= a.x) return 2.0 * d.y;
+    return 2.0 * d.x;
+}
+// Cube image coordinates (s, t in [1, 2] as v_cube* produce them, face id) back to a direction.
+vec3 cubeDir(vec3 c) {
+    float u = 2.0 * c.x - 3.0, v = 2.0 * c.y - 3.0;
+    switch (int(c.z + 0.5) & 7) {
+    case 0: return vec3(1.0, -v, -u);
+    case 1: return vec3(-1.0, -v, u);
+    case 2: return vec3(u, 1.0, v);
+    case 3: return vec3(u, -1.0, -v);
+    case 4: return vec3(u, -v, 1.0);
+    default: return vec3(-u, -v, -1.0);
+    }
+}
+void main() {
+uint exec_hi = 0u; uint exec_lo = 0u; uint s0 = 0u; uint s1 = 0u; uint s10 = 0u; uint s16 = 0u; uint s17 = 0u;
+uint s18 = 0u; uint s2 = 0u; uint s20 = 0u; uint s21 = 0u; uint s22 = 0u; uint s23 = 0u; uint s24 = 0u; uint s25 = 0u;
+uint s26 = 0u; uint s28 = 0u; uint s29 = 0u; uint s3 = 0u; uint s30 = 0u; uint s31 = 0u; uint s32 = 0u; uint s33 = 0u;
+uint s34 = 0u; uint s35 = 0u; uint s36 = 0u; uint s37 = 0u; uint s38 = 0u; uint s4 = 0u; uint s40 = 0u; uint s41 = 0u;
+uint s42 = 0u; uint s43 = 0u; uint s44 = 0u; uint s48 = 0u; uint s49 = 0u; uint s5 = 0u; uint s50 = 0u; uint s52 = 0u;
+uint s53 = 0u; uint s54 = 0u; uint s56 = 0u; uint s57 = 0u; uint s58 = 0u; uint s6 = 0u; uint s68 = 0u; uint s69 = 0u;
+uint s7 = 0u; uint s70 = 0u; uint s76 = 0u; uint s77 = 0u; uint s78 = 0u; uint s79 = 0u; uint s8 = 0u; uint s80 = 0u;
+uint s82 = 0u; uint s88 = 0u; uint s89 = 0u; uint s9 = 0u; uint s90 = 0u; uint s91 = 0u; float v0 = 0.0;
+float v1 = 0.0; float v10 = 0.0; float v11 = 0.0; float v12 = 0.0; float v13 = 0.0; float v14 = 0.0; float v15 = 0.0;
+float v16 = 0.0; float v17 = 0.0; float v18 = 0.0; float v19 = 0.0; float v2 = 0.0; float v20 = 0.0; float v21 = 0.0;
+float v22 = 0.0; float v23 = 0.0; float v24 = 0.0; float v25 = 0.0; float v26 = 0.0; float v27 = 0.0; float v28 = 0.0;
+float v29 = 0.0; float v3 = 0.0; float v30 = 0.0; float v31 = 0.0; float v32 = 0.0; float v33 = 0.0; float v34 = 0.0;
+float v35 = 0.0; float v36 = 0.0; float v37 = 0.0; float v38 = 0.0; float v39 = 0.0; float v4 = 0.0; float v40 = 0.0;
+float v41 = 0.0; float v42 = 0.0; float v43 = 0.0; float v44 = 0.0; float v45 = 0.0; float v46 = 0.0; float v47 = 0.0;
+float v48 = 0.0; float v49 = 0.0; float v5 = 0.0; float v50 = 0.0; float v51 = 0.0; float v52 = 0.0; float v53 = 0.0;
+float v54 = 0.0; float v55 = 0.0; float v56 = 0.0; float v57 = 0.0; float v58 = 0.0; float v59 = 0.0; float v6 = 0.0;
+float v60 = 0.0; float v61 = 0.0; float v62 = 0.0; float v63 = 0.0; float v7 = 0.0; float v8 = 0.0; float v9 = 0.0;
+uint vcc_hi = 0u; uint vcc_lo = 0u; bool scc = false; uint pc = 0x00000000u;
+exec_lo = 1u;
+v2 = gl_FragCoord.x; v3 = gl_FragCoord.y; v4 = gl_FragCoord.w;
+{
+pc = 0x00000000u;
+}
+// Geometric normal, shadow remaps, and the four point lights.
+s91 = cb.c[20].x; s90 = s91 & 8u;
+vec3 gn = a3.xyz;
+float ni = inversesqrt(gn.z * gn.z + (gn.y * gn.y + gn.x * gn.x)); v20 = gn.x * ni; v21 = gn.y * ni; v22 = gn.z * ni;
+v5 = F(cb.c[20].y) * v2; v6 = F(cb.c[20].z) * v3; v17 = 1.0; v18 = 1.0; v19 = 1.0;
+if (s90 != 0u) {
+    vec4 shadow = at(1, vec2(v5, v6));
+    v17 = shadow.r; v18 = shadow.g; v19 = shadow.a;
+    vec4 rm = cf(22);
+    v17 = rm.x * v17 + rm.y; v18 = v18 * rm.z + rm.w;
+}
+v7 = v17; v29 = v18;
+if (s90 != 0u) {
+    vec4 rm = cf(22);
+    v7 = rm.x * v17 + rm.y; v29 = rm.z * v18 + rm.w;
+}
+v7 = v7 * v29;
+vec3 tb = cf(23).xyz;
+v33 = (1.0 - tb.r) * v7 + tb.r; v31 = (1.0 - tb.g) * v7 + tb.g; v32 = (1.0 - tb.b) * v7 + tb.b;
+v14 = v33; v7 = v31; v8 = v32;
+if (s90 != 0u) {
+    vec4 tt = cf(24);
+    float gain = tt.z + tt.w;
+    v14 = gain * (v33 * tt.x + tt.y);
+    v7 = gain * (v31 * tt.x + tt.y);
+    v8 = gain * (tt.x * v32 + tt.y);
+}
+v28 = a6.x; v27 = a6.y; v26 = a6.z; v15 = 0.0; v13 = 0.0; v30 = 0.0;
+for (int i = 0; i < 4; ++i) {
+    if ((s91 & (0x10000u << uint(i))) == 0u) continue;
+    vec4 pp = cf(25 + i);
+    float dx = v28 - pp.x, dy = v27 - pp.y, dz = v26 - pp.z;
+    float dd = dx * dx, nd = v20 * dx;
+    dd = dy * dy + dd; nd = v21 * dy + nd;
+    dd = dz * dz + dd;
+    float invd = inversesqrt(dd);
+    nd = dz * v22 + nd;
+    float lam = clamp(-invd * nd, 0.0, 1.0);
+    if (lam > 0.0) {
+        float distance_ = sqrt(dd);
+        vec4 light = cf(29 + i);
+        float o = max(0.0, distance_ - light.w);
+        float po = pp.w * o;
+        float attenuation = 1.0 / (po * o + 1.0);
+        attenuation = clamp(F(0x3f808102u) * attenuation + F(0xbb810205u), 0.0, 1.0);
+        float weight = lam * attenuation;
+        if (i == 0) {
+            v15 = light.r * weight; v13 = light.g * weight; v30 = light.b * weight;
+        } else {
+            v15 = light.r * weight + v15;
+            v13 = light.g * weight + v13;
+            v30 = light.b * weight + v30;
+        }
+    }
+}
+pc = 0x000004a4u;
+if (pc == 0x000004a4u) {
+v10 = a0[3];
+vcc_lo = 0x3f400000u;
+v9 = a0[2]; v16 = a4[1]; v43 = a5[0]; v51 = (v19 * v14); v38 = (v17 * v18); s56 = cb.c[33][0]; s57 = cb.c[33][1];
+s58 = cb.c[33][2]; s48 = cb.c[41][0]; s49 = cb.c[41][1]; s50 = cb.c[41][2]; s52 = cb.c[42][0]; s53 = cb.c[42][1];
+s54 = cb.c[42][2]; s16 = cb.c[34][0]; s17 = cb.c[34][1]; s18 = cb.c[34][2]; s20 = cb.c[35][0]; s21 = cb.c[35][1];
+s22 = cb.c[35][2]; s23 = cb.c[35][3]; s88 = cb.c[21][0]; s89 = cb.c[21][1]; s76 = cb.c[36][0]; s78 = cb.c[73][0];
+s79 = cb.c[73][1]; v34 = (v19 * v8); v41 = a3[3]; v35 = (v19 * v7); v8 = (v28 - F(s56)); v7 = (v8 * v8);
+v11 = (v27 - F(s57)); v12 = (v26 - F(s58)); v7 = (v11 * v11 + v7); v7 = (v12 * v12 + v7); v17 = (inversesqrt(v7));
+v36 = (v17 * v8 + F(s48)); v24 = (v17 * v8); v7 = (v17 * v12 + F(s50)); v18 = (v17 * v11 + F(0xbe99999au));
+v23 = (v17 * v12); v12 = (v17 * v11 + F(s49)); v8 = (F(s48) * v20); v39 = (F(s49) * v21 + v8); v25 = (v17 * v11);
+v11 = (v36 * v36); v11 = (v12 * v12 + v11); v11 = (v7 * v7 + v11); v39 = (F(s50) * v22 + v39);
+v14 = clamp(F(vcc_lo) - v39, 0.0, 1.0); v8 = (F(s89) * v10); v10 = (v36 * v20); v12 = (v12 * v21 + v10);
+v10 = (inversesqrt(v11)); v12 = (v22 * v7 + v12); v7 = clamp((-v10) * v12, 0.0, 1.0); v36 = (log2(v7));
+v7 = (F(s88) * v9); v10 = (F(s52) * v20); v10 = (F(s53) * v21 + v10); v10 = (F(s54) * v22 + v10);
+v17 = (max(F(0u), (-v10)));
+{
+vec2 uv_ = vec2(v5, v6);
+uv_.xy *= sc(3);
+{ vec4 t_ = vec4(texture(tex[3], uv_));
+v9 = t_[0]; v10 = t_[1]; v11 = t_[2]; v12 = t_[3];
+}
+}
+s4 = cb.c[43][0]; s5 = cb.c[43][1]; s6 = cb.c[43][2]; s7 = cb.c[43][3]; v5 = (v24 * v20); s24 = cb.c[37][0];
+s25 = cb.c[37][1]; s26 = cb.c[37][2]; s28 = cb.c[38][0]; s29 = cb.c[38][1]; s30 = cb.c[38][2]; s31 = cb.c[38][3];
+v6 = (v24 * v24); v6 = (v18 * v18 + v6); v18 = (v18 * v21 + v5); v6 = (v23 * v23 + v6); v37 = (inversesqrt(v6));
+v18 = (v22 * v23 + v18); v18 = clamp((-v37) * v18, 0.0, 1.0); v6 = (F(s31) * v36); v18 = (log2(v18));
+v42 = (v21 * v25 + v5); v5 = F(s16); v18 = (F(s31) * v18); v36 = (exp2(v18)); v42 = ((v22 * v23 + v42) * 2.0);
+v55 = ((-v22) * v42 + v23); s80 = cb.c[39][0]; s82 = cb.c[39][2]; s68 = cb.c[40][0]; s69 = cb.c[40][1];
+s70 = cb.c[40][2]; v47 = (exp2(v6)); v6 = F(s17); v37 = (min(1.0, v17));
+{
+vec2 uv_ = vec2(v7, v8);
+uv_.xy *= sc(5);
+{ vec4 t_ = vec4(texture(tex[5], uv_));
+v17 = t_[0]; v18 = t_[1];
+}
+}
+v45 = (F(s25) * v6); v6 = a0[1]; v46 = (F(s24) * v5); v5 = F(s4); v48 = (1.0 / F(s82)); v50 = (F(s23) * v5);
+v5 = a1[0]; v49 = (v5 * v19); v5 = a4[0]; v44 = (v5 + v15); v5 = a0[0];
+{
+vec2 uv_ = vec2(v5, v6);
+uv_.xy *= sc(4);
+{ vec4 t_ = vec4(texture(tex[4], uv_));
+v5 = t_[0]; v6 = t_[1]; v7 = t_[2]; v8 = t_[3];
+}
+}
+s32 = cb.c[45][0]; s33 = cb.c[45][1]; s34 = cb.c[45][2]; s35 = cb.c[45][3]; s36 = cb.c[46][0]; s37 = cb.c[46][1];
+s38 = cb.c[46][2]; v40 = (v43 * v46); v52 = (v40 * v44); v40 = (v38 * v14); v14 = (max(F(0u), (-v39)));
+v39 = (v20 * v42 + (-v24)); v15 = (F(s36) * v29); v54 = (min(1.0, v14)); v14 = ((-v21) * v42 + v25);
+v60 = (F(s33) * v47); v53 = (F(s38) * v29); v38 = (v16 + v13); v13 = (F(s32) * v33);
+v16 = (cubeTc(vec3(v39, v14, v55))); v56 = (v13 * v54); v13 = (F(s36) * v36); v57 = (v13 * v37);
+v13 = (cubeMa(vec3(v39, v14, v55))); v58 = (1.0 / abs(v13)); v13 = (cubeSc(vec3(v39, v14, v55)));
+v13 = (v13 * v58 + F(0x3fc00000u)); v56 = (v37 * v15 + v56); v15 = (1.0 - F(s76)); v42 = (v15 * v29 + F(s76));
+v15 = (cubeId(vec3(v39, v14, v55))); v14 = (v16 * v58 + F(0x3fc00000u)); v16 = F(s20); v55 = (F(s28) * v16);
+{
+vec3 uv_ = vec3(v13, v14, v15);
+uv_ = cubeDir(uv_);
+{ vec4 t_ = vec4(texture(env, uv_));
+v13 = t_[0]; v14 = t_[1]; v15 = t_[2]; v16 = t_[3];
+}
+}
+v58 = (v49 * v55); v39 = a5[1]; v55 = (v43 * v55); v43 = (F(s32) * v47); v59 = (v43 * v33); v33 = F(s22);
+v43 = (F(s30) * v33); v33 = (2.0 * F(s78)); v59 = (v33 * v57 + v59); v40 = (max(F(s79), v40)); v57 = (v58 * v59);
+v58 = (F(s34) * v47); v59 = (F(s37) * v29); v47 = a1[1]; v47 = (v47 * v19); v63 = (v58 * v32); v32 = (F(s34) * v32);
+v62 = (v32 * v54); v58 = F(s18); v58 = (F(s26) * v58); v62 = (v37 * v53 + v62); v32 = (v60 * v31);
+v31 = (F(s33) * v31); v60 = a4[2]; v53 = (v31 * v54); v54 = (F(s38) * v36); v54 = (v54 * v37); v31 = F(s5);
+v61 = (F(s23) * v31); v60 = (v60 + v30); v30 = F(s6); v30 = (F(s23) * v30); v53 = (v37 * v59 + v53);
+v59 = (v36 * v51); v63 = (v33 * v54 + v63); v54 = a5[2]; s77 = 0x3e19999au;
+vcc_hi = s91 & 4u;
+scc = vcc_hi != 0u;
+vcc_lo = s91 & 0x00400000u;
+scc = vcc_lo != 0u;
+s4 = 0xbdbc49cau;
+scc = vcc_lo != 0u;
+v31 = a2[0]; s7 = scc ? 0u : 1u;
+scc = vcc_hi != 0u;
+vcc_lo = ((exec_lo & 1u) != 0u && (vcc_hi != 0u)) ? 1u : 0u; vcc_hi = 0u;
+v9 = (v9 * v48); v52 = (v9 * v29 + v52); v52 = (v51 * v52); v10 = (v10 * v48); v9 = (v54 * v43); v51 = (v5 * v5);
+v7 = (v7 * v7); v50 = (v50 * v51 + F(s68)); v30 = (v30 * v7 + F(s70)); v5 = (v6 * v6); v6 = (v39 * v45);
+v50 = (v56 * v46 + v50); v30 = (v62 * v58 + v30); v49 = (v49 * v50); v46 = (v61 * v5 + F(s69)); v50 = (v6 * v38);
+v6 = a1[2]; v19 = (v6 * v19); v6 = (v12 * v48); v12 = (v11 * v48); v6 = (v29 * v6); v48 = (v55 * v44 + v6);
+v44 = (v54 * v58); v49 = (v42 * v52 + v49); v46 = (v53 * v45 + v46); v50 = (v10 * v29 + v50); v11 = (v47 * v46);
+v46 = (v51 * v49); v57 = (v48 * v59 + v57); v48 = (v35 * v50); v10 = (v36 * v35); v35 = (v17 * v41);
+v46 = (v57 * v18 + v46); v11 = (v42 * v48 + v11); v11 = (v5 * v11); v5 = a2[1]; v0 = a2[2];
+v1 = (max(F(0x3b808081u), v16)); v1 = (1.0 / v1); v1 = (F(0x3e800000u) * v1); v13 = (v13 * v1); v16 = (v19 * v30);
+v30 = (v44 * v60); v19 = (v19 * v43); v30 = (v12 * v29 + v30); v12 = (v36 * v34); v45 = (v19 * v63);
+v19 = (v35 * v40); v29 = (v9 * v60 + v6); v9 = (v34 * v30); v16 = (v42 * v9 + v16); v9 = (v14 * v1); v1 = (v15 * v1);
+v15 = (v19 * v13); v14 = (v7 * v16); v7 = (F(s37) * v36); v7 = (v7 * v37); v32 = (v33 * v7 + v32);
+v46 = (v13 * v15 + v46); v45 = (v29 * v12 + v45); v12 = F(s21); v12 = (F(s29) * v12); v17 = (v47 * v12);
+v12 = (v39 * v12); v13 = (v17 * v32); v6 = (v38 * v12 + v6); v13 = (v6 * v10 + v13); v6 = ((F(s80) * v46) * 2.0);
+v15 = (v19 * v9); v7 = (v19 * v1); v11 = (v13 * v18 + v11); v14 = (v45 * v18 + v14); v12 = (F(s77) * v6 + 0.5);
+v10 = (v15 * v9 + v11); v9 = F(0x3e19999au); v14 = (v1 * v7 + v14); v12 = (v6 * v12 + F(0x3d75c290u));
+v11 = (v9 * v6 + F(0x3d4ccccdu)); v1 = ((F(s80) * v10) * 2.0); v7 = ((F(s80) * v14) * 2.0); v10 = (F(s77) * v1 + 0.5);
+v6 = (v11 * v6 + F(0x3b83126fu)); v11 = (1.0 / v12); v6 = (v11 * v6); v11 = (v9 * v1 + F(0x3d4ccccdu));
+v9 = (v9 * v7 + F(0x3d4ccccdu)); v11 = (v11 * v1 + F(0x3b83126fu)); v1 = (v1 * v10 + F(0x3d75c290u)); v1 = (1.0 / v1);
+v9 = (v9 * v7 + F(0x3b83126fu)); v1 = (v1 * v11); v10 = F(0x3fb0852eu); v6 = clamp(v10 * v6 + F(s4), 0.0, 1.0);
+v11 = clamp(v10 * v1 + F(s4), 0.0, 1.0); v1 = (sqrt(v6)); v6 = (sqrt(v11)); v11 = (v31 + v1); v12 = (v5 + v6);
+v5 = (F(s77) * v7 + 0.5); v5 = (v7 * v5 + F(0x3d75c290u)); v5 = (1.0 / v5); v5 = (v5 * v9);
+v5 = clamp(v10 * v5 + F(s4), 0.0, 1.0); v5 = (sqrt(v5)); v0 = (v0 + v5); v7 = (vcc_lo & 1u) != 0u ? v11 : v1;
+v9 = (vcc_lo & 1u) != 0u ? v12 : v6; v10 = (vcc_lo & 1u) != 0u ? v0 : v5;
+vcc_lo = scc ? 1u : 0u;
+vcc_lo = s7 | vcc_lo;
+scc = vcc_lo != 0u;
+v13 = F(0u);
+pc = (scc) ? 0x00000ae4u : 0x00000a7cu;
+}
+if (pc == 0x00000a7cu) {
+v0 = (F(s56) - v28); v0 = (v0 * v0); v7 = (F(s57) - v27); v0 = (v7 * v7 + v0); v7 = (F(s58) - v26); s16 = cb.c[47][0];
+s17 = cb.c[47][1]; s18 = cb.c[47][2]; s20 = cb.c[48][0]; s21 = cb.c[48][1]; s22 = cb.c[48][2]; s23 = cb.c[48][3];
+v0 = (v7 * v7 + v0); v0 = (sqrt(v0)); v13 = F(s23); v13 = clamp(F(s22) * v0 + v13, 0.0, 1.0);
+v7 = (F(s16) * v13 + v1); v9 = (F(s17) * v13 + v6); v10 = (F(s18) * v13 + v5); v7 = (v13 * (-v1) + v7);
+v9 = (v13 * (-v6) + v9); v10 = (v13 * (-v5) + v10);
+pc = 0x00000ae4u;
+}
+if (pc == 0x00000ae4u) {
+v0 = F(0u);
+scc = s90 != 0u;
+{ uint lo_ = scc ? exec_lo : 0u; uint hi_ = scc ? exec_hi : 0u; vcc_lo = lo_; vcc_hi = hi_; }
+s28 = cb.c[36][2]; s24 = cb.c[36][3]; s20 = cb.c[44][2]; s16 = cb.c[20][0]; s4 = cb.c[49][0]; s5 = cb.c[49][1];
+s6 = cb.c[49][2]; s7 = cb.c[49][3]; v1 = F(s28); v1 = (F(s24) * v1); v1 = (F(s20) * v1); v8 = (v1 * v8);
+v11 = (F(s7) * v8); v6 = (F(s4) * v7); v5 = (F(s5) * v9); v1 = (F(s6) * v10); v14 = (vcc_lo & 1u) != 0u ? v8 : v11;
+v15 = (vcc_lo & 1u) != 0u ? v7 : v6; v16 = (vcc_lo & 1u) != 0u ? v9 : v5; v17 = (vcc_lo & 1u) != 0u ? v10 : v1;
+vcc_lo = s16 & 0x02000000u;
+scc = vcc_lo != 0u;
+scc = vcc_lo != 0u;
+{ uint lo_ = scc ? exec_lo : 0u; uint hi_ = scc ? exec_hi : 0u; vcc_lo = lo_; vcc_hi = hi_; }
+pc = ((vcc_lo & 1u) != 0u) ? 0x00000f10u : 0x00000b64u;
+}
+if (pc == 0x00000b64u) {
+v19 = F(0u); s40 = cb.c[20][1]; s41 = cb.c[20][2]; s42 = cb.c[50][0]; s32 = cb.c[51][0]; s33 = cb.c[51][1];
+s34 = cb.c[51][2]; s35 = cb.c[51][3]; s43 = cb.c[50][1]; s44 = cb.c[50][2]; s36 = cb.c[44][3]; v11 = (F(s40) * v2);
+v12 = (F(s41) * v3);
+{
+vec2 uv_ = vec2(v11, v12);
+uv_.xy *= sc(7);
+{ vec4 t_ = vec4(texture(tex[7], uv_));
+v7 = t_[0];
+}
+}
+{
+vec2 uv_ = vec2(v11, v12);
+uv_.xy *= sc(8);
+{ vec4 t_ = vec4(texture(tex[8], uv_));
+v0 = t_[0]; v1 = t_[1]; v2 = t_[2];
+}
+}
+v3 = F(s32); v6 = (F(s34) - v3); v18 = F(s32); v5 = F(s33); v6 = (1.0 / v6); v5 = (F(s32) - v5); v5 = (1.0 / v5);
+vcc_lo = s36 & 4u;
+scc = vcc_lo != 0u;
+v7 = (F(s42) + v7); v7 = (1.0 / v7); v18 = (F(s43) * v7 + (-v18)); v28 = clamp((-v18) * v6 + 1.0, 0.0, 1.0);
+v27 = ((-F(s43)) * v7); v7 = (F(s44) * v28); v26 = ((-v27) * v5); v31 = (2.0 * v1 + -1.0); v1 = (max(F(s35), v7));
+v32 = (2.0 * v0 + -1.0); v26 = clamp((-F(s33)) * v5 + v26, 0.0, 1.0); v8 = (v26 * v1); v30 = (F(s40) * v32);
+v29 = (F(s41) * (-v31)); v0 = (v30 * v8 + v11); v1 = (v29 * v8 + v12);
+{
+vec2 uv_ = vec2(v0, v1);
+uv_.xy *= sc(8);
+{ vec4 t_ = vec4(texture(tex[8], uv_));
+v5 = t_[0]; v6 = t_[1]; v7 = t_[2];
+}
+}
+v0 = ((-v30) * v8 + v11); v1 = ((-v29) * v8 + v12);
+{
+vec2 uv_ = vec2(v0, v1);
+uv_.xy *= sc(8);
+{ vec4 t_ = vec4(texture(tex[8], uv_));
+v8 = t_[0]; v9 = t_[1]; v10 = t_[2];
+}
+}
+v1 = (2.0 * v2 + -1.0); v0 = (v32 + v31); v0 = (v0 + v1); v2 = (v6 * v31); v33 = ((v5 * v32) * 2.0); v6 = (v7 * v1);
+v5 = (v9 * v31); v8 = ((v8 * v32) * 2.0); v1 = (v10 * v1); v33 = (2.0 * v2 + v33); v8 = (2.0 * v5 + v8);
+v33 = (2.0 * v6 + v33); v8 = (2.0 * v1 + v8); v2 = (v33 - v0); v5 = (v8 - v0);
+pc = (!scc) ? 0x00000d14u : 0x00000cb8u;
+}
+if (pc == 0x00000cb8u) {
+v0 = (0.5 * v5 + 0.5); v0 = ((v2 * v0 + v0) * 0.5); v1 = (v0 * v0 + F(0x3b808081u)); s0 = cb.c[52][0];
+s1 = cb.c[52][1]; v6 = ((-F(s1)) * v26 + 1.0);
+vcc_lo = ((exec_lo & 1u) != 0u && (v1 >= v6)) ? 1u : 0u; vcc_hi = 0u;
+v6 = (vcc_lo & 1u) != 0u ? F(0x3f800000u) : F(0u); v1 = (1.0 - F(s0)); v6 = clamp(v0 * v0 + v6, 0.0, 1.0);
+v0 = (v1 * v6 + F(s0)); v19 = ((-v26) * v0 + v26);
+pc = 0x00000d14u;
+}
+if (pc == 0x00000d14u) {
+v0 = F(0u);
+vcc_lo = s36 & 8u;
+scc = vcc_lo != 0u;
+pc = (!scc) ? 0x00000de0u : 0x00000d20u;
+}
+if (pc == 0x00000d20u) {
+v6 = (2.0 * v27); s8 = cb.c[52][2]; s9 = cb.c[52][3]; s10 = cb.c[50][3]; v0 = (F(s8) * v28); v0 = (max(F(s35), v0));
+v8 = (v26 * v0); v0 = (v30 * v8 + v11); v1 = (v29 * v8 + v12);
+{
+vec2 uv_ = vec2(v0, v1);
+uv_.xy *= sc(7);
+{ vec4 t_ = vec4(texture(tex[7], uv_));
+v7 = t_[0];
+}
+}
+v0 = ((-v30) * v8 + v11); v1 = ((-v29) * v8 + v12);
+{
+vec2 uv_ = vec2(v0, v1);
+uv_.xy *= sc(7);
+{ vec4 t_ = vec4(texture(tex[7], uv_));
+v8 = t_[0];
+}
+}
+v1 = ((-F(s10)) * v26 + 1.0); v0 = (1.0 - F(s9)); v7 = (F(s42) + v7); v7 = (1.0 / v7); v6 = (F(s43) * v7 + v6);
+v7 = (F(s42) + v8); v7 = (1.0 / v7); v6 = (F(s43) * v7 + v6); v6 = (-0.5 * v6 + 1.0); v7 = (F(0x3b808081u) + v6);
+vcc_lo = ((exec_lo & 1u) != 0u && (v7 >= v1)) ? 1u : 0u; vcc_hi = 0u;
+v1 = (vcc_lo & 1u) != 0u ? F(0x3f800000u) : F(0u); v1 = clamp(v1 + v6, 0.0, 1.0); v0 = (v0 * v1 + F(s9));
+v0 = ((-v26) * v0 + v26);
+pc = 0x00000de0u;
+}
+if (pc == 0x00000de0u) {
+v1 = F(0u);
+vcc_lo = s36 & 2u;
+scc = vcc_lo != 0u;
+pc = (!scc) ? 0x00000ebcu : 0x00000decu;
+}
+if (pc == 0x00000decu) {
+v1 = (v20 * v24); v1 = (v25 * v21 + v1); v1 = (v23 * v22 + v1); v1 = (max(F(0u), (-v1))); v1 = (min(1.0, v1));
+s0 = cb.c[53][0]; s1 = cb.c[53][1]; s2 = cb.c[53][2]; s3 = cb.c[53][3]; s8 = cb.c[54][0]; s9 = cb.c[54][1];
+s4 = cb.c[54][2]; v6 = (F(0x3b808081u) + v1); v1 = ((-v2) * v5 + 1.0); v2 = F(s0); v2 = (F(0xba83126fu) + v2);
+v2 = (min(F(s1), v2)); v5 = (F(s0) - v2); v5 = (1.0 / v5); v8 = ((-v27) * v5); v7 = F(s2);
+v8 = clamp(v2 * (-v5) + v8, 0.0, 1.0); v5 = (F(s9) - v7); v5 = (v8 * v5 + F(s2)); v5 = (v26 * v5 + F(0x3b808081u));
+v5 = (1.0 / v5); v7 = F(s3); v5 = clamp(v5 * v6, 0.0, 1.0); v6 = (1.0 - F(s8)); v7 = (F(s4) - v7); v6 = (v6 * v5);
+v2 = (v7 * v8 + F(s3)); v5 = clamp(v6 * v5 + F(s8), 0.0, 1.0);
+vcc_lo = ((exec_lo & 1u) != 0u && (v1 >= v2)) ? 1u : 0u; vcc_hi = 0u;
+v26 = (v5 * (-v26) + v26); v5 = (vcc_lo & 1u) != 0u ? F(0x3f800000u) : F(0u); v5 = (v5 * v26);
+vcc_lo = ((exec_lo & 1u) != 0u && (F(0u) < v2)) ? 1u : 0u; vcc_hi = 0u;
+v1 = (vcc_lo & 1u) != 0u ? v5 : v26;
+pc = 0x00000ebcu;
+}
+if (pc == 0x00000ebcu) {
+v0 = (max(max(v0, v1), v19)); s4 = cb.c[55][0]; s5 = cb.c[55][1]; s0 = cb.c[54][3]; v1 = (F(s4) - v3);
+v1 = (1.0 / v1); v1 = clamp((-v18) * v1 + 1.0, 0.0, 1.0); v2 = (1.0 - F(s5)); v1 = (max(v2, v1)); v0 = (v1 * v0);
+v0 = (v0 * (-v13) + v0);
+vcc_lo = ((exec_lo & 1u) != 0u && (F(s0) <= v0)) ? 1u : 0u; vcc_hi = 0u;
+v1 = (vcc_lo & 1u) != 0u ? F(0x3f800000u) : F(0u); v0 = (v1 * v0);
+pc = 0x00000f10u;
+}
+if (pc == 0x00000f10u) {
+v2 = (v14); s0 = cb.c[20][0];
+vcc_lo = s0 & 0x00800000u;
+scc = vcc_lo != 0u;
+pc = (!scc) ? 0x00000f88u : 0x00000f30u;
+}
+if (pc == 0x00000f30u) {
+s0 = cb.c[56][0]; s1 = cb.c[56][1]; s2 = cb.c[56][2]; s3 = cb.c[56][3]; v2 = F(s0); v3 = F(s1); v1 = F(s2);
+v15 = (F(s3) * v15 + v2); v16 = (F(s3) * v16 + v3); v17 = (F(s3) * v17 + v1); v5 = F(s3); v0 = (F(s3) * v0);
+v2 = (F(s3) * v14); v15 = ((-F(s0)) * v5 + v15); v16 = ((-F(s1)) * v5 + v16); v17 = ((-F(s2)) * v5 + v17);
+pc = 0x00000f88u;
+}
+if (pc == 0x00000f88u) {
+    float alpha0 = (cb.c[20].w & 1u) != 0u
+        ? clamp(F(0x3a4d9a68u) * v4, 0.0, 1.0) : v14;
+    o1 = swz(half4(vec4(v0, 0.0, 0.0, v2)), cb.c[69].y);
+    o0 = swz(half4(vec4(v15, v16, v17, alpha0)), cb.c[69].x);
+    return;
+}
+}
+)";
+
+// Specialize copies: neither a shared GLSL string nor an existing variant's
+// composed shader text changes. The vertex path shares the diffuse fog/normal
+// arithmetic and reflection weight; its second UV precedes the baked-light stream.
+std::string d2uRefVertexSource() {
+    std::string source = kVs;
+    const auto replace = [&](const char* from, const char* to) {
+        source.replace(source.find(from), std::strlen(from), to);
+    };
+    replace("vec4 n = fetch(1u), col = fetch(2u), b = fetch(4u);",
+            "vec4 n = fetch(1u), col = fetch(2u), b = fetch(5u);");
+    replace("p0 = vec4(fetch(3u).xy + uvo.xy, 0.0, 0.0);",
+            "p0 = vec4(fetch(3u).xy + uvo.xy, fetch(4u).xy + uvo.zw);");
+    replace("T = exp2(f0.xyz * c.w * uintBitsToFloat(0x3fb8aa3bu));",
+            "for (int i = 0; i < 3; ++i) T[i] = exp2(mul(mul(f0[i], c.w), uintBitsToFloat(0x3fb8aa3bu)));");
+    replace("float f2 = f * f, f4 = f2 * f2;",
+            "float f2 = mul(f, f), f4 = mul(f2, f2);");
+    replace("rw = 0.5 * mac(cf(72).x, f4, cf(72).x);",
+            "rw = mul(0.5, mac(cf(72).x, f4, cf(72).x));");
+    return source;
+}
+
+std::string d2uRefFragmentSource() {
+    const std::string shared = kFs;
+    return shared.substr(0, shared.find("void main()")) + kFsD2uRefMain;
+}
+
 bool decodable(const VertexBuffer& v) {
     static constexpr uint32_t kDfmts[] = {1, 2, 3, 4, 5, 10, 11, 12, 13, 14};
     bool dfmt = false;
@@ -2074,10 +2557,8 @@ public:
 
     bool draw(int role, const Draw& d, Gpu& gpu) override {
         if (role < 1 || role > kVariantCount) return false;
-        // r_o1dut_b(vr)2dut[ref] still differs from the game's shader (darker, up to ~60/255): drawn
-        // only in compare mode, where it is checked, until it matches.
-        if (role == kUnmatchedRole && !d.compareCopy) return decline(role, "not yet matched (drawn into compare copies only)");
         const Variant& var = kVariants[role - 1];
+        if (var.unmatched && !d.compareCopy) return decline(role, "not yet matched (drawn into compare copies only)");
         const VertexShaderInfo& vsi = kVertexShaders[var.vs];
         const char* vsWanted = vsi.name;
         if (!d.vsName || (*d.vsName != vsWanted && d.vsName->rfind(std::string(vsWanted) + " +", 0) != 0))
@@ -2388,10 +2869,10 @@ private:
         const Variant& var = kVariants[role - 1];
         const std::string header = kHeader;
         const std::string vsDefs = kVertexShaders[var.vs].defines;
-        const VkShaderModule vsm = gpu.shader(header + vsDefs + kVs, Gpu::Stage::Vertex);
+        const VkShaderModule vsm = gpu.shader(header + vsDefs + (var.vs == 6 ? d2uRefVertexSource() : std::string(kVs)), Gpu::Stage::Vertex);
         // The fragment stage's extension, ahead of everything else.
         const std::string fsHeader = "#version 450\n#extension GL_EXT_demote_to_helper_invocation : require\n" + header.substr(header.find('\n') + 1);
-        const VkShaderModule fsm = gpu.shader(fsHeader + var.defines + kFs, Gpu::Stage::Fragment);
+        const VkShaderModule fsm = gpu.shader(fsHeader + var.defines + (var.vs == 6 ? d2uRefFragmentSource() : std::string(kFs)), Gpu::Stage::Fragment);
         if (!vsm || !fsm) return out = VK_NULL_HANDLE;
         VkPipelineShaderStageCreateInfo st[2]{};
         st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vsm, "main", nullptr};
