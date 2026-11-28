@@ -938,8 +938,12 @@ private:
                 plain = plain && ((v->dstSel >> (3 * c)) & 7) == 4 + c;
             const uint64_t offset = uint64_t(v->data.byteOffset) + v->offset;
             if (!v->data.buffer || v->indexVgpr || v->stride % 4 || offset % 4 ||
-                offset > UINT32_MAX || !format || !plain || !v->records)
-                return decline(role, "a skin fetch format it does not read exactly");
+                offset > UINT32_MAX || !format || !plain || !v->records) {
+                char why[160];
+                std::snprintf(why, sizeof why, "a fetch format it does not read exactly: slot %d dfmt %u nfmt %u components %u dst_sel 0x%x stride %u offset %u",
+                              i, unsigned(v->dfmt), unsigned(v->nfmt), unsigned(v->components), unsigned(v->dstSel), unsigned(v->stride), unsigned(v->offset));
+                return decline(role, why);
+            }
             // The renderer may cap the descriptor range independently of
             // NUM_RECORDS; do not require the entire declared stream to fit.
             if (offset > v->data.range || bytes > v->data.range - offset)
@@ -1134,8 +1138,12 @@ private:
                 plain = plain && ((v->dstSel >> (3 * c)) & 7) == 4 + c;
             const uint64_t offset = uint64_t(v->data.byteOffset) + v->offset;
             if (!v->data.buffer || v->indexVgpr || v->stride % 4 || offset % 4 ||
-                offset > UINT32_MAX || !format || !plain || !v->records)
-                return decline(role, "a skin fetch format it does not read exactly");
+                offset > UINT32_MAX || !format || !plain || !v->records) {
+                char why[160];
+                std::snprintf(why, sizeof why, "a fetch format it does not read exactly: slot %d dfmt %u nfmt %u components %u dst_sel 0x%x stride %u offset %u",
+                              i, unsigned(v->dfmt), unsigned(v->nfmt), unsigned(v->components), unsigned(v->dstSel), unsigned(v->stride), unsigned(v->offset));
+                return decline(role, why);
+            }
             // The renderer may cap the descriptor range independently of
             // NUM_RECORDS; do not require the entire declared stream to fit.
             if (offset > v->data.range || bytes > v->data.range - offset)
