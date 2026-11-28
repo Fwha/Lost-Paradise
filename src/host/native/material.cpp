@@ -1545,7 +1545,7 @@ const Variant kVariants[] = {
     {"r_o1d.fxo", "#define SIMPLE_MATERIAL\n#define GEOMETRIC_NORMAL\n#define BARE_MATERIAL\n", kPsLoadsO1d, count(kPsLoadsO1d), {0, 0xa0, 0, 0x664, 0x6b0, 0, 0, 0xa94, 0xa9c, 0}, 5},
     {"r_o1dut_a(vr)2d.fxo", "#define KEEP_PRIMARY_NORMAL\n#define SPECULAR_GREEN\n#define AMBIENT_DETAIL_ADD\n", kPsLoadsA2d, count(kPsLoadsA2d), {0x4c, 0x178, 0x818, 0x74c, 0x7a0, 0x7c8, 0, 0xbd8, 0xbe0, 0}, 0},
     {"r_o1d2u[ref].fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define GEOMETRIC_NORMAL\n", kPsLoadsD2uRef, count(kPsLoadsD2uRef), {0, 0x94, 0, 0x5e0, 0x6a4, 0x65c, 0, 0xba4, 0xbac, 0}, 6, 0x750}, // compare: within 1/255 (~560 draws)
-    {"r_p1dst[tree][plant].fxo", "#define SIMPLE_MATERIAL\n", kPsLoadsPlant, count(kPsLoadsPlant), {0x4c, 0x178, 0, 0x704, 0x758, 0x82c, 0, 0xbcc, 0xbd4, 0}, 7, 0, true},
+    {"r_p1dst[tree][plant].fxo", "#define SIMPLE_MATERIAL\n", kPsLoadsPlant, count(kPsLoadsPlant), {0x4c, 0x178, 0, 0x704, 0x758, 0x82c, 0, 0xbcc, 0xbd4, 0}, 7, 0}, // compare: 0 px (84 draws)
     {"r_o1d2u3t_m4d[nref][sign].fxo", "#define REFLECT_MATERIAL\n", kPsLoadsStage, count(kPsLoadsStage),
      {0x38, 0x15c, 0x1e8, 0x8e8, 0x8e0, 0x9ac, 0xe3c, 0xd84, 0xd8c, 0}, 8, 0x804, true, 0x644},
 };
