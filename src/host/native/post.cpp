@@ -20,7 +20,7 @@ namespace {
 
 enum Role { kDown2 = 1, kDown4, kLumi, kBlur, kCompose, kSsao, kTemporal, kSsaoBlur, kUpsample,
             kHandDraw2, kHandDrawFinalize, kToonEdgeFxaa, kHaze, kShadow };
-static_assert(kShadow<24); // renderer.cpp's kCompareRoles.
+static_assert(kShadow<48); // renderer.cpp's kCompareRoles.
 struct Variant {
     const char* ps;
     const char* vs;

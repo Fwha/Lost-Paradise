@@ -6435,7 +6435,7 @@ void main() {
     // compared on the GPU. Every 10 seconds: per role and target, the draws compared and the pixels
     // that differ (by more than half an 8-bit step; depth: any bit), with the largest difference.
     static constexpr uint32_t kComparePerFrame = 8; // a role
-    static constexpr uint32_t kCompareRoles = 24;
+    static constexpr uint32_t kCompareRoles = 48; // the material pass has 24 roles and more coming
     static constexpr uint32_t kCompareSlots = kCompareRoles * 9; // role * 9 + target (8: depth)
     struct CompareSlot {
         uint32_t px, maxBits, sum, claim; // sum: of differences in 1/255 steps (colour) or ulps (depth), saturating
