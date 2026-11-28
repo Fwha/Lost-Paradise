@@ -78,7 +78,8 @@ enum : uint32_t {
     cReflectVs = 72, // x: the reflection coefficient (VSV[0x10] 0x0, [ref] vertex shaders)
     cReflectPs = 73, // PSV[0x30] 0xf0 (the secondary specular gain) and 0xf4 (the reflection light's floor)
     cDiffuseView = 74, // 2: PSView 0x210; raster scale zw, camera in next xyz
-    kConstants = 76,
+    cWind = 76,     // plant: byte offset, stride, records, bound byte size of VS pc 0x50
+    kConstants = 77,
 };
 
 // A scalar load of the game's shaders and where its dwords go: vec4 `index`, from component `at`.
@@ -1357,6 +1358,72 @@ constexpr Load kPsLoadsD2uRef[] = {
     {false, 0xfb0,  1, cPsFlags,         3},
 };
 
+constexpr Load kVsLoadsPlant[] = {
+    {true, 0x58, 8, cWorld, 0},
+    {true, 0x5c, 4, cWorld + 2, 0},
+    {true, 0x60, 4, cProj + 3, 0},
+    {true, 0x64, 1, cVsMisc, 2},
+    {true, 0x130, 16, cFog, 0},
+    {true, 0x134, 4, cFogDir, 0},
+    {true, 0x13c, 4, cCamera, 0},
+    {true, 0x2a0, 8, cProj, 0},
+    {true, 0x2a4, 4, cProj + 2, 0},
+    {true, 0x2a8, 2, cVsMisc, 0},
+    {true, 0x2ac, 2, cUvOffset, 0},
+};
+constexpr Load kPsLoadsPlant[] = {
+    {false, 0x30, 4, cUvScale, 0},
+    {false, 0x94, 1, cPsFlags, 0},
+    {false, 0xc8, 2, cPsFlags, 1},
+    {false, 0x190, 4, cShadowMap, 0},
+    {false, 0x1c4, 4, cShadowMap, 0},
+    {false, 0x1fc, 4, cTintBase, 0},
+    {false, 0x254, 4, cTint, 0},
+    {false, 0x2c0, 4, cPointPos, 0},
+    {false, 0x328, 4, cPointColor, 0},
+    {false, 0x378, 4, cPointPos + 1, 0},
+    {false, 0x3e0, 4, cPointColor + 1, 0},
+    {false, 0x430, 4, cPointPos + 2, 0},
+    {false, 0x498, 4, cPointColor + 2, 0},
+    {false, 0x4e8, 4, cPointPos + 3, 0},
+    {false, 0x550, 4, cPointColor + 3, 0},
+    {false, 0x5d0, 4, cPsCamera, 0},
+    {false, 0x5d4, 8, cDir, 0},
+    {false, 0x5d8, 8, cMaterial, 0},
+    {false, 0x5dc, 1, cMisc, 1},
+    {false, 0x5e0, 8, cMul, 0},
+    {false, 0x5e4, 4, cExposure, 0},
+    {false, 0x5e8, 4, cAmbient, 0},
+    {false, 0x5ec, 8, cLight, 0},
+    {false, 0x674, 1, cReflectPs, 0},
+    {false, 0x718, 4, cAmbientTint, 0},
+    {false, 0x748, 1, cMisc, 0},
+    {false, 0xaa0, 8, cDistFog, 0},
+    {false, 0xaf8, 1, cUvBlock, 0},
+    {false, 0xb1c, 1, cMisc, 3},
+    {false, 0xb30, 1, cMisc, 2},
+    {false, 0xb34, 1, cMisc2, 2},
+    {false, 0xb38, 1, cPsFlags, 0},
+    {false, 0xb3c, 4, cOutScale, 0},
+    {false, 0xba8, 2, cPsFlags, 1},
+    {false, 0xbac, 1, cMask0, 0},
+    {false, 0xbb0, 4, cMask1, 0},
+    {false, 0xbb4, 1, cMask0, 1},
+    {false, 0xbb8, 1, cMask0, 2},
+    {false, 0xbbc, 1, cMisc2, 3},
+    {false, 0xd00, 2, cMask2, 0},
+    {false, 0xd5c, 2, cMask2, 2},
+    {false, 0xd60, 1, cMask0, 3},
+    {false, 0xe30, 4, cMask3, 0},
+    {false, 0xe34, 2, cMask4, 0},
+    {false, 0xe38, 1, cMask4, 2},
+    {false, 0xef4, 2, cMask5, 0},
+    {false, 0xef8, 1, cMask4, 3},
+    {false, 0xf44, 1, cPsFlags, 0},
+    {false, 0xf60, 4, cBlend, 0},
+    {false, 0xfd4, 1, cPsFlags, 3},
+};
+
 struct VertexShaderInfo {
     const char* name;
     const char* defines;
@@ -1401,10 +1468,11 @@ const Variant kVariants[] = {
     {"r_o1d.fxo", "#define SIMPLE_MATERIAL\n#define GEOMETRIC_NORMAL\n#define BARE_MATERIAL\n", kPsLoadsO1d, count(kPsLoadsO1d), {0, 0xa0, 0, 0x664, 0x6b0, 0, 0, 0xa94, 0xa9c, 0}, 5},
     {"r_o1dut_a(vr)2d.fxo", "#define KEEP_PRIMARY_NORMAL\n#define SPECULAR_GREEN\n#define AMBIENT_DETAIL_ADD\n", kPsLoadsA2d, count(kPsLoadsA2d), {0x4c, 0x178, 0x818, 0x74c, 0x7a0, 0x7c8, 0, 0xbd8, 0xbe0, 0}, 0},
     {"r_o1d2u[ref].fxo", "#define SIMPLE_MATERIAL\n#define SPECULAR_GREEN\n#define REFLECT_MATERIAL\n#define GEOMETRIC_NORMAL\n", kPsLoadsD2uRef, count(kPsLoadsD2uRef), {0, 0x94, 0, 0x5e0, 0x6a4, 0x65c, 0, 0xba4, 0xbac, 0}, 6, 0x750}, // compare: within 1/255 (~560 draws)
+    {"r_p1dst[tree][plant].fxo", "#define SIMPLE_MATERIAL\n", kPsLoadsPlant, count(kPsLoadsPlant), {0x4c, 0x178, 0, 0x704, 0x758, 0x82c, 0, 0xbcc, 0xbd4, 0}, 7, 0, true},
 };
 
-constexpr int kVariantCount = 23;
-constexpr VertexShaderInfo kVertexShaders[7] = {
+constexpr int kVariantCount = 24;
+constexpr VertexShaderInfo kVertexShaders[8] = {
     {"r_b1dst_a(vr)2d.fxo", "", kVsLoads, count(kVsLoads), {3, 4, 4, 4, 2, 2, 4}, 7},
     {"r_b1dst.fxo", "#define SIMPLE_MATERIAL\n", kVsLoadsSimple, count(kVsLoadsSimple), {3, 3, 4, 4, 2, 4, 0}, 6},
     {"r_b1dst[ref].fxo", "#define SIMPLE_MATERIAL\n#define REFLECT_MATERIAL\n", kVsLoadsRefSt, count(kVsLoadsRefSt), {3, 3, 4, 4, 2, 4, 0}, 6},
@@ -1412,6 +1480,7 @@ constexpr VertexShaderInfo kVertexShaders[7] = {
     {"r_o1dut_a(vr)2d[ref].fxo", "#define REFLECT_MATERIAL\n#define REFLECT_VERTEX_U\n", kVsLoadsRefM2d, count(kVsLoadsRefM2d), {3, 4, 4, 4, 2, 2, 4}, 7},
     {"r_b1d.fxo", "#define SIMPLE_MATERIAL\n#define DIFFUSE_MATERIAL\n", kVsLoadsD, count(kVsLoadsD), {3, 3, 4, 2, 4, 0, 0}, 5},
     {"r_o1d2u[ref].fxo", "#define SIMPLE_MATERIAL\n#define DIFFUSE_MATERIAL\n#define REFLECT_MATERIAL\n", kVsLoadsD2uRef, count(kVsLoadsD2uRef), {3, 3, 4, 2, 2, 4, 0}, 6},
+    {"r_o1dst[tree][plant].fxo", "#define SIMPLE_MATERIAL\n", kVsLoadsPlant, count(kVsLoadsPlant), {3, 1, 4, 4, 4, 2, 4}, 7},
 };
 
 constexpr const char* kHeader = R"(#version 450
@@ -2534,6 +2603,392 @@ std::string d2uRefFragmentSource() {
     return shared.substr(0, shared.find("void main()")) + kFsD2uRefMain;
 }
 
+// Plant wind deformation and late alpha rejection (VS 0x53c599300, PS 0x53c5f7a00).
+// The VS keeps precise operation boundaries; the PS retains the translated
+// program's forward blocks, sample order, and unconstrained multiply-adds.
+constexpr const char* kVsPlantMain = R"(
+layout(set = 0, binding = 10, std430) readonly buffer Wind { uint w[]; } wind;
+void main() {
+    vec4 x = fetch(0u), n = fetch(2u), t = fetch(3u), col = fetch(4u), b = fetch(6u);
+    vec3 axis = vec3(mac(2.0, b.y, -1.0), mac(2.0, b.z, -1.0), mac(2.0, b.w, -1.0));
+    uint idx = floatBitsToUint(fetch(1u).x);
+    uvec4 wi = cb.c[76];
+    uint a = wi.x + idx * wi.y;
+    vec4 windValue = vec4(0.0);
+    if ((wi.y != 0u ? idx < wi.z : wi.z != 0u) && a < wi.w) {
+        uint i = a >> 2;
+        windValue = uintBitsToFloat(uvec4(wind.w[i], wind.w[i + 1u], wind.w[i + 2u], wind.w[i + 3u]));
+    }
+    vec4 W[3] = vec4[3](cf(0), cf(1), cf(2));
+    vec3 world;
+    for (int i = 0; i < 3; ++i)
+        world[i] = mac(W[i].w, x.w, mac(W[i].z, x.z, mac(W[i].y, x.y, mul(W[i].x, x.x))));
+    float along = mac(axis.z, windValue.z, mac(axis.y, windValue.y, mul(windValue.x, axis.x)));
+    vec3 perpendicular;
+    for (int i = 0; i < 3; ++i) perpendicular[i] = mac(along, -axis[i], windValue[i]);
+    float length2 = mac(windValue.w, windValue.w,
+                        mac(perpendicular.z, perpendicular.z,
+                            mac(perpendicular.y, perpendicular.y, mul(perpendicular.x, perpendicular.x))));
+    float bend = mul(uintBitsToFloat(0x3e4ccccdu), sqrt(length2));
+    for (int i = 0; i < 3; ++i)
+        world[i] = mac(mac(bend, axis[i], perpendicular[i]), b.x, world[i]);
+    float homogeneous = mac(b.x, windValue.w, x.w);
+    vec4 pos;
+    for (int i = 0; i < 4; ++i) {
+        vec4 P = cf(6 + i);
+        pos[i] = mac(P.w, homogeneous, mac(P.z, world.z, mac(P.y, world.y, mul(P.x, world.x))));
+    }
+    vec3 T = vec3(1.0), scatter = vec3(0.0);
+    uint flags = cb.c[14].z;
+    if ((flags & 0x20000u) != 0u) {
+        vec4 f0 = cf(15), f1 = cf(16), f2 = cf(17), f3 = cf(18);
+        for (int i = 0; i < 3; ++i)
+            T[i] = exp2(mul(uintBitsToFloat(0x3fb8aa3bu), mul(f0[i], pos.w)));
+        precise vec3 d = world - cf(5).xyz;
+        float dd = mac(d.z, d.z, mac(d.y, d.y, mul(d.x, d.x)));
+        float fd = mac(cf(19).z, d.z, mac(cf(19).y, d.y, mul(cf(19).x, d.x)));
+        float cosine = mul(-inversesqrt(dd), fd);
+        float r = inversesqrt(mac(f2.w, cosine, f1.w));
+        float rr = mul(mul(r, r), r);
+        float cc = mac(cosine, cosine, f3.w);
+        for (int i = 0; i < 3; ++i) {
+            float phase = mac(f2[i], rr, mul(f1[i], cc));
+            float amp = mul(f3[i], phase);
+            scatter[i] = mac(amp, -T[i], mul(f3.w, amp));
+        }
+    }
+    if ((flags & 0x40000u) != 0u) scatter = vec3(0.0);
+    const float k = uintBitsToFloat(0x40008102u);
+    vec3 normal = vec3(mac(k, n.x, -1.0), mac(k, n.y, -1.0), mac(k, n.z, -1.0));
+    vec3 tangent = vec3(mac(k, t.x, -1.0), mac(k, t.y, -1.0), mac(k, t.z, -1.0));
+    gl_Position = pos;
+    if (cb.c[69].z != 0u) gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;
+    precise vec2 uv = cf(13).xy + fetch(5u).xy;
+    p0 = vec4(uv, 0.0, 0.0);
+    p1 = vec4(mul(col.r, T.r), mul(T.g, col.g), mul(T.b, col.b), mul(cf(14).y, col.a));
+    p2 = vec4(scatter, mac(-cf(14).x, clamp(mul(uintBitsToFloat(0x3f808102u), n.w), 0.0, 1.0), cf(14).x));
+    p3 = vec4(dot3(W[0], normal), dot3(W[1], normal), dot3(W[2], normal), 0.0);
+    p4 = vec4(0.0);
+    p5 = vec4(T, 0.0);
+    p6 = vec4(dot3(W[0], tangent), dot3(W[1], tangent), dot3(W[2], tangent), mac(k, t.w, -1.0));
+    p7 = vec4(world, 0.0);
+}
+)";
+
+constexpr const char* kFsPlantMain = R"(
+float F(uint x) { return uintBitsToFloat(x); }
+void main() {
+uint exec_hi = 0u; uint exec_lo = 0u; uint m0 = 0u; uint s0 = 0u; uint s1 = 0u; uint s10 = 0u; uint s14 = 0u;
+uint s15 = 0u; uint s16 = 0u; uint s17 = 0u; uint s18 = 0u; uint s19 = 0u; uint s2 = 0u; uint s20 = 0u; uint s21 = 0u;
+uint s22 = 0u; uint s23 = 0u; uint s24 = 0u; uint s25 = 0u; uint s28 = 0u; uint s29 = 0u; uint s3 = 0u; uint s32 = 0u;
+uint s33 = 0u; uint s34 = 0u; uint s35 = 0u; uint s36 = 0u; uint s37 = 0u; uint s38 = 0u; uint s39 = 0u; uint s4 = 0u;
+uint s40 = 0u; uint s41 = 0u; uint s42 = 0u; uint s43 = 0u; uint s44 = 0u; uint s45 = 0u; uint s46 = 0u; uint s47 = 0u;
+uint s48 = 0u; uint s49 = 0u; uint s5 = 0u; uint s50 = 0u; uint s51 = 0u; uint s52 = 0u; uint s53 = 0u; uint s54 = 0u;
+uint s55 = 0u; uint s56 = 0u; uint s6 = 0u; uint s64 = 0u; uint s65 = 0u; uint s66 = 0u; uint s67 = 0u; uint s68 = 0u;
+uint s69 = 0u; uint s7 = 0u; uint s70 = 0u; uint s71 = 0u; uint s76 = 0u; uint s77 = 0u; uint s78 = 0u; uint s79 = 0u;
+uint s8 = 0u; uint s84 = 0u; uint s85 = 0u; uint s86 = 0u; uint s87 = 0u; uint s9 = 0u; float v0 = 0.0; float v1 = 0.0;
+float v10 = 0.0; float v106 = 0.0; float v11 = 0.0; float v12 = 0.0; float v13 = 0.0; float v14 = 0.0; float v15 = 0.0;
+float v16 = 0.0; float v17 = 0.0; float v18 = 0.0; float v19 = 0.0; float v2 = 0.0; float v20 = 0.0; float v21 = 0.0;
+float v22 = 0.0; float v23 = 0.0; float v24 = 0.0; float v25 = 0.0; float v26 = 0.0; float v27 = 0.0; float v28 = 0.0;
+float v29 = 0.0; float v3 = 0.0; float v30 = 0.0; float v31 = 0.0; float v32 = 0.0; float v33 = 0.0; float v34 = 0.0;
+float v35 = 0.0; float v36 = 0.0; float v37 = 0.0; float v38 = 0.0; float v39 = 0.0; float v4 = 0.0; float v40 = 0.0;
+float v41 = 0.0; float v42 = 0.0; float v43 = 0.0; float v44 = 0.0; float v45 = 0.0; float v46 = 0.0; float v47 = 0.0;
+float v5 = 0.0; float v6 = 0.0; float v7 = 0.0; float v8 = 0.0; float v9 = 0.0; uint vcc_hi = 0u; uint vcc_lo = 0u;
+bool scc = false; uint pc = 0x00000000u; exec_lo = 1u; v2 = gl_FragCoord.x; v3 = gl_FragCoord.y; v4 = gl_FragCoord.w;
+{
+pc = 0x00000000u;
+}
+if (pc == 0x00000000u) {
+vcc_hi = 0x00000212u; m0 = s14; { uint lo_ = exec_lo; uint hi_ = exec_hi; s14 = lo_; s15 = hi_; }
+{ uint lo_ = exec_lo; uint hi_ = exec_hi; exec_lo = lo_; exec_hi = hi_; } s64 = cb.c[21][0]; s65 = cb.c[21][1];
+s66 = cb.c[21][2]; s67 = cb.c[21][3]; v15 = a0[0]; v16 = a0[1]; v5 = (F(s66) * v15); v6 = (F(s67) * v16);
+{
+vec2 uv_ = vec2(v5, v6); uv_ *= sc(0); { vec4 t_ = vec4(texture(tex[0], uv_)); v7 = t_[0]; v8 = t_[1];
+}
+}
+v10 = a3[1]; v11 = a6[2]; v20 = a6[0]; v13 = (v10 * v11); v9 = a3[2]; v17 = a6[1]; v5 = a6[3]; v12 = a3[0];
+v14 = (v9 * v20); s67 = cb.c[20][0]; v13 = (v17 * (-v9) + v13); v21 = (v5 * v13); v6 = (v12 * v17);
+v14 = (v11 * (-v12) + v14); v19 = (v5 * v14); v6 = (v20 * (-v10) + v6); v18 = (v5 * v6); s66 = s67 & 8u; scc = s66 != 0u;
+s24 = cb.c[20][1]; s25 = cb.c[20][2]; scc = s66 != 0u;
+{ uint lo_ = scc ? exec_lo : 0u; uint hi_ = scc ? exec_hi : 0u; s28 = lo_; s29 = hi_; }
+{ uint lo_ = s28; uint hi_ = s29; vcc_lo = lo_; vcc_hi = hi_; } v5 = (F(s24) * v2); v6 = (F(s25) * v3);
+v13 = F(0x3f800000u); v14 = F(0x3f800000u); v22 = (2.0 * v7 + -1.0); v23 = (v22 * v22); v7 = (2.0 * v8 + -1.0);
+v23 = (v7 * v7 + v23); v8 = clamp(1.0 - v23, 0.0, 1.0); v20 = (v20 * v22); v8 = (sqrt(v8)); v17 = (v17 * v22);
+v20 = (v7 * v21 + v20); v20 = (v8 * v12 + v20); v12 = (v19 * v7 + v17); v17 = (v11 * v22); v11 = (v20 * v20);
+v12 = (v8 * v10 + v12); v17 = (v7 * v18 + v17); v10 = (v12 * v12 + v11); v7 = (v9 * v8 + v17); v10 = (v7 * v7 + v10);
+v8 = (inversesqrt(v10)); v17 = (v8 * v20); v18 = (v8 * v12); v19 = (v8 * v7);
+{ uint lo_ = vcc_lo; uint hi_ = vcc_hi; vcc_lo = lo_; vcc_hi = hi_; }
+pc = ((vcc_lo & 1u) == 0u) ? 0x00000180u : 0x0000016cu;
+}
+if (pc == 0x0000016cu) {
+{
+vec2 uv_ = vec2(v5, v6); uv_ *= sc(1); { vec4 t_ = vec4(texture(tex[1], uv_)); v13 = t_[0]; v14 = t_[1];
+}
+}
+pc = 0x00000180u;
+}
+if (pc == 0x00000180u) {
+{ uint lo_ = exec_lo & s28; uint hi_ = exec_hi & s29; vcc_lo = lo_; vcc_hi = hi_; } scc = (vcc_lo | vcc_hi) != 0u;
+pc = ((vcc_lo & 1u) == 0u) ? 0x000001b4u : 0x00000188u;
+}
+if (pc == 0x00000188u) {
+s16 = cb.c[22][0]; s17 = cb.c[22][1]; s18 = cb.c[22][2]; s19 = cb.c[22][3]; v7 = F(s17); v8 = F(s19);
+v13 = (F(s16) * v13 + v7); v14 = (v14 * F(s18) + v8); pc = 0x000001b4u;
+}
+if (pc == 0x000001b4u) {
+{ uint lo_ = exec_lo & s28; uint hi_ = exec_hi & s29; vcc_lo = lo_; vcc_hi = hi_; } scc = (vcc_lo | vcc_hi) != 0u;
+pc = ((vcc_lo & 1u) == 0u) ? 0x000001e8u : 0x000001bcu;
+}
+if (pc == 0x000001bcu) {
+s16 = cb.c[22][0]; s17 = cb.c[22][1]; s18 = cb.c[22][2]; s19 = cb.c[22][3]; v7 = F(s17); v8 = F(s19);
+v13 = (F(s16) * v13 + v7); v14 = (v14 * F(s18) + v8); pc = 0x000001e8u;
+}
+if (pc == 0x000001e8u) {
+v8 = (v13 * v14); { uint lo_ = exec_lo & s28; uint hi_ = exec_hi & s29; vcc_lo = lo_; vcc_hi = hi_; }
+scc = (vcc_lo | vcc_hi) != 0u; s16 = cb.c[23][0]; s17 = cb.c[23][1]; s18 = cb.c[23][2]; s19 = cb.c[23][3];
+v7 = (1.0 - F(s16)); v10 = (1.0 - F(s17)); v9 = (1.0 - F(s18)); v7 = (v7 * v8 + F(s16)); v31 = (v10 * v8 + F(s17));
+v29 = (v9 * v8 + F(s18)); v32 = (v7); v28 = (v31); v26 = (v29);
+{ uint lo_ = vcc_lo; uint hi_ = vcc_hi; vcc_lo = lo_; vcc_hi = hi_; }
+pc = ((vcc_lo & 1u) == 0u) ? 0x00000288u : 0x0000024cu;
+}
+if (pc == 0x0000024cu) {
+s16 = cb.c[24][0]; s17 = cb.c[24][1]; s18 = cb.c[24][2]; s19 = cb.c[24][3]; v8 = F(s19); v10 = F(s17);
+v8 = (F(s18) + v8); v11 = (v7 * F(s16) + v10); v9 = (v31 * F(s16) + v10); v10 = (F(s16) * v29 + v10); v32 = (v8 * v11);
+v28 = (v8 * v9); v26 = (v8 * v10); pc = 0x00000288u;
+}
+if (pc == 0x00000288u) {
+    v25 = a7.x; v24 = a7.y; v23 = a7.z;
+    v8 = 0.0; v30 = 0.0; v27 = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        if ((s67 & (0x10000u << uint(i))) == 0u) continue;
+        vec4 pp = cf(25 + i), light = cf(29 + i);
+        float dx = v25 - pp.x, dy = v24 - pp.y, dz = v23 - pp.z;
+        float dd = dx * dx, nd = v17 * dx;
+        dd = dy * dy + dd; nd = v18 * dy + nd;
+        dd = dz * dz + dd;
+        float invd = inversesqrt(dd);
+        nd = dz * v19 + nd;
+        float lam = clamp(-invd * nd, 0.0, 1.0);
+        if (lam > 0.0) {
+            float distance_ = sqrt(dd);
+            float o = max(0.0, distance_ - light.w);
+            float po = pp.w * o;
+            float att = 1.0 / (po * o + 1.0);
+            att = clamp(F(0x3f808102u) * att + F(0xbb810205u), 0.0, 1.0);
+            float weight = lam * att;
+            if (i == 0) {
+                v8 = light.r * weight; v30 = light.g * weight; v27 = light.b * weight;
+            } else {
+                v8 = light.r * weight + v8;
+                v30 = light.g * weight + v30;
+                v27 = light.b * weight + v27;
+            }
+        }
+    }
+    pc = 0x0000058cu;
+}
+if (pc == 0x0000058cu) {
+v38 = a1[0]; v41 = a5[0]; vcc_lo = 0x3e19999au; vcc_hi = 0xbdbc49cau; s68 = cb.c[33][0]; s69 = cb.c[33][1];
+s70 = cb.c[33][2]; s71 = cb.c[33][3]; s40 = cb.c[41][0]; s41 = cb.c[41][1]; s42 = cb.c[41][2]; s43 = cb.c[41][3];
+s44 = cb.c[42][0]; s45 = cb.c[42][1]; s46 = cb.c[42][2]; s47 = cb.c[42][3]; s16 = cb.c[37][0]; s17 = cb.c[37][1];
+s18 = cb.c[37][2]; s19 = cb.c[37][3]; s20 = cb.c[38][0]; s21 = cb.c[38][1]; s22 = cb.c[38][2]; s23 = cb.c[38][3];
+s56 = cb.c[36][1]; s32 = cb.c[34][0]; s33 = cb.c[34][1]; s34 = cb.c[34][2]; s35 = cb.c[34][3]; s36 = cb.c[35][0];
+s37 = cb.c[35][1]; s38 = cb.c[35][2]; s39 = cb.c[35][3]; s76 = cb.c[39][0]; s77 = cb.c[39][1]; s78 = cb.c[39][2];
+s79 = cb.c[39][3]; s84 = cb.c[40][0]; s85 = cb.c[40][1]; s86 = cb.c[40][2]; s87 = cb.c[40][3]; s48 = cb.c[45][0];
+s49 = cb.c[45][1]; s50 = cb.c[45][2]; s51 = cb.c[45][3]; s52 = cb.c[46][0]; s53 = cb.c[46][1]; s54 = cb.c[46][2];
+s55 = cb.c[46][3]; v12 = (v25 - F(s68)); v10 = (v12 * v12); v9 = (v24 - F(s69)); v11 = (v23 - F(s70));
+v10 = (v9 * v9 + v10); v10 = (v11 * v11 + v10); v10 = (inversesqrt(v10)); v13 = (v10 * v12 + F(s40));
+v22 = (v10 * v9 + F(s41)); v21 = (v10 * v12); v12 = (v13 * v17); v13 = (v13 * v13); v20 = (v10 * v11);
+v33 = (v22 * v18 + v12); v12 = (v22 * v22 + v13); v22 = (v10 * v11 + F(s42)); v12 = (v22 * v22 + v12);
+v12 = (inversesqrt(v12)); v33 = (v19 * v22 + v33); v11 = clamp((-v12) * v33, 0.0, 1.0);
+v12 = (v10 * v9 + F(0xbe99999au)); v11 = (log2(v11)); v33 = (2.0 * F(s56)); s19 = cb.c[73][0]; v39 = (1.0 / F(s78));
+s35 = s67 & 4u; scc = s35 != 0u; v22 = (v10 * v9); v10 = (v21 * v21); v9 = (v21 * v17); v10 = (v12 * v12 + v10);
+v9 = (v18 * v12 + v9); v10 = (v20 * v20 + v10); v10 = (inversesqrt(v10)); v9 = (v19 * v20 + v9);
+v9 = clamp((-v10) * v9, 0.0, 1.0); v9 = (log2(v9)); v10 = (F(s23) * v9); v9 = (F(s23) * v11); v44 = (exp2(v9));
+v35 = (exp2(v10)); v10 = (F(s44) * v17); v10 = (F(s45) * v18 + v10); v10 = (F(s46) * v19 + v10);
+v10 = (max(F(0u), (-v10))); v9 = (F(s48) * v44); v34 = (min(1.0, v10)); v10 = (F(s52) * v35); v12 = F(s36);
+v9 = (v9 * v7); v11 = (v10 * v34); v10 = (F(s20) * v12); v9 = (v33 * v11 + v9); v11 = (v38 * v10); v7 = (F(s48) * v7);
+v13 = (v41 * v10); v40 = (v11 * v9);
+{
+vec2 uv_ = vec2(v5, v6); uv_ *= sc(3); { vec4 t_ = vec4(texture(tex[3], uv_)); v9 = t_[0]; v10 = t_[1]; v11 = t_[2];
+v12 = t_[3];
+}
+}
+v5 = a4[0]; v6 = (F(s52) * v14); s4 = cb.c[43][0]; s5 = cb.c[43][1]; s6 = cb.c[43][2]; s7 = cb.c[43][3]; v46 = (v5 + v8);
+v5 = (F(s40) * v17); v5 = (F(s41) * v18 + v5); v5 = (F(s42) * v19 + v5); v8 = (max(F(0u), (-v5))); v47 = F(s4);
+v42 = (min(1.0, v8)); v45 = (v7 * v42); s4 = cb.c[36][0]; v45 = (v34 * v6 + v45); v36 = clamp(max(F(0u), v5), 0.0, 1.0);
+{
+vec2 uv_ = vec2(v15, v16); uv_ *= sc(4); { vec4 t_ = vec4(texture(tex[4], uv_)); v5 = t_[0]; v6 = t_[1]; v7 = t_[2];
+v8 = t_[3];
+}
+}
+v43 = (v35 * v32); v12 = (v12 * v39); v37 = (v14 * v12); v9 = (v9 * v39); v12 = (v13 * v46 + v37); v13 = (F(s65) * v16);
+v43 = (v43 * v12 + v40); v12 = (F(s64) * v15); v15 = (F(s39) * v47); v16 = (F(s50) * v44); v40 = (v10 * v39);
+v10 = F(s32); v47 = (F(s16) * v10); v10 = (v41 * v47); v10 = (v10 * v46); v10 = (v9 * v14 + v10); v9 = (F(s49) * v44);
+v44 = (v9 * v31); v5 = (v5 * v5); v15 = (v15 * v5 + F(s84)); v15 = (v45 * v47 + v15); v46 = (F(s49) * v31); v9 = F(s5);
+v41 = (v6 * v6); v6 = (v32 * v10); v10 = (F(s53) * v35); v10 = (v10 * v34); v44 = (v33 * v10 + v44); v9 = (F(s39) * v9);
+v32 = (v9 * v41 + F(s85)); v10 = a5[2]; v9 = (v7 * v7); v7 = F(s19); v7 = (F(s48) * v7); v15 = (v36 * v7 + v15);
+v7 = (1.0 - F(s4)); v31 = (v38 * v15); v15 = (v7 * v14 + F(s4)); v31 = (v15 * v6 + v31); v47 = (v5 * v31);
+{
+vec2 uv_ = vec2(v12, v13); uv_ *= sc(5); { vec4 t_ = vec4(texture(tex[5], uv_)); v5 = t_[0]; v6 = t_[1]; v7 = t_[2];
+}
+}
+v12 = F(0x3e19999au); v38 = a5[1]; v13 = (v11 * v39); v11 = (F(s50) * v29); v39 = (v46 * v42); v31 = (v16 * v29);
+v16 = a4[1]; v30 = (v16 + v30); v29 = (v11 * v42); v11 = F(s37); v45 = (F(s21) * v11); v46 = (v38 * v45);
+v11 = F(0x3fb0852eu); v16 = a2[0]; v47 = (v43 * v5 + v47); v5 = ((F(s76) * v47) * 2.0); v43 = (F(vcc_lo) * v5 + 0.5);
+v42 = (v12 * v5 + F(0x3d4ccccdu)); v43 = (v5 * v43 + F(0x3d75c290u)); v43 = (1.0 / v43);
+v5 = (v42 * v5 + F(0x3b83126fu)); v42 = a1[1]; v5 = (v43 * v5); v43 = (v42 * v45); v47 = (v43 * v44); v43 = F(s33);
+v43 = (F(s17) * v43); v44 = (F(s53) * v14); v38 = (v38 * v43); v44 = (v44 * v34 + v39); v32 = (v44 * v43 + v32);
+v45 = (v46 * v30 + v37); v30 = (v38 * v30); v38 = F(s49); v38 = (F(s19) * v38); v32 = (v36 * v38 + v32);
+v30 = (v40 * v14 + v30); v32 = (v42 * v32); v46 = (v35 * v28); v28 = (v28 * v30); v32 = (v15 * v28 + v32);
+v28 = (v41 * v32); v47 = (v45 * v46 + v47); v28 = (v47 * v6 + v28); v6 = ((F(s76) * v28) * 2.0);
+v30 = (v12 * v6 + F(0x3d4ccccdu)); v30 = (v30 * v6 + F(0x3b83126fu)); v28 = (F(vcc_lo) * v6 + 0.5);
+v28 = (v6 * v28 + F(0x3d75c290u)); v6 = a1[2]; v28 = (1.0 / v28); v28 = (v28 * v30); v30 = (F(s54) * v35);
+v30 = (v30 * v34); v31 = (v33 * v30 + v31); v30 = F(s38); v30 = (F(s22) * v30); v38 = (v6 * v30); v33 = (v10 * v30);
+v30 = a4[2]; v30 = (v30 + v27); v27 = F(s6); v27 = (F(s39) * v27); v32 = (v27 * v9 + F(s86)); v38 = (v38 * v31);
+v31 = (v35 * v26); v37 = (v30 * v33 + v37); v38 = (v37 * v31 + v38); v5 = clamp(v11 * v5 + F(vcc_hi), 0.0, 1.0);
+v33 = clamp(v11 * v28 + F(vcc_hi), 0.0, 1.0); v5 = (sqrt(v5)); v0 = (sqrt(v33)); v27 = a2[1]; v28 = a2[2];
+v1 = (F(s54) * v14); v1 = (v1 * v34 + v29); v29 = F(s34); v29 = (F(s18) * v29); v10 = (v10 * v29); v10 = (v10 * v30);
+v32 = (v1 * v29 + v32); v10 = (v13 * v14 + v10); v13 = F(s50); v13 = (F(s19) * v13); v32 = (v36 * v13 + v32);
+v1 = (v6 * v32); v6 = (v26 * v10); v1 = (v15 * v6 + v1); v1 = (v9 * v1); v1 = (v38 * v7 + v1);
+v1 = ((F(s76) * v1) * 2.0); v6 = (F(vcc_lo) * v1 + 0.5); v6 = (v1 * v6 + F(0x3d75c290u));
+v7 = (v12 * v1 + F(0x3d4ccccdu)); v6 = (1.0 / v6); v1 = (v7 * v1 + F(0x3b83126fu)); v1 = (v6 * v1);
+vcc_lo = s67 & 0x00400000u; scc = vcc_lo != 0u; v1 = clamp(v11 * v1 + F(vcc_hi), 0.0, 1.0); scc = vcc_lo != 0u;
+vcc_lo = ((exec_lo & 1u) != 0u && (s35 != 0u)) ? 1u : 0u; vcc_hi = 0u; v1 = (sqrt(v1)); v16 = (v16 + v5);
+v7 = (v27 + v0); v9 = (v28 + v1); v6 = (vcc_lo & 1u) != 0u ? v16 : v5; v7 = (vcc_lo & 1u) != 0u ? v7 : v0;
+v9 = (vcc_lo & 1u) != 0u ? v9 : v1; vcc_hi = scc ? 0u : 1u; scc = s35 != 0u; vcc_lo = scc ? 1u : 0u;
+vcc_lo = vcc_hi | vcc_lo; scc = vcc_lo != 0u; v13 = F(0u); pc = (scc) ? 0x00000af0u : 0x00000a88u;
+}
+if (pc == 0x00000a88u) {
+v6 = (F(s68) - v25); v6 = (v6 * v6); v7 = (F(s69) - v24); v6 = (v7 * v7 + v6); s16 = cb.c[47][0]; s17 = cb.c[47][1];
+s18 = cb.c[47][2]; s19 = cb.c[47][3]; s20 = cb.c[48][0]; s21 = cb.c[48][1]; s22 = cb.c[48][2]; s23 = cb.c[48][3];
+v7 = (F(s70) - v23); v6 = (v7 * v7 + v6); v6 = (sqrt(v6)); v13 = F(s23); v13 = clamp(F(s22) * v6 + v13, 0.0, 1.0);
+v6 = (F(s16) * v13 + v5); v7 = (F(s17) * v13 + v0); v9 = (F(s18) * v13 + v1); v6 = (v13 * (-v5) + v6);
+v7 = (v13 * (-v0) + v7); v9 = (v13 * (-v1) + v9); pc = 0x00000af0u;
+}
+if (pc == 0x00000af0u) {
+s4 = cb.c[70][0]; vcc_lo = ((exec_lo & 1u) != 0u && (F(s4) > v8)) ? 1u : 0u; vcc_hi = 0u;
+{ uint lo_ = s14 & ~vcc_lo; uint hi_ = s15 & ~vcc_hi; s14 = lo_; s15 = hi_; } scc = (s14 | s15) != 0u;
+pc = (!scc) ? 0x0000100cu : 0x00000b0cu;
+}
+if (pc == 0x00000b0cu) {
+s24 = cb.c[36][3]; { uint lo_ = s14; uint hi_ = s15; exec_lo = lo_; exec_hi = hi_; } scc = s66 != 0u;
+{ uint lo_ = scc ? exec_lo : 0u; uint hi_ = scc ? exec_hi : 0u; vcc_lo = lo_; vcc_hi = hi_; } s25 = cb.c[36][2];
+s20 = cb.c[44][2]; s16 = cb.c[20][0]; s4 = cb.c[49][0]; s5 = cb.c[49][1]; s6 = cb.c[49][2]; s7 = cb.c[49][3]; v0 = F(0u);
+v1 = F(s25); v1 = (F(s24) * v1); v1 = (F(s20) * v1); v10 = (v1 * v8); v11 = (F(s7) * v10); v8 = (F(s4) * v6);
+v5 = (F(s5) * v7); v1 = (F(s6) * v9); v14 = (vcc_lo & 1u) != 0u ? v10 : v11; v15 = (vcc_lo & 1u) != 0u ? v6 : v8;
+v16 = (vcc_lo & 1u) != 0u ? v7 : v5; v23 = (vcc_lo & 1u) != 0u ? v9 : v1; vcc_lo = s16 & 0x02000000u; scc = vcc_lo != 0u;
+scc = vcc_lo != 0u; { uint lo_ = scc ? exec_lo : 0u; uint hi_ = scc ? exec_hi : 0u; vcc_lo = lo_; vcc_hi = hi_; }
+pc = ((vcc_lo & 1u) != 0u) ? 0x00000f38u : 0x00000b8cu;
+}
+if (pc == 0x00000b8cu) {
+v25 = F(0u); s40 = cb.c[20][1]; s41 = cb.c[20][2]; s42 = cb.c[50][0]; s32 = cb.c[51][0]; s33 = cb.c[51][1];
+s34 = cb.c[51][2]; s35 = cb.c[51][3]; s43 = cb.c[50][1]; s44 = cb.c[50][2]; s36 = cb.c[44][3]; v11 = (F(s40) * v2);
+v12 = (F(s41) * v3);
+{
+vec2 uv_ = vec2(v11, v12); uv_ *= sc(7); { vec4 t_ = vec4(texture(tex[7], uv_)); v7 = t_[0];
+}
+}
+{
+vec2 uv_ = vec2(v11, v12); uv_ *= sc(8); { vec4 t_ = vec4(texture(tex[8], uv_)); v0 = t_[0]; v1 = t_[1]; v2 = t_[2];
+}
+}
+v3 = F(s32); v6 = (F(s34) - v3); v24 = F(s32); v5 = F(s33); v6 = (1.0 / v6); v5 = (F(s32) - v5); v5 = (1.0 / v5);
+vcc_lo = s36 & 4u; scc = vcc_lo != 0u; v7 = (F(s42) + v7); v7 = (1.0 / v7); v24 = (F(s43) * v7 + (-v24));
+v28 = clamp((-v24) * v6 + 1.0, 0.0, 1.0); v27 = ((-F(s43)) * v7); v7 = (F(s44) * v28); v26 = ((-v27) * v5);
+v31 = (2.0 * v1 + -1.0); v1 = (max(F(s35), v7)); v32 = (2.0 * v0 + -1.0); v26 = clamp((-F(s33)) * v5 + v26, 0.0, 1.0);
+v8 = (v26 * v1); v30 = (F(s40) * v32); v29 = (F(s41) * (-v31)); v0 = (v30 * v8 + v11); v1 = (v29 * v8 + v12);
+{
+vec2 uv_ = vec2(v0, v1); uv_ *= sc(8); { vec4 t_ = vec4(texture(tex[8], uv_)); v5 = t_[0]; v6 = t_[1]; v7 = t_[2];
+}
+}
+v0 = ((-v30) * v8 + v11); v1 = ((-v29) * v8 + v12);
+{
+vec2 uv_ = vec2(v0, v1); uv_ *= sc(8); { vec4 t_ = vec4(texture(tex[8], uv_)); v8 = t_[0]; v9 = t_[1]; v10 = t_[2];
+}
+}
+v1 = (2.0 * v2 + -1.0); v0 = (v32 + v31); v0 = (v0 + v1); v2 = (v6 * v31); v33 = ((v5 * v32) * 2.0); v6 = (v7 * v1);
+v5 = (v9 * v31); v8 = ((v8 * v32) * 2.0); v1 = (v10 * v1); v33 = (2.0 * v2 + v33); v8 = (2.0 * v5 + v8);
+v33 = (2.0 * v6 + v33); v8 = (2.0 * v1 + v8); v2 = (v33 - v0); v5 = (v8 - v0); pc = (!scc) ? 0x00000d3cu : 0x00000ce0u;
+}
+if (pc == 0x00000ce0u) {
+v0 = (0.5 * v5 + 0.5); v0 = ((v2 * v0 + v0) * 0.5); v1 = (v0 * v0 + F(0x3b808081u)); s0 = cb.c[52][0]; s1 = cb.c[52][1];
+v6 = ((-F(s1)) * v26 + 1.0); vcc_lo = ((exec_lo & 1u) != 0u && (v1 >= v6)) ? 1u : 0u; vcc_hi = 0u;
+v6 = (vcc_lo & 1u) != 0u ? 1.0 : 0.0; v1 = (1.0 - F(s0)); v6 = clamp(v0 * v0 + v6, 0.0, 1.0); v0 = (v1 * v6 + F(s0));
+v25 = ((-v26) * v0 + v26); pc = 0x00000d3cu;
+}
+if (pc == 0x00000d3cu) {
+v0 = F(0u); vcc_lo = s36 & 8u; scc = vcc_lo != 0u; pc = (!scc) ? 0x00000e08u : 0x00000d48u;
+}
+if (pc == 0x00000d48u) {
+v6 = (2.0 * v27); s8 = cb.c[52][2]; s9 = cb.c[52][3]; s10 = cb.c[50][3]; v0 = (F(s8) * v28); v0 = (max(F(s35), v0));
+v8 = (v26 * v0); v0 = (v30 * v8 + v11); v1 = (v29 * v8 + v12);
+{
+vec2 uv_ = vec2(v0, v1); uv_ *= sc(7); { vec4 t_ = vec4(texture(tex[7], uv_)); v7 = t_[0];
+}
+}
+v0 = ((-v30) * v8 + v11); v1 = ((-v29) * v8 + v12);
+{
+vec2 uv_ = vec2(v0, v1); uv_ *= sc(7); { vec4 t_ = vec4(texture(tex[7], uv_)); v8 = t_[0];
+}
+}
+v1 = ((-F(s10)) * v26 + 1.0); v0 = (1.0 - F(s9)); v7 = (F(s42) + v7); v7 = (1.0 / v7); v6 = (F(s43) * v7 + v6);
+v7 = (F(s42) + v8); v7 = (1.0 / v7); v6 = (F(s43) * v7 + v6); v6 = (-0.5 * v6 + 1.0); v7 = (F(0x3b808081u) + v6);
+vcc_lo = ((exec_lo & 1u) != 0u && (v7 >= v1)) ? 1u : 0u; vcc_hi = 0u; v1 = (vcc_lo & 1u) != 0u ? 1.0 : 0.0;
+v1 = clamp(v1 + v6, 0.0, 1.0); v0 = (v0 * v1 + F(s9)); v0 = ((-v26) * v0 + v26); pc = 0x00000e08u;
+}
+if (pc == 0x00000e08u) {
+v1 = F(0u); vcc_lo = s36 & 2u; scc = vcc_lo != 0u; pc = (!scc) ? 0x00000ee4u : 0x00000e14u;
+}
+if (pc == 0x00000e14u) {
+v1 = (v17 * v21); v1 = (v22 * v18 + v1); v1 = (v20 * v19 + v1); v1 = (max(F(0u), (-v1))); s0 = cb.c[53][0];
+s1 = cb.c[53][1]; s2 = cb.c[53][2]; s3 = cb.c[53][3]; s8 = cb.c[54][0]; s9 = cb.c[54][1]; s4 = cb.c[54][2];
+v1 = (min(1.0, v1)); v1 = (F(0x3b808081u) + v1); v2 = ((-v2) * v5 + 1.0); v6 = F(s0); v6 = (F(0xba83126fu) + v6);
+v6 = (min(F(s1), v6)); v7 = (F(s0) - v6); v7 = (1.0 / v7); v10 = ((-v27) * v7); v8 = F(s2);
+v10 = clamp(v6 * (-v7) + v10, 0.0, 1.0); v7 = (F(s9) - v8); v7 = (v10 * v7 + F(s2)); v7 = (v26 * v7 + F(0x3b808081u));
+v8 = (1.0 / v7); v7 = F(s3); v1 = clamp(v8 * v1, 0.0, 1.0); v8 = (1.0 - F(s8)); v9 = (F(s4) - v7); v7 = (v8 * v1);
+v6 = (v9 * v10 + F(s3)); v1 = clamp(v7 * v1 + F(s8), 0.0, 1.0);
+vcc_lo = ((exec_lo & 1u) != 0u && (v2 >= v6)) ? 1u : 0u; vcc_hi = 0u; v2 = (vcc_lo & 1u) != 0u ? 1.0 : 0.0;
+v26 = (v1 * (-v26) + v26); v2 = (v2 * v26); vcc_lo = ((exec_lo & 1u) != 0u && (F(0u) < v6)) ? 1u : 0u; vcc_hi = 0u;
+v1 = (vcc_lo & 1u) != 0u ? v2 : v26; pc = 0x00000ee4u;
+}
+if (pc == 0x00000ee4u) {
+v0 = (max(max(v0, v1), v25)); s4 = cb.c[55][0]; s5 = cb.c[55][1]; s0 = cb.c[54][3]; v1 = (F(s4) - v3); v1 = (1.0 / v1);
+v1 = clamp((-v24) * v1 + 1.0, 0.0, 1.0); v2 = (1.0 - F(s5)); v1 = (max(v2, v1)); v0 = (v1 * v0); v0 = (v0 * (-v13) + v0);
+vcc_lo = ((exec_lo & 1u) != 0u && (F(s0) <= v0)) ? 1u : 0u; vcc_hi = 0u; v1 = (vcc_lo & 1u) != 0u ? 1.0 : 0.0;
+v0 = (v1 * v0); pc = 0x00000f38u;
+}
+if (pc == 0x00000f38u) {
+v2 = (v14); s0 = cb.c[20][0]; vcc_lo = s0 & 0x00800000u; scc = vcc_lo != 0u; pc = (!scc) ? 0x00000fb0u : 0x00000f58u;
+}
+if (pc == 0x00000f58u) {
+s0 = cb.c[56][0]; s1 = cb.c[56][1]; s2 = cb.c[56][2]; s3 = cb.c[56][3]; v2 = F(s0); v3 = F(s1); v1 = F(s2);
+v15 = (F(s3) * v15 + v2); v16 = (F(s3) * v16 + v3); v23 = (F(s3) * v23 + v1); v5 = F(s3); v0 = (F(s3) * v0);
+v2 = (F(s3) * v14); v15 = ((-F(s0)) * v5 + v15); v16 = ((-F(s1)) * v5 + v16); v23 = ((-F(s2)) * v5 + v23);
+pc = 0x00000fb0u;
+}
+if (pc == 0x00000fb0u) {
+float alpha0 = (cb.c[20].w & 1u) != 0u ? clamp(F(0x3a4d9a68u) * v4, 0.0, 1.0) : v14; if ((s14 & 1u) == 0u) discard;
+o1 = swz(half4(vec4(v0, 0.0, 0.0, v2)), cb.c[69].y); o0 = swz(half4(vec4(v15, v16, v23, alpha0)), cb.c[69].x); return;
+}
+if (pc == 0x0000100cu) discard;
+}
+)";
+
+std::string plantVertexSource() {
+    const std::string shared = kVs;
+    std::string source = shared.substr(0, shared.find("void main()"));
+    const std::string end = "return uintBitsToFloat(e);";
+    source.replace(source.find(end), end.size(),
+                   "for (uint c = (s.z >> 8) & 7u; c < 4u; ++c) e[c] = 0u;\n    return uintBitsToFloat(e);");
+    return source + kVsPlantMain;
+}
+
+std::string plantFragmentSource() {
+    const std::string shared = kFs;
+    return shared.substr(0, shared.find("void main()")) + kFsPlantMain;
+}
+
 bool decodable(const VertexBuffer& v) {
     static constexpr uint32_t kDfmts[] = {1, 2, 3, 4, 5, 10, 11, 12, 13, 14};
     bool dfmt = false;
@@ -2606,7 +3061,9 @@ public:
             if (!v) return decline(role, "a vertex input missing");
             bool plain = v->components >= kUsed[i];
             for (uint32_t k = 0; k < kUsed[i]; ++k) plain = plain && ((v->dstSel >> (3 * k)) & 7) == 4 + k;
-            if (!decodable(*v) || !plain) {
+            VertexBuffer decoded = *v;
+            if (var.vs == 7 && i == 1 && (v->nfmt == 4 || v->nfmt == 5)) decoded.nfmt = 7;
+            if (!decodable(decoded) || !plain) {
                 char why[112];
                 std::snprintf(why, sizeof why, "vertex input %d format dfmt %u nfmt %u stride %u sel 0x%x components %u", i, v->dfmt,
                               v->nfmt, v->stride, v->dstSel, v->components);
@@ -2614,9 +3071,29 @@ public:
             }
             c[cFetch + i][0] = (v->data.byteOffset + v->offset) / 4, c[cFetch + i][1] = v->stride / 4;
             c[cFetch + i][2] = v->dfmt | v->nfmt << 4;
+            if (var.vs == 7) c[cFetch + i][2] |= v->components << 8;
         }
         if (slot[0]->nfmt != 7 || (slot[0]->dfmt != 13 && slot[0]->dfmt != 14 && slot[0]->dfmt != 12))
             return decline(role, "a position format it does not read exactly");
+        VkDescriptorBufferInfo wind{};
+        if (var.vs == 7) {
+            const VertexBuffer* v = nullptr;
+            for (const VertexBuffer& b : d.vertex)
+                if (b.slot < 0 && b.pc == 0x50) v = &b;
+            if (!v || !v->data.buffer || v->dfmt != 14 || v->nfmt != 7 || v->offset ||
+                v->stride % 4 || v->data.byteOffset % 4 || !v->data.range ||
+                v->data.range == VK_WHOLE_SIZE || v->data.range > UINT32_MAX)
+                return decline(role, "a wind buffer layout it does not read exactly");
+            const uint64_t bytes = v->records
+                ? uint64_t(v->data.byteOffset) + (v->stride ? uint64_t(v->records - 1) * v->stride : 0) + 16
+                : v->data.byteOffset;
+            if (bytes > v->data.range) return decline(role, "a truncated wind buffer");
+            c[cWind][0] = v->data.byteOffset;
+            c[cWind][1] = v->stride;
+            c[cWind][2] = v->records;
+            c[cWind][3] = uint32_t(v->data.range);
+            wind = {v->data.buffer, v->data.offset, v->data.range};
+        }
         VkDescriptorImageInfo images[kTextures]{};
         for (int t = 0; t < kTextures; ++t) {
             const Texture* x = nullptr;
@@ -2671,7 +3148,7 @@ public:
         std::memcpy(bs.data(), bufs, sizeof bufs);
         std::array<uint32_t, 6> st;
         for (int i = 0; i < 2; ++i) st[i * 3] = d.stencilRef[i], st[i * 3 + 1] = d.stencilCompare[i], st[i * 3 + 2] = d.stencilWrite[i];
-        gpu.record([pipe, layout = layout_, bs, imgs, cube, vp, sc, index, firstIndex, indexed = d.indexed, indexType = d.indexType, count = d.count,
+        gpu.record([pipe, layout = layout_, bs, imgs, cube, wind, vp, sc, index, firstIndex, indexed = d.indexed, indexType = d.indexType, count = d.count,
                     st, bc = std::to_array(d.blendConstants), pushSet = gpu.pushDescriptorSet()](VkCommandBuffer cmd) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             vkCmdSetBlendConstants(cmd, bc.data());
@@ -2683,7 +3160,7 @@ public:
             }
             vkCmdSetViewport(cmd, 0, 1, &vp);
             vkCmdSetScissor(cmd, 0, 1, &sc);
-            VkWriteDescriptorSet w[10]{};
+            VkWriteDescriptorSet w[11]{};
             for (uint32_t i = 0; i < 8; ++i) {
                 w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 w[i].dstBinding = i;
@@ -2704,6 +3181,14 @@ public:
                 w[9].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                 w[9].pImageInfo = &cube;
                 n = 10;
+            }
+            if (wind.buffer) {
+                w[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w[n].dstBinding = 10;
+                w[n].descriptorCount = 1;
+                w[n].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                w[n].pBufferInfo = &wind;
+                ++n;
             }
             pushSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, n, w);
             if (indexed) {
@@ -2846,7 +3331,7 @@ private:
         VkPipeline& out = pipes_[key];
         const VkDevice dev = gpu.device();
         if (!layout_) {
-            VkDescriptorSetLayoutBinding b[10];
+            VkDescriptorSetLayoutBinding b[11];
             for (uint32_t i = 0; i < 8; ++i)
                 b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VkShaderStageFlags(i < 7 ? VK_SHADER_STAGE_VERTEX_BIT
                                                                                            : VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT),
@@ -2855,7 +3340,8 @@ private:
             b[9] = {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}; // [ref]'s cube map
             VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
             dl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-            dl.bindingCount = 10;
+            b[10] = {10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+            dl.bindingCount = 11;
             dl.pBindings = b;
             if (vkCreateDescriptorSetLayout(dev, &dl, nullptr, &setLayout_) != VK_SUCCESS) return out = VK_NULL_HANDLE;
             VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -2869,10 +3355,10 @@ private:
         const Variant& var = kVariants[role - 1];
         const std::string header = kHeader;
         const std::string vsDefs = kVertexShaders[var.vs].defines;
-        const VkShaderModule vsm = gpu.shader(header + vsDefs + (var.vs == 6 ? d2uRefVertexSource() : std::string(kVs)), Gpu::Stage::Vertex);
+        const VkShaderModule vsm = gpu.shader(header + vsDefs + (var.vs == 7 ? plantVertexSource() : var.vs == 6 ? d2uRefVertexSource() : std::string(kVs)), Gpu::Stage::Vertex);
         // The fragment stage's extension, ahead of everything else.
         const std::string fsHeader = "#version 450\n#extension GL_EXT_demote_to_helper_invocation : require\n" + header.substr(header.find('\n') + 1);
-        const VkShaderModule fsm = gpu.shader(fsHeader + var.defines + (var.vs == 6 ? d2uRefFragmentSource() : std::string(kFs)), Gpu::Stage::Fragment);
+        const VkShaderModule fsm = gpu.shader(fsHeader + var.defines + (var.vs == 7 ? plantFragmentSource() : var.vs == 6 ? d2uRefFragmentSource() : std::string(kFs)), Gpu::Stage::Fragment);
         if (!vsm || !fsm) return out = VK_NULL_HANDLE;
         VkPipelineShaderStageCreateInfo st[2]{};
         st[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vsm, "main", nullptr};
