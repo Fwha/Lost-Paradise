@@ -466,3 +466,16 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
 - Compare after that fix: role 5 at 0 px (~340 draws), role 6 within 1/255, role 7 at 0 px (~15,000
   draws). Drawn by default; LPN_PREPASS_LONGTAIL=0 leaves them to the translated renderer.
   A normal run was clean.
+
+### Long tail: three more stage materials
+
+- `native/material.cpp` roles 23-25 (Codex's ports, `~/lost-paradise-re/dis/longtail3/`):
+  - r_o1d2u[ref]: geometric normal, two UV sets.
+  - r_p1dst[tree][plant]: wind buffer, late alpha rejection.
+  - r_o1d2u3t_m4d[nref][sign]: nine fetch slots, a 3D texture.
+- A per-variant `unmatched` flag replaces kUnmatchedRole. r_o1dut_b(vr)2dut[ref] is still unmatched,
+  though its last run was closer: mostly 0 px, at most 23/255.
+- Compare: role 23 within 1/255 (~560 draws), role 24 at 0 px (84 draws), role 25 within 1/255
+  (~1,500 draws). All three are drawn by default, and a normal run was clean.
+- Compare mode now has 48 role slots. With 24, the material pass's role 24 was counted as role 23.
+- Codex ports more reliably one variant per request; a three-variant request came back with stubs.
