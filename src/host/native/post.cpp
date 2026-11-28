@@ -1545,8 +1545,9 @@ public:
         // outline pass within 1/255 (~4% of pixels a step off). Drawn by default.
         if (role<kDown2 || role>kStarGlare) return false;
         if (role==kStarGlare) {
-            if (!d.compareCopy)
-                return decline(role,"not yet matched (drawn into compare copies only)");
+            // Compare: 0 px (30 draws). Drawn by default; LPN_POST_GLARE=0 leaves it to the translated renderer.
+            static const bool glare = [] { const char* e = std::getenv("LPN_POST_GLARE"); return !e || *e != '0'; }();
+            if (!glare && !d.compareCopy) return decline(role,"off (LPN_POST_GLARE=0)");
             if (!d.vsName || *d.vsName!=kRoles[role].vs)
                 return decline(role,"another vertex shader");
             if (d.colorCount!=1 || d.color[0].format!=VK_FORMAT_R8G8B8A8_UNORM ||
