@@ -479,3 +479,9 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   (~1,500 draws). All three are drawn by default, and a normal run was clean.
 - Compare mode now has 48 role slots. With 24, the material pass's role 24 was counted as role 23.
 - Codex ports more reliably one variant per request; a three-variant request came back with stubs.
+
+### Long tail: the plain character material
+
+- `native/character.cpp` role 10 (Codex's port, `~/lost-paradise-re/dis/longtail4/`): s_o1dzt.fxo with s_b1dst +43
+  (the body) and s_o1dzt[mouth] +2 (with its shifted loads). It has a per-variant unmatched flag.
+- Compare: 0 px over ~6,500 draws. Drawn by default, and a normal run was clean.
