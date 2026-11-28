@@ -494,3 +494,10 @@ Result: ~85–95 fps there with it on, GPU time ~10 ms against ~12 off.
   allowed 7. The fetch-format decline now names the slot, format and selects, so a guess like that shows up in one run.
 - Compare: 0 px over ~900 draws. Drawn by default with the other long-tail roles (LPN_PREPASS_LONGTAIL=0 turns
   them off). A normal run was clean.
+
+### Post-processing: the star glare
+
+- `native/post.cpp` role 15 (Codex's port, `~/lost-paradise-re/dis/glare/`): fx_star_glare. It is a full-screen
+  rect filter drawn 18 times a frame into small targets (the streak directions and passes).
+- Compare: 0 px over 30 draws (glare only shows near bright lights). Drawn by default, and LPN_POST_GLARE=0 leaves
+  it to the translated renderer. A normal run was clean.
