@@ -643,6 +643,89 @@ constexpr Load kVsEye[] = {
     V(0x5b4, 8, cV30, 0x0),
     V(0x5b8, 4, cV30, 0x20),
 };
+// The mouth VS has the same skinning and varyings, then scales param0.xyz.
+constexpr Load kVsMouth[] = {
+    V(0x114, 1, cV0, 0x12c),
+    V(0x2dc, 4, cV0, 0x0d0),
+    V(0x2e0, 4, cV0, 0x050),
+    V(0x2e4, 4, cV0, 0x090),
+    V(0x360, 1, cV40, 0),
+    V(0x364, 4, cV10, 0x170),
+    V(0x3b4, 4, cV30, 0x220),
+    V(0x3d8, 4, cV10, 0x160),
+    V(0x414, 16, cV30, 0x030),
+    V(0x418, 4, cV30, 0x220),
+    V(0x490, 4, cVF1, 0x080),
+    V(0x494, 16, cVF0, 0x040),
+    V(0x5c8, 8, cV30, 0),
+    V(0x5cc, 4, cV30, 0x020),
+    V(0x5d0, 1, cV10, 0x03c),
+};
+// s_o1dzt +1: PSV layouts match [ref], but all instruction PCs are its own.
+constexpr Load kPsO1dzt[] = {
+    P(0x20, 1, cP60, 0xdc),
+    P(0x74, 4, cP60, 0xd0),
+    P(0x78, 4, cP60, 0x50),
+    P(0xd4, 4, cP60, 0x90),
+    P(0x180, 1, cFlags, 0x0),
+    P(0x1ac, 1, cP70, 0xac),
+    P(0x1cc, 2, cView, 0x218),
+    P(0x2c8, 4, cP10, 0xf0),
+    P(0x364, 4, cP30, 0xa0),
+    P(0x368, 4, cP30, 0x20),
+    P(0x470, 4, cP30, 0xb0),
+    P(0x474, 4, cP30, 0x30),
+    P(0x580, 4, cP30, 0xc0),
+    P(0x584, 4, cP30, 0x40),
+    P(0x690, 4, cP30, 0xd0),
+    P(0x694, 4, cP30, 0x50),
+    P(0x884, 16, cP20, 0x4f0),
+    P(0x89c, 16, cP20, 0x530),
+    P(0x8ac, 8, cP30, 0x80),
+    P(0x8b0, 4, cP30, 0xe0),
+    P(0x8b4, 1, cView, 0x22c),
+    P(0x8b8, 4, cP30, 0x60),
+    P(0x8bc, 8, cP30, 0x0),
+    P(0x8f4, 1, cP0, 0x48),
+    P(0x8fc, 4, cP30, 0x100),
+    P(0x900, 2, cP0, 0x40),
+    P(0x9dc, 1, cP0, 0xc),
+    P(0xa04, 4, cP10, 0x0),
+    P(0xa14, 1, cP90, 0x134),
+    P(0xa30, 2, cP70, 0x68),
+    P(0xa60, 1, cP70, 0x88),
+    P(0xb88, 16, cP20, 0x570),
+    P(0xba4, 4, cP20, 0x5b0),
+    P(0xbd8, 8, cP70, 0x90),
+    P(0xbe4, 8, cP60, 0x0),
+    P(0xc0c, 4, cP60, 0x110),
+    P(0xf10, 16, cP0, 0x0),
+    P(0x1054, 4, cView, 0x220),
+    P(0x1058, 8, cP10, 0x10),
+    P(0x10dc, 1, cP50, 0x1c),
+    P(0x10e0, 1, cP70, 0x9c),
+    P(0x10e4, 1, cP60, 0xc),
+    P(0x10e8, 1, cFlags, 0x0),
+    P(0x10ec, 4, cP10, 0x30),
+    P(0x1154, 2, cView, 0x218),
+    P(0x1158, 1, cP0, 0x2c),
+    P(0x115c, 4, cP0, 0x284),
+    P(0x1160, 1, cP0, 0x3c),
+    P(0x1164, 1, cP0, 0x26c),
+    P(0x1168, 1, cP0, 0xc),
+    P(0x12ac, 2, cP0, 0x270),
+    P(0x1308, 2, cP0, 0x260),
+    P(0x130c, 1, cP0, 0x268),
+    P(0x13e0, 4, cP0, 0x2a0),
+    P(0x13e4, 2, cP0, 0x278),
+    P(0x13e8, 1, cP0, 0x280),
+    P(0x14a0, 2, cP0, 0x294),
+    P(0x14a4, 1, cP0, 0x29c),
+    P(0x14f4, 1, cFlags, 0x0),
+    P(0x14f8, 1, cP60, 0x11c),
+    P(0x1520, 4, cView, 0x230),
+    P(0x1598, 1, cView, 0x22c),
+};
 #undef V
 #undef P
 
@@ -658,6 +741,9 @@ struct Variant {
     std::span<const Load> vsLoads, psLoads;
     uint32_t texturePc[kTextures];
     uint32_t cubePc = 0;
+    bool unmatched = false;
+    const char* alternateVs = nullptr;
+    std::span<const Load> alternateVsLoads{};
 };
 const Variant kVariants[] = {
     {"sm_o1dzt[skin].fxo", "s_b1dzt[skin].fxo", "#define SKIN\n",
@@ -696,7 +782,13 @@ const Variant kVariants[] = {
      kVsHair, kPsHairPHt,
      {0x138, 0, 0x2a8, 0xaec, 0x130, 0xb08,
       0x974, 0x994, 0x97c, 0x99c, 0, 0, 0, 0, 0}},
+    {"s_o1dzt.fxo", "s_b1dst.fxo", "",
+     kVsRigid, kPsO1dzt,
+     {0x150,0x158,0x2b0,0,0xbc0,0xb4c,0,0,0,0x1178,0x1330,0x1348,0x1180,0x1218,0x1230},
+     0, false, "s_o1dzt[mouth].fxo", kVsMouth}, // compare: 0 px (~6,500 draws)
 };
+constexpr int kVariantCount = std::size(kVariants);
+constexpr int kO1dztRole = 10;
 
 constexpr const char* kHeader = R"(#version 450
 layout(set = 0, binding = 7, std430) readonly buffer C { uvec4 c[]; } cb;
@@ -2243,6 +2335,717 @@ void main() {
 #endif // HAIR
 )";
 
+// Only the new role renames main. The nine established shader compositions
+// still use exactly kHeader + their original defines + kVs / kFs.
+constexpr const char* kO1dztVsSuffix = R"(
+#undef main
+void main() {
+    characterMain();
+    if (cb.c[455].w != 0u) p0.xyz = mul(F(V10,0x3c),p0.xyz);
+}
+)";
+
+// PS 0x53c661700. Keep the translator's scalar instruction expressions and
+// branch/sample order. In particular, these operations may contract, and
+// opcode 303 uses packHalf2x16 (nearest), rather than the older halfRTZ helper.
+// Identity float/uint round trips are removed from VGPRs. Keep SGPR bits and
+// packed exports as uints. Descriptor loads become native bindings; buffer
+// loads retain their PCs above.
+constexpr const char* kO1dztFs = R"(
+layout(set=0,binding=8) uniform sampler2D tex[15];
+layout(location=0) in vec4 a0;
+layout(location=1) in vec4 a1;
+layout(location=2) in vec4 a2;
+layout(location=3) in vec4 a3;
+layout(location=4) in vec4 a4;
+layout(location=5) in vec4 a5;
+layout(location=0) out vec4 o0;
+layout(location=1) out vec4 o1;
+float F(uint x) { return uintBitsToFloat(x); }
+vec2 sc(int t) { vec4 s=cf(441+t/2); return (t&1)!=0 ? s.zw : s.xy; }
+vec4 swz(vec4 v,uint s) {
+    return vec4(v[s&3u],v[(s>>2)&3u],v[(s>>4)&3u],v[(s>>6)&3u]);
+}
+void main() {
+    uint e=0u, eh=0u, m0=0u, s0=0u, s1=0u, s2=0u, s3=0u, s4=0u; uint s5=0u, s6=0u, s7=0u, s8=0u, s9=0u, s10=0u, s14=0u, s15=0u;
+    uint s16=0u, s17=0u, s18=0u, s19=0u, s20=0u, s21=0u, s22=0u, s23=0u; uint s24=0u, s25=0u, s26=0u, s27=0u, s28=0u, s29=0u, s30=0u, s31=0u;
+    uint s32=0u, s33=0u, s34=0u, s35=0u, s36=0u, s37=0u, s38=0u, s39=0u; uint s40=0u, s41=0u, s42=0u, s43=0u, s44=0u, s45=0u, s46=0u, s47=0u;
+    uint s48=0u, s49=0u, s50=0u, s51=0u, s52=0u, s53=0u, s54=0u, s55=0u; uint s56=0u, s57=0u, s58=0u, s59=0u, s60=0u, s61=0u, s62=0u, s63=0u;
+    uint s64=0u, s65=0u, s66=0u, s67=0u, s68=0u, s69=0u, s70=0u, s71=0u; uint s72=0u, s73=0u, s74=0u, s75=0u, s76=0u, s77=0u, s78=0u, s79=0u;
+    uint s84=0u, s85=0u, s86=0u, s87=0u, s88=0u, s89=0u, s90=0u, s91=0u; uint s92=0u, s93=0u, s94=0u, s95=0u, s100=0u, s101=0u, vc=0u, vh=0u;
+    uint h0=0u,h1=0u,h2=0u,h3=0u; float v0=0.0, v1=0.0, v2=0.0, v3=0.0, v4=0.0, v5=0.0, v6=0.0, v7=0.0;
+    float v8=0.0, v9=0.0, v10=0.0, v11=0.0, v12=0.0, v13=0.0, v14=0.0, v15=0.0;
+    float v16=0.0, v17=0.0, v18=0.0, v19=0.0, v20=0.0, v21=0.0, v22=0.0, v23=0.0;
+    float v24=0.0, v25=0.0, v26=0.0, v27=0.0, v28=0.0, v29=0.0, v30=0.0, v31=0.0;
+    float v32=0.0, v33=0.0, v34=0.0, v35=0.0, v36=0.0, v37=0.0, v38=0.0, v39=0.0;
+    float v40=0.0, v41=0.0, v42=0.0, v43=0.0, v44=0.0, v45=0.0, v46=0.0, v47=0.0;
+    float v48=0.0, v49=0.0, v50=0.0, v51=0.0, v52=0.0, v53=0.0, v54=0.0, v55=0.0; float v56=0.0, v57=0.0, v58=0.0, v59=0.0; bool cc = false;
+    uint pc = 0x0u; e = 1u; v2 = gl_FragCoord.x; v3 = gl_FragCoord.y; v4 = gl_FragCoord.w;
+    {
+        pc = 0x0u;
+    }
+    if (pc == 0x0u) {
+        vh = 0x2cbu; m0 = s14;
+        { uint lo_ = e; uint hi_ = eh; s14 = lo_; s15 = hi_; }
+        { uint lo_ = e; uint hi_ = eh; e = lo_; eh = hi_; }
+        s28 = U(P60,0xdc);
+        if(e!=0u) {
+            v21 = a0[3]; v23 = a3[3]; v22 = a4[3]; v5 = (v23); v6 = (v22); v7 = (v21);
+        }
+        s29 = 0u; pc = 0x48u;
+    }
+    for (uint guard0 = 0u; guard0 < 100000u; ++guard0) {
+        if (pc == 0x48u) {
+            if(e!=0u) {
+                v8 = float(int(s29));
+            }
+            vc = ((e & 1u) != 0u && (F(s28) > v8)) ? 1u : 0u; vh = 0u; pc = ((vc & 1u) == 0u) ? 0x10cu : 0x58u;
+        }
+        if (pc == 0x58u) {
+            s30 = s29 * 16u;
+            { uint a_ = s30; uint b_ = 0xd0u; uint r_ = a_ + b_; cc = ((~(a_ ^ b_) & (a_ ^ r_)) >> 31) != 0u; s20 = r_; }
+            { uint a_ = s30; uint b_ = 0x50u; uint r_ = a_ + b_; cc = ((~(a_ ^ b_) & (a_ ^ r_)) >> 31) != 0u; s24 = r_; }
+            s20 = U(P60,0xd0); s21 = U(P60,0xd4); s22 = U(P60,0xd8); s23 = U(P60,0xdc); s24 = U(P60,0x50); s25 = U(P60,0x54); s26 = U(P60,0x58);
+            s27 = U(P60,0x5c);
+            if(e!=0u) {
+                v8 = F(s20) * v5; v9 = F(s24); v8 = (-F(s20)) * v9 + v8; v9 = F(s25); v8 = F(s21) * v6 + v8; v8 = (-F(s21)) * v9 + v8; v9 = F(s26);
+                v8 = F(s22) * v7 + v8; v8 = (-F(s22)) * v9 + v8;
+            }
+            vc = ((e & 1u) != 0u && (abs(v8) < F(s27))) ? 1u : 0u; vh = 0u;
+            { uint lo_ = s14 & ~vc; uint hi_ = s15 & ~vh; s14 = lo_; s15 = hi_; }
+            cc = (s14 | s15) != 0u; pc = (!cc) ? 0x15ccu : 0xc0u;
+        }
+        if (pc == 0xc0u) {
+            vc = ((e & 1u) != 0u && (0.0 <= v8)) ? 1u : 0u; vh = 0u;
+            if(e!=0u) {
+                v8 = (vc & 1u) != 0u ? 1.0 : 0.0;
+            }
+            { uint a_ = s30; uint b_ = 0x90u; uint r_ = a_ + b_; cc = ((~(a_ ^ b_) & (a_ ^ r_)) >> 31) != 0u; s20 = r_; }
+            s16 = U(P60,0x90); s17 = U(P60,0x94); s18 = U(P60,0x98); s19 = U(P60,0x9c);
+            { uint a_ = s29; uint b_ = 1u; uint r_ = a_ + b_; cc = ((~(a_ ^ b_) & (a_ ^ r_)) >> 31) != 0u; s29 = r_; }
+            if(e!=0u) {
+                v11 = F(s19); v9 = F(s16) * v11; v10 = F(s17) * v11; v11 = F(s18) * v11; v5 = v8 * (-v9) + v5; v6 = v8 * (-v10) + v6; v7 = v8 * (-v11) + v7;
+            }
+            pc = 0x48u;
+        }
+        if (pc == 0x48u) continue;
+        break;
+    }
+    if (pc == 0x10cu) {
+        if(e!=0u) {
+            v5 = a2[0]; v6 = a2[1]; v29 = a4[1]; v19 = a5[2];
+        }
+        {
+            vec2 uv_ = vec2(v5, v6); uv_ *= sc(0);
+            { vec4 t_ = vec4(texture(tex[0], uv_));
+                if(e!=0u) {
+                    v11 = t_[0]; v12 = t_[1];
+                }
+            }
+        }
+        {
+            vec2 uv_ = vec2(v5, v6); uv_ *= sc(1);
+            { vec4 t_ = vec4(texture(tex[1], uv_));
+                if(e!=0u) {
+                    v13 = t_[0]; v14 = t_[1]; v15 = t_[2];
+                }
+            }
+        }
+        if(e!=0u) {
+            v26 = a5[0]; v9 = v29 * v19; v28 = a4[2]; v20 = a5[1];
+        }
+        s101 = U(Flags,0x0);
+        if(e!=0u) {
+            v8 = a5[3]; v30 = a4[0]; v10 = v28 * v26; v9 = v20 * (-v28) + v9; v27 = v8 * v9; v9 = v30 * v20; v10 = v19 * (-v30) + v10; v25 = v8 * v10;
+        }
+        s20 = U(P70,0xac);
+        if(e!=0u) {
+            v9 = v26 * (-v29) + v9; v24 = v8 * v9; v7 = a3[0];
+        }
+        s16 = U(View,0x218); s17 = U(View,0x21c);
+        if(e!=0u) {
+            v10 = v7 * v7; v9 = a3[1];
+        }
+        s100 = s101 & 8u; cc = s100 != 0u;
+        if(e!=0u) {
+            v8 = a3[2];
+        }
+        cc = s100 != 0u;
+        if(e!=0u) {
+            v10 = v9 * v9 + v10;
+        }
+        { uint lo_ = cc ? e : 0u; uint hi_ = cc ? eh : 0u; s28 = lo_; s29 = hi_; }
+        if(e!=0u) {
+            v10 = v8 * v8 + v10; v10 = inversesqrt(v10);
+        }
+        { uint lo_ = s28; uint hi_ = s29; vc = lo_; vh = hi_; }
+        if(e!=0u) {
+            v16 = v7 * v10; v17 = v9 * v10; v18 = v8 * v10; v7 = F(s16) * v2; v8 = F(s17) * v3; v9 = F(0x3f800000u); v10 = F(0x3f800000u);
+            v31 = 2.0 * v11 + -1.0; v32 = v31 * v31; v11 = 2.0 * v12 + -1.0; v32 = v11 * v11 + v32; v12 = sat(1.0 - v32); v26 = v26 * v31;
+            v12 = sqrt(v12); v32 = v27 * v11 + v26; v20 = v20 * v31; v19 = v19 * v31; v32 = v12 * v30 + v32; v20 = v11 * v25 + v20; v25 = v32 * v32;
+            v20 = v12 * v29 + v20; v19 = v11 * v24 + v19; v11 = v28 * v12 + v19; v25 = v20 * v20 + v25; v25 = v11 * v11 + v25; v12 = inversesqrt(v25);
+            v24 = F(s20) * v15; v15 = v12 * v32; v19 = v12 * v20; v20 = v12 * v11; v27 = max(1.0, v24);
+        }
+        { uint lo_ = vc; uint hi_ = vh; vc = lo_; vh = hi_; }
+        pc = ((vc & 1u) == 0u) ? 0x2b8u : 0x2a4u;
+    }
+    if (pc == 0x2a4u) {
+        {
+            vec2 uv_ = vec2(v7, v8); uv_ *= sc(2);
+            { vec4 t_ = vec4(texture(tex[2], uv_));
+                if(e!=0u) {
+                    v9 = t_[0]; v10 = t_[1];
+                }
+            }
+        }
+        pc = 0x2b8u;
+    }
+    if (pc == 0x2b8u) {
+        { uint lo_ = e & s28; uint hi_ = eh & s29; vc = lo_; vh = hi_; }
+        cc = (vc | vh) != 0u; pc = ((vc & 1u) == 0u) ? 0x2ecu : 0x2c0u;
+    }
+    if (pc == 0x2c0u) {
+        s16 = U(P10,0xf0); s17 = U(P10,0xf4); s18 = U(P10,0xf8); s19 = U(P10,0xfc);
+        if(e!=0u) {
+            v11 = F(s17); v12 = F(s19); v9 = F(s16) * v9 + v11; v10 = v10 * F(s18) + v12;
+        }
+        pc = 0x2ecu;
+    }
+    if (pc == 0x2ecu) {
+        if(e!=0u) {
+            v31 = 0.0;
+        }
+        vc = s101 & 0x10000u; cc = vc != 0u; vh = s101 & 1u; cc = vh != 0u; cc = vc != 0u;
+        if(e!=0u) {
+            v59 = 0.0; v32 = 0.0; v58 = 0.0; v57 = 0.0; v24 = 0.0;
+        }
+        { uint lo_ = cc ? e : 0u; uint hi_ = cc ? eh : 0u; s16 = lo_; s17 = hi_; }
+        cc = vh != 0u; pc = (!cc) ? 0x844u : 0x320u;
+    }
+    if (pc == 0x320u) {
+        if(e!=0u) {
+            v58 = 0.0;
+        }
+        { uint lo_ = e & s16; uint hi_ = eh & s17; vc = lo_; vh = hi_; }
+        cc = (vc | vh) != 0u;
+        if(e!=0u) {
+            v57 = 0.0; v24 = 0.0; v11 = 0.0; v12 = 0.0; v31 = 0.0; v36 = 0.0; v37 = 0.0; v35 = 0.0;
+        }
+        pc = ((vc & 1u) == 0u) ? 0x434u : 0x34cu;
+    }
+    if (pc == 0x34cu) {
+        if(e!=0u) {
+            v12 = F(0x3f808102u);
+        }
+        vc = 0xbb810205u; s16 = U(P30,0xa0); s17 = U(P30,0xa4); s18 = U(P30,0xa8); s19 = U(P30,0xac); s20 = U(P30,0x20); s21 = U(P30,0x24);
+        s22 = U(P30,0x28); s23 = U(P30,0x2c);
+        if(e!=0u) {
+            v26 = v23 - F(s16); v25 = v26 * v26; v24 = v22 - F(s17); v11 = v21 - F(s18); v25 = v24 * v24 + v25; v25 = v11 * v11 + v25; v31 = sqrt(v25);
+            v31 = v31 - F(s23); v25 = inversesqrt(v25); v31 = max(0.0, v31); v33 = v26 * v25; v32 = F(s19) * v31; v33 = v15 * v33; v34 = v24 * v25;
+            v31 = v32 * v31 + 1.0; v35 = v19 * v34 + v33; v34 = v11 * v25; v32 = v26 * v25 + v16; v26 = 1.0 / v31; v36 = v32 * v32;
+            v33 = v24 * v25 + v17; v35 = v34 * v20 + v35; v24 = sat(v12 * v26 + F(vc)); v12 = max(0.0, (-v35)); v34 = v11 * v25 + v18;
+            v36 = v33 * v33 + v36; v11 = F(s20) * v24; v25 = min(1.0, v12); v12 = F(s21) * v24; v31 = F(s22) * v24; v35 = v34 * v34 + v36;
+            v26 = v25 * v11; v24 = v25 * v12; v36 = v25 * v31; v35 = inversesqrt(v35); v58 = max(0.0, v26); v57 = max(0.0, v24); v24 = max(0.0, v36);
+            v36 = v35 * v32; v37 = v35 * v33; v35 = v35 * v34;
+        }
+        pc = 0x434u;
+    }
+    if (pc == 0x434u) {
+        if(e!=0u) {
+            v32 = 0.0;
+        }
+        vc = s101 & 0x20000u; cc = vc != 0u;
+        if(e!=0u) {
+            v33 = 0.0; v34 = 0.0; v38 = 0.0; v39 = 0.0; v40 = 0.0;
+        }
+        pc = (!cc) ? 0x544u : 0x458u;
+    }
+    if (pc == 0x458u) {
+        if(e!=0u) {
+            v33 = F(0x3f808102u);
+        }
+        vc = 0xbb810205u; s16 = U(P30,0xb0); s17 = U(P30,0xb4); s18 = U(P30,0xb8); s19 = U(P30,0xbc); s20 = U(P30,0x30); s21 = U(P30,0x34);
+        s22 = U(P30,0x38); s23 = U(P30,0x3c);
+        if(e!=0u) {
+            v34 = v23 - F(s16); v25 = v34 * v34; v32 = v22 - F(s17); v38 = v21 - F(s18); v25 = v32 * v32 + v25; v25 = v38 * v38 + v25; v40 = sqrt(v25);
+            v40 = v40 - F(s23); v39 = inversesqrt(v25); v40 = max(0.0, v40); v42 = v34 * v39; v41 = F(s19) * v40; v42 = v15 * v42; v43 = v32 * v39;
+            v40 = v41 * v40 + 1.0; v42 = v43 * v19 + v42; v43 = v38 * v39; v41 = 1.0 / v40; v40 = v34 * v39 + v16; v42 = v43 * v20 + v42;
+            v34 = sat(v33 * v41 + F(vc)); v33 = max(0.0, (-v42)); v25 = v40 * v40; v41 = v32 * v39 + v17; v32 = F(s20) * v34; v43 = min(1.0, v33);
+            v33 = F(s21) * v34; v34 = F(s22) * v34; v42 = v38 * v39 + v18; v25 = v41 * v41 + v25; v45 = v43 * v32; v38 = v43 * v33; v39 = v43 * v34;
+            v25 = v42 * v42 + v25; v44 = max(0.0, v45); v38 = max(0.0, v38); v39 = max(0.0, v39); v43 = inversesqrt(v25); v58 = v58 + v44;
+            v57 = v57 + v38; v24 = v24 + v39; v38 = v43 * v40; v39 = v43 * v41; v40 = v43 * v42;
+        }
+        pc = 0x544u;
+    }
+    if (pc == 0x544u) {
+        if(e!=0u) {
+            v42 = 0.0;
+        }
+        vc = s101 & 0x40000u; cc = vc != 0u;
+        if(e!=0u) {
+            v43 = 0.0; v41 = 0.0; v44 = 0.0; v45 = 0.0; v46 = 0.0;
+        }
+        pc = (!cc) ? 0x654u : 0x568u;
+    }
+    if (pc == 0x568u) {
+        if(e!=0u) {
+            v45 = F(0x3f808102u);
+        }
+        vc = 0xbb810205u; s16 = U(P30,0xc0); s17 = U(P30,0xc4); s18 = U(P30,0xc8); s19 = U(P30,0xcc); s20 = U(P30,0x40); s21 = U(P30,0x44);
+        s22 = U(P30,0x48); s23 = U(P30,0x4c);
+        if(e!=0u) {
+            v42 = v23 - F(s16); v25 = v42 * v42; v41 = v22 - F(s17); v43 = v21 - F(s18); v25 = v41 * v41 + v25; v25 = v43 * v43 + v25; v46 = sqrt(v25);
+            v46 = v46 - F(s23); v47 = max(0.0, v46); v48 = F(s19) * v47; v44 = inversesqrt(v25); v46 = v41 * v44; v47 = v48 * v47 + 1.0;
+            v48 = v42 * v44; v25 = v15 * v48; v25 = v46 * v19 + v25; v47 = 1.0 / v47; v49 = sat(v45 * v47 + F(vc)); v47 = v42 * v44 + v16;
+            v45 = v41 * v44 + v17; v41 = v43 * v44; v25 = v41 * v20 + v25; v41 = F(s22) * v49; v42 = F(s20) * v49; v46 = v43 * v44 + v18;
+            v43 = max(0.0, (-v25)); v48 = min(1.0, v43); v44 = v47 * v47; v43 = F(s21) * v49; v44 = v45 * v45 + v44; v44 = v46 * v46 + v44;
+            v49 = inversesqrt(v44); v44 = v49 * v47; v47 = v48 * v41; v47 = max(0.0, v47); v24 = v24 + v47; v47 = v48 * v43; v48 = v48 * v42;
+            v48 = max(0.0, v48); v47 = max(0.0, v47); v58 = v58 + v48; v57 = v57 + v47; v45 = v49 * v45; v46 = v49 * v46;
+        }
+        pc = 0x654u;
+    }
+    if (pc == 0x654u) {
+        if(e!=0u) {
+            v51 = 0.0;
+        }
+        vc = s101 & 0x80000u; cc = vc != 0u;
+        if(e!=0u) {
+            v52 = 0.0; v50 = 0.0; v48 = 0.0; v49 = 0.0; v47 = 0.0;
+        }
+        pc = (!cc) ? 0x76cu : 0x678u;
+    }
+    if (pc == 0x678u) {
+        if(e!=0u) {
+            v49 = F(0x3f808102u);
+        }
+        vc = 0xbb810205u; s16 = U(P30,0xd0); s17 = U(P30,0xd4); s18 = U(P30,0xd8); s19 = U(P30,0xdc); s20 = U(P30,0x50); s21 = U(P30,0x54);
+        s22 = U(P30,0x58); s23 = U(P30,0x5c);
+        if(e!=0u) {
+            v51 = v23 - F(s16); v25 = v51 * v51; v47 = v22 - F(s17); v48 = v21 - F(s18); v25 = v47 * v47 + v25; v25 = v48 * v48 + v25; v52 = sqrt(v25);
+            v52 = v52 - F(s23); v52 = max(0.0, v52); v53 = F(s19) * v52; v52 = v53 * v52 + 1.0; v54 = 1.0 / v52; v53 = inversesqrt(v25);
+            v52 = v47 * v53; v50 = v48 * v53 + v18; v48 = v48 * v53; v49 = sat(v49 * v54 + F(vc)); v54 = v51 * v53; v54 = v15 * v54;
+            v51 = v51 * v53 + v16; v25 = v19 * v52 + v54; v52 = v47 * v53 + v17; v47 = v51 * v51; v26 = v52 * v52 + v47; v25 = v48 * v20 + v25;
+            v48 = max(0.0, (-v25)); v26 = v50 * v50 + v26; v53 = min(1.0, v48); v48 = F(s20) * v49; v54 = inversesqrt(v26); v47 = F(s22) * v49;
+            v49 = F(s21) * v49; v51 = v54 * v51; v52 = v54 * v52; v50 = v54 * v50; v54 = v53 * v48; v54 = max(0.0, v54); v58 = v58 + v54;
+            v54 = v53 * v49; v53 = v53 * v47; v53 = max(0.0, v53); v54 = max(0.0, v54); v24 = v24 + v53; v57 = v57 + v54;
+        }
+        pc = 0x76cu;
+    }
+    if (pc == 0x76cu) {
+        if(e!=0u) {
+            v36 = v36 * v15; v25 = v37 * v19 + v36; v37 = v51 * v15; v26 = v52 * v19 + v37; v25 = v20 * v35 + v25; v35 = max(0.0, (-v25));
+            v26 = v20 * v50 + v26; v35 = min(1.0, v35); v36 = max(0.0, (-v26)); v35 = log2(v35); v36 = min(1.0, v36); v37 = v35 * v27; v36 = log2(v36);
+            v35 = v36 * v27; v36 = exp2(v37); v37 = v38 * v15; v37 = v19 * v39 + v37; v37 = v20 * v40 + v37; v37 = max(0.0, (-v37));
+            v37 = min(1.0, v37); v37 = log2(v37); v37 = v37 * v27; v11 = v36 * v11; v37 = exp2(v37); v12 = v36 * v12; v31 = v36 * v31; v36 = v44 * v15;
+            v36 = v19 * v45 + v36; v36 = v20 * v46 + v36; v36 = max(0.0, (-v36)); v36 = min(1.0, v36); v36 = log2(v36); v36 = v36 * v27;
+            v36 = exp2(v36); v11 = v32 * v37 + v11; v12 = v33 * v37 + v12; v31 = v34 * v37 + v31; v35 = exp2(v35); v25 = v36 * v41 + v31;
+            v11 = v42 * v36 + v11; v12 = v43 * v36 + v12; v11 = v48 * v35 + v11; v12 = v49 * v35 + v12; v25 = v47 * v35 + v25; v31 = max(0.0, v11);
+            v59 = max(0.0, v12); v32 = max(0.0, v25);
+        }
+        pc = 0x844u;
+    }
+    if (pc == 0x844u) {
+        if(e!=0u) {
+            v11 = v30 * v16; v11 = v17 * v29 + v11; v11 = v18 * v28 + v11; v12 = v15 * v16; v41 = v19 * v17 + v12; v41 = v18 * v20 + v41;
+            v43 = sat(1.0 + v11); v11 = v15 * v15;
+        }
+        s16 = U(P20,0x4f0); s17 = U(P20,0x4f4); s18 = U(P20,0x4f8); s19 = U(P20,0x4fc); s20 = U(P20,0x500); s21 = U(P20,0x504); s22 = U(P20,0x508);
+        s23 = U(P20,0x50c); s24 = U(P20,0x510); s25 = U(P20,0x514); s26 = U(P20,0x518); s27 = U(P20,0x51c); s28 = U(P20,0x520); s29 = U(P20,0x524);
+        s30 = U(P20,0x528); s31 = U(P20,0x52c);
+        if(e!=0u) {
+            v11 = v19 * v19 + v11; v11 = v20 * v20 + v11; v12 = inversesqrt(v11); v36 = v12 * v15;
+        }
+        s32 = U(P20,0x530); s33 = U(P20,0x534); s34 = U(P20,0x538); s35 = U(P20,0x53c); s36 = U(P20,0x540); s37 = U(P20,0x544); s38 = U(P20,0x548);
+        s39 = U(P20,0x54c); s40 = U(P20,0x550); s41 = U(P20,0x554); s42 = U(P20,0x558); s43 = U(P20,0x55c); s44 = U(P20,0x560); s45 = U(P20,0x564);
+        s46 = U(P20,0x568); s47 = U(P20,0x56c);
+        if(e!=0u) {
+            v39 = v12 * v19; v37 = v12 * v20;
+        }
+        s48 = U(P30,0x80); s49 = U(P30,0x84); s50 = U(P30,0x88); s51 = U(P30,0x8c); s52 = U(P30,0x90); s53 = U(P30,0x94); s54 = U(P30,0x98);
+        s55 = U(P30,0x9c); s76 = U(P30,0xe0); s77 = U(P30,0xe4); s78 = U(P30,0xe8); s79 = U(P30,0xec); s88 = U(View,0x22c); s84 = U(P30,0x60);
+        s85 = U(P30,0x64); s86 = U(P30,0x68); s87 = U(P30,0x6c); s56 = U(P30,0x0); s57 = U(P30,0x4); s58 = U(P30,0x8); s59 = U(P30,0xc);
+        s60 = U(P30,0x10); s61 = U(P30,0x14); s62 = U(P30,0x18); s63 = U(P30,0x1c);
+        if(e!=0u) {
+            v52 = 2.0 * v41; v55 = (-v15) * v52 + v16; v56 = (-v19) * v52 + v17; v52 = (-v20) * v52 + v18; v11 = F(s35); v12 = F(s33) * v39 + v11;
+            v12 = F(s34) * v37 + v12;
+        }
+        s55 = U(P0,0x48); vc = s88 & 2u; cc = vc != 0u; s88 = U(P30,0x100); s89 = U(P30,0x104); s90 = U(P30,0x108); s91 = U(P30,0x10c);
+        s70 = U(P0,0x40); s71 = U(P0,0x44); cc = vc != 0u;
+        if(e!=0u) {
+            v11 = min(v9, v10); v9 = v9 * v10; v10 = F(s24) * v36; v10 = F(s25) * v39 + v10; v10 = F(s26) * v37 + v10; v12 = v10 * v39 + v12;
+            v10 = F(s28) * v36; v28 = F(s29) * v39 + v10; v28 = F(s30) * v37 + v28; v10 = F(s23); v10 = F(s32) + v10; v12 = F(s27) * v39 + v12;
+            v12 = v28 * v37 + v12; v28 = F(s20) * v36; v28 = F(s21) * v39 + v28; v28 = F(s22) * v37 + v28; v10 = v10 + v28; v12 = F(s31) * v37 + v12;
+            v12 = v10 * v36 + v12; v12 = max(F(0x3d800000u), v12);
+        }
+        { uint lo_ = cc ? e : 0u; uint hi_ = cc ? eh : 0u; vc = lo_; vh = hi_; }
+        if(e!=0u) {
+            v30 = (vc & 1u) != 0u ? v9 : v11; v9 = F(s52) * v15; v9 = F(s53) * v19 + v9; v9 = F(s54) * v20 + v9; v10 = max(0.0, (-v9)); v9 = F(s76);
+            v11 = F(s16) * v12 + v9; v9 = F(s84) - v9; v9 = v9 * v19 + v9; v12 = F(s52) + v16; v54 = F(s52) * v55; v55 = F(s48) * v55;
+            v54 = F(s53) * v56 + v54; v55 = F(s49) * v56 + v55; v54 = F(s54) * v52 + v54; v54 = max(0.0, (-v54)); v55 = F(s50) * v52 + v55;
+            v55 = max(0.0, (-v55)); v54 = min(1.0, v54); v56 = F(0x3d22ca2fu); v56 = v56 * v27 + F(0x3daf7aacu); v53 = F(s48) + v16;
+        }
+        s51 = U(P0,0xc);
+        if(e!=0u) {
+            v48 = v12 * v12; v49 = v12 * v16; v52 = log2(v54); v54 = min(1.0, v55); v54 = log2(v54); v54 = v54 * v27; v55 = v53 * v53;
+        }
+        s92 = U(P10,0x0); s93 = U(P10,0x4); s94 = U(P10,0x8); s95 = U(P10,0xc);
+        if(e!=0u) {
+            v52 = v52 * v27; v46 = F(s39); v52 = exp2(v52);
+        }
+        s17 = U(P90,0x134);
+        if(e!=0u) {
+            v52 = v52 * v56; v27 = exp2(v54); v54 = F(s50) + v18; v34 = min(1.0, v10);
+        }
+        s68 = U(P70,0x68); s69 = U(P70,0x6c);
+        if(e!=0u) {
+            v10 = F(s48) * v15; v10 = F(s49) * v19 + v10; v10 = F(s50) * v20 + v10; v12 = max(0.0, (-v10)); v44 = 2.0 + F(s69); v38 = min(1.0, v12);
+            v29 = F(s56) * v38; v11 = v29 * v30 + v11;
+        }
+        s39 = U(P70,0x88);
+        if(e!=0u) {
+            v27 = v27 * v56; v56 = F(s49) + v17; v55 = v56 * v56 + v55; v55 = v54 * v54 + v55; v55 = inversesqrt(v55); v53 = v55 * v53; v53 = v16 * v53;
+            v56 = v55 * v56; v54 = v55 * v54; v55 = F(s53) + v17; v48 = v55 * v55 + v48; v49 = v17 * v55 + v49; v55 = F(s54) + v18;
+            v48 = v55 * v55 + v48; v48 = inversesqrt(v48); v49 = v18 * v55 + v49; v55 = (-v48) * v49 + 1.0; v53 = v56 * v17 + v53; v49 = v55 * v55;
+            v48 = F(s40) * v36; v53 = v54 * v18 + v53; v53 = 1.0 - v53; v49 = v49 * v49; v48 = F(s41) * v39 + v48; v54 = v53 * v53;
+            v48 = F(s42) * v37 + v48; v54 = v54 * v54; v53 = v54 * v53; v54 = F(s39); v56 = (-F(s95)) * v54 + 1.0; v54 = F(s95) * v54;
+            v53 = v53 * v56 + v54; v56 = v49 * v56; v28 = F(s60) * v34; v27 = v27 * v53; v54 = v55 * v56 + v54; v42 = F(s17) * v28 + v11;
+            v40 = 1.0 / F(s94); v27 = v27 * v38; v53 = F(s56) * v30; v45 = F(s77); v53 = v53 * v27; v42 = 0.5 * v9 + v42; v9 = F(s71); v9 = F(s55) - v9;
+            v9 = 1.0 / v9; v10 = (-v10) * v9; v10 = sat((-F(s71)) * v9 + v10); v9 = -1.0 + v10; v33 = F(s70) * v9 + 1.0;
+        }
+        {
+            vec2 uv_ = vec2(v7, v8); uv_ *= sc(5);
+            { vec4 t_ = vec4(texture(tex[5], uv_));
+                if(e!=0u) {
+                    v9 = t_[0]; v10 = t_[1]; v11 = t_[2]; v12 = t_[3];
+                }
+            }
+        }
+        if(e!=0u) {
+            v7 = sat(1.0 + v41); v7 = v43 * v7; v7 = log2(v7); v7 = v7 * v44; v7 = exp2(v7); v7 = v14 * v7; v8 = F(s68); v7 = F(s91) * v7;
+            v8 = F(0x40200000u) + v8; v7 = v7 * v8;
+        }
+        s20 = U(P20,0x570); s21 = U(P20,0x574); s22 = U(P20,0x578); s23 = U(P20,0x57c); s24 = U(P20,0x580); s25 = U(P20,0x584); s26 = U(P20,0x588);
+        s27 = U(P20,0x58c); s28 = U(P20,0x590); s29 = U(P20,0x594); s30 = U(P20,0x598); s31 = U(P20,0x59c); s32 = U(P20,0x5a0); s33 = U(P20,0x5a4);
+        s34 = U(P20,0x5a8); s35 = U(P20,0x5ac);
+        if(e!=0u) {
+            v41 = F(0x3dcccccdu) * v7; v44 = F(s78);
+        }
+        vc = s51 & 1u; cc = vc != 0u; s48 = U(P20,0x5b0); s49 = U(P20,0x5b4); s50 = U(P20,0x5b8); s51 = U(P20,0x5bc); vc = 0x3e19999au;
+        vh = 0xbdbc49cau;
+        {
+            vec2 uv_ = vec2(v5, v6); uv_ *= sc(4);
+            { vec4 t_ = vec4(texture(tex[4], uv_));
+                if(e!=0u) {
+                    v5 = t_[0]; v6 = t_[1]; v7 = t_[2]; v8 = t_[3];
+                }
+            }
+        }
+        if(e!=0u) {
+            v51 = F(s23); v51 = F(s21) * v39 + v51; v49 = F(s22) * v37 + v51;
+        }
+        s64 = U(P70,0x90); s65 = U(P70,0x94); s66 = U(P70,0x98); s67 = U(P70,0x9c); s68 = U(P70,0xa0); s69 = U(P70,0xa4); s70 = U(P70,0xa8);
+        s71 = U(P70,0xac);
+        if(e!=0u) {
+            v50 = F(s20) + v46; v49 = v48 * v39 + v49;
+        }
+        s72 = U(P60,0x0); s73 = U(P60,0x4); s74 = U(P60,0x8); s75 = U(P60,0xc); s76 = U(P60,0x10); s77 = U(P60,0x14); s78 = U(P60,0x18);
+        s79 = U(P60,0x1c);
+        if(e!=0u) {
+            v51 = F(s44) * v36; v55 = F(s51); v49 = F(s43) * v39 + v49; v51 = F(s45) * v39 + v51; v55 = F(s49) * v39 + v55; v25 = F(s50) * v37 + v55;
+            v26 = F(s32) * v36; v51 = F(s46) * v37 + v51;
+        }
+        s4 = U(P60,0x110); s5 = U(P60,0x114); s6 = U(P60,0x118); s7 = U(P60,0x11c);
+        if(e!=0u) {
+            v48 = v37 * v51 + v49; v49 = F(s36) * v36; v49 = F(s37) * v39 + v49; v43 = F(s24) * v36; v49 = F(s38) * v37 + v49; v26 = F(s33) * v39 + v26;
+            v51 = v52 * v54; v49 = v50 + v49; v50 = F(s28) * v36; v52 = F(s29) * v39 + v50; v52 = F(s30) * v37 + v52; v25 = v52 * v39 + v25;
+            v46 = F(s25) * v39 + v43; v43 = F(s64) * v14; v39 = F(s31) * v39 + v25; v47 = F(s27); v48 = F(s47) * v37 + v48; v26 = F(s34) * v37 + v26;
+            v43 = F(s72) * v43; v25 = v37 * v26 + v39; v47 = F(s48) + v47; v56 = F(s76); v48 = v49 * v36 + v48; v46 = F(s26) * v37 + v46;
+            v56 = F(s68) * v56; v48 = max(F(0x3d800000u), v48); v39 = v47 + v46; v25 = F(s35) * v37 + v25; v26 = a0[0]; v48 = F(s16) * v48 + v45;
+            v49 = F(s85) - v45; v45 = v51 * v34; v53 = F(s60) * v45 + v53; v47 = 0.5 * v19 + 0.5; v25 = v39 * v36 + v25; v52 = F(s57) * v38;
+            v39 = F(s58) * v30; v35 = F(s7); v48 = v47 * v49 + v48; v55 = F(s61) * v34; v37 = F(s65) * v14; v49 = F(s57) * v30; v50 = F(s86) - v44;
+            v39 = v39 * v27; v48 = v52 * v30 + v48; v46 = F(s92) * v26; v26 = max(F(0x3d800000u), v25); v36 = F(s16) * v26 + v44; v37 = F(s73) * v37;
+            v49 = v49 * v27; v54 = F(s58) * v38; v48 = F(s17) * v55 + v48; v36 = v47 * v50 + v36; v27 = F(s61) * v45 + v49; v26 = F(s62) * v34;
+            v38 = F(s66) * v14; v36 = v54 * v30 + v36; v14 = F(s74) * v38; v44 = F(s78); v36 = F(s17) * v26 + v36; v25 = F(s62) * v45 + v39;
+            v39 = F(s77); v39 = F(s69) * v39; v44 = F(s70) * v44; v38 = a0[2]; v38 = F(s92) * v38; v45 = F(0x3fb0852eu); v58 = v40 * v9 + v58;
+            v51 = v42 * v33 + v58; v57 = v40 * v10 + v57; v34 = v48 * v33 + v57; v59 = v40 * v12 + v59; v27 = v39 * v27 + v59; v11 = v11 * v40 + v24;
+            v24 = v36 * v33 + v11; v39 = a0[1]; v39 = F(s92) * v39; v5 = v5 * v5; v5 = F(s88) * v41 + v5; v5 = v43 * v5; v43 = v5 * v51; v10 = v6 * v6;
+            v6 = v12 * v40 + v31; v9 = v7 * v7; v10 = F(s89) * v41 + v10; v42 = v37 * v10; v9 = F(s90) * v41 + v9; v5 = v12 * v40 + v32;
+            v32 = v56 * v53 + v6; v43 = v32 * v13 + v43; v12 = F(s4) * v35 + v43; v12 = (-F(s7)) * v43 + v12; v12 = (v46 * v12) * 2.0;
+            v32 = F(0x3e19999au); v41 = v32 * v12 + F(0x3d4ccccdu); v31 = F(vc) * v12 + 0.5; v31 = v12 * v31 + F(0x3d75c290u); v31 = 1.0 / v31;
+            v12 = v41 * v12 + F(0x3b83126fu); v41 = v14 * v9; v9 = v42 * v34; v9 = v27 * v13 + v9; v10 = F(s5) * v35 + v9; v34 = v44 * v25 + v5;
+            v10 = (-F(s7)) * v9 + v10; v9 = v41 * v24; v9 = v34 * v13 + v9; v27 = (v39 * v10) * 2.0; v10 = F(s6) * v35 + v9; v10 = (-F(s7)) * v9 + v10;
+            v13 = (v38 * v10) * 2.0; v24 = F(vc) * v27 + 0.5; v30 = F(vc) * v13 + 0.5; v33 = v27 * v24 + F(0x3d75c290u);
+            v24 = v32 * v27 + F(0x3d4ccccdu); v30 = v13 * v30 + F(0x3d75c290u); v32 = v32 * v13 + F(0x3d4ccccdu); v33 = 1.0 / v33;
+            v24 = v24 * v27 + F(0x3b83126fu); v27 = 1.0 / v30; v30 = v32 * v13 + F(0x3b83126fu); v31 = v31 * v12; v13 = v33 * v24; v24 = v27 * v30;
+            v49 = sat(v45 * v31 + F(vh)); v31 = sat(v45 * v13 + F(vh)); v27 = sat(v45 * v24 + F(vh)); v49 = sqrt(v49); v47 = sqrt(v31); v27 = sqrt(v27);
+        }
+        pc = (!cc) ? 0xfe8u : 0xef0u;
+    }
+    if (pc == 0xef0u) {
+        if(e!=0u) {
+            v10 = v57 + v59; v5 = v11 + v5; v6 = v58 + v6; v7 = v10 + v52; v5 = v5 + v54; v6 = v6 + v29;
+        }
+        s16 = U(P0,0x0); s17 = U(P0,0x4); s18 = U(P0,0x8); s19 = U(P0,0xc); s20 = U(P0,0x10); s21 = U(P0,0x14); s22 = U(P0,0x18); s23 = U(P0,0x1c);
+        s24 = U(P0,0x20); s25 = U(P0,0x24); s26 = U(P0,0x28); s27 = U(P0,0x2c); s28 = U(P0,0x30); s29 = U(P0,0x34); s30 = U(P0,0x38);
+        s31 = U(P0,0x3c);
+        if(e!=0u) {
+            v7 = v7 + v55; v5 = v5 + v26; v6 = v6 + v28; v5 = v7 + v5; v6 = F(0x3eaaaaabu) * v6; v5 = v5 * F(0x3eaaaaabu) + v6; v6 = 1.0 - v5;
+            v7 = (-v6) * v6 + 1.0; v10 = sat(v6 * v6); v6 = 1.0 - F(s23); v11 = F(s20) * v10; v6 = v6 - F(s23); v12 = F(s24) * v10; v14 = F(s28) * v10;
+            v7 = sat(v5 * (-v5) + v7); v25 = F(s21) * v7 + v11; v5 = sat(v5 * v5); v6 = 1.0 / v6; v12 = F(s25) * v7 + v12; v14 = F(s29) * v7 + v14;
+            v9 = sat(v6 * v49 + (-F(s23))); v11 = sat(v6 * v47 + (-F(s23))); v6 = sat(v6 * v27 + (-F(s23))); v25 = F(s22) * v5 + v25;
+            v12 = F(s26) * v5 + v12; v14 = F(s30) * v5 + v14; v7 = F(s16) + v25; v9 = log2(v9); v10 = F(s17) + v12; v11 = log2(v11); v5 = F(s18) + v14;
+            v6 = log2(v6); v7 = v9 * v7; v9 = v11 * v10; v5 = v6 * v5; v49 = sat(exp2(v7)); v47 = sat(exp2(v9)); v27 = sat(exp2(v5));
+        }
+        pc = 0xfe8u;
+    }
+    if (pc == 0xfe8u) {
+        s4 = s101 & 4u; cc = s4 != 0u; vc = s101 & 0x400000u; cc = vc != 0u; cc = vc != 0u;
+        vc = ((e & 1u) != 0u && (s4 != 0u)) ? 1u : 0u; vh = 0u;
+        if(e!=0u) {
+            v6 = a1[0]; v5 = a1[1]; v0 = a1[2]; v1 = v6 + v49; v5 = v5 + v47; v6 = v0 + v27; v0 = (vc & 1u) != 0u ? v1 : v49;
+            v1 = (vc & 1u) != 0u ? v5 : v47; v5 = (vc & 1u) != 0u ? v6 : v27;
+        }
+        vh = cc ? 0u : 1u; cc = s4 != 0u; vc = cc ? 1u : 0u; vc = vh | vc; cc = vc != 0u;
+        if(e!=0u) {
+            v14 = 0.0;
+        }
+        pc = (cc) ? 0x10b8u : 0x1048u;
+    }
+    if (pc == 0x1048u) {
+        s4 = U(View,0x220); s5 = U(View,0x224); s6 = U(View,0x228); s7 = U(View,0x22c); s16 = U(P10,0x10); s17 = U(P10,0x14); s18 = U(P10,0x18);
+        s19 = U(P10,0x1c); s20 = U(P10,0x20); s21 = U(P10,0x24); s22 = U(P10,0x28); s23 = U(P10,0x2c);
+        if(e!=0u) {
+            v0 = F(s4) - v23; v0 = v0 * v0; v1 = F(s5) - v22; v0 = v1 * v1 + v0; v1 = F(s6) - v21; v0 = v1 * v1 + v0; v0 = sqrt(v0); v14 = F(s23);
+            v14 = sat(F(s22) * v0 + v14); v0 = F(s16) * v14 + v49; v1 = F(s17) * v14 + v47; v5 = F(s18) * v14 + v27; v0 = v14 * (-v49) + v0;
+            v1 = v14 * (-v47) + v1; v5 = v14 * (-v27) + v5;
+        }
+        pc = 0x10b8u;
+    }
+    if (pc == 0x10b8u) {
+        if(e!=0u) {
+            v6 = 0.0;
+        }
+        cc = s100 != 0u;
+        { uint lo_ = cc ? e : 0u; uint hi_ = cc ? eh : 0u; vc = lo_; vh = hi_; }
+        s28 = U(P50,0x1c); s24 = U(P70,0x9c); s20 = U(P60,0xc); s16 = U(Flags,0x0); s4 = U(P10,0x30); s5 = U(P10,0x34); s6 = U(P10,0x38);
+        s7 = U(P10,0x3c);
+        if(e!=0u) {
+            v7 = F(s28); v7 = F(s24) * v7; v7 = F(s20) * v7; v10 = v7 * v8; v11 = F(s7) * v10; v9 = F(s4) * v0; v8 = F(s5) * v1; v7 = F(s6) * v5;
+            v13 = (vc & 1u) != 0u ? v10 : v11; v21 = (vc & 1u) != 0u ? v0 : v9; v22 = (vc & 1u) != 0u ? v1 : v8; v23 = (vc & 1u) != 0u ? v5 : v7;
+        }
+        vc = s16 & 0x2000000u; cc = vc != 0u; cc = vc != 0u;
+        { uint lo_ = cc ? e : 0u; uint hi_ = cc ? eh : 0u; vc = lo_; vh = hi_; }
+        pc = ((vc & 1u) != 0u) ? 0x14e4u : 0x1138u;
+    }
+    if (pc == 0x1138u) {
+        if(e!=0u) {
+            v25 = 0.0;
+        }
+        s40 = U(View,0x218); s41 = U(View,0x21c); s42 = U(P0,0x2c); s32 = U(P0,0x284); s33 = U(P0,0x288); s34 = U(P0,0x28c); s35 = U(P0,0x290);
+        s43 = U(P0,0x3c); s44 = U(P0,0x26c); s36 = U(P0,0xc);
+        if(e!=0u) {
+            v11 = F(s40) * v2; v12 = F(s41) * v3;
+        }
+        {
+            vec2 uv_ = vec2(v11, v12); uv_ *= sc(9);
+            { vec4 t_ = vec4(texture(tex[9], uv_));
+                if(e!=0u) {
+                    v7 = t_[0];
+                }
+            }
+        }
+        {
+            vec2 uv_ = vec2(v11, v12); uv_ *= sc(12);
+            { vec4 t_ = vec4(texture(tex[12], uv_));
+                if(e!=0u) {
+                    v0 = t_[0]; v1 = t_[1]; v2 = t_[2];
+                }
+            }
+        }
+        if(e!=0u) {
+            v3 = F(s32); v6 = F(s34) - v3; v24 = F(s32); v5 = F(s33); v6 = 1.0 / v6; v5 = F(s32) - v5; v5 = 1.0 / v5;
+        }
+        vc = s36 & 4u; cc = vc != 0u;
+        if(e!=0u) {
+            v7 = F(s42) + v7; v7 = 1.0 / v7; v24 = F(s43) * v7 + (-v24); v28 = sat((-v24) * v6 + 1.0); v27 = (-F(s43)) * v7; v7 = F(s44) * v28;
+            v26 = (-v27) * v5; v31 = 2.0 * v1 + -1.0; v1 = max(F(s35), v7); v32 = 2.0 * v0 + -1.0; v26 = sat((-F(s33)) * v5 + v26); v8 = v26 * v1;
+            v30 = F(s40) * v32; v29 = F(s41) * (-v31); v0 = v30 * v8 + v11; v1 = v29 * v8 + v12;
+        }
+        {
+            vec2 uv_ = vec2(v0, v1); uv_ *= sc(13);
+            { vec4 t_ = vec4(texture(tex[13], uv_));
+                if(e!=0u) {
+                    v5 = t_[0]; v6 = t_[1]; v7 = t_[2];
+                }
+            }
+        }
+        if(e!=0u) {
+            v0 = (-v30) * v8 + v11; v1 = (-v29) * v8 + v12;
+        }
+        {
+            vec2 uv_ = vec2(v0, v1); uv_ *= sc(14);
+            { vec4 t_ = vec4(texture(tex[14], uv_));
+                if(e!=0u) {
+                    v8 = t_[0]; v9 = t_[1]; v10 = t_[2];
+                }
+            }
+        }
+        if(e!=0u) {
+            v1 = 2.0 * v2 + -1.0; v0 = v32 + v31; v0 = v0 + v1; v2 = v6 * v31; v33 = (v5 * v32) * 2.0; v6 = v7 * v1; v5 = v9 * v31;
+            v8 = (v8 * v32) * 2.0; v1 = v10 * v1; v33 = 2.0 * v2 + v33; v8 = 2.0 * v5 + v8; v33 = 2.0 * v6 + v33; v8 = 2.0 * v1 + v8; v2 = v33 - v0;
+            v5 = v8 - v0;
+        }
+        pc = (!cc) ? 0x12e8u : 0x128cu;
+    }
+    if (pc == 0x128cu) {
+        if(e!=0u) {
+            v0 = 0.5 * v5 + 0.5; v0 = (v2 * v0 + v0) * 0.5; v1 = v0 * v0 + F(0x3b808081u);
+        }
+        s0 = U(P0,0x270); s1 = U(P0,0x274);
+        if(e!=0u) {
+            v6 = (-F(s1)) * v26 + 1.0;
+        }
+        vc = ((e & 1u) != 0u && (v1 >= v6)) ? 1u : 0u; vh = 0u;
+        if(e!=0u) {
+            v6 = (vc & 1u) != 0u ? 1.0 : 0.0; v1 = 1.0 - F(s0); v6 = sat(v0 * v0 + v6); v0 = v1 * v6 + F(s0); v25 = (-v26) * v0 + v26;
+        }
+        pc = 0x12e8u;
+    }
+    if (pc == 0x12e8u) {
+        if(e!=0u) {
+            v0 = 0.0;
+        }
+        vc = s36 & 8u; cc = vc != 0u; pc = (!cc) ? 0x13b4u : 0x12f4u;
+    }
+    if (pc == 0x12f4u) {
+        if(e!=0u) {
+            v6 = 2.0 * v27;
+        }
+        s8 = U(P0,0x260); s9 = U(P0,0x264); s10 = U(P0,0x268);
+        if(e!=0u) {
+            v0 = F(s8) * v28; v0 = max(F(s35), v0); v8 = v26 * v0; v0 = v30 * v8 + v11; v1 = v29 * v8 + v12;
+        }
+        {
+            vec2 uv_ = vec2(v0, v1); uv_ *= sc(10);
+            { vec4 t_ = vec4(texture(tex[10], uv_));
+                if(e!=0u) {
+                    v7 = t_[0];
+                }
+            }
+        }
+        if(e!=0u) {
+            v0 = (-v30) * v8 + v11; v1 = (-v29) * v8 + v12;
+        }
+        {
+            vec2 uv_ = vec2(v0, v1); uv_ *= sc(11);
+            { vec4 t_ = vec4(texture(tex[11], uv_));
+                if(e!=0u) {
+                    v8 = t_[0];
+                }
+            }
+        }
+        if(e!=0u) {
+            v1 = (-F(s10)) * v26 + 1.0; v0 = 1.0 - F(s9); v7 = F(s42) + v7; v7 = 1.0 / v7; v6 = F(s43) * v7 + v6; v7 = F(s42) + v8; v7 = 1.0 / v7;
+            v6 = F(s43) * v7 + v6; v6 = -0.5 * v6 + 1.0; v7 = F(0x3b808081u) + v6;
+        }
+        vc = ((e & 1u) != 0u && (v7 >= v1)) ? 1u : 0u; vh = 0u;
+        if(e!=0u) {
+            v1 = (vc & 1u) != 0u ? 1.0 : 0.0; v1 = sat(v1 + v6); v0 = v0 * v1 + F(s9); v0 = (-v26) * v0 + v26;
+        }
+        pc = 0x13b4u;
+    }
+    if (pc == 0x13b4u) {
+        if(e!=0u) {
+            v1 = 0.0;
+        }
+        vc = s36 & 2u; cc = vc != 0u; pc = (!cc) ? 0x1490u : 0x13c0u;
+    }
+    if (pc == 0x13c0u) {
+        if(e!=0u) {
+            v1 = v15 * v16; v1 = v17 * v19 + v1; v1 = v18 * v20 + v1; v1 = max(0.0, (-v1)); v1 = min(1.0, v1);
+        }
+        s0 = U(P0,0x2a0); s1 = U(P0,0x2a4); s2 = U(P0,0x2a8); s3 = U(P0,0x2ac); s8 = U(P0,0x278); s9 = U(P0,0x27c); s4 = U(P0,0x280);
+        if(e!=0u) {
+            v6 = F(0x3b808081u) + v1; v1 = (-v2) * v5 + 1.0; v2 = F(s0); v2 = F(0xba83126fu) + v2; v2 = min(F(s1), v2); v5 = F(s0) - v2; v5 = 1.0 / v5;
+            v8 = (-v27) * v5; v7 = F(s2); v8 = sat(v2 * (-v5) + v8); v5 = F(s9) - v7; v5 = v8 * v5 + F(s2); v5 = v26 * v5 + F(0x3b808081u);
+            v5 = 1.0 / v5; v7 = F(s3); v5 = sat(v5 * v6); v6 = 1.0 - F(s8); v7 = F(s4) - v7; v6 = v6 * v5; v2 = v7 * v8 + F(s3);
+            v5 = sat(v6 * v5 + F(s8));
+        }
+        vc = ((e & 1u) != 0u && (v1 >= v2)) ? 1u : 0u; vh = 0u;
+        if(e!=0u) {
+            v26 = v5 * (-v26) + v26; v5 = (vc & 1u) != 0u ? 1.0 : 0.0; v5 = v5 * v26;
+        }
+        vc = ((e & 1u) != 0u && (0.0 < v2)) ? 1u : 0u; vh = 0u;
+        if(e!=0u) {
+            v1 = (vc & 1u) != 0u ? v5 : v26;
+        }
+        pc = 0x1490u;
+    }
+    if (pc == 0x1490u) {
+        if(e!=0u) {
+            v0 = max(max(v0, v1), v25);
+        }
+        s4 = U(P0,0x294); s5 = U(P0,0x298); s0 = U(P0,0x29c);
+        if(e!=0u) {
+            v1 = F(s4) - v3; v1 = 1.0 / v1; v1 = sat((-v24) * v1 + 1.0); v2 = 1.0 - F(s5); v1 = max(v2, v1); v0 = v1 * v0; v0 = v0 * (-v14) + v0;
+        }
+        vc = ((e & 1u) != 0u && (F(s0) <= v0)) ? 1u : 0u; vh = 0u;
+        if(e!=0u) {
+            v1 = (vc & 1u) != 0u ? 1.0 : 0.0; v6 = v1 * v0;
+        }
+        pc = 0x14e4u;
+    }
+    if (pc == 0x14e4u) {
+        if(e!=0u) {
+            v1 = (v13);
+        }
+        s4 = U(Flags,0x0); s0 = U(P60,0x11c);
+        if(e!=0u) {
+            v0 = 1.0 - F(s0);
+        }
+        vc = s4 & 0x800000u; cc = vc != 0u;
+        if(e!=0u) {
+            v0 = v0 * v6;
+        }
+        pc = (!cc) ? 0x1570u : 0x1518u;
+    }
+    if (pc == 0x1518u) {
+        s0 = U(View,0x230); s1 = U(View,0x234); s2 = U(View,0x238); s3 = U(View,0x23c);
+        if(e!=0u) {
+            v2 = F(s0); v3 = F(s1); v1 = F(s2); v21 = F(s3) * v21 + v2; v22 = F(s3) * v22 + v3; v23 = F(s3) * v23 + v1; v5 = F(s3); v0 = F(s3) * v0;
+            v1 = F(s3) * v13; v21 = (-F(s0)) * v5 + v21; v22 = (-F(s1)) * v5 + v22; v23 = (-F(s2)) * v5 + v23;
+        }
+        pc = 0x1570u;
+    }
+    if (pc == 0x1570u) {
+        if(e!=0u) {
+            h0 = packHalf2x16(vec2(v0, 0.0));
+        }
+        vc = 0x3a4d9a68u;
+        if(e!=0u) {
+            v2 = sat(F(vc) * v4); h1 = packHalf2x16(vec2(0.0, v1)); h3 = packHalf2x16(vec2(v21, v22));
+        }
+        s0 = U(View,0x22c); vc = s0 & 1u; cc = vc != 0u; cc = vc != 0u;
+        { uint lo_ = cc ? e : 0u; uint hi_ = cc ? eh : 0u; vc = lo_; vh = hi_; }
+        if(e!=0u) {
+            v2 = (vc & 1u) != 0u ? v2 : v13; h2 = packHalf2x16(vec2(v23, v2));
+        }
+        { uint lo_ = s14; uint hi_ = s15; e = lo_; eh = hi_; }
+        if(e==0u) discard;
+        o1 = swz(vec4(unpackHalf2x16(h0), unpackHalf2x16(h1)),cb.c[455].y); o0 = swz(vec4(unpackHalf2x16(h3), unpackHalf2x16(h2)),cb.c[455].x);
+        return;
+        pc = 0x15ccu;
+    }
+    if (pc == 0x15ccu) {
+        { uint lo_ = 0u; uint hi_ = 0u; e = lo_; eh = hi_; }
+        if(e==0u) discard;
+        o1 = swz(vec4(unpackHalf2x16(h0), unpackHalf2x16(h0)),cb.c[455].y);
+        return;
+        return;
+    }
+}
+)";
+
 bool named(const std::string& name, const char* wanted) {
     return name == wanted || name.rfind(std::string(wanted) + " +", 0) == 0;
 }
@@ -2273,15 +3076,19 @@ class Character final : public Pass {
 public:
     const char* name() const override { return "character"; }
     int claims(const std::string& psName) const override {
-        for (int i = 0; i < 9; ++i)
+        for (int i = 0; i < kVariantCount; ++i)
             if (named(psName, kVariants[i].ps)) return i + 1;
         return 0;
     }
 
     bool draw(int role, const Draw& d, Gpu& gpu) override {
-        if (role < 1 || role > 9) return false;
+        if (role < 1 || role > kVariantCount) return false;
         const Variant& var = kVariants[role - 1];
-        if (!d.vsName || !named(*d.vsName, var.vs))
+        if (var.unmatched && !d.compareCopy)
+            return decline(role, "not yet matched (drawn into compare copies only)");
+        const bool alternate = d.vsName && var.alternateVs && named(*d.vsName, var.alternateVs);
+        const auto vsLoads = alternate ? var.alternateVsLoads : var.vsLoads;
+        if (!d.vsName || (!named(*d.vsName, var.vs) && !alternate))
             return decline(role, "another vertex shader");
         if (d.upscaler) return decline(role, "an upscaler is on");
         if (d.pixelPositions) return decline(role, "positions in pixels");
@@ -2296,10 +3103,10 @@ public:
 
         uint32_t c[kConstants][4] = {};
         uint64_t loaded[(kConstants * 4 + 63) / 64] = {};
-        const auto& offs = offsets(role, d);
-        const size_t vsCount = var.vsLoads.size();
+        const auto& offs = offsets(role, d, vsLoads);
+        const size_t vsCount = vsLoads.size();
         for (size_t k = 0; k < vsCount + var.psLoads.size(); ++k) {
-            const Load& l = k < vsCount ? var.vsLoads[k] : var.psLoads[k - vsCount];
+            const Load& l = k < vsCount ? vsLoads[k] : var.psLoads[k - vsCount];
             const uint32_t* data = l.vs ? d.vsData : d.psData;
             const size_t size = l.vs ? d.vsSize : d.psSize;
             std::array<uint32_t, 16> temporary{};
@@ -2404,6 +3211,7 @@ public:
             c[cOut][i] = uint32_t(sw[0] | sw[1] << 2 | sw[2] << 4 | sw[3] << 6);
         }
         c[cOut][2] = d.clipZHalf ? 1 : 0;
+        c[cOut][3] = alternate ? 1 : 0;
 
         Buffer constants;
         if (!gpu.upload(c, sizeof c, constants)) return decline(role, "no room for constants");
@@ -2487,12 +3295,12 @@ private:
         const auto& offset = l.vs ? d.vsOffset : d.psOffset;
         return offset ? offset(l.pc) : -1;
     }
-    const std::vector<int64_t>& offsets(int role, const Draw& d) {
+    const std::vector<int64_t>& offsets(int role, const Draw& d, std::span<const Load> vsLoads) {
         const Variant& var = kVariants[role - 1];
         const auto loadAt = [&](size_t k) -> const Load& {
-            return k < var.vsLoads.size() ? var.vsLoads[k] : var.psLoads[k - var.vsLoads.size()];
+            return k < vsLoads.size() ? vsLoads[k] : var.psLoads[k - vsLoads.size()];
         };
-        const size_t count = var.vsLoads.size() + var.psLoads.size();
+        const size_t count = vsLoads.size() + var.psLoads.size();
         const PairKey key{role, d.vsId, d.psId};
         if (!d.vsId || !d.psId || !d.vsOffset || !d.psOffset) {
             thread_local std::vector<int64_t> current;
@@ -2638,11 +3446,14 @@ private:
         }
         const std::string header = kHeader;
         const std::string defines = kVariants[role - 1].defines;
-        const VkShaderModule vs = gpu.shader(header + defines + kVs, Gpu::Stage::Vertex);
+        const std::string vsSource = role == kO1dztRole
+            ? header + "#define main characterMain\n" + kVs + kO1dztVsSuffix
+            : header + defines + kVs;
+        const VkShaderModule vs = gpu.shader(vsSource, Gpu::Stage::Vertex);
         const std::string fsHeader =
             "#version 450\n#extension GL_EXT_demote_to_helper_invocation : require\n" +
             header.substr(header.find('\n') + 1);
-        const VkShaderModule fs = gpu.shader(fsHeader + defines + kFs, Gpu::Stage::Fragment);
+        const VkShaderModule fs = gpu.shader(fsHeader + defines + (role == kO1dztRole ? kO1dztFs : kFs), Gpu::Stage::Fragment);
         if (!vs || !fs) return out = VK_NULL_HANDLE;
         VkPipelineShaderStageCreateInfo stages[2]{};
         stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
@@ -2707,8 +3518,8 @@ private:
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     std::mutex m_;
-    std::set<std::string> declined_[10];
-    std::atomic<bool> logged_[10]{};
+    std::set<std::string> declined_[kVariantCount + 1];
+    std::atomic<bool> logged_[kVariantCount + 1]{};
     std::shared_mutex offsetsMutex_;
     std::unordered_map<PairKey, std::vector<int64_t>, PairHash> offsets_;
     std::atomic<int> cacheWarned_{0};
